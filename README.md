@@ -21,13 +21,13 @@ Minimal 5% bootstrap of a daemon service for `.aedt` queue intake.
 ## Scope in this bootstrap
 - Folder queue watcher (`incoming/pending/uploaded/done/failed`)
 - Gate spool upload dispatcher (`PENDING -> UPLOADED/FAILED_UPLOAD`)
+- Slurm worker pool manager (계정별 목표 worker 수 유지)
 - Persistent job state in DuckDB
 - Daemon main loop with graceful shutdown (SIGTERM/SIGINT)
 - systemd `--user` unit template
 
 Out of scope for now:
-- Slurm worker pool/dispatch
-- HFSS analyze/export execution
+- HFSS worker execution pipeline (analyze/export/report packaging)
 
 ## Run
 ```bash
@@ -51,6 +51,17 @@ The runtime directories are created automatically under `var/`:
 - Upload idempotency:
   - remote file exists 시 재업로드하지 않고 `UPLOADED`로 복구
   - upload 실패 시 `FAILED_UPLOAD`로 전이하고 오류코드를 기록
+
+## Slurm Worker Pool Contract
+- 어댑터 인터페이스:
+  - `query_workers`, `submit_worker`, `cancel_worker`
+- 계정별 풀 유지:
+  - 목표 수(`pool_target_per_account`)보다 적으면 자동 제출
+  - 목표 수보다 많으면 초과분 자동 취소
+- 고정 자원 정책:
+  - partition=`cpu2`, cores=`32`, mem=`320GB`, internal_procs=`8`
+- 장애 격리:
+  - 계정별 degraded 상태를 추적하고, 정상 계정의 풀 관리는 계속 수행
 
 ## systemd user service
 Template file:

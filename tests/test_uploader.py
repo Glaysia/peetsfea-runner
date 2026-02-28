@@ -3,7 +3,14 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from peetsfea_runner.config import GateAccount, RemoteSpoolPaths, RunnerConfig, build_queue_dirs
+from peetsfea_runner.config import (
+    GateAccount,
+    RemoteSpoolPaths,
+    RunnerConfig,
+    SlurmPolicy,
+    WorkerAccount,
+    build_queue_dirs,
+)
 from peetsfea_runner.state import JobState
 from peetsfea_runner.store import JobStore
 from peetsfea_runner.uploader import (
@@ -58,6 +65,13 @@ def _build_config(tmp_path: Path) -> RunnerConfig:
             failed="/spool/failed",
         ),
     )
+    slurm_policy = SlurmPolicy(
+        partition="cpu2",
+        cores=32,
+        memory_gb=320,
+        job_internal_procs=8,
+        pool_target_per_account=10,
+    )
     return RunnerConfig(
         base_dir=base_dir,
         poll_interval_sec=0.01,
@@ -65,6 +79,8 @@ def _build_config(tmp_path: Path) -> RunnerConfig:
         duckdb_path=queue_dirs.state / "runner.duckdb",
         queue_dirs=queue_dirs,
         gate_account=gate_account,
+        worker_accounts=(WorkerAccount(account_id=gate_account.account_id, ssh_alias=gate_account.ssh_alias),),
+        slurm_policy=slurm_policy,
     )
 
 

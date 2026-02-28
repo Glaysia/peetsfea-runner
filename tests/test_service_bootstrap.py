@@ -4,10 +4,17 @@ import shutil
 import signal
 from pathlib import Path
 
-from peetsfea_runner.config import GateAccount, RemoteSpoolPaths, RunnerConfig, build_queue_dirs
+from peetsfea_runner.config import (
+    GateAccount,
+    RemoteSpoolPaths,
+    RunnerConfig,
+    SlurmPolicy,
+    WorkerAccount,
+    build_queue_dirs,
+)
+from peetsfea_runner.service import RunnerService
 from peetsfea_runner.state import JobState
 from peetsfea_runner.store import JobStore
-from peetsfea_runner.service import RunnerService
 
 
 class _FakeUploadClient:
@@ -30,6 +37,29 @@ class _FakeUploadClient:
         shutil.copy2(local_path, target)
 
 
+class _FakeSlurmClient:
+    def __init__(self) -> None:
+        self._jobs: dict[str, list[str]] = {}
+        self._next_id = 1000
+        self.submit_calls = 0
+
+    def query_workers(self, *, account: WorkerAccount, policy: SlurmPolicy) -> list[str]:
+        _ = policy
+        return list(self._jobs.get(account.account_id, []))
+
+    def submit_worker(self, *, account: WorkerAccount, policy: SlurmPolicy) -> str:
+        _ = policy
+        self.submit_calls += 1
+        self._next_id += 1
+        job_id = str(self._next_id)
+        self._jobs.setdefault(account.account_id, []).append(job_id)
+        return job_id
+
+    def cancel_worker(self, *, account: WorkerAccount, slurm_job_id: str) -> None:
+        current = self._jobs.get(account.account_id, [])
+        self._jobs[account.account_id] = [job for job in current if job != slurm_job_id]
+
+
 def _build_config(tmp_path: Path) -> RunnerConfig:
     base_dir = tmp_path / "var"
     queue_dirs = build_queue_dirs(base_dir)
@@ -43,6 +73,13 @@ def _build_config(tmp_path: Path) -> RunnerConfig:
             failed="/remote/spool/failed",
         ),
     )
+    slurm_policy = SlurmPolicy(
+        partition="cpu2",
+        cores=32,
+        memory_gb=320,
+        job_internal_procs=8,
+        pool_target_per_account=10,
+    )
     return RunnerConfig(
         base_dir=base_dir,
         poll_interval_sec=0.01,
@@ -50,12 +87,14 @@ def _build_config(tmp_path: Path) -> RunnerConfig:
         duckdb_path=queue_dirs.state / "runner.duckdb",
         queue_dirs=queue_dirs,
         gate_account=gate_account,
+        worker_accounts=(WorkerAccount(account_id=gate_account.account_id, ssh_alias=gate_account.ssh_alias),),
+        slurm_policy=slurm_policy,
     )
 
 
 def test_service_bootstrap_creates_queue_directories(tmp_path: Path) -> None:
     config = _build_config(tmp_path)
-    service = RunnerService(config)
+    service = RunnerService(config, slurm_client=_FakeSlurmClient())
 
     service.ensure_runtime_directories()
 
@@ -71,7 +110,7 @@ def test_service_bootstrap_creates_queue_directories(tmp_path: Path) -> None:
 
 def test_service_stops_on_signal_handler(tmp_path: Path) -> None:
     config = _build_config(tmp_path)
-    service = RunnerService(config)
+    service = RunnerService(config, slurm_client=_FakeSlurmClient())
 
     service._handle_signal(signal.SIGTERM, None)
 
@@ -83,7 +122,8 @@ def test_service_processes_pending_upload_in_same_loop(tmp_path: Path) -> None:
     config = _build_config(tmp_path)
     remote_root = tmp_path / "remote"
     upload_client = _FakeUploadClient(remote_root)
-    service = RunnerService(config, upload_client=upload_client)
+    slurm_client = _FakeSlurmClient()
+    service = RunnerService(config, upload_client=upload_client, slurm_client=slurm_client)
 
     service.ensure_runtime_directories()
     store = JobStore(config.duckdb_path)
@@ -103,5 +143,6 @@ def test_service_processes_pending_upload_in_same_loop(tmp_path: Path) -> None:
     assert upload_client.upload_calls == 1
     assert (config.queue_dirs.uploaded / "loop.aedt").exists()
     assert (remote_root / "remote" / "spool" / "inbox" / "loop" / "loop.aedt").exists()
+    assert slurm_client.submit_calls == 10
 
     service.close()
