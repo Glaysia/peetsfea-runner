@@ -48,6 +48,7 @@
 - 잡 내부 동시 PyAEDT 프로세스: `8`
 - 계정당 활성 Slurm 잡 상한: `10`
 - 계정 수: `5`
+- AEDT 실행 경로: `/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt`
 - 리포트 export: 해석 후 `모든 리포트`를 출력
 - 결과 보존: mainPC에 `report-only zip` 1개만 보존
 - 원본 `.aedt`: 완료 후 원격/로컬에서 삭제

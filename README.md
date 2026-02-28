@@ -22,12 +22,13 @@ Minimal 5% bootstrap of a daemon service for `.aedt` queue intake.
 - Folder queue watcher (`incoming/pending/uploaded/done/failed`)
 - Gate spool upload dispatcher (`PENDING -> UPLOADED/FAILED_UPLOAD`)
 - Slurm worker pool manager (계정별 목표 worker 수 유지)
+- HFSS worker execution contract (`analyze -> full report export -> report-only zip -> cleanup`)
 - Persistent job state in DuckDB
 - Daemon main loop with graceful shutdown (SIGTERM/SIGINT)
 - systemd `--user` unit template
 
 Out of scope for now:
-- HFSS worker execution pipeline (analyze/export/report packaging)
+- 원격 Slurm worker 잡 내부와 HFSS worker 모듈의 실제 연결
 
 ## Run
 ```bash
@@ -63,6 +64,16 @@ The runtime directories are created automatically under `var/`:
 - 장애 격리:
   - 계정별 degraded 상태를 추적하고, 정상 계정의 풀 관리는 계속 수행
   - 업로드 단계는 degraded 계정을 제외한 건강한 계정으로만 라우팅
+
+## HFSS Worker Contract
+- 고정 AEDT 실행 경로:
+  - `/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt`
+- 실행 순서:
+  - `.aedt` 열기 -> 자동저장 비활성화 -> analyze -> 모든 리포트 export -> report-only zip 생성
+- 패키징 규약:
+  - zip에는 리포트 출력 파일만 포함하고 `.aedt`/중간파일은 포함하지 않음
+- 정리 규약:
+  - 성공/실패 모두 `.aedt`와 작업 디렉터리를 정리
 
 ## systemd user service
 Template file:
