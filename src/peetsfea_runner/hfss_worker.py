@@ -73,6 +73,18 @@ def sanitize_report_name(report_name: str) -> str:
     return candidate or "report"
 
 
+def build_unique_report_targets(report_names: list[str]) -> list[tuple[str, str]]:
+    targets: list[tuple[str, str]] = []
+    used_counts: dict[str, int] = {}
+    for report_name in report_names:
+        base = sanitize_report_name(report_name)
+        count = used_counts.get(base, 0) + 1
+        used_counts[base] = count
+        unique_name = base if count == 1 else f"{base}__{count}"
+        targets.append((report_name, unique_name))
+    return targets
+
+
 def package_reports_only(*, reports_dir: Path, zip_path: Path) -> None:
     files = sorted(path for path in reports_dir.rglob("*") if path.is_file())
     if not files:
@@ -155,11 +167,13 @@ class HfssWorkerRunner:
                 if not report_names:
                     raise NoReportsError("No reports available for export")
 
-                for report_name in report_names:
-                    safe_name = sanitize_report_name(report_name)
+                report_targets = build_unique_report_targets(report_names)
+                export_formats = tuple(dict.fromkeys(self._export_spec.formats))
+
+                for report_name, safe_name in report_targets:
                     report_dir = reports_dir / safe_name
                     report_dir.mkdir(parents=True, exist_ok=True)
-                    for export_format in self._export_spec.formats:
+                    for export_format in export_formats:
                         output_path = report_dir / f"{safe_name}.{export_format}"
                         adapter.export_report(
                             report_name=report_name,

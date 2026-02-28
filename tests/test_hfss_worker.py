@@ -6,6 +6,7 @@ from zipfile import ZipFile
 from peetsfea_runner.hfss_worker import (
     AEDT_EXECUTABLE_PATH,
     E_HFSS_ANALYZE,
+    E_HFSS_CLEANUP,
     E_HFSS_EXPORT,
     E_HFSS_NO_REPORTS,
     E_HFSS_PACKAGE,
@@ -166,3 +167,36 @@ def test_hfss_worker_marks_packaging_failure(tmp_path: Path, monkeypatch: object
     assert result.error_code == E_HFSS_PACKAGE
     assert result.report_zip_path is None
     assert result.aedt_deleted is True
+
+
+def test_hfss_worker_avoids_filename_collisions_for_sanitized_report_names(tmp_path: Path) -> None:
+    task = _build_task(tmp_path, task_id="collision")
+    adapter = FakeHfssAdapter(reports=["Gain Plot", "Gain/Plot", "Gain-Plot"])
+    runner = HfssWorkerRunner(export_spec=ReportExportSpec(formats=("csv",)))
+
+    result = runner.run_task(task=task, adapter=adapter)
+
+    assert result.success is True
+    assert result.report_zip_path is not None
+    with ZipFile(result.report_zip_path) as archive:
+        names = sorted(archive.namelist())
+
+    assert names == [
+        "Gain-Plot/Gain-Plot.csv",
+        "Gain_Plot/Gain_Plot.csv",
+        "Gain_Plot__2/Gain_Plot__2.csv",
+    ]
+
+
+def test_hfss_worker_marks_cleanup_failure_when_close_fails(tmp_path: Path) -> None:
+    task = _build_task(tmp_path, task_id="close_fail")
+    adapter = FakeHfssAdapter(reports=["S11"], fail_close=True)
+    runner = HfssWorkerRunner()
+
+    result = runner.run_task(task=task, adapter=adapter)
+
+    assert result.success is False
+    assert result.error_code == E_HFSS_CLEANUP
+    assert result.report_zip_path is None
+    assert result.aedt_deleted is True
+    assert task.aedt_path.exists() is False
