@@ -14,6 +14,7 @@ E_UPLOAD_NETWORK = "E_UPLOAD_NETWORK"
 E_UPLOAD_PERMISSION = "E_UPLOAD_PERMISSION"
 E_UPLOAD_REMOTE_PATH = "E_UPLOAD_REMOTE_PATH"
 E_UPLOAD_LOCAL_MISSING = "E_UPLOAD_LOCAL_MISSING"
+E_UPLOAD_LOCAL_MOVE = "E_UPLOAD_LOCAL_MOVE"
 
 
 class UploadClientError(RuntimeError):
@@ -97,6 +98,20 @@ class UploadDispatcher:
             return E_UPLOAD_REMOTE_PATH
         return E_UPLOAD_NETWORK
 
+    def _mark_failed_upload(self, *, task_id: str, error_code: str, message: str) -> None:
+        self._store.update_state_by_task_id(
+            task_id=task_id,
+            state=JobState.FAILED_UPLOAD,
+            error_code=error_code,
+            error_message=message,
+        )
+        self._store.record_event(
+            task_id=task_id,
+            event_type="UPLOAD_FAILED",
+            error_code=error_code,
+            message=message,
+        )
+
     def _move_to_uploaded(self, *, source_path: Path, uploaded_path: Path) -> None:
         uploaded_path.parent.mkdir(parents=True, exist_ok=True)
         if uploaded_path.exists():
@@ -139,24 +154,22 @@ class UploadDispatcher:
                 )
             except UploadClientError as exc:
                 error_code = self._classify_upload_error(exc.message)
-                self._store.update_state_by_task_id(
-                    task_id=task_id,
-                    state=JobState.FAILED_UPLOAD,
-                    error_code=error_code,
-                    error_message=exc.message,
-                )
-                self._store.record_event(
-                    task_id=task_id,
-                    event_type="UPLOAD_FAILED",
-                    error_code=error_code,
-                    message=exc.message,
-                )
+                self._mark_failed_upload(task_id=task_id, error_code=error_code, message=exc.message)
                 processed += 1
                 continue
 
             if remote_exists:
                 if pending_path.exists():
-                    self._move_to_uploaded(source_path=pending_path, uploaded_path=uploaded_path)
+                    try:
+                        self._move_to_uploaded(source_path=pending_path, uploaded_path=uploaded_path)
+                    except OSError as exc:
+                        self._mark_failed_upload(
+                            task_id=task_id,
+                            error_code=E_UPLOAD_LOCAL_MOVE,
+                            message=str(exc),
+                        )
+                        processed += 1
+                        continue
                 self._mark_upload_success(
                     task_id=task_id,
                     uploaded_path=uploaded_path,
@@ -178,15 +191,8 @@ class UploadDispatcher:
                 )
 
             if source_for_upload is None:
-                self._store.update_state_by_task_id(
+                self._mark_failed_upload(
                     task_id=task_id,
-                    state=JobState.FAILED_UPLOAD,
-                    error_code=E_UPLOAD_LOCAL_MISSING,
-                    error_message="No local source found for upload (pending/uploaded missing)",
-                )
-                self._store.record_event(
-                    task_id=task_id,
-                    event_type="UPLOAD_FAILED",
                     error_code=E_UPLOAD_LOCAL_MISSING,
                     message="No local source found for upload (pending/uploaded missing)",
                 )
@@ -207,23 +213,21 @@ class UploadDispatcher:
                 )
             except UploadClientError as exc:
                 error_code = self._classify_upload_error(exc.message)
-                self._store.update_state_by_task_id(
-                    task_id=task_id,
-                    state=JobState.FAILED_UPLOAD,
-                    error_code=error_code,
-                    error_message=exc.message,
-                )
-                self._store.record_event(
-                    task_id=task_id,
-                    event_type="UPLOAD_FAILED",
-                    error_code=error_code,
-                    message=exc.message,
-                )
+                self._mark_failed_upload(task_id=task_id, error_code=error_code, message=exc.message)
                 processed += 1
                 continue
 
             if source_for_upload == pending_path and pending_path.exists():
-                self._move_to_uploaded(source_path=pending_path, uploaded_path=uploaded_path)
+                try:
+                    self._move_to_uploaded(source_path=pending_path, uploaded_path=uploaded_path)
+                except OSError as exc:
+                    self._mark_failed_upload(
+                        task_id=task_id,
+                        error_code=E_UPLOAD_LOCAL_MOVE,
+                        message=str(exc),
+                    )
+                    processed += 1
+                    continue
 
             self._mark_upload_success(
                 task_id=task_id,

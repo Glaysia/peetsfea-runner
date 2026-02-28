@@ -7,6 +7,7 @@ from peetsfea_runner.config import GateAccount, RemoteSpoolPaths, RunnerConfig, 
 from peetsfea_runner.state import JobState
 from peetsfea_runner.store import JobStore
 from peetsfea_runner.uploader import (
+    E_UPLOAD_LOCAL_MOVE,
     E_UPLOAD_NETWORK,
     E_UPLOAD_PERMISSION,
     E_UPLOAD_REMOTE_PATH,
@@ -227,4 +228,82 @@ def test_upload_dispatcher_recovers_when_remote_already_exists_without_reupload(
     processed_again = dispatcher.process_once()
     assert processed_again == 0
     assert client.upload_calls == 0
+    store.close()
+
+
+def test_upload_dispatcher_resumes_upload_from_uploaded_when_pending_missing(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    _mkdir_queue_dirs(config)
+
+    store = JobStore(config.duckdb_path)
+    store.initialize_schema()
+
+    uploaded_file = config.queue_dirs.uploaded / "resume_up.aedt"
+    uploaded_file.write_text("payload")
+    pending_file = config.queue_dirs.pending / "resume_up.aedt"
+
+    inserted = store.insert_job(
+        task_id="resume_up",
+        filename="resume_up.aedt",
+        source_path=str(config.queue_dirs.incoming / "resume_up.aedt"),
+        pending_path=str(pending_file),
+        uploaded_path=str(uploaded_file),
+        state=JobState.PENDING,
+    )
+    assert inserted is True
+
+    remote_root = tmp_path / "remote"
+    client = FakeUploadClient(remote_root)
+    dispatcher = UploadDispatcher(config, store, client=client)
+
+    processed = dispatcher.process_once()
+
+    assert processed == 1
+    assert client.upload_calls == 1
+    assert store.get_job_state("resume_up") == JobState.UPLOADED.value
+    assert (remote_root / "spool" / "inbox" / "resume_up" / "resume_up.aedt").exists()
+
+    events = [event[0] for event in store.get_task_events("resume_up")]
+    assert "UPLOAD_RESUME_FROM_UPLOADED" in events
+    assert "UPLOAD_DONE" in events
+    store.close()
+
+
+def test_upload_dispatcher_marks_failed_upload_when_local_move_fails(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    config = _build_config(tmp_path)
+    _mkdir_queue_dirs(config)
+
+    store = JobStore(config.duckdb_path)
+    store.initialize_schema()
+
+    pending_file = config.queue_dirs.pending / "move_fail.aedt"
+    pending_file.write_text("payload")
+    _insert_pending_job(store, task_id="move_fail", pending_file=pending_file)
+
+    remote_root = tmp_path / "remote"
+    client = FakeUploadClient(remote_root)
+    dispatcher = UploadDispatcher(config, store, client=client)
+
+    uploaded_file = config.queue_dirs.uploaded / "move_fail.aedt"
+    original_rename = Path.rename
+
+    def _patched_rename(self: Path, target: Path) -> Path:
+        if self == pending_file and target == uploaded_file:
+            raise OSError("forced local move failure")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", _patched_rename)
+
+    processed = dispatcher.process_once()
+
+    assert processed == 1
+    assert store.get_job_state("move_fail") == JobState.FAILED_UPLOAD.value
+    error = store.get_job_error("move_fail")
+    assert error is not None
+    assert error[0] == E_UPLOAD_LOCAL_MOVE
+    assert pending_file.exists()
+    assert (remote_root / "spool" / "inbox" / "move_fail" / "move_fail.aedt").exists()
     store.close()
