@@ -82,6 +82,7 @@ The runtime directories are created automatically under `var/`:
   - `PENDING` 파일 TTL 초과 시 `incoming/`으로 requeue
   - `PENDING/UPLOADED/FAILED_UPLOAD` 상태와 `pending/`, `uploaded/` 파일 실제 상태 불일치 보정
   - `DONE` 상태의 `report_zip_local_path` 유실 복구 또는 실패 격하
+  - `done/`의 고아 `*.reports.zip`(DB 미등록)을 자동 등록해 DB-파일 정합성 복구
 - `.aedt` 삭제 감사:
   - `DONE + aedt_retention=delete_after_done`에서 로컬 `.aedt` 잔존 탐지
   - 잔존 발견 시 `AEDT_RETENTION_VIOLATION_DETECTED` 기록 후 삭제 시도

@@ -15,6 +15,7 @@ from peetsfea_runner.event_types import (
     AEDT_DELETE_LOCAL_DONE,
     AEDT_RETENTION_VIOLATION_DETECTED,
     RECONCILE_DONE_ZIP_MISSING,
+    RECONCILE_ORPHAN_DONE_ZIP_REGISTERED,
     RECONCILE_DONE_ZIP_RECOVERED,
     RECONCILE_PENDING_TO_UPLOADED,
     RECONCILE_PENDING_TTL_REQUEUE,
@@ -100,6 +101,27 @@ def test_reconciler_requeues_pending_when_ttl_exceeded(tmp_path: Path) -> None:
 
     events = [event[0] for event in store.get_task_events("stale")]
     assert RECONCILE_PENDING_TTL_REQUEUE in events
+    store.close()
+
+
+def test_reconciler_registers_orphan_done_zip_into_db(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    _mkdir_queue_dirs(config)
+    store = JobStore(config.duckdb_path)
+    store.initialize_schema()
+
+    orphan_zip = config.queue_dirs.done / "orphan.reports.zip"
+    orphan_zip.write_text("zip")
+
+    reconciler = OperationsReconciler(config, store)
+    processed = reconciler.process_once()
+
+    assert processed == 1
+    assert store.get_job_state("orphan") == JobState.DONE.value
+    assert store.get_report_zip_local_path("orphan") == str(orphan_zip)
+
+    events = [event[0] for event in store.get_task_events("orphan")]
+    assert RECONCILE_ORPHAN_DONE_ZIP_REGISTERED in events
     store.close()
 
 

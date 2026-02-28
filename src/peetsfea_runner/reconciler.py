@@ -10,6 +10,7 @@ from peetsfea_runner.event_types import (
     AEDT_DELETE_LOCAL_FAILED,
     AEDT_RETENTION_VIOLATION_DETECTED,
     RECONCILE_DONE_ZIP_MISSING,
+    RECONCILE_ORPHAN_DONE_ZIP_REGISTERED,
     RECONCILE_DONE_ZIP_RECOVERED,
     RECONCILE_PENDING_TO_UPLOADED,
     RECONCILE_PENDING_TTL_REQUEUE,
@@ -56,6 +57,37 @@ class OperationsReconciler:
             error_code=error_code,
             message=message,
         )
+
+    def _register_orphan_done_zips(self) -> int:
+        processed = 0
+        for zip_path in sorted(self._config.queue_dirs.done.glob("*.reports.zip")):
+            task_id = zip_path.name.removesuffix(".reports.zip")
+            if not task_id:
+                continue
+            if self._store.task_exists(task_id):
+                continue
+
+            filename = f"{task_id}.aedt"
+            inserted = self._store.insert_job(
+                task_id=task_id,
+                filename=filename,
+                source_path=str(self._config.queue_dirs.incoming / filename),
+                pending_path=str(self._config.queue_dirs.pending / filename),
+                uploaded_path=str(self._config.queue_dirs.uploaded / filename),
+                report_zip_local_path=str(zip_path),
+                state=JobState.DONE,
+            )
+            if not inserted:
+                continue
+
+            self._record_event(
+                task_id=task_id,
+                event_type=RECONCILE_ORPHAN_DONE_ZIP_REGISTERED,
+                message=f"report_zip_local_path={zip_path}",
+            )
+            processed += 1
+
+        return processed
 
     def _requeue_pending_if_ttl_exceeded(
         self,
@@ -281,7 +313,7 @@ class OperationsReconciler:
         return processed
 
     def process_once(self) -> int:
-        processed = 0
+        processed = self._register_orphan_done_zips()
         now_ts = time()
 
         for (

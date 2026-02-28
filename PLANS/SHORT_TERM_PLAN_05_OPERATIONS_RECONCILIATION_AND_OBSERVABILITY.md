@@ -21,6 +21,7 @@
 
 ## Implemented Rules (2026-03-01)
 - Reconciler 모듈:
+  - `done/`에 zip은 있으나 DB에 없는 고아 결과를 `DONE` 작업으로 자동 등록한다.
   - `PENDING` TTL 초과 작업을 `incoming/`으로 requeue한다.
   - `PENDING/UPLOADED/FAILED_UPLOAD`와 로컬 파일(`pending/`, `uploaded/`) 불일치를 자동 보정한다.
   - `DONE` 작업의 `report_zip_local_path`가 유실되면 `var/done/<task_id>.reports.zip`에서 복구 시도 후, 실패 시 `FAILED`로 격하한다.

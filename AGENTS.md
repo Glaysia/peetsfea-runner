@@ -54,7 +54,7 @@
 - 결과 보존: mainPC에 `report-only zip` 1개만 보존
 - 원본 `.aedt`: 완료 후 원격/로컬에서 삭제
 - 저장소 운영 위치: repo는 `mainPC`에서만 운영(계정 gate/home clone 금지)
-- 운영 감사: Reconciler가 상태 불일치 보정과 `.aedt` 잔존 감사(`delete_after_done`)를 수행
+- 운영 감사: Reconciler가 상태 불일치(고아 done zip 포함) 보정과 `.aedt` 잔존 감사(`delete_after_done`)를 수행
 
 ## Discord 알림 규칙 (MCP)
 - 작업 시작/종료 시각은 셸 초 단위로 계산한다.

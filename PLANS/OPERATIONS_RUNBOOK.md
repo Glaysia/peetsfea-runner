@@ -18,6 +18,7 @@
    - `systemctl --user restart peetsfea-runner`
 2. 1회 루프 이후 보정 이벤트 확인:
    - `duckdb var/state/runner.duckdb "SELECT task_id,event_type,error_code FROM job_events WHERE event_type LIKE 'RECONCILE_%' ORDER BY created_at DESC LIMIT 100;"`
+   - `RECONCILE_ORPHAN_DONE_ZIP_REGISTERED` 이벤트가 있으면 done zip 고아 정합성 복구가 수행된 것이다.
 3. 삭제 정책 위반 탐지 확인:
    - `duckdb var/state/runner.duckdb "SELECT task_id,event_type,message FROM job_events WHERE event_type IN ('AEDT_RETENTION_VIOLATION_DETECTED','AEDT_DELETE_LOCAL_FAILED','AEDT_DELETE_LOCAL_DONE') ORDER BY created_at DESC LIMIT 100;"`
 
@@ -55,6 +56,7 @@
   - `RECONCILE_PENDING_TTL_REQUEUE`
   - `RECONCILE_PENDING_TO_UPLOADED`, `RECONCILE_UPLOADED_TO_PENDING`
   - `RECONCILE_DONE_ZIP_RECOVERED`, `RECONCILE_DONE_ZIP_MISSING`
+  - `RECONCILE_ORPHAN_DONE_ZIP_REGISTERED`
 
 ## Validation Record (Plan 05)
 - 단위 테스트로 아래 시나리오를 검증한다:

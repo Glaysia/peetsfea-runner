@@ -227,3 +227,24 @@ def test_service_reconciles_done_job_with_missing_zip_on_startup(tmp_path: Path)
     assert error[0] == E_RECONCILE_DONE_ZIP_MISSING
     store.close()
     service.close()
+
+
+def test_service_registers_orphan_done_zip_on_startup(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    service = RunnerService(config, slurm_client=_FakeSlurmClient())
+    service.ensure_runtime_directories()
+
+    orphan_zip = config.queue_dirs.done / "orphan.reports.zip"
+    orphan_zip.write_text("zip")
+
+    store = JobStore(config.duckdb_path)
+    store.initialize_schema()
+    store.close()
+
+    service.run(register_signals=False, max_loops=1)
+
+    store = JobStore(config.duckdb_path)
+    assert store.get_job_state("orphan") == JobState.DONE.value
+    assert store.get_report_zip_local_path("orphan") == str(orphan_zip)
+    store.close()
+    service.close()
