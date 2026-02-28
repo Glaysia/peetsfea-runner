@@ -1,0 +1,14 @@
+[Unit]
+Description=peetsfea-runner queue daemon
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/harry/Projects/PythonProjects/Legacy/peetsfea/peetsfea-runner
+ExecStart=/home/harry/Projects/PythonProjects/Legacy/peetsfea/peetsfea-runner/.venv/bin/python -m peetsfea_runner.main
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
