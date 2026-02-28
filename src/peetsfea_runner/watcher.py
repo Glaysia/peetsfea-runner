@@ -58,12 +58,110 @@ class QueueWatcher:
                 message=f"{message}; quarantine_error={exc}",
             )
 
+    def _recover_pending_state_gaps(self) -> int:
+        recovered = 0
+        for task_id, pending_path_text in self._store.list_jobs_by_state(JobState.NEW):
+            if not pending_path_text:
+                continue
+            pending_path = Path(pending_path_text)
+            if not pending_path.exists():
+                continue
+
+            self._store.update_state_by_task_id(
+                task_id=task_id,
+                state=JobState.PENDING,
+                error_code=None,
+                error_message=None,
+            )
+            self._store.record_event(
+                task_id=task_id,
+                event_type="INGEST_RECOVERED_PENDING_STATE",
+                message=f"pending={pending_path}",
+            )
+            recovered += 1
+        return recovered
+
+    def _resume_existing_task(self, *, source_path: Path, task_id: str) -> int:
+        pending_path = self._config.queue_dirs.pending / source_path.name
+        self._store.refresh_job_paths(
+            task_id=task_id,
+            filename=source_path.name,
+            source_path=str(source_path),
+            pending_path=str(pending_path),
+        )
+
+        if pending_path.exists():
+            # Existing pending file wins; incoming copy is treated as duplicate payload.
+            self._store.update_state_by_task_id(
+                task_id=task_id,
+                state=JobState.PENDING,
+                error_code=None,
+                error_message=None,
+            )
+            self._store.record_event(
+                task_id=task_id,
+                event_type="INGEST_RESUME_PENDING_ALREADY_EXISTS",
+                message=f"pending={pending_path}",
+            )
+            self._quarantine_source(
+                source_path=source_path,
+                task_id=task_id,
+                tag="duplicate",
+                event_type="INGEST_DUPLICATE_IGNORED",
+                error_code=E_DUPLICATE_TASK_ID,
+                message="Duplicate payload ignored while existing task resumed",
+            )
+            return 1
+
+        try:
+            source_path.rename(pending_path)
+        except OSError as exc:
+            self._store.update_state_by_task_id(
+                task_id=task_id,
+                state=JobState.FAILED_LOCAL,
+                error_code=E_INGEST_MOVE_PENDING,
+                error_message=str(exc),
+            )
+            self._store.record_event(
+                task_id=task_id,
+                event_type="INGEST_MOVE_FAILED",
+                error_code=E_INGEST_MOVE_PENDING,
+                message=str(exc),
+            )
+            self._quarantine_source(
+                source_path=source_path,
+                task_id=task_id,
+                tag="ingest_failed",
+                event_type="INGEST_SOURCE_QUARANTINED",
+                error_code=E_INGEST_MOVE_PENDING,
+                message="Source quarantined after resume move failure",
+            )
+            return 1
+
+        self._store.update_state_by_task_id(
+            task_id=task_id,
+            state=JobState.PENDING,
+            error_code=None,
+            error_message=None,
+        )
+        self._store.record_event(
+            task_id=task_id,
+            event_type="INGEST_RESUMED_TO_PENDING",
+            message=f"pending={pending_path}",
+        )
+        return 1
+
     def process_once(self) -> int:
-        processed = 0
+        processed = self._recover_pending_state_gaps()
         for source_path in discover_aedt_files(self._config.queue_dirs.incoming):
             task_id = task_id_from_path(source_path)
 
             if self._store.task_exists(task_id):
+                existing = self._store.get_job_row(task_id)
+                if existing is not None and existing[4] in (JobState.NEW.value, JobState.FAILED_LOCAL.value):
+                    processed += self._resume_existing_task(source_path=source_path, task_id=task_id)
+                    continue
+
                 self._quarantine_source(
                     source_path=source_path,
                     task_id=task_id,

@@ -240,6 +240,37 @@ class JobStore:
             return None
         return (str(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4]))
 
+    def list_jobs_by_state(self, state: JobState) -> list[tuple[str, str]]:
+        rows = self.connection.execute(
+            """
+            SELECT task_id, pending_path
+            FROM jobs
+            WHERE state = ?
+            """,
+            [state.value],
+        ).fetchall()
+        return [(str(row[0]), str(row[1]) if row[1] is not None else "") for row in rows]
+
+    def refresh_job_paths(
+        self,
+        *,
+        task_id: str,
+        filename: str,
+        source_path: str,
+        pending_path: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE jobs
+            SET filename = ?,
+                source_path = ?,
+                pending_path = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+            """,
+            [filename, source_path, pending_path, task_id],
+        )
+
     def get_task_events(self, task_id: str) -> list[tuple[str, str | None, str | None]]:
         rows = self.connection.execute(
             """

@@ -109,3 +109,67 @@ def test_watcher_marks_failed_local_on_pending_collision(tmp_path: Path) -> None
     assert events[-1][0] == "INGEST_PENDING_COLLISION"
     assert events[-1][1] == E_INGEST_PENDING_COLLISION
     store.close()
+
+
+def test_watcher_resumes_existing_new_task_from_incoming(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    _mkdir_queue_dirs(config)
+
+    store = JobStore(config.duckdb_path)
+    store.initialize_schema()
+
+    incoming = config.queue_dirs.incoming / "resume.aedt"
+    incoming.write_text("payload")
+    pending = config.queue_dirs.pending / "resume.aedt"
+
+    inserted = store.insert_job(
+        task_id="resume",
+        filename="resume.aedt",
+        source_path=str(incoming),
+        pending_path=str(pending),
+        state=JobState.NEW,
+    )
+    assert inserted is True
+
+    watcher = QueueWatcher(config, store)
+    processed = watcher.process_once()
+
+    assert processed == 1
+    assert not incoming.exists()
+    assert pending.exists()
+    assert store.get_job_state("resume") == JobState.PENDING.value
+    assert list(config.queue_dirs.failed.glob("resume.*.aedt")) == []
+
+    events = store.get_task_events("resume")
+    assert events[-1][0] == "INGEST_RESUMED_TO_PENDING"
+    store.close()
+
+
+def test_watcher_recovers_new_job_when_pending_file_already_exists(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    _mkdir_queue_dirs(config)
+
+    store = JobStore(config.duckdb_path)
+    store.initialize_schema()
+
+    pending = config.queue_dirs.pending / "gap.aedt"
+    pending.write_text("already-moved")
+
+    inserted = store.insert_job(
+        task_id="gap",
+        filename="gap.aedt",
+        source_path=str(config.queue_dirs.incoming / "gap.aedt"),
+        pending_path=str(pending),
+        state=JobState.NEW,
+    )
+    assert inserted is True
+
+    watcher = QueueWatcher(config, store)
+    processed = watcher.process_once()
+
+    assert processed == 1
+    assert store.get_job_state("gap") == JobState.PENDING.value
+
+    events = store.get_task_events("gap")
+    assert events[-1][0] == "INGEST_RECOVERED_PENDING_STATE"
+    store.close()
