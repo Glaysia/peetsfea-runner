@@ -6,15 +6,17 @@ from pathlib import Path
 
 from peetsfea_runner.config import RunnerConfig
 from peetsfea_runner.store import JobStore
+from peetsfea_runner.uploader import SpoolUploadClient, UploadDispatcher
 from peetsfea_runner.watcher import QueueWatcher
 
 
 class RunnerService:
-    def __init__(self, config: RunnerConfig) -> None:
+    def __init__(self, config: RunnerConfig, upload_client: SpoolUploadClient | None = None) -> None:
         self._config = config
         self._stop_event = threading.Event()
         self._store = JobStore(config.duckdb_path)
         self._watcher = QueueWatcher(config, self._store)
+        self._uploader = UploadDispatcher(config, self._store, client=upload_client)
 
     @property
     def stop_event(self) -> threading.Event:
@@ -50,6 +52,7 @@ class RunnerService:
         loops = 0
         while not self._stop_event.is_set():
             processed = self._watcher.process_once()
+            processed += self._uploader.process_once()
             wait_sec = self._config.poll_interval_sec if processed else self._config.idle_sleep_sec
             self._stop_event.wait(wait_sec)
 

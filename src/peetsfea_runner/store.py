@@ -51,6 +51,8 @@ class JobStore:
                 filename TEXT NOT NULL,
                 source_path TEXT NOT NULL,
                 pending_path TEXT,
+                uploaded_path TEXT,
+                remote_inbox_path TEXT,
                 state TEXT NOT NULL,
                 aedt_retention TEXT NOT NULL DEFAULT 'delete_after_done',
                 local_aedt_deleted_ts TIMESTAMP,
@@ -73,6 +75,14 @@ class JobStore:
             else:
                 self.connection.execute("ALTER TABLE jobs ADD COLUMN pending_path TEXT")
             columns.add("pending_path")
+
+        if "uploaded_path" not in columns:
+            self.connection.execute("ALTER TABLE jobs ADD COLUMN uploaded_path TEXT")
+            columns.add("uploaded_path")
+
+        if "remote_inbox_path" not in columns:
+            self.connection.execute("ALTER TABLE jobs ADD COLUMN remote_inbox_path TEXT")
+            columns.add("remote_inbox_path")
 
         if "aedt_retention" not in columns:
             self.connection.execute(
@@ -140,6 +150,8 @@ class JobStore:
         source_path: str,
         pending_path: str,
         state: JobState,
+        uploaded_path: str | None = None,
+        remote_inbox_path: str | None = None,
         aedt_retention: str = "delete_after_done",
         error_code: str | None = None,
         error_message: str | None = None,
@@ -152,18 +164,22 @@ class JobStore:
                     filename,
                     source_path,
                     pending_path,
+                    uploaded_path,
+                    remote_inbox_path,
                     state,
                     aedt_retention,
                     error_code,
                     error_message
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     task_id,
                     filename,
                     source_path,
                     pending_path,
+                    uploaded_path,
+                    remote_inbox_path,
                     state.value,
                     aedt_retention,
                     error_code,
@@ -239,6 +255,55 @@ class JobStore:
         if row is None:
             return None
         return (str(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4]))
+
+    def get_job_error(self, task_id: str) -> tuple[str | None, str | None] | None:
+        row = self.connection.execute(
+            """
+            SELECT error_code, error_message
+            FROM jobs
+            WHERE task_id = ?
+            """,
+            [task_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return (row[0], row[1])
+
+    def list_pending_upload_jobs(self) -> list[tuple[str, str, str, str, str]]:
+        rows = self.connection.execute(
+            """
+            SELECT task_id, filename, pending_path, uploaded_path, remote_inbox_path
+            FROM jobs
+            WHERE state = ?
+            ORDER BY created_at, task_id
+            """,
+            [JobState.PENDING.value],
+        ).fetchall()
+        return [
+            (
+                str(row[0]),
+                str(row[1]),
+                str(row[2]) if row[2] is not None else "",
+                str(row[3]) if row[3] is not None else "",
+                str(row[4]) if row[4] is not None else "",
+            )
+            for row in rows
+        ]
+
+    def mark_uploaded(self, *, task_id: str, uploaded_path: str, remote_inbox_path: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE jobs
+            SET state = ?,
+                uploaded_path = ?,
+                remote_inbox_path = ?,
+                error_code = NULL,
+                error_message = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+            """,
+            [JobState.UPLOADED.value, uploaded_path, remote_inbox_path, task_id],
+        )
 
     def list_jobs_by_state(self, state: JobState) -> list[tuple[str, str]]:
         rows = self.connection.execute(

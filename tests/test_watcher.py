@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from peetsfea_runner.config import RunnerConfig, build_queue_dirs
+from peetsfea_runner.config import GateAccount, RemoteSpoolPaths, RunnerConfig, build_queue_dirs
 from peetsfea_runner.state import JobState
 from peetsfea_runner.store import JobStore
 from peetsfea_runner.watcher import (
@@ -15,12 +15,23 @@ from peetsfea_runner.watcher import (
 def _build_config(tmp_path: Path) -> RunnerConfig:
     base_dir = tmp_path / "var"
     queue_dirs = build_queue_dirs(base_dir)
+    gate_account = GateAccount(
+        account_id="acct-test",
+        ssh_alias="gate-test",
+        spool_paths=RemoteSpoolPaths(
+            inbox="/remote/spool/inbox",
+            claimed="/remote/spool/claimed",
+            results="/remote/spool/results",
+            failed="/remote/spool/failed",
+        ),
+    )
     return RunnerConfig(
         base_dir=base_dir,
         poll_interval_sec=0.01,
         idle_sleep_sec=0.01,
         duckdb_path=queue_dirs.state / "runner.duckdb",
         queue_dirs=queue_dirs,
+        gate_account=gate_account,
     )
 
 

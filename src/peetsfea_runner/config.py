@@ -5,6 +5,21 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
+class RemoteSpoolPaths:
+    inbox: str
+    claimed: str
+    results: str
+    failed: str
+
+
+@dataclass(frozen=True)
+class GateAccount:
+    account_id: str
+    ssh_alias: str
+    spool_paths: RemoteSpoolPaths
+
+
+@dataclass(frozen=True)
 class QueueDirs:
     incoming: Path
     pending: Path
@@ -21,6 +36,7 @@ class RunnerConfig:
     idle_sleep_sec: float
     duckdb_path: Path
     queue_dirs: QueueDirs
+    gate_account: GateAccount
 
 
 def build_queue_dirs(base_dir: Path) -> QueueDirs:

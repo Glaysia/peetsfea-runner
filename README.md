@@ -20,12 +20,13 @@ Minimal 5% bootstrap of a daemon service for `.aedt` queue intake.
 
 ## Scope in this bootstrap
 - Folder queue watcher (`incoming/pending/uploaded/done/failed`)
+- Gate spool upload dispatcher (`PENDING -> UPLOADED/FAILED_UPLOAD`)
 - Persistent job state in DuckDB
 - Daemon main loop with graceful shutdown (SIGTERM/SIGINT)
 - systemd `--user` unit template
 
 Out of scope for now:
-- Remote SSH/Slurm dispatch
+- Slurm worker pool/dispatch
 - HFSS analyze/export execution
 
 ## Run
@@ -41,6 +42,15 @@ The runtime directories are created automatically under `var/`:
 - `var/failed`
 - `var/state`
 - `var/state/runner.duckdb`
+
+## Gate Upload Path Contract
+- Remote spool path contract:
+  - `inbox/`, `claimed/`, `results/`, `failed/`
+- Upload target path template:
+  - `<spool_inbox>/<task_id>/<filename>`
+- Upload idempotency:
+  - remote file exists 시 재업로드하지 않고 `UPLOADED`로 복구
+  - upload 실패 시 `FAILED_UPLOAD`로 전이하고 오류코드를 기록
 
 ## systemd user service
 Template file:
