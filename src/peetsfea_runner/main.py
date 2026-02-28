@@ -13,7 +13,7 @@ CONFIG = RunnerConfig(
     base_dir=BASE_DIR,
     poll_interval_sec=1.0,
     idle_sleep_sec=5.0,
-    duckdb_path=BASE_DIR / "runner.duckdb",
+    duckdb_path=QUEUE_DIRS.state / "runner.duckdb",
     queue_dirs=QUEUE_DIRS,
 )
 

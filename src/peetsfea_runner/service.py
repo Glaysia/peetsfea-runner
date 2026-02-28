@@ -31,10 +31,12 @@ class RunnerService:
     def ensure_runtime_directories(self) -> None:
         self._config.base_dir.mkdir(parents=True, exist_ok=True)
         queue_dirs: list[Path] = [
-            self._config.queue_dirs.inbox,
-            self._config.queue_dirs.staging,
+            self._config.queue_dirs.incoming,
+            self._config.queue_dirs.pending,
+            self._config.queue_dirs.uploaded,
             self._config.queue_dirs.done,
             self._config.queue_dirs.failed,
+            self._config.queue_dirs.state,
         ]
         for directory in queue_dirs:
             directory.mkdir(parents=True, exist_ok=True)

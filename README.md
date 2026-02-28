@@ -19,7 +19,7 @@ Minimal 5% bootstrap of a daemon service for `.aedt` queue intake.
 - 단기 계획 05: [PLANS/SHORT_TERM_PLAN_05_OPERATIONS_RECONCILIATION_AND_OBSERVABILITY.md](PLANS/SHORT_TERM_PLAN_05_OPERATIONS_RECONCILIATION_AND_OBSERVABILITY.md)
 
 ## Scope in this bootstrap
-- Folder queue watcher (`inbox/staging/done/failed`)
+- Folder queue watcher (`incoming/pending/uploaded/done/failed`)
 - Persistent job state in DuckDB
 - Daemon main loop with graceful shutdown (SIGTERM/SIGINT)
 - systemd `--user` unit template
@@ -34,11 +34,13 @@ python -m peetsfea_runner.main
 ```
 
 The runtime directories are created automatically under `var/`:
-- `var/inbox`
-- `var/staging`
+- `var/incoming`
+- `var/pending`
+- `var/uploaded`
 - `var/done`
 - `var/failed`
-- `var/runner.duckdb`
+- `var/state`
+- `var/state/runner.duckdb`
 
 ## systemd user service
 Template file:
