@@ -125,3 +125,29 @@ def test_store_sets_and_reads_report_zip_local_path(tmp_path: Path) -> None:
 
     assert store.get_report_zip_local_path("task-zip") == zip_path
     store.close()
+
+
+def test_store_sets_and_reads_report_zip_remote_path(tmp_path: Path) -> None:
+    db_path = tmp_path / "state" / "runner.duckdb"
+    store = JobStore(db_path)
+    store.initialize_schema()
+
+    store.insert_job(
+        task_id="task-zip-remote",
+        filename="task-zip-remote.aedt",
+        source_path="/tmp/incoming/task-zip-remote.aedt",
+        pending_path="/tmp/pending/task-zip-remote.aedt",
+        state=JobState.UPLOADED,
+    )
+
+    local_zip = "/tmp/done/task-zip-remote.reports.zip"
+    remote_zip = "/remote/spool/results/task-zip-remote.reports.zip"
+    store.set_report_zip_paths(
+        task_id="task-zip-remote",
+        report_zip_local_path=local_zip,
+        report_zip_remote_path=remote_zip,
+    )
+
+    assert store.get_report_zip_local_path("task-zip-remote") == local_zip
+    assert store.get_report_zip_remote_path("task-zip-remote") == remote_zip
+    store.close()

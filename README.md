@@ -23,6 +23,7 @@ Minimal 5% bootstrap of a daemon service for `.aedt` queue intake.
 ## Scope in this bootstrap
 - Folder queue watcher (`incoming/pending/uploaded/done/failed`)
 - Gate spool upload dispatcher (`PENDING -> UPLOADED/FAILED_UPLOAD`)
+- Gate results collector (`results -> done`, atomic download, idempotent skip)
 - Slurm worker pool manager (계정별 목표 worker 수 유지)
 - HFSS worker execution contract (`analyze -> full report export -> report-only zip -> cleanup`)
 - Reconciler/Auditor (`pending TTL requeue`, `DB-file mismatch correction`, `DONE .aedt retention audit`)

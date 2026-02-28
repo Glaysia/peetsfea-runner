@@ -66,6 +66,33 @@ class _FakeSlurmClient:
         self._jobs[account.account_id] = [job for job in current if job != slurm_job_id]
 
 
+class _FakeResultsClient:
+    def __init__(self, remote_root: Path) -> None:
+        self._remote_root = remote_root
+        self.download_calls = 0
+
+    def _local_remote_path(self, remote_path: str) -> Path:
+        return self._remote_root / remote_path.lstrip("/")
+
+    def list_result_zips(self, *, remote_host: str, remote_results_path: str) -> list[str]:
+        _ = remote_host
+        base = self._local_remote_path(remote_results_path)
+        if not base.exists():
+            return []
+        paths: list[str] = []
+        for file_path in sorted(base.rglob("*.reports.zip")):
+            relative = file_path.relative_to(base).as_posix()
+            paths.append(f"{remote_results_path.rstrip('/')}/{relative}")
+        return paths
+
+    def download_result_zip(self, *, remote_host: str, remote_path: str, local_path: Path) -> None:
+        _ = remote_host
+        self.download_calls += 1
+        source = self._local_remote_path(remote_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, local_path)
+
+
 def _build_config(tmp_path: Path) -> RunnerConfig:
     base_dir = tmp_path / "var"
     queue_dirs = build_queue_dirs(base_dir)
@@ -246,5 +273,43 @@ def test_service_registers_orphan_done_zip_on_startup(tmp_path: Path) -> None:
     store = JobStore(config.duckdb_path)
     assert store.get_job_state("orphan") == JobState.DONE.value
     assert store.get_report_zip_local_path("orphan") == str(orphan_zip)
+    store.close()
+    service.close()
+
+
+def test_service_collects_remote_result_zip_in_same_loop(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    remote_root = tmp_path / "remote"
+    results_client = _FakeResultsClient(remote_root)
+    slurm_client = _FakeSlurmClient()
+    slurm_client._jobs["acct-a"] = ["2001"] * 10
+    slurm_client._jobs["acct-b"] = ["3001"] * 10
+    service = RunnerService(config, results_client=results_client, slurm_client=slurm_client)
+    service.ensure_runtime_directories()
+
+    store = JobStore(config.duckdb_path)
+    store.initialize_schema()
+    inserted = store.insert_job(
+        task_id="collect-loop",
+        filename="collect-loop.aedt",
+        source_path=str(config.queue_dirs.incoming / "collect-loop.aedt"),
+        pending_path=str(config.queue_dirs.pending / "collect-loop.aedt"),
+        uploaded_path=str(config.queue_dirs.uploaded / "collect-loop.aedt"),
+        state=JobState.UPLOADED,
+    )
+    assert inserted is True
+    store.close()
+
+    remote_zip = remote_root / "remote" / "acct-a" / "spool" / "results" / "collect-loop.reports.zip"
+    remote_zip.parent.mkdir(parents=True, exist_ok=True)
+    remote_zip.write_text("zip")
+
+    service.run(register_signals=False, max_loops=1)
+
+    local_zip = config.queue_dirs.done / "collect-loop.reports.zip"
+    store = JobStore(config.duckdb_path)
+    assert local_zip.exists() is True
+    assert store.get_report_zip_local_path("collect-loop") == str(local_zip)
+    assert store.get_report_zip_remote_path("collect-loop") == "/remote/acct-a/spool/results/collect-loop.reports.zip"
     store.close()
     service.close()

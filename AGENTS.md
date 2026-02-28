@@ -54,6 +54,7 @@
 - 결과 보존: mainPC에 `report-only zip` 1개만 보존
 - 원본 `.aedt`: 완료 후 원격/로컬에서 삭제
 - 저장소 운영 위치: repo는 `mainPC`에서만 운영(계정 gate/home clone 금지)
+- 결과 회수: Collector가 gate `results/`를 스캔해 `done/`으로 원자 회수하며 중복 다운로드를 건너뛴다.
 - 운영 감사: Reconciler가 상태 불일치(고아 done zip 포함) 보정과 `.aedt` 잔존 감사(`delete_after_done`)를 수행
 
 ## Discord 알림 규칙 (MCP)

@@ -4,6 +4,7 @@ import signal
 import threading
 from pathlib import Path
 
+from peetsfea_runner.collector import ResultsCollector, SpoolResultsClient
 from peetsfea_runner.config import GateAccount, RunnerConfig
 from peetsfea_runner.reconciler import OperationsReconciler
 from peetsfea_runner.slurm_pool import SlurmClient, WorkerPoolManager
@@ -17,6 +18,7 @@ class RunnerService:
         self,
         config: RunnerConfig,
         upload_client: SpoolUploadClient | None = None,
+        results_client: SpoolResultsClient | None = None,
         slurm_client: SlurmClient | None = None,
     ) -> None:
         self._config = config
@@ -24,6 +26,7 @@ class RunnerService:
         self._store = JobStore(config.duckdb_path)
         self._watcher = QueueWatcher(config, self._store)
         self._uploader = UploadDispatcher(config, self._store, client=upload_client)
+        self._collector = ResultsCollector(config, self._store, client=results_client)
         self._worker_pool = WorkerPoolManager(config, client=slurm_client)
         self._reconciler = OperationsReconciler(config, self._store)
 
@@ -67,6 +70,7 @@ class RunnerService:
                 account for account in self._config.gate_accounts if account.account_id in healthy_ids
             )
             processed += self._uploader.process_once(preferred_accounts=preferred_accounts)
+            processed += self._collector.process_once(preferred_accounts=preferred_accounts)
             processed += self._reconciler.process_once()
             wait_sec = self._config.poll_interval_sec if processed else self._config.idle_sleep_sec
             self._stop_event.wait(wait_sec)

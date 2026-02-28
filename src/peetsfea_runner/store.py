@@ -54,6 +54,7 @@ class JobStore:
                 pending_path TEXT,
                 uploaded_path TEXT,
                 report_zip_local_path TEXT,
+                report_zip_remote_path TEXT,
                 remote_account_id TEXT,
                 remote_inbox_path TEXT,
                 state TEXT NOT NULL,
@@ -86,6 +87,10 @@ class JobStore:
         if "report_zip_local_path" not in columns:
             self.connection.execute("ALTER TABLE jobs ADD COLUMN report_zip_local_path TEXT")
             columns.add("report_zip_local_path")
+
+        if "report_zip_remote_path" not in columns:
+            self.connection.execute("ALTER TABLE jobs ADD COLUMN report_zip_remote_path TEXT")
+            columns.add("report_zip_remote_path")
 
         if "remote_account_id" not in columns:
             self.connection.execute("ALTER TABLE jobs ADD COLUMN remote_account_id TEXT")
@@ -163,6 +168,7 @@ class JobStore:
         state: JobState,
         uploaded_path: str | None = None,
         report_zip_local_path: str | None = None,
+        report_zip_remote_path: str | None = None,
         remote_account_id: str | None = None,
         remote_inbox_path: str | None = None,
         aedt_retention: str = "delete_after_done",
@@ -179,6 +185,7 @@ class JobStore:
                     pending_path,
                     uploaded_path,
                     report_zip_local_path,
+                    report_zip_remote_path,
                     remote_account_id,
                     remote_inbox_path,
                     state,
@@ -186,7 +193,7 @@ class JobStore:
                     error_code,
                     error_message
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     task_id,
@@ -195,6 +202,7 @@ class JobStore:
                     pending_path,
                     uploaded_path,
                     report_zip_local_path,
+                    report_zip_remote_path,
                     remote_account_id,
                     remote_inbox_path,
                     state.value,
@@ -374,9 +382,36 @@ class JobStore:
             [report_zip_local_path, task_id],
         )
 
+    def set_report_zip_paths(
+        self,
+        *,
+        task_id: str,
+        report_zip_local_path: str | None = None,
+        report_zip_remote_path: str | None = None,
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE jobs
+            SET report_zip_local_path = COALESCE(?, report_zip_local_path),
+                report_zip_remote_path = COALESCE(?, report_zip_remote_path),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+            """,
+            [report_zip_local_path, report_zip_remote_path, task_id],
+        )
+
     def get_report_zip_local_path(self, task_id: str) -> str | None:
         row = self.connection.execute(
             "SELECT report_zip_local_path FROM jobs WHERE task_id = ?",
+            [task_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row[0]) if row[0] is not None else None
+
+    def get_report_zip_remote_path(self, task_id: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT report_zip_remote_path FROM jobs WHERE task_id = ?",
             [task_id],
         ).fetchone()
         if row is None:
