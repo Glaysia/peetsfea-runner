@@ -52,6 +52,7 @@ class JobStore:
                 source_path TEXT NOT NULL,
                 pending_path TEXT,
                 uploaded_path TEXT,
+                remote_account_id TEXT,
                 remote_inbox_path TEXT,
                 state TEXT NOT NULL,
                 aedt_retention TEXT NOT NULL DEFAULT 'delete_after_done',
@@ -79,6 +80,10 @@ class JobStore:
         if "uploaded_path" not in columns:
             self.connection.execute("ALTER TABLE jobs ADD COLUMN uploaded_path TEXT")
             columns.add("uploaded_path")
+
+        if "remote_account_id" not in columns:
+            self.connection.execute("ALTER TABLE jobs ADD COLUMN remote_account_id TEXT")
+            columns.add("remote_account_id")
 
         if "remote_inbox_path" not in columns:
             self.connection.execute("ALTER TABLE jobs ADD COLUMN remote_inbox_path TEXT")
@@ -151,6 +156,7 @@ class JobStore:
         pending_path: str,
         state: JobState,
         uploaded_path: str | None = None,
+        remote_account_id: str | None = None,
         remote_inbox_path: str | None = None,
         aedt_retention: str = "delete_after_done",
         error_code: str | None = None,
@@ -165,13 +171,14 @@ class JobStore:
                     source_path,
                     pending_path,
                     uploaded_path,
+                    remote_account_id,
                     remote_inbox_path,
                     state,
                     aedt_retention,
                     error_code,
                     error_message
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     task_id,
@@ -179,6 +186,7 @@ class JobStore:
                     source_path,
                     pending_path,
                     uploaded_path,
+                    remote_account_id,
                     remote_inbox_path,
                     state.value,
                     aedt_retention,
@@ -269,10 +277,10 @@ class JobStore:
             return None
         return (row[0], row[1])
 
-    def list_pending_upload_jobs(self) -> list[tuple[str, str, str, str, str]]:
+    def list_pending_upload_jobs(self) -> list[tuple[str, str, str, str, str, str]]:
         rows = self.connection.execute(
             """
-            SELECT task_id, filename, pending_path, uploaded_path, remote_inbox_path
+            SELECT task_id, filename, pending_path, uploaded_path, remote_account_id, remote_inbox_path
             FROM jobs
             WHERE state = ?
             ORDER BY created_at, task_id
@@ -286,23 +294,32 @@ class JobStore:
                 str(row[2]) if row[2] is not None else "",
                 str(row[3]) if row[3] is not None else "",
                 str(row[4]) if row[4] is not None else "",
+                str(row[5]) if row[5] is not None else "",
             )
             for row in rows
         ]
 
-    def mark_uploaded(self, *, task_id: str, uploaded_path: str, remote_inbox_path: str) -> None:
+    def mark_uploaded(
+        self,
+        *,
+        task_id: str,
+        uploaded_path: str,
+        remote_account_id: str,
+        remote_inbox_path: str,
+    ) -> None:
         self.connection.execute(
             """
             UPDATE jobs
             SET state = ?,
                 uploaded_path = ?,
+                remote_account_id = ?,
                 remote_inbox_path = ?,
                 error_code = NULL,
                 error_message = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE task_id = ?
             """,
-            [JobState.UPLOADED.value, uploaded_path, remote_inbox_path, task_id],
+            [JobState.UPLOADED.value, uploaded_path, remote_account_id, remote_inbox_path, task_id],
         )
 
     def list_jobs_by_state(self, state: JobState) -> list[tuple[str, str]]:

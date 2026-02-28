@@ -89,6 +89,7 @@ CONFIG = RunnerConfig(
     duckdb_path=QUEUE_DIRS.state / "runner.duckdb",
     queue_dirs=QUEUE_DIRS,
     gate_account=ACCOUNTS[0],
+    gate_accounts=ACCOUNTS,
     worker_accounts=WORKER_ACCOUNTS,
     slurm_policy=SLURM_POLICY,
 )

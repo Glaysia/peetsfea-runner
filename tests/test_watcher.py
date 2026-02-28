@@ -46,6 +46,7 @@ def _build_config(tmp_path: Path) -> RunnerConfig:
         duckdb_path=queue_dirs.state / "runner.duckdb",
         queue_dirs=queue_dirs,
         gate_account=gate_account,
+        gate_accounts=(gate_account,),
         worker_accounts=(WorkerAccount(account_id=gate_account.account_id, ssh_alias=gate_account.ssh_alias),),
         slurm_policy=slurm_policy,
     )

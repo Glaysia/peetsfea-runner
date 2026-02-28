@@ -4,7 +4,7 @@ import signal
 import threading
 from pathlib import Path
 
-from peetsfea_runner.config import RunnerConfig
+from peetsfea_runner.config import GateAccount, RunnerConfig
 from peetsfea_runner.slurm_pool import SlurmClient, WorkerPoolManager
 from peetsfea_runner.store import JobStore
 from peetsfea_runner.uploader import SpoolUploadClient, UploadDispatcher
@@ -59,8 +59,12 @@ class RunnerService:
         loops = 0
         while not self._stop_event.is_set():
             processed = self._watcher.process_once()
-            processed += self._uploader.process_once()
             processed += self._worker_pool.process_once()
+            healthy_ids = {account.account_id for account in self._worker_pool.healthy_accounts()}
+            preferred_accounts: tuple[GateAccount, ...] = tuple(
+                account for account in self._config.gate_accounts if account.account_id in healthy_ids
+            )
+            processed += self._uploader.process_once(preferred_accounts=preferred_accounts)
             wait_sec = self._config.poll_interval_sec if processed else self._config.idle_sleep_sec
             self._stop_event.wait(wait_sec)
 

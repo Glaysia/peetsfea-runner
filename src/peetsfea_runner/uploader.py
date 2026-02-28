@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from time import time
 from typing import Protocol
 
-from peetsfea_runner.config import RunnerConfig
+from peetsfea_runner.config import GateAccount, RunnerConfig
 from peetsfea_runner.state import JobState
 from peetsfea_runner.store import JobStore
 
@@ -76,9 +77,12 @@ class UploadDispatcher:
         self._config = config
         self._store = store
         self._client = client if client is not None else SubprocessSpoolUploadClient()
+        self._gate_account_by_id: dict[str, GateAccount] = {
+            account.account_id: account for account in config.gate_accounts
+        }
 
-    def _build_remote_inbox_path(self, *, task_id: str, filename: str) -> str:
-        base = self._config.gate_account.spool_paths.inbox.rstrip("/")
+    def _build_remote_inbox_path(self, *, gate_account: GateAccount, task_id: str, filename: str) -> str:
+        base = gate_account.spool_paths.inbox.rstrip("/")
         return str(PurePosixPath(base) / task_id / filename)
 
     def _build_uploaded_path(self, filename: str, uploaded_path_text: str) -> Path:
@@ -112,6 +116,31 @@ class UploadDispatcher:
             message=message,
         )
 
+    def _resolve_candidates(self, preferred_accounts: tuple[GateAccount, ...] | None) -> tuple[GateAccount, ...]:
+        if preferred_accounts:
+            return preferred_accounts
+        if self._config.gate_accounts:
+            return self._config.gate_accounts
+        return (self._config.gate_account,)
+
+    def _choose_account_for_task(
+        self,
+        *,
+        task_id: str,
+        remote_account_id_text: str,
+        candidates: tuple[GateAccount, ...],
+    ) -> GateAccount | None:
+        if remote_account_id_text:
+            existing = self._gate_account_by_id.get(remote_account_id_text)
+            if existing is not None:
+                return existing
+        if not candidates:
+            return None
+        # Deterministic sharding by task_id to keep retries/account selection stable.
+        digest = sha256(task_id.encode("utf-8")).hexdigest()
+        index = int(digest, 16) % len(candidates)
+        return candidates[index]
+
     def _move_to_uploaded(self, *, source_path: Path, uploaded_path: Path) -> None:
         uploaded_path.parent.mkdir(parents=True, exist_ok=True)
         if uploaded_path.exists():
@@ -125,6 +154,7 @@ class UploadDispatcher:
         self,
         *,
         task_id: str,
+        remote_account_id: str,
         uploaded_path: Path,
         remote_inbox_path: str,
         event_type: str,
@@ -132,24 +162,52 @@ class UploadDispatcher:
         self._store.mark_uploaded(
             task_id=task_id,
             uploaded_path=str(uploaded_path),
+            remote_account_id=remote_account_id,
             remote_inbox_path=remote_inbox_path,
         )
         self._store.record_event(
             task_id=task_id,
             event_type=event_type,
-            message=f"uploaded={uploaded_path}; remote={remote_inbox_path}",
+            message=f"uploaded={uploaded_path}; remote_account={remote_account_id}; remote={remote_inbox_path}",
         )
 
-    def process_once(self) -> int:
+    def process_once(self, preferred_accounts: tuple[GateAccount, ...] | None = None) -> int:
         processed = 0
-        for task_id, filename, pending_path_text, uploaded_path_text, remote_path_text in self._store.list_pending_upload_jobs():
+        candidates = self._resolve_candidates(preferred_accounts)
+        for (
+            task_id,
+            filename,
+            pending_path_text,
+            uploaded_path_text,
+            remote_account_id_text,
+            remote_path_text,
+        ) in self._store.list_pending_upload_jobs():
             pending_path = Path(pending_path_text) if pending_path_text else self._config.queue_dirs.pending / filename
             uploaded_path = self._build_uploaded_path(filename, uploaded_path_text)
-            remote_inbox_path = remote_path_text or self._build_remote_inbox_path(task_id=task_id, filename=filename)
+            gate_account = self._choose_account_for_task(
+                task_id=task_id,
+                remote_account_id_text=remote_account_id_text,
+                candidates=candidates,
+            )
+            if gate_account is None:
+                self._mark_failed_upload(
+                    task_id=task_id,
+                    error_code=E_UPLOAD_NETWORK,
+                    message="No healthy gate account candidate available for upload",
+                )
+                processed += 1
+                continue
+
+            remote_account_id = gate_account.account_id
+            remote_inbox_path = remote_path_text or self._build_remote_inbox_path(
+                gate_account=gate_account,
+                task_id=task_id,
+                filename=filename,
+            )
 
             try:
                 remote_exists = self._client.remote_file_exists(
-                    remote_host=self._config.gate_account.ssh_alias,
+                    remote_host=gate_account.ssh_alias,
                     remote_path=remote_inbox_path,
                 )
             except UploadClientError as exc:
@@ -172,6 +230,7 @@ class UploadDispatcher:
                         continue
                 self._mark_upload_success(
                     task_id=task_id,
+                    remote_account_id=remote_account_id,
                     uploaded_path=uploaded_path,
                     remote_inbox_path=remote_inbox_path,
                     event_type="UPLOAD_RECOVERED_REMOTE_EXISTS",
@@ -202,13 +261,13 @@ class UploadDispatcher:
             self._store.record_event(
                 task_id=task_id,
                 event_type="UPLOAD_STARTED",
-                message=f"source={source_for_upload}; remote={remote_inbox_path}",
+                message=f"source={source_for_upload}; remote_account={remote_account_id}; remote={remote_inbox_path}",
             )
 
             try:
                 self._client.upload_to_spool_inbox(
                     local_path=source_for_upload,
-                    remote_host=self._config.gate_account.ssh_alias,
+                    remote_host=gate_account.ssh_alias,
                     remote_path=remote_inbox_path,
                 )
             except UploadClientError as exc:
@@ -231,6 +290,7 @@ class UploadDispatcher:
 
             self._mark_upload_success(
                 task_id=task_id,
+                remote_account_id=remote_account_id,
                 uploaded_path=uploaded_path,
                 remote_inbox_path=remote_inbox_path,
                 event_type="UPLOAD_DONE",

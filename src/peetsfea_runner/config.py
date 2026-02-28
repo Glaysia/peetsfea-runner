@@ -53,6 +53,7 @@ class RunnerConfig:
     duckdb_path: Path
     queue_dirs: QueueDirs
     gate_account: GateAccount
+    gate_accounts: tuple[GateAccount, ...]
     worker_accounts: tuple[WorkerAccount, ...]
     slurm_policy: SlurmPolicy
 

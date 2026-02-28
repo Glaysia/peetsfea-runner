@@ -30,6 +30,7 @@ class FakeUploadClient:
         self.upload_error: str | None = None
         self.exists_calls = 0
         self.upload_calls = 0
+        self.remote_hosts: list[str] = []
 
     def _local_remote_path(self, remote_path: str) -> Path:
         return self._remote_root / remote_path.lstrip("/")
@@ -42,7 +43,7 @@ class FakeUploadClient:
         return self._local_remote_path(remote_path).exists()
 
     def upload_to_spool_inbox(self, *, local_path: Path, remote_host: str, remote_path: str) -> None:
-        _ = remote_host
+        self.remote_hosts.append(remote_host)
         self.upload_calls += 1
         if self.upload_error is not None:
             raise UploadClientError(self.upload_error)
@@ -79,6 +80,7 @@ def _build_config(tmp_path: Path) -> RunnerConfig:
         duckdb_path=queue_dirs.state / "runner.duckdb",
         queue_dirs=queue_dirs,
         gate_account=gate_account,
+        gate_accounts=(gate_account,),
         worker_accounts=(WorkerAccount(account_id=gate_account.account_id, ssh_alias=gate_account.ssh_alias),),
         slurm_policy=slurm_policy,
     )
@@ -322,4 +324,50 @@ def test_upload_dispatcher_marks_failed_upload_when_local_move_fails(
     assert error[0] == E_UPLOAD_LOCAL_MOVE
     assert pending_file.exists()
     assert (remote_root / "spool" / "inbox" / "move_fail" / "move_fail.aedt").exists()
+    store.close()
+
+
+def test_upload_dispatcher_uses_preferred_healthy_account_for_routing(tmp_path: Path) -> None:
+    base_config = _build_config(tmp_path)
+    account_a = base_config.gate_account
+    account_b = GateAccount(
+        account_id="acct-b",
+        ssh_alias="gate-b",
+        spool_paths=RemoteSpoolPaths(
+            inbox="/spool-b/inbox",
+            claimed="/spool-b/claimed",
+            results="/spool-b/results",
+            failed="/spool-b/failed",
+        ),
+    )
+    config = RunnerConfig(
+        base_dir=base_config.base_dir,
+        poll_interval_sec=base_config.poll_interval_sec,
+        idle_sleep_sec=base_config.idle_sleep_sec,
+        duckdb_path=base_config.duckdb_path,
+        queue_dirs=base_config.queue_dirs,
+        gate_account=account_a,
+        gate_accounts=(account_a, account_b),
+        worker_accounts=base_config.worker_accounts,
+        slurm_policy=base_config.slurm_policy,
+    )
+
+    _mkdir_queue_dirs(config)
+    store = JobStore(config.duckdb_path)
+    store.initialize_schema()
+
+    pending_file = config.queue_dirs.pending / "route_pref.aedt"
+    pending_file.write_text("payload")
+    _insert_pending_job(store, task_id="route_pref", pending_file=pending_file)
+
+    remote_root = tmp_path / "remote"
+    client = FakeUploadClient(remote_root)
+    dispatcher = UploadDispatcher(config, store, client=client)
+
+    processed = dispatcher.process_once(preferred_accounts=(account_b,))
+
+    assert processed == 1
+    assert client.remote_hosts == ["gate-b"]
+    assert store.get_job_state("route_pref") == JobState.UPLOADED.value
+    assert (remote_root / "spool-b" / "inbox" / "route_pref" / "route_pref.aedt").exists()
     store.close()

@@ -62,6 +62,7 @@ The runtime directories are created automatically under `var/`:
   - partition=`cpu2`, cores=`32`, mem=`320GB`, internal_procs=`8`
 - 장애 격리:
   - 계정별 degraded 상태를 추적하고, 정상 계정의 풀 관리는 계속 수행
+  - 업로드 단계는 degraded 계정을 제외한 건강한 계정으로만 라우팅
 
 ## systemd user service
 Template file:
