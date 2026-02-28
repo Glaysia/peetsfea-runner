@@ -41,6 +41,7 @@
   - `README.md`
   - `PLANS/*`
   - `AGENTS.md`
+  - 운영 절차 변경 시 `PLANS/OPERATIONS_RUNBOOK.md`도 함께 갱신한다.
 
 ## 운영 핵심 고정값 (합의 사항)
 - Slurm 파티션: `cpu2`
@@ -53,6 +54,7 @@
 - 결과 보존: mainPC에 `report-only zip` 1개만 보존
 - 원본 `.aedt`: 완료 후 원격/로컬에서 삭제
 - 저장소 운영 위치: repo는 `mainPC`에서만 운영(계정 gate/home clone 금지)
+- 운영 감사: Reconciler가 상태 불일치 보정과 `.aedt` 잔존 감사(`delete_after_done`)를 수행
 
 ## Discord 알림 규칙 (MCP)
 - 작업 시작/종료 시각은 셸 초 단위로 계산한다.

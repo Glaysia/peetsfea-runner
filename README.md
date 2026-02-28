@@ -17,12 +17,14 @@ Minimal 5% bootstrap of a daemon service for `.aedt` queue intake.
 - 단기 계획 03: [PLANS/SHORT_TERM_PLAN_03_SLURM_BATCH_AND_CAPACITY_CONTROL.md](PLANS/SHORT_TERM_PLAN_03_SLURM_BATCH_AND_CAPACITY_CONTROL.md)
 - 단기 계획 04: [PLANS/SHORT_TERM_PLAN_04_HFSS_EXECUTION_REPORT_EXPORT_AND_PACKAGING.md](PLANS/SHORT_TERM_PLAN_04_HFSS_EXECUTION_REPORT_EXPORT_AND_PACKAGING.md)
 - 단기 계획 05: [PLANS/SHORT_TERM_PLAN_05_OPERATIONS_RECONCILIATION_AND_OBSERVABILITY.md](PLANS/SHORT_TERM_PLAN_05_OPERATIONS_RECONCILIATION_AND_OBSERVABILITY.md)
+- 운영 runbook: [PLANS/OPERATIONS_RUNBOOK.md](PLANS/OPERATIONS_RUNBOOK.md)
 
 ## Scope in this bootstrap
 - Folder queue watcher (`incoming/pending/uploaded/done/failed`)
 - Gate spool upload dispatcher (`PENDING -> UPLOADED/FAILED_UPLOAD`)
 - Slurm worker pool manager (계정별 목표 worker 수 유지)
 - HFSS worker execution contract (`analyze -> full report export -> report-only zip -> cleanup`)
+- Reconciler/Auditor (`pending TTL requeue`, `DB-file mismatch correction`, `DONE .aedt retention audit`)
 - Persistent job state in DuckDB
 - Daemon main loop with graceful shutdown (SIGTERM/SIGINT)
 - systemd `--user` unit template
@@ -74,6 +76,18 @@ The runtime directories are created automatically under `var/`:
   - zip에는 리포트 출력 파일만 포함하고 `.aedt`/중간파일은 포함하지 않음
 - 정리 규약:
   - 성공/실패 모두 `.aedt`와 작업 디렉터리를 정리
+
+## Operations Reconciliation Contract
+- 주기적 reconcile 대상:
+  - `PENDING` 파일 TTL 초과 시 `incoming/`으로 requeue
+  - `PENDING/UPLOADED/FAILED_UPLOAD` 상태와 `pending/`, `uploaded/` 파일 실제 상태 불일치 보정
+  - `DONE` 상태의 `report_zip_local_path` 유실 복구 또는 실패 격하
+- `.aedt` 삭제 감사:
+  - `DONE + aedt_retention=delete_after_done`에서 로컬 `.aedt` 잔존 탐지
+  - 잔존 발견 시 `AEDT_RETENTION_VIOLATION_DETECTED` 기록 후 삭제 시도
+  - 삭제 성공 시 `AEDT_DELETE_LOCAL_DONE`, 실패 시 작업을 `FAILED`로 전이
+- 표준 이벤트 키:
+  - `EXPORT_REPORTS_*`, `PACKAGE_ZIP_*`, `AEDT_DELETE_*`, `RECONCILE_*`
 
 ## systemd user service
 Template file:

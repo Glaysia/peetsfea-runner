@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import duckdb
 
+from peetsfea_runner.event_types import AEDT_DELETE_LOCAL_DONE
 from peetsfea_runner.state import JobState
 
 
@@ -52,6 +53,7 @@ class JobStore:
                 source_path TEXT NOT NULL,
                 pending_path TEXT,
                 uploaded_path TEXT,
+                report_zip_local_path TEXT,
                 remote_account_id TEXT,
                 remote_inbox_path TEXT,
                 state TEXT NOT NULL,
@@ -80,6 +82,10 @@ class JobStore:
         if "uploaded_path" not in columns:
             self.connection.execute("ALTER TABLE jobs ADD COLUMN uploaded_path TEXT")
             columns.add("uploaded_path")
+
+        if "report_zip_local_path" not in columns:
+            self.connection.execute("ALTER TABLE jobs ADD COLUMN report_zip_local_path TEXT")
+            columns.add("report_zip_local_path")
 
         if "remote_account_id" not in columns:
             self.connection.execute("ALTER TABLE jobs ADD COLUMN remote_account_id TEXT")
@@ -156,6 +162,7 @@ class JobStore:
         pending_path: str,
         state: JobState,
         uploaded_path: str | None = None,
+        report_zip_local_path: str | None = None,
         remote_account_id: str | None = None,
         remote_inbox_path: str | None = None,
         aedt_retention: str = "delete_after_done",
@@ -171,6 +178,7 @@ class JobStore:
                     source_path,
                     pending_path,
                     uploaded_path,
+                    report_zip_local_path,
                     remote_account_id,
                     remote_inbox_path,
                     state,
@@ -178,7 +186,7 @@ class JobStore:
                     error_code,
                     error_message
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     task_id,
@@ -186,6 +194,7 @@ class JobStore:
                     source_path,
                     pending_path,
                     uploaded_path,
+                    report_zip_local_path,
                     remote_account_id,
                     remote_inbox_path,
                     state.value,
@@ -299,6 +308,38 @@ class JobStore:
             for row in rows
         ]
 
+    def list_jobs_for_reconcile(
+        self,
+    ) -> list[tuple[str, str, str, str, str, str, str, str]]:
+        rows = self.connection.execute(
+            """
+            SELECT
+                task_id,
+                filename,
+                source_path,
+                pending_path,
+                uploaded_path,
+                report_zip_local_path,
+                state,
+                aedt_retention
+            FROM jobs
+            ORDER BY created_at, task_id
+            """
+        ).fetchall()
+        return [
+            (
+                str(row[0]),
+                str(row[1]),
+                str(row[2]) if row[2] is not None else "",
+                str(row[3]) if row[3] is not None else "",
+                str(row[4]) if row[4] is not None else "",
+                str(row[5]) if row[5] is not None else "",
+                str(row[6]),
+                str(row[7]) if row[7] is not None else "",
+            )
+            for row in rows
+        ]
+
     def mark_uploaded(
         self,
         *,
@@ -321,6 +362,26 @@ class JobStore:
             """,
             [JobState.UPLOADED.value, uploaded_path, remote_account_id, remote_inbox_path, task_id],
         )
+
+    def set_report_zip_local_path(self, *, task_id: str, report_zip_local_path: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE jobs
+            SET report_zip_local_path = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+            """,
+            [report_zip_local_path, task_id],
+        )
+
+    def get_report_zip_local_path(self, task_id: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT report_zip_local_path FROM jobs WHERE task_id = ?",
+            [task_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row[0]) if row[0] is not None else None
 
     def list_jobs_by_state(self, state: JobState) -> list[tuple[str, str]]:
         rows = self.connection.execute(
@@ -369,7 +430,7 @@ class JobStore:
         self,
         *,
         task_id: str,
-        required_events: tuple[str, ...] = ("AEDT_DELETE_LOCAL_DONE",),
+        required_events: tuple[str, ...] = (AEDT_DELETE_LOCAL_DONE,),
     ) -> bool:
         if not required_events:
             return True

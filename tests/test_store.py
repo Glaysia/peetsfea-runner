@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from peetsfea_runner.event_types import AEDT_DELETE_LOCAL_DONE
 from peetsfea_runner.state import JobState
 from peetsfea_runner.store import JobStore
 
@@ -89,13 +90,13 @@ def test_store_records_events_and_done_promotion_hook(tmp_path: Path) -> None:
 
     assert store.can_promote_done(task_id="task-3") is False
 
-    store.record_event(task_id="task-3", event_type="AEDT_DELETE_LOCAL_DONE")
+    store.record_event(task_id="task-3", event_type=AEDT_DELETE_LOCAL_DONE)
     store.mark_local_aedt_deleted(task_id="task-3")
 
     assert store.can_promote_done(task_id="task-3") is True
 
     events = store.get_task_events("task-3")
-    assert events[-1][0] == "AEDT_DELETE_LOCAL_DONE"
+    assert events[-1][0] == AEDT_DELETE_LOCAL_DONE
 
     row = store.connection.execute(
         "SELECT local_aedt_deleted_ts FROM jobs WHERE task_id = ?",
@@ -103,4 +104,24 @@ def test_store_records_events_and_done_promotion_hook(tmp_path: Path) -> None:
     ).fetchone()
     assert row is not None
     assert row[0] is not None
+    store.close()
+
+
+def test_store_sets_and_reads_report_zip_local_path(tmp_path: Path) -> None:
+    db_path = tmp_path / "state" / "runner.duckdb"
+    store = JobStore(db_path)
+    store.initialize_schema()
+
+    store.insert_job(
+        task_id="task-zip",
+        filename="task-zip.aedt",
+        source_path="/tmp/incoming/task-zip.aedt",
+        pending_path="/tmp/pending/task-zip.aedt",
+        state=JobState.DONE,
+    )
+
+    zip_path = "/tmp/done/task-zip.reports.zip"
+    store.set_report_zip_local_path(task_id="task-zip", report_zip_local_path=zip_path)
+
+    assert store.get_report_zip_local_path("task-zip") == zip_path
     store.close()

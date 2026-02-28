@@ -12,6 +12,7 @@ from peetsfea_runner.config import (
     WorkerAccount,
     build_queue_dirs,
 )
+from peetsfea_runner.reconciler import E_RECONCILE_DONE_ZIP_MISSING
 from peetsfea_runner.slurm_pool import SlurmClientError
 from peetsfea_runner.service import RunnerService
 from peetsfea_runner.state import JobState
@@ -197,4 +198,32 @@ def test_service_routes_upload_to_healthy_account_when_one_is_degraded(tmp_path:
     assert upload_client.remote_hosts == ["gate-b"]
     assert (remote_root / "remote" / "acct-b" / "spool" / "inbox" / "route" / "route.aedt").exists()
 
+    service.close()
+
+
+def test_service_reconciles_done_job_with_missing_zip_on_startup(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    service = RunnerService(config, slurm_client=_FakeSlurmClient())
+    service.ensure_runtime_directories()
+
+    store = JobStore(config.duckdb_path)
+    store.initialize_schema()
+    inserted = store.insert_job(
+        task_id="done-missing",
+        filename="done-missing.aedt",
+        source_path=str(config.queue_dirs.incoming / "done-missing.aedt"),
+        pending_path=str(config.queue_dirs.pending / "done-missing.aedt"),
+        state=JobState.DONE,
+    )
+    assert inserted is True
+    store.close()
+
+    service.run(register_signals=False, max_loops=1)
+
+    store = JobStore(config.duckdb_path)
+    assert store.get_job_state("done-missing") == JobState.FAILED.value
+    error = store.get_job_error("done-missing")
+    assert error is not None
+    assert error[0] == E_RECONCILE_DONE_ZIP_MISSING
+    store.close()
     service.close()

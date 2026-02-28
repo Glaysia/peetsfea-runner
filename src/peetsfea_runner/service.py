@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 from peetsfea_runner.config import GateAccount, RunnerConfig
+from peetsfea_runner.reconciler import OperationsReconciler
 from peetsfea_runner.slurm_pool import SlurmClient, WorkerPoolManager
 from peetsfea_runner.store import JobStore
 from peetsfea_runner.uploader import SpoolUploadClient, UploadDispatcher
@@ -24,6 +25,7 @@ class RunnerService:
         self._watcher = QueueWatcher(config, self._store)
         self._uploader = UploadDispatcher(config, self._store, client=upload_client)
         self._worker_pool = WorkerPoolManager(config, client=slurm_client)
+        self._reconciler = OperationsReconciler(config, self._store)
 
     @property
     def stop_event(self) -> threading.Event:
@@ -65,6 +67,7 @@ class RunnerService:
                 account for account in self._config.gate_accounts if account.account_id in healthy_ids
             )
             processed += self._uploader.process_once(preferred_accounts=preferred_accounts)
+            processed += self._reconciler.process_once()
             wait_sec = self._config.poll_interval_sec if processed else self._config.idle_sleep_sec
             self._stop_event.wait(wait_sec)
 
