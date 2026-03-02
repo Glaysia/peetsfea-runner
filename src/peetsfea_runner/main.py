@@ -18,13 +18,13 @@ QUEUE_DIRS = build_queue_dirs(BASE_DIR)
 
 ACCOUNTS: tuple[GateAccount, ...] = (
     GateAccount(
-        account_id="harry261",
-        ssh_alias="gate1-harry",
+        account_id="win5600x2",
+        ssh_alias="5600X2",
         spool_paths=RemoteSpoolPaths(
-            inbox="/home1/harry261/peetsfea-spool/inbox",
-            claimed="/home1/harry261/peetsfea-spool/claimed",
-            results="/home1/harry261/peetsfea-spool/results",
-            failed="/home1/harry261/peetsfea-spool/failed",
+            inbox="C:/peetsfea-spool/inbox",
+            claimed="C:/peetsfea-spool/claimed",
+            results="C:/peetsfea-spool/results",
+            failed="C:/peetsfea-spool/failed",
         ),
     ),
 )
@@ -39,11 +39,11 @@ WORKER_ACCOUNTS: tuple[WorkerAccount, ...] = tuple(
 )
 
 SLURM_POLICY = SlurmPolicy(
-    partition="cpu2",
-    cores=32,
-    memory_gb=320,
-    job_internal_procs=8,
-    pool_target_per_account=10,
+    partition="debug-windows",
+    cores=1,
+    memory_gb=16,
+    job_internal_procs=1,
+    pool_target_per_account=1,
     repo_url="https://github.com/Glaysia/peetsfea-runner",
     release_tag="v2026.03.02-gate1-r2",
 )

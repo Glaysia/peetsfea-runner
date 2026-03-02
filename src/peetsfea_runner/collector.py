@@ -3,7 +3,7 @@ from __future__ import annotations
 import shlex
 import shutil
 import subprocess
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from time import time
 from typing import Protocol
 
@@ -37,6 +37,14 @@ class SpoolResultsClient(Protocol):
 
 
 class SubprocessSpoolResultsClient:
+    @staticmethod
+    def _is_windows_path(path: str) -> bool:
+        return len(path) >= 2 and path[1] == ":"
+
+    @staticmethod
+    def _ps_quote(path: str) -> str:
+        return "'" + path.replace("'", "''") + "'"
+
     def _run_or_raise(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(args, capture_output=True, text=True, check=False)
         if result.returncode == 0:
@@ -48,12 +56,25 @@ class SubprocessSpoolResultsClient:
         raise ResultsClientError(f"command={' '.join(args)}; detail={detail}")
 
     def list_result_zips(self, *, remote_host: str, remote_results_path: str) -> list[str]:
-        escaped_dir = shlex.quote(remote_results_path)
-        list_cmd = (
-            f"if [ -d {escaped_dir} ]; then "
-            f"find {escaped_dir} -type f -name '*.reports.zip' | sort; "
-            "fi"
-        )
+        if self._is_windows_path(remote_results_path):
+            list_cmd = (
+                "powershell -NoProfile -Command "
+                + shlex.quote(
+                    "if (Test-Path -LiteralPath "
+                    f"{self._ps_quote(remote_results_path)}) "
+                    "{ Get-ChildItem -LiteralPath "
+                    f"{self._ps_quote(remote_results_path)} "
+                    "-Recurse -File -Filter '*.reports.zip' | Sort-Object FullName | "
+                    "ForEach-Object { $_.FullName } }"
+                )
+            )
+        else:
+            escaped_dir = shlex.quote(remote_results_path)
+            list_cmd = (
+                f"if [ -d {escaped_dir} ]; then "
+                f"find {escaped_dir} -type f -name '*.reports.zip' | sort; "
+                "fi"
+            )
         result = self._run_or_raise(["ssh", remote_host, list_cmd])
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         return lines
@@ -85,7 +106,7 @@ class ResultsCollector:
         return (self._config.gate_account,)
 
     def _extract_task_id(self, remote_zip_path: str) -> str | None:
-        name = PurePosixPath(remote_zip_path).name
+        name = remote_zip_path.replace("\\", "/").rsplit("/", 1)[-1]
         if not name.endswith(".reports.zip"):
             return None
         task_id = name.removesuffix(".reports.zip")

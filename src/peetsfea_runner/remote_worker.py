@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import socket
 import subprocess
 import shutil
@@ -11,7 +12,7 @@ from pathlib import Path
 from time import sleep, time
 from typing import Callable
 
-from peetsfea_runner.hfss_worker import HfssAdapter, HfssWorkerRunner, HfssWorkerTask
+from peetsfea_runner.hfss_worker import AEDT_EXECUTABLE_PATH, HfssAdapter, HfssWorkerRunner, HfssWorkerTask
 
 LOG = logging.getLogger(__name__)
 
@@ -25,11 +26,14 @@ class RemoteWorkerConfig:
     poll_sec: float = 2.0
     internal_procs: int = 8
     max_tasks: int | None = None
+    aedt_executable_path: str = AEDT_EXECUTABLE_PATH
+    gui_mode: bool = False
 
 
 class PyAedtHfssAdapter(HfssAdapter):
-    def __init__(self, *, internal_procs: int = 8) -> None:
+    def __init__(self, *, internal_procs: int = 8, gui_mode: bool = False) -> None:
         self._internal_procs = internal_procs
+        self._gui_mode = gui_mode
         self._app: object | None = None
         self._ansys_process: subprocess.Popen[bytes] | None = None
 
@@ -39,17 +43,30 @@ class PyAedtHfssAdapter(HfssAdapter):
             return int(sock.getsockname()[1])
 
     def _launch_ansys_grpc(self, *, aedt_executable_path: str, port: int) -> subprocess.Popen[bytes]:
-        launch_cmd = (
-            "set -euo pipefail; "
-            "source /etc/profile.d/modules.sh >/dev/null 2>&1 || true; "
-            "module load ansys-electronics/v252; "
-            f"exec {aedt_executable_path} -ng -grpcsrv {port}"
-        )
-        process = subprocess.Popen(  # noqa: S603
-            ["bash", "-lc", launch_cmd],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        is_windows_exec = aedt_executable_path.lower().endswith(".exe") or ":" in aedt_executable_path[:3]
+        if is_windows_exec:
+            cmd = [aedt_executable_path]
+            if not self._gui_mode:
+                cmd.append("-ng")
+            cmd.extend(["-grpcsrv", str(port)])
+            process = subprocess.Popen(  # noqa: S603
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            headless_arg = "" if self._gui_mode else "-ng "
+            launch_cmd = (
+                "set -euo pipefail; "
+                "source /etc/profile.d/modules.sh >/dev/null 2>&1 || true; "
+                "module load ansys-electronics/v252; "
+                f"exec {aedt_executable_path} {headless_arg}-grpcsrv {port}"
+            )
+            process = subprocess.Popen(  # noqa: S603
+                ["bash", "-lc", launch_cmd],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         sleep(6.0)
         if process.poll() is not None:
             raise RuntimeError(f"Failed to start ansysedt gRPC server on port {port}")
@@ -82,7 +99,7 @@ class PyAedtHfssAdapter(HfssAdapter):
         try:
             self._app = hfs_cls(
                 project=str(aedt_path),
-                non_graphical=True,
+                non_graphical=not self._gui_mode,
                 new_desktop=True,
                 close_on_exit=False,
                 aedt_process_id=None,
@@ -203,9 +220,14 @@ class RemoteWorker:
         adapter_factory: Callable[[], HfssAdapter] | None = None,
     ) -> None:
         self._config = config
-        self._runner = runner if runner is not None else HfssWorkerRunner()
+        self._runner = runner if runner is not None else HfssWorkerRunner(
+            aedt_executable_path=config.aedt_executable_path
+        )
         self._adapter_factory = adapter_factory if adapter_factory is not None else (
-            lambda: PyAedtHfssAdapter(internal_procs=config.internal_procs)
+            lambda: PyAedtHfssAdapter(
+                internal_procs=config.internal_procs,
+                gui_mode=config.gui_mode,
+            )
         )
 
     def _ensure_dirs(self) -> None:
@@ -310,6 +332,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-sec", type=float, default=2.0)
     parser.add_argument("--internal-procs", type=int, default=8)
     parser.add_argument("--max-tasks", type=int, default=None)
+    parser.add_argument("--aedt-executable-path", default=AEDT_EXECUTABLE_PATH)
+    parser.add_argument("--gui", action="store_true")
     return parser
 
 
@@ -324,6 +348,8 @@ def main() -> None:
         poll_sec=args.poll_sec,
         internal_procs=args.internal_procs,
         max_tasks=args.max_tasks,
+        aedt_executable_path=args.aedt_executable_path,
+        gui_mode=bool(args.gui),
     )
     worker = RemoteWorker(config)
     processed = worker.run_forever()

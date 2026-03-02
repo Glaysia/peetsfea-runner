@@ -36,6 +36,10 @@ class SlurmClient(Protocol):
 class SubprocessSlurmClient:
     _REMOTE_REPO_PATH = "/home1/harry261/peetsfea-runner"
     _REMOTE_VENV_PATH = "/home1/harry261/.peetsfea-venv"
+    _REMOTE_REPO_PATH_WIN = "C:/peetsfea-runner"
+    _REMOTE_VENV_PATH_WIN = "C:/.peetsfea-venv"
+    _REMOTE_PID_PATH_WIN = "C:/peetsfea-runner/var/remote_worker.pid"
+    _REMOTE_AEDT_PATH_WIN = r"C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe"
     _WORKER_POLL_SEC = 2.0
 
     def __init__(self) -> None:
@@ -57,6 +61,20 @@ class SubprocessSlurmClient:
         except SlurmClientError as exc:
             raise SlurmClientError(f"error_code={code}; {exc.message}") from exc
 
+    @staticmethod
+    def _is_windows_account(account: WorkerAccount) -> bool:
+        if account.spool_paths is None:
+            return False
+        return len(account.spool_paths.inbox) >= 2 and account.spool_paths.inbox[1] == ":"
+
+    @staticmethod
+    def _ps_quote(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    def _run_windows_powershell_or_raise(self, *, account: WorkerAccount, script: str) -> subprocess.CompletedProcess[str]:
+        command = "powershell -NoProfile -Command " + shlex.quote(script)
+        return self._run_or_raise(["ssh", account.ssh_alias, command])
+
     def _ensure_remote_bootstrap(self, *, account: WorkerAccount, policy: SlurmPolicy) -> None:
         if account.account_id in self._bootstrapped_accounts:
             return
@@ -64,6 +82,10 @@ class SubprocessSlurmClient:
             raise SlurmClientError(
                 f"account={account.account_id}; detail=missing spool_paths for remote worker bootstrap"
             )
+        if self._is_windows_account(account):
+            self._ensure_remote_bootstrap_windows(account=account, policy=policy)
+            self._bootstrapped_accounts.add(account.account_id)
+            return
 
         self._run_bootstrap_step_or_raise(
             code=E_BOOTSTRAP_GIT,
@@ -152,14 +174,72 @@ class SubprocessSlurmClient:
 
         self._bootstrapped_accounts.add(account.account_id)
 
+    def _ensure_remote_bootstrap_windows(self, *, account: WorkerAccount, policy: SlurmPolicy) -> None:
+        assert account.spool_paths is not None
+        bootstrap_script = (
+            "$ErrorActionPreference='Stop'; "
+            f"$repo={self._ps_quote(self._REMOTE_REPO_PATH_WIN)}; "
+            f"$venv={self._ps_quote(self._REMOTE_VENV_PATH_WIN)}; "
+            f"$repoUrl={self._ps_quote(policy.repo_url)}; "
+            f"$releaseTag={self._ps_quote(policy.release_tag)}; "
+            "$spool=@("
+            f"{self._ps_quote(account.spool_paths.inbox)},"
+            f"{self._ps_quote(account.spool_paths.claimed)},"
+            f"{self._ps_quote(account.spool_paths.results)},"
+            f"{self._ps_quote(account.spool_paths.failed)}"
+            "); "
+            "foreach($d in $spool){ New-Item -ItemType Directory -Force -Path $d | Out-Null }; "
+            "if (!(Test-Path -LiteralPath ($repo + '/.git'))) { "
+            "if (Test-Path -LiteralPath $repo) { Remove-Item -Recurse -Force -LiteralPath $repo }; "
+            "git clone $repoUrl $repo | Out-Null }; "
+            "Set-Location $repo; "
+            "git fetch --tags --force --prune | Out-Null; "
+            "git checkout --force ('tags/' + $releaseTag) | Out-Null; "
+            "git clean -fdx | Out-Null; "
+            "if (!(Test-Path -LiteralPath ($venv + '/Scripts/python.exe'))) { "
+            "if (Get-Command py -ErrorAction SilentlyContinue) { py -3.12 -m venv $venv } "
+            "elseif (Get-Command python -ErrorAction SilentlyContinue) { python -m venv $venv } "
+            "else { throw 'python3.12 launcher not found on Windows host' } }; "
+            "& ($venv + '/Scripts/python.exe') -m ensurepip | Out-Null; "
+            "& ($venv + '/Scripts/python.exe') -m pip install --disable-pip-version-check uv | Out-Null; "
+            "& ($venv + '/Scripts/python.exe') -m uv pip install -e . pyaedt==0.24.1 | Out-Null"
+        )
+        self._run_bootstrap_step_or_raise(
+            code=E_BOOTSTRAP_GIT,
+            args=[
+                "ssh",
+                account.ssh_alias,
+                "powershell -NoProfile -Command " + shlex.quote(bootstrap_script),
+            ],
+        )
+
     def query_workers(self, *, account: WorkerAccount, policy: SlurmPolicy) -> list[str]:
+        if self._is_windows_account(account):
+            return self._query_windows_workers(account=account)
         job_name = f"{policy.job_name_prefix}-{account.account_id}"
         query_cmd = f"squeue -h -n {shlex.quote(job_name)} -o %A"
         result = self._run_or_raise(["ssh", account.ssh_alias, query_cmd])
         lines = [line.strip() for line in result.stdout.splitlines()]
         return [line for line in lines if line]
 
+    def _query_windows_workers(self, *, account: WorkerAccount) -> list[str]:
+        query_script = (
+            "$ErrorActionPreference='Stop'; "
+            f"$pidPath={self._ps_quote(self._REMOTE_PID_PATH_WIN)}; "
+            "if (!(Test-Path -LiteralPath $pidPath)) { exit 0 }; "
+            "$pid=(Get-Content -LiteralPath $pidPath -Raw).Trim(); "
+            "if (-not $pid) { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue; exit 0 }; "
+            "$p=Get-Process -Id $pid -ErrorAction SilentlyContinue; "
+            "if ($null -eq $p) { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue; exit 0 }; "
+            "Write-Output $pid"
+        )
+        result = self._run_windows_powershell_or_raise(account=account, script=query_script)
+        lines = [line.strip() for line in result.stdout.splitlines()]
+        return [line for line in lines if line]
+
     def submit_worker(self, *, account: WorkerAccount, policy: SlurmPolicy) -> str:
+        if self._is_windows_account(account):
+            return self._submit_windows_worker(account=account, policy=policy)
         job_name = f"{policy.job_name_prefix}-{account.account_id}"
         self._ensure_remote_bootstrap(account=account, policy=policy)
         assert account.spool_paths is not None
@@ -198,7 +278,52 @@ class SubprocessSlurmClient:
             )
         return job_id_field
 
+    def _submit_windows_worker(self, *, account: WorkerAccount, policy: SlurmPolicy) -> str:
+        self._ensure_remote_bootstrap(account=account, policy=policy)
+        assert account.spool_paths is not None
+
+        active = self._query_windows_workers(account=account)
+        if active:
+            return active[0]
+
+        start_script = (
+            "$ErrorActionPreference='Stop'; "
+            f"$repo={self._ps_quote(self._REMOTE_REPO_PATH_WIN)}; "
+            f"$venv={self._ps_quote(self._REMOTE_VENV_PATH_WIN)}; "
+            f"$pidPath={self._ps_quote(self._REMOTE_PID_PATH_WIN)}; "
+            "$python=($venv + '/Scripts/python.exe'); "
+            "$args=@("
+            "'-m','peetsfea_runner.remote_worker',"
+            f"'--spool-inbox',{self._ps_quote(account.spool_paths.inbox)},"
+            f"'--spool-claimed',{self._ps_quote(account.spool_paths.claimed)},"
+            f"'--spool-results',{self._ps_quote(account.spool_paths.results)},"
+            f"'--spool-failed',{self._ps_quote(account.spool_paths.failed)},"
+            f"'--poll-sec',{self._ps_quote(str(self._WORKER_POLL_SEC))},"
+            f"'--internal-procs',{self._ps_quote(str(policy.job_internal_procs))},"
+            f"'--aedt-executable-path',{self._ps_quote(self._REMOTE_AEDT_PATH_WIN)},"
+            "'--gui'"
+            "); "
+            "$proc=Start-Process -FilePath $python -ArgumentList $args -WorkingDirectory $repo -PassThru; "
+            "$proc.Id | Set-Content -LiteralPath $pidPath -NoNewline; "
+            "Write-Output $proc.Id"
+        )
+        result = self._run_windows_powershell_or_raise(account=account, script=start_script)
+        job_id_field = result.stdout.strip().splitlines()[0].strip() if result.stdout.strip() else ""
+        if not job_id_field:
+            raise SlurmClientError(f"account={account.account_id}; detail=empty windows worker pid")
+        return job_id_field
+
     def cancel_worker(self, *, account: WorkerAccount, slurm_job_id: str) -> None:
+        if self._is_windows_account(account):
+            stop_script = (
+                "$ErrorActionPreference='Stop'; "
+                f"$pidPath={self._ps_quote(self._REMOTE_PID_PATH_WIN)}; "
+                f"$pid={self._ps_quote(slurm_job_id)}; "
+                "Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue; "
+                "if (Test-Path -LiteralPath $pidPath) { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue }"
+            )
+            self._run_windows_powershell_or_raise(account=account, script=stop_script)
+            return
         self._run_or_raise(["ssh", account.ssh_alias, f"scancel {shlex.quote(slurm_job_id)}"])
 
 

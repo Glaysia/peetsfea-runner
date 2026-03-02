@@ -3,7 +3,7 @@ from __future__ import annotations
 import shlex
 import subprocess
 from hashlib import sha256
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from time import time
 from typing import Protocol
 
@@ -33,6 +33,14 @@ class SpoolUploadClient(Protocol):
 
 
 class SubprocessSpoolUploadClient:
+    @staticmethod
+    def _is_windows_path(path: str) -> bool:
+        return len(path) >= 2 and path[1] == ":"
+
+    @staticmethod
+    def _ps_quote(path: str) -> str:
+        return "'" + path.replace("'", "''") + "'"
+
     def _run_or_raise(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(args, capture_output=True, text=True, check=False)
         if result.returncode == 0:
@@ -44,6 +52,24 @@ class SubprocessSpoolUploadClient:
         raise UploadClientError(f"command={' '.join(args)}; detail={detail}")
 
     def remote_file_exists(self, *, remote_host: str, remote_path: str) -> bool:
+        if self._is_windows_path(remote_path):
+            check_cmd = (
+                "powershell -NoProfile -Command "
+                + shlex.quote(
+                    f"if (Test-Path -LiteralPath {self._ps_quote(remote_path)} -PathType Leaf) {{ exit 0 }} else {{ exit 1 }}"
+                )
+            )
+            result = subprocess.run(["ssh", remote_host, check_cmd], capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                return True
+            if result.returncode == 1:
+                return False
+
+            stderr = result.stderr.strip()
+            stdout = result.stdout.strip()
+            detail = stderr or stdout or f"exit_code={result.returncode}"
+            raise UploadClientError(f"command=ssh {remote_host} {check_cmd}; detail={detail}")
+
         check_cmd = f"test -f {shlex.quote(remote_path)}"
         result = subprocess.run(["ssh", remote_host, check_cmd], capture_output=True, text=True, check=False)
         if result.returncode == 0:
@@ -57,10 +83,27 @@ class SubprocessSpoolUploadClient:
         raise UploadClientError(f"command=ssh {remote_host} {check_cmd}; detail={detail}")
 
     def upload_to_spool_inbox(self, *, local_path: Path, remote_host: str, remote_path: str) -> None:
-        remote_dir = str(PurePosixPath(remote_path).parent)
+        if self._is_windows_path(remote_path):
+            remote_dir = PureWindowsPath(remote_path).parent.as_posix()
+        else:
+            remote_dir = str(PurePosixPath(remote_path).parent)
         tmp_remote_path = f"{remote_path}.part"
-        mkdir_cmd = f"mkdir -p {shlex.quote(remote_dir)}"
-        move_cmd = f"mv {shlex.quote(tmp_remote_path)} {shlex.quote(remote_path)}"
+        if self._is_windows_path(remote_path):
+            mkdir_cmd = (
+                "powershell -NoProfile -Command "
+                + shlex.quote(
+                    f"New-Item -ItemType Directory -Force -Path {self._ps_quote(remote_dir)} | Out-Null"
+                )
+            )
+            move_cmd = (
+                "powershell -NoProfile -Command "
+                + shlex.quote(
+                    f"Move-Item -LiteralPath {self._ps_quote(tmp_remote_path)} -Destination {self._ps_quote(remote_path)} -Force"
+                )
+            )
+        else:
+            mkdir_cmd = f"mkdir -p {shlex.quote(remote_dir)}"
+            move_cmd = f"mv {shlex.quote(tmp_remote_path)} {shlex.quote(remote_path)}"
 
         self._run_or_raise(["ssh", remote_host, mkdir_cmd])
         self._run_or_raise(["scp", str(local_path), f"{remote_host}:{tmp_remote_path}"])
