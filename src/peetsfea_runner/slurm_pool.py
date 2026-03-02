@@ -8,6 +8,7 @@ import subprocess
 from typing import Protocol
 
 from peetsfea_runner.config import RunnerConfig, SlurmPolicy, WorkerAccount
+from peetsfea_runner.ssh_transport import ssh_command
 
 LOG = logging.getLogger(__name__)
 
@@ -118,7 +119,7 @@ class SubprocessSlurmClient:
     def _run_windows_powershell_or_raise(self, *, account: WorkerAccount, script: str) -> subprocess.CompletedProcess[str]:
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         command = f"powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"
-        return self._run_or_raise(["ssh", account.ssh_alias, command])
+        return self._run_or_raise(ssh_command(remote_host=account.ssh_alias, remote_command=command))
 
     def _ensure_remote_bootstrap(self, *, account: WorkerAccount, policy: SlurmPolicy) -> None:
         if account.account_id in self._bootstrapped_accounts:
@@ -134,10 +135,9 @@ class SubprocessSlurmClient:
 
         self._run_bootstrap_step_or_raise(
             code=E_BOOTSTRAP_GIT,
-            args=[
-                "ssh",
-                account.ssh_alias,
-                (
+            args=ssh_command(
+                remote_host=account.ssh_alias,
+                remote_command=(
                     "mkdir -p "
                     f"{shlex.quote(self._REMOTE_REPO_PATH)} "
                     f"{shlex.quote(account.spool_paths.inbox)} "
@@ -145,7 +145,7 @@ class SubprocessSlurmClient:
                     f"{shlex.quote(account.spool_paths.results)} "
                     f"{shlex.quote(account.spool_paths.failed)}"
                 ),
-            ],
+            ),
         )
 
         repo_cmd = (
@@ -164,7 +164,7 @@ class SubprocessSlurmClient:
         )
         self._run_bootstrap_step_or_raise(
             code=E_BOOTSTRAP_GIT,
-            args=["ssh", account.ssh_alias, f"bash -lc {shlex.quote(repo_cmd)}"],
+            args=ssh_command(remote_host=account.ssh_alias, remote_command=f"bash -lc {shlex.quote(repo_cmd)}"),
         )
 
         python_cmd = (
@@ -190,7 +190,7 @@ class SubprocessSlurmClient:
         )
         self._run_bootstrap_step_or_raise(
             code=E_BOOTSTRAP_PYTHON,
-            args=["ssh", account.ssh_alias, f"bash -lc {shlex.quote(python_cmd)}"],
+            args=ssh_command(remote_host=account.ssh_alias, remote_command=f"bash -lc {shlex.quote(python_cmd)}"),
         )
 
         deps_cmd = (
@@ -204,7 +204,7 @@ class SubprocessSlurmClient:
         )
         self._run_bootstrap_step_or_raise(
             code=E_BOOTSTRAP_DEPS,
-            args=["ssh", account.ssh_alias, f"bash -lc {shlex.quote(deps_cmd)}"],
+            args=ssh_command(remote_host=account.ssh_alias, remote_command=f"bash -lc {shlex.quote(deps_cmd)}"),
         )
 
         check_cmd = (
@@ -214,7 +214,7 @@ class SubprocessSlurmClient:
         )
         self._run_bootstrap_step_or_raise(
             code=E_BOOTSTRAP_VENV,
-            args=["ssh", account.ssh_alias, f"bash -lc {shlex.quote(check_cmd)}"],
+            args=ssh_command(remote_host=account.ssh_alias, remote_command=f"bash -lc {shlex.quote(check_cmd)}"),
         )
 
         self._bootstrapped_accounts.add(account.account_id)
@@ -259,7 +259,7 @@ class SubprocessSlurmClient:
             return self._query_windows_workers(account=account, policy=policy)
         job_name = f"{policy.job_name_prefix}-{account.account_id}"
         query_cmd = f"squeue -h -n {shlex.quote(job_name)} -o %A"
-        result = self._run_or_raise(["ssh", account.ssh_alias, query_cmd])
+        result = self._run_or_raise(ssh_command(remote_host=account.ssh_alias, remote_command=query_cmd))
         lines = [line.strip() for line in result.stdout.splitlines()]
         return [line for line in lines if line]
 
@@ -360,11 +360,11 @@ class SubprocessSlurmClient:
             f"--export ALL,PEETSFEA_INTERNAL_PROCS={policy.job_internal_procs} "
             f"--wrap={shlex.quote(wrap)}"
         )
-        result = self._run_or_raise(["ssh", account.ssh_alias, submit_cmd])
+        result = self._run_or_raise(ssh_command(remote_host=account.ssh_alias, remote_command=submit_cmd))
         job_id_field = result.stdout.strip().split(";", 1)[0]
         if not job_id_field:
             raise SlurmClientError(
-                f"command=ssh {account.ssh_alias} {submit_cmd}; detail=empty job id"
+                f"command={' '.join(ssh_command(remote_host=account.ssh_alias, remote_command=submit_cmd))}; detail=empty job id"
             )
         return job_id_field
 
@@ -561,7 +561,9 @@ class SubprocessSlurmClient:
             )
             self._run_windows_powershell_or_raise(account=account, script=stop_script)
             return
-        self._run_or_raise(["ssh", account.ssh_alias, f"scancel {shlex.quote(slurm_job_id)}"])
+        self._run_or_raise(
+            ssh_command(remote_host=account.ssh_alias, remote_command=f"scancel {shlex.quote(slurm_job_id)}")
+        )
 
 
 class WorkerPoolManager:

@@ -15,6 +15,7 @@ from peetsfea_runner.event_types import (
     COLLECT_FAILED,
     COLLECT_STARTED,
 )
+from peetsfea_runner.ssh_transport import scp_from_remote_command, ssh_command
 from peetsfea_runner.state import JobState
 from peetsfea_runner.store import JobStore
 
@@ -81,13 +82,15 @@ class SubprocessSpoolResultsClient:
                 f"find {escaped_dir} -type f -name '*.reports.zip' | sort; "
                 "fi"
             )
-        result = self._run_or_raise(["ssh", remote_host, list_cmd])
+        result = self._run_or_raise(ssh_command(remote_host=remote_host, remote_command=list_cmd))
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         return lines
 
     def download_result_zip(self, *, remote_host: str, remote_path: str, local_path: Path) -> None:
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        self._run_or_raise(["scp", f"{remote_host}:{remote_path}", str(local_path)])
+        self._run_or_raise(
+            scp_from_remote_command(remote_host=remote_host, remote_path=remote_path, local_path=str(local_path))
+        )
 
 
 class ResultsCollector:

@@ -60,6 +60,14 @@ def _decode_powershell_script(command: str) -> str:
     return base64.b64decode(encoded).decode("utf-16le")
 
 
+def _ssh_remote_host(args: list[str]) -> str:
+    return args[-2]
+
+
+def _ssh_remote_command(args: list[str]) -> str:
+    return args[-1]
+
+
 def _build_config(
     tmp_path: Path,
     *,
@@ -252,25 +260,25 @@ def test_subprocess_slurm_client_submit_uses_remote_worker_entrypoint(monkeypatc
     assert job_id == "12345"
     assert len(calls) == 6
     assert calls[0][0] == "ssh"
-    assert "mkdir -p /home1/harry261/peetsfea-runner" in calls[0][2]
+    assert "mkdir -p /home1/harry261/peetsfea-runner" in _ssh_remote_command(calls[0])
     assert calls[1][0] == "ssh"
-    assert "git clone" in calls[1][2]
-    assert "git fetch --tags --force --prune" in calls[1][2]
-    assert "RELEASE_TAG=v2026.03.02-gate1-r1" in calls[1][2]
-    assert 'git checkout --force "tags/$RELEASE_TAG"' in calls[1][2]
+    assert "git clone" in _ssh_remote_command(calls[1])
+    assert "git fetch --tags --force --prune" in _ssh_remote_command(calls[1])
+    assert "RELEASE_TAG=v2026.03.02-gate1-r1" in _ssh_remote_command(calls[1])
+    assert 'git checkout --force "tags/$RELEASE_TAG"' in _ssh_remote_command(calls[1])
     assert calls[2][0] == "ssh"
-    assert "python3.12 -m venv" in calls[2][2]
-    assert "miniconda" in calls[2][2]
+    assert "python3.12 -m venv" in _ssh_remote_command(calls[2])
+    assert "miniconda" in _ssh_remote_command(calls[2])
 
     assert calls[3][0] == "ssh"
-    assert "\"$VENV_PATH/bin/python\" -m uv pip install -q -e . pyaedt==0.24.1" in calls[3][2]
+    assert "\"$VENV_PATH/bin/python\" -m uv pip install -q -e . pyaedt==0.24.1" in _ssh_remote_command(calls[3])
     assert calls[4][0] == "ssh"
-    assert 'test -x "$VENV_PATH/bin/python"' in calls[4][2]
+    assert 'test -x "$VENV_PATH/bin/python"' in _ssh_remote_command(calls[4])
 
     submit_args = calls[5]
     assert submit_args[0] == "ssh"
-    assert submit_args[1] == "gate1-harry"
-    command = submit_args[2]
+    assert _ssh_remote_host(submit_args) == "gate1-harry"
+    command = _ssh_remote_command(submit_args)
     assert "sbatch --parsable" in command
     assert "--partition cpu2" in command
     assert "--cpus-per-task 32" in command
@@ -374,7 +382,7 @@ def test_subprocess_slurm_client_python_bootstrap_has_conda_fallback(monkeypatch
     client.submit_worker(account=account, policy=policy)
 
     assert len(calls) >= 3
-    python_bootstrap_cmd = calls[2][2]
+    python_bootstrap_cmd = _ssh_remote_command(calls[2])
     assert "command -v python3.12" in python_bootstrap_cmd
     assert "command -v conda" in python_bootstrap_cmd
     assert "repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh" in python_bootstrap_cmd
@@ -412,7 +420,7 @@ def test_subprocess_slurm_client_uses_policy_repo_url_and_release_tag(monkeypatc
 
     client.submit_worker(account=account, policy=policy)
 
-    git_bootstrap_cmd = calls[1][2]
+    git_bootstrap_cmd = _ssh_remote_command(calls[1])
     assert "https://github.com/Glaysia/peetsfea-runner" in git_bootstrap_cmd
     assert "RELEASE_TAG=v2026.03.02-gate1-r1" in git_bootstrap_cmd
     assert 'git checkout --force "tags/$RELEASE_TAG"' in git_bootstrap_cmd
@@ -452,7 +460,7 @@ def test_subprocess_slurm_client_windows_query_filters_non_numeric_lines(monkeyp
 
     assert lines == ["12888"]
     assert len(calls) == 1
-    query_script = _decode_powershell_script(calls[0][2])
+    query_script = _decode_powershell_script(_ssh_remote_command(calls[0]))
     assert "Get-CimInstance Win32_Process" in query_script
     assert "peetsfea_runner.remote_worker" in query_script
     assert "TASK_STATE=" in query_script
@@ -501,7 +509,7 @@ def test_subprocess_slurm_client_windows_submit_uses_interactive_task_scheduler(
 
     assert pid == "13180"
     assert len(calls) == 3
-    launch_script = _decode_powershell_script(calls[2][2])
+    launch_script = _decode_powershell_script(_ssh_remote_command(calls[2]))
     assert "Start-Sleep -Seconds 4" in launch_script
     assert "worker_died_after_launch" in launch_script
     assert "New-ScheduledTaskAction -Execute $py -Argument $arg" in launch_script
@@ -587,7 +595,7 @@ def test_subprocess_slurm_client_windows_cancel_cleans_scheduled_task(monkeypatc
     client.cancel_worker(account=account, slurm_job_id="4242")
 
     assert len(calls) == 1
-    cancel_script = _decode_powershell_script(calls[0][2])
+    cancel_script = _decode_powershell_script(_ssh_remote_command(calls[0]))
     assert "Stop-ScheduledTask -TaskName" in cancel_script
     assert "Unregister-ScheduledTask -TaskName" in cancel_script
     assert "Stop-Process -Id $workerPid" in cancel_script

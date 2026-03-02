@@ -9,6 +9,7 @@ from time import time
 from typing import Protocol
 
 from peetsfea_runner.config import GateAccount, RunnerConfig
+from peetsfea_runner.ssh_transport import scp_to_remote_command, ssh_command
 from peetsfea_runner.state import JobState
 from peetsfea_runner.store import JobStore
 
@@ -65,16 +66,17 @@ class SubprocessSpoolUploadClient:
             check_cmd = self._powershell_encoded(
                 f"if (Test-Path -LiteralPath {self._ps_quote(remote_path)} -PathType Leaf) {{ exit 0 }} else {{ exit 1 }}"
             )
+            ssh_args = ssh_command(remote_host=remote_host, remote_command=check_cmd)
             try:
                 result = subprocess.run(
-                    ["ssh", remote_host, check_cmd],
+                    ssh_args,
                     capture_output=True,
                     text=True,
                     check=False,
                     errors="replace",
                 )
             except TypeError:
-                result = subprocess.run(["ssh", remote_host, check_cmd], capture_output=True, text=True, check=False)
+                result = subprocess.run(ssh_args, capture_output=True, text=True, check=False)
             if result.returncode == 0:
                 return True
             if result.returncode == 1:
@@ -83,19 +85,20 @@ class SubprocessSpoolUploadClient:
             stderr = result.stderr.strip()
             stdout = result.stdout.strip()
             detail = stderr or stdout or f"exit_code={result.returncode}"
-            raise UploadClientError(f"command=ssh {remote_host} {check_cmd}; detail={detail}")
+            raise UploadClientError(f"command={' '.join(ssh_args)}; detail={detail}")
 
         check_cmd = f"test -f {shlex.quote(remote_path)}"
+        ssh_args = ssh_command(remote_host=remote_host, remote_command=check_cmd)
         try:
             result = subprocess.run(
-                ["ssh", remote_host, check_cmd],
+                ssh_args,
                 capture_output=True,
                 text=True,
                 check=False,
                 errors="replace",
             )
         except TypeError:
-            result = subprocess.run(["ssh", remote_host, check_cmd], capture_output=True, text=True, check=False)
+            result = subprocess.run(ssh_args, capture_output=True, text=True, check=False)
         if result.returncode == 0:
             return True
         if result.returncode == 1:
@@ -104,7 +107,7 @@ class SubprocessSpoolUploadClient:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
         detail = stderr or stdout or f"exit_code={result.returncode}"
-        raise UploadClientError(f"command=ssh {remote_host} {check_cmd}; detail={detail}")
+        raise UploadClientError(f"command={' '.join(ssh_args)}; detail={detail}")
 
     def upload_to_spool_inbox(self, *, local_path: Path, remote_host: str, remote_path: str) -> None:
         if self._is_windows_path(remote_path):
@@ -123,9 +126,11 @@ class SubprocessSpoolUploadClient:
             mkdir_cmd = f"mkdir -p {shlex.quote(remote_dir)}"
             move_cmd = f"mv {shlex.quote(tmp_remote_path)} {shlex.quote(remote_path)}"
 
-        self._run_or_raise(["ssh", remote_host, mkdir_cmd])
-        self._run_or_raise(["scp", str(local_path), f"{remote_host}:{tmp_remote_path}"])
-        self._run_or_raise(["ssh", remote_host, move_cmd])
+        self._run_or_raise(ssh_command(remote_host=remote_host, remote_command=mkdir_cmd))
+        self._run_or_raise(
+            scp_to_remote_command(local_path=str(local_path), remote_host=remote_host, remote_path=tmp_remote_path)
+        )
+        self._run_or_raise(ssh_command(remote_host=remote_host, remote_command=move_cmd))
 
 
 class UploadDispatcher:
