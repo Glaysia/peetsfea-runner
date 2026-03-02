@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from zipfile import ZipFile
 
+from peetsfea_runner import remote_worker as remote_worker_module
 from peetsfea_runner.remote_worker import RemoteWorker, RemoteWorkerConfig
 
 
@@ -80,3 +82,78 @@ def test_remote_worker_writes_failure_metadata_when_execution_fails(tmp_path: Pa
     payload = json.loads(metadata.read_text(encoding="utf-8"))
     assert payload["task_id"] == "task-2"
     assert "analyze failed" in payload["message"]
+
+
+def test_remote_worker_main_writes_startup_banner(tmp_path: Path, monkeypatch: object) -> None:
+    spool_root = tmp_path / "spool"
+    for name in ("inbox", "claimed", "results", "failed"):
+        (spool_root / name).mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "remote_worker.py",
+            "--spool-inbox",
+            str(spool_root / "inbox"),
+            "--spool-claimed",
+            str(spool_root / "claimed"),
+            "--spool-results",
+            str(spool_root / "results"),
+            "--spool-failed",
+            str(spool_root / "failed"),
+            "--max-tasks",
+            "0",
+        ],
+    )
+    monkeypatch.setattr(remote_worker_module.RemoteWorker, "run_forever", lambda _self: 0)
+
+    remote_worker_module.main()
+
+    startup = tmp_path / "var" / "remote_worker.startup.json"
+    assert startup.exists()
+    payload = json.loads(startup.read_text(encoding="utf-8"))
+    assert payload["spool_inbox"] == str(spool_root / "inbox")
+    assert payload["pid"] > 0
+
+
+def test_remote_worker_main_writes_fatal_log(tmp_path: Path, monkeypatch: object) -> None:
+    spool_root = tmp_path / "spool"
+    for name in ("inbox", "claimed", "results", "failed"):
+        (spool_root / name).mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "remote_worker.py",
+            "--spool-inbox",
+            str(spool_root / "inbox"),
+            "--spool-claimed",
+            str(spool_root / "claimed"),
+            "--spool-results",
+            str(spool_root / "results"),
+            "--spool-failed",
+            str(spool_root / "failed"),
+        ],
+    )
+
+    def _raise_runtime(_self: object) -> int:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(remote_worker_module.RemoteWorker, "run_forever", _raise_runtime)
+
+    try:
+        remote_worker_module.main()
+    except RuntimeError as exc:
+        assert "boom" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+    fatal = tmp_path / "var" / "remote_worker.fatal.json"
+    assert fatal.exists()
+    payload = json.loads(fatal.read_text(encoding="utf-8"))
+    assert payload["error_type"] == "RuntimeError"
+    assert "boom" in payload["error_message"]

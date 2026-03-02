@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import subprocess
 from pathlib import Path
 
@@ -45,6 +46,13 @@ class FakeSlurmClient:
         current = self.jobs.get(account.account_id, [])
         self.jobs[account.account_id] = [job_id for job_id in current if job_id != slurm_job_id]
         self.cancel_records.append((account.account_id, slurm_job_id))
+
+
+def _decode_powershell_script(command: str) -> str:
+    prefix = "powershell -NoProfile -NonInteractive -EncodedCommand "
+    assert command.startswith(prefix)
+    encoded = command[len(prefix):]
+    return base64.b64decode(encoded).decode("utf-16le")
 
 
 def _build_config(
@@ -356,3 +364,89 @@ def test_subprocess_slurm_client_uses_policy_repo_url_and_release_tag(monkeypatc
     assert "https://github.com/Glaysia/peetsfea-runner" in git_bootstrap_cmd
     assert "RELEASE_TAG=v2026.03.02-gate1-r1" in git_bootstrap_cmd
     assert 'git checkout --force "tags/$RELEASE_TAG"' in git_bootstrap_cmd
+
+
+def test_subprocess_slurm_client_windows_query_filters_non_numeric_lines(monkeypatch: object) -> None:
+    calls: list[list[str]] = []
+
+    def _fake_run(args: list[str], capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+        _ = capture_output, text, check
+        calls.append(args)
+        stdout = "#< CLIXML\n12888\n<Objs Version='1.1.0.1'></Objs>\n"
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    client = SubprocessSlurmClient()
+    account = WorkerAccount(
+        account_id="win5600x2",
+        ssh_alias="5600X2",
+        spool_paths=RemoteSpoolPaths(
+            inbox="C:/peetsfea-spool/inbox",
+            claimed="C:/peetsfea-spool/claimed",
+            results="C:/peetsfea-spool/results",
+            failed="C:/peetsfea-spool/failed",
+        ),
+    )
+    policy = SlurmPolicy(
+        partition="debug-windows",
+        cores=1,
+        memory_gb=16,
+        job_internal_procs=6,
+        pool_target_per_account=1,
+        aedt_executable_path=r"C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe",
+    )
+
+    lines = client.query_workers(account=account, policy=policy)
+
+    assert lines == ["12888"]
+    assert len(calls) == 1
+
+
+def test_subprocess_slurm_client_windows_submit_uses_health_check_and_quoted_aedt_path(monkeypatch: object) -> None:
+    calls: list[list[str]] = []
+
+    def _fake_run(args: list[str], capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+        _ = capture_output, text, check
+        calls.append(args)
+        call_index = len(calls)
+        if call_index == 1:
+            # bootstrap
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if call_index == 2:
+            # query active workers
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if call_index == 3:
+            # start worker
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="#< CLIXML\n13180\n", stderr="")
+        raise AssertionError(f"unexpected call index {call_index}")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    client = SubprocessSlurmClient()
+    account = WorkerAccount(
+        account_id="win5600x2",
+        ssh_alias="5600X2",
+        spool_paths=RemoteSpoolPaths(
+            inbox="C:/peetsfea-spool/inbox",
+            claimed="C:/peetsfea-spool/claimed",
+            results="C:/peetsfea-spool/results",
+            failed="C:/peetsfea-spool/failed",
+        ),
+    )
+    policy = SlurmPolicy(
+        partition="debug-windows",
+        cores=1,
+        memory_gb=16,
+        job_internal_procs=6,
+        pool_target_per_account=1,
+        aedt_executable_path=r"C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe",
+    )
+
+    pid = client.submit_worker(account=account, policy=policy)
+
+    assert pid == "13180"
+    assert len(calls) == 3
+    launch_script = _decode_powershell_script(calls[2][2])
+    assert "Start-Sleep -Seconds 3" in launch_script
+    assert "worker_died_after_launch" in launch_script
+    assert "Invoke-CimMethod -ClassName Win32_Process -MethodName Create" in launch_script
+    assert r"C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe" in launch_script

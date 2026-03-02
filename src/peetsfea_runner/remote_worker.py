@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import socket
 import subprocess
 import shutil
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from time import sleep, time
@@ -336,6 +338,11 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _write_json_log(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _build_parser().parse_args()
@@ -350,9 +357,39 @@ def main() -> None:
         aedt_executable_path=args.aedt_executable_path,
         gui_mode=bool(args.gui),
     )
+    runtime_var_dir = Path.cwd() / "var"
+    startup_payload: dict[str, object] = {
+        "pid": os.getpid(),
+        "timestamp_ms": int(time() * 1000),
+        "python_executable": str(Path(os.sys.executable)),
+        "spool_inbox": str(config.spool_inbox),
+        "spool_claimed": str(config.spool_claimed),
+        "spool_results": str(config.spool_results),
+        "spool_failed": str(config.spool_failed),
+        "poll_sec": config.poll_sec,
+        "internal_procs": config.internal_procs,
+        "max_tasks": config.max_tasks,
+        "aedt_executable_path": config.aedt_executable_path,
+        "gui_mode": config.gui_mode,
+    }
+    _write_json_log(runtime_var_dir / "remote_worker.startup.json", startup_payload)
+
     worker = RemoteWorker(config)
-    processed = worker.run_forever()
-    LOG.info("remote_worker_done processed=%d", processed)
+    try:
+        processed = worker.run_forever()
+        LOG.info("remote_worker_done processed=%d", processed)
+    except Exception as exc:  # noqa: BLE001
+        fatal_payload: dict[str, object] = {
+            "pid": os.getpid(),
+            "timestamp_ms": int(time() * 1000),
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        _write_json_log(runtime_var_dir / "remote_worker.fatal.json", fatal_payload)
+        _write_json_log(config.spool_failed / "remote_worker.fatal.json", fatal_payload)
+        LOG.exception("remote_worker_fatal")
+        raise
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import shlex
 import subprocess
 from typing import Protocol
@@ -21,6 +22,10 @@ E_BOOTSTRAP_GIT = "E_BOOTSTRAP_GIT"
 E_BOOTSTRAP_PYTHON = "E_BOOTSTRAP_PYTHON"
 E_BOOTSTRAP_VENV = "E_BOOTSTRAP_VENV"
 E_BOOTSTRAP_DEPS = "E_BOOTSTRAP_DEPS"
+E_WIN_WORKER_PYTHON = "E_WIN_WORKER_PYTHON"
+E_WIN_WORKER_IMPORT = "E_WIN_WORKER_IMPORT"
+E_WIN_WORKER_RUNTIME = "E_WIN_WORKER_RUNTIME"
+E_WIN_WORKER_NATIVE_CRASH = "E_WIN_WORKER_NATIVE_CRASH"
 
 
 class SlurmClient(Protocol):
@@ -75,9 +80,13 @@ class SubprocessSlurmClient:
     def _ps_quote(value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
 
+    @staticmethod
+    def _extract_digit_lines(text: str) -> list[str]:
+        return [line.strip() for line in text.splitlines() if re.fullmatch(r"\d+", line.strip() or "")]
+
     def _run_windows_powershell_or_raise(self, *, account: WorkerAccount, script: str) -> subprocess.CompletedProcess[str]:
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-        command = f"powershell -NoProfile -EncodedCommand {encoded}"
+        command = f"powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"
         return self._run_or_raise(["ssh", account.ssh_alias, command])
 
     def _ensure_remote_bootstrap(self, *, account: WorkerAccount, policy: SlurmPolicy) -> None:
@@ -226,6 +235,7 @@ class SubprocessSlurmClient:
     def _query_windows_workers(self, *, account: WorkerAccount) -> list[str]:
         query_script = (
             "$ErrorActionPreference='Stop'; "
+            "$ProgressPreference='SilentlyContinue'; "
             f"$pidPath={self._ps_quote(self._REMOTE_PID_PATH_WIN)}; "
             "if (!(Test-Path -LiteralPath $pidPath)) { exit 0 }; "
             "$workerPid=(Get-Content -LiteralPath $pidPath -Raw).Trim(); "
@@ -235,8 +245,7 @@ class SubprocessSlurmClient:
             "Write-Output $workerPid"
         )
         result = self._run_windows_powershell_or_raise(account=account, script=query_script)
-        lines = [line.strip() for line in result.stdout.splitlines()]
-        return [line for line in lines if line]
+        return self._extract_digit_lines(result.stdout)
 
     def submit_worker(self, *, account: WorkerAccount, policy: SlurmPolicy) -> str:
         if self._is_windows_account(account):
@@ -296,6 +305,7 @@ class SubprocessSlurmClient:
 
         start_script = (
             "$ErrorActionPreference='Stop'; "
+            "$ProgressPreference='SilentlyContinue'; "
             f"$repo={self._ps_quote(self._REMOTE_REPO_PATH_WIN)}; "
             f"$venv={self._ps_quote(self._REMOTE_VENV_PATH_WIN)}; "
             f"$pidPath={self._ps_quote(self._REMOTE_PID_PATH_WIN)}; "
@@ -304,6 +314,9 @@ class SubprocessSlurmClient:
             "$stdoutPath=($pidDir + '/remote_worker.stdout.log'); "
             "$stderrPath=($pidDir + '/remote_worker.stderr.log'); "
             "$python=($venv + '/Scripts/python.exe'); "
+            "if (!(Test-Path -LiteralPath $python)) { "
+            f"throw {self._ps_quote(f'error_code={E_WIN_WORKER_PYTHON}; detail=missing python: ')} + $python "
+            "}; "
             "$args=@("
             "'-m','peetsfea_runner.remote_worker',"
             f"'--spool-inbox',{self._ps_quote(account.spool_paths.inbox)},"
@@ -315,15 +328,48 @@ class SubprocessSlurmClient:
             f"'--aedt-executable-path',{self._ps_quote(aedt_executable_path)},"
             "'--gui'"
             "); "
-            "$proc=Start-Process -FilePath $python -ArgumentList $args -WorkingDirectory $repo "
-            "-RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru; "
-            "$proc.Id | Set-Content -LiteralPath $pidPath -NoNewline; "
-            "Write-Output $proc.Id"
+            "$quotedArgs=($args | ForEach-Object { '\"' + ($_ -replace '\"','\\\"') + '\"' }) -join ' '; "
+            "$commandLine="
+            "'cmd.exe /d /c cd /d \"' + $repo + '\" && \"' + $python + '\" ' + "
+            "$quotedArgs + "
+            "' 1>>\"' + $stdoutPath + '\" 2>>\"' + $stderrPath + '\"'; "
+            "$result=Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+            "-Arguments @{CommandLine=$commandLine; CurrentDirectory=$repo}; "
+            "if ($result.ReturnValue -ne 0 -or -not $result.ProcessId) { "
+            f"throw {self._ps_quote(f'error_code={E_WIN_WORKER_RUNTIME}; detail=Win32_Process.Create failed; return_value=')} + $result.ReturnValue "
+            "}; "
+            "$workerPid=[int]$result.ProcessId; "
+            "Start-Sleep -Seconds 3; "
+            "$alive=Get-Process -Id $workerPid -ErrorAction SilentlyContinue; "
+            "if ($null -eq $alive) { "
+            "$stderrTail=''; "
+            "if (Test-Path -LiteralPath $stderrPath) { $stderrTail=((Get-Content -LiteralPath $stderrPath -Tail 80) -join \"`n\") }; "
+            "$stdoutTail=''; "
+            "if (Test-Path -LiteralPath $stdoutPath) { $stdoutTail=((Get-Content -LiteralPath $stdoutPath -Tail 80) -join \"`n\") }; "
+            f"$code={self._ps_quote(E_WIN_WORKER_RUNTIME)}; "
+            "if ($stderrTail -match 'ModuleNotFoundError|ImportError|No module named|Failed to import') { "
+            f"$code={self._ps_quote(E_WIN_WORKER_IMPORT)} "
+            "} "
+            "elseif ([string]::IsNullOrWhiteSpace($stderrTail)) { "
+            f"$code={self._ps_quote(E_WIN_WORKER_NATIVE_CRASH)} "
+            "}; "
+            "throw ("
+            "'error_code=' + $code + "
+            "'; detail=worker_died_after_launch; pid=' + $workerPid + "
+            "'; stdout_tail=' + $stdoutTail + "
+            "'; stderr_tail=' + $stderrTail"
+            "); "
+            "}; "
+            "$workerPid | Set-Content -LiteralPath $pidPath -NoNewline; "
+            "Write-Output $workerPid"
         )
         result = self._run_windows_powershell_or_raise(account=account, script=start_script)
-        job_id_field = result.stdout.strip().splitlines()[0].strip() if result.stdout.strip() else ""
+        numeric_lines = self._extract_digit_lines(result.stdout)
+        job_id_field = numeric_lines[-1] if numeric_lines else ""
         if not job_id_field:
-            raise SlurmClientError(f"account={account.account_id}; detail=empty windows worker pid")
+            raise SlurmClientError(
+                f"account={account.account_id}; detail=empty windows worker pid; stdout={result.stdout.strip()}"
+            )
         return job_id_field
 
     def cancel_worker(self, *, account: WorkerAccount, slurm_job_id: str) -> None:
