@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import shlex
 import subprocess
-from pathlib import Path
 from typing import Protocol
 
 from peetsfea_runner.config import RunnerConfig, SlurmPolicy, WorkerAccount
@@ -15,6 +14,12 @@ class SlurmClientError(RuntimeError):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+
+
+E_BOOTSTRAP_GIT = "E_BOOTSTRAP_GIT"
+E_BOOTSTRAP_PYTHON = "E_BOOTSTRAP_PYTHON"
+E_BOOTSTRAP_VENV = "E_BOOTSTRAP_VENV"
+E_BOOTSTRAP_DEPS = "E_BOOTSTRAP_DEPS"
 
 
 class SlurmClient(Protocol):
@@ -29,7 +34,6 @@ class SlurmClient(Protocol):
 
 
 class SubprocessSlurmClient:
-    _LOCAL_REPO_PATH = Path(__file__).resolve().parents[2]
     _REMOTE_REPO_PATH = "/home1/harry261/peetsfea-runner"
     _REMOTE_VENV_PATH = "/home1/harry261/.peetsfea-venv"
     _WORKER_POLL_SEC = 2.0
@@ -47,7 +51,13 @@ class SubprocessSlurmClient:
         detail = stderr or stdout or f"exit_code={result.returncode}"
         raise SlurmClientError(f"command={' '.join(args)}; detail={detail}")
 
-    def _ensure_remote_bootstrap(self, *, account: WorkerAccount) -> None:
+    def _run_bootstrap_step_or_raise(self, *, code: str, args: list[str]) -> None:
+        try:
+            self._run_or_raise(args)
+        except SlurmClientError as exc:
+            raise SlurmClientError(f"error_code={code}; {exc.message}") from exc
+
+    def _ensure_remote_bootstrap(self, *, account: WorkerAccount, policy: SlurmPolicy) -> None:
         if account.account_id in self._bootstrapped_accounts:
             return
         if account.spool_paths is None:
@@ -55,8 +65,9 @@ class SubprocessSlurmClient:
                 f"account={account.account_id}; detail=missing spool_paths for remote worker bootstrap"
             )
 
-        self._run_or_raise(
-            [
+        self._run_bootstrap_step_or_raise(
+            code=E_BOOTSTRAP_GIT,
+            args=[
                 "ssh",
                 account.ssh_alias,
                 (
@@ -67,37 +78,78 @@ class SubprocessSlurmClient:
                     f"{shlex.quote(account.spool_paths.results)} "
                     f"{shlex.quote(account.spool_paths.failed)}"
                 ),
-            ]
+            ],
         )
 
-        self._run_or_raise(
-            [
-                "rsync",
-                "-az",
-                "--delete",
-                "--exclude",
-                ".git",
-                "--exclude",
-                ".venv",
-                "--exclude",
-                "__pycache__",
-                "--exclude",
-                ".pytest_cache",
-                f"{self._LOCAL_REPO_PATH}/",
-                f"{account.ssh_alias}:{self._REMOTE_REPO_PATH}/",
-            ]
+        repo_cmd = (
+            "set -euo pipefail; "
+            f"REPO_PATH={shlex.quote(self._REMOTE_REPO_PATH)}; "
+            f"REPO_URL={shlex.quote(policy.repo_url)}; "
+            f"RELEASE_TAG={shlex.quote(policy.release_tag)}; "
+            'if [ ! -d "$REPO_PATH/.git" ]; then '
+            'rm -rf "$REPO_PATH"; '
+            'git clone "$REPO_URL" "$REPO_PATH"; '
+            "fi; "
+            'cd "$REPO_PATH"; '
+            "git fetch --tags --force --prune; "
+            'git checkout --force "tags/$RELEASE_TAG"; '
+            "git clean -fdx"
+        )
+        self._run_bootstrap_step_or_raise(
+            code=E_BOOTSTRAP_GIT,
+            args=["ssh", account.ssh_alias, f"bash -lc {shlex.quote(repo_cmd)}"],
         )
 
-        bootstrap_cmd = (
+        python_cmd = (
+            "set -euo pipefail; "
+            f"VENV_PATH={shlex.quote(self._REMOTE_VENV_PATH)}; "
+            'if [ ! -x "$VENV_PATH/bin/python" ]; then '
+            "if command -v python3.12 >/dev/null 2>&1; then "
+            'python3.12 -m venv "$VENV_PATH"; '
+            "elif command -v conda >/dev/null 2>&1; then "
+            'conda create -y -n peetsfea-py312 python=3.12 && '
+            'conda run -n peetsfea-py312 python -m venv "$VENV_PATH"; '
+            "else "
+            'if [ ! -x "$HOME/miniconda3/bin/conda" ]; then '
+            'curl -fsSL -o "$HOME/miniconda.sh" '
+            '"https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"; '
+            'bash "$HOME/miniconda.sh" -b -p "$HOME/miniconda3"; '
+            'rm -f "$HOME/miniconda.sh"; '
+            "fi; "
+            '"$HOME/miniconda3/bin/conda" create -y -n peetsfea-py312 python=3.12 && '
+            '"$HOME/miniconda3/bin/conda" run -n peetsfea-py312 python -m venv "$VENV_PATH"; '
+            "fi; "
+            "fi"
+        )
+        self._run_bootstrap_step_or_raise(
+            code=E_BOOTSTRAP_PYTHON,
+            args=["ssh", account.ssh_alias, f"bash -lc {shlex.quote(python_cmd)}"],
+        )
+
+        deps_cmd = (
             "set -euo pipefail; "
             f"VENV_PATH={shlex.quote(self._REMOTE_VENV_PATH)}; "
             f"REPO_PATH={shlex.quote(self._REMOTE_REPO_PATH)}; "
-            'if [ ! -x "$VENV_PATH/bin/python" ]; then python3.12 -m venv "$VENV_PATH"; fi; '
             '"$VENV_PATH/bin/python" -m ensurepip >/dev/null 2>&1 || true; '
             '"$VENV_PATH/bin/python" -m pip install -q --disable-pip-version-check uv; '
-            '"$VENV_PATH/bin/python" -m uv pip install -q -e "$REPO_PATH" pyaedt==0.24.1'
+            'cd "$REPO_PATH"; '
+            '"$VENV_PATH/bin/python" -m uv pip install -q -e . pyaedt==0.24.1'
         )
-        self._run_or_raise(["ssh", account.ssh_alias, f"bash -lc {shlex.quote(bootstrap_cmd)}"])
+        self._run_bootstrap_step_or_raise(
+            code=E_BOOTSTRAP_DEPS,
+            args=["ssh", account.ssh_alias, f"bash -lc {shlex.quote(deps_cmd)}"],
+        )
+
+        check_cmd = (
+            "set -euo pipefail; "
+            f"VENV_PATH={shlex.quote(self._REMOTE_VENV_PATH)}; "
+            'test -x "$VENV_PATH/bin/python"'
+        )
+        self._run_bootstrap_step_or_raise(
+            code=E_BOOTSTRAP_VENV,
+            args=["ssh", account.ssh_alias, f"bash -lc {shlex.quote(check_cmd)}"],
+        )
+
         self._bootstrapped_accounts.add(account.account_id)
 
     def query_workers(self, *, account: WorkerAccount, policy: SlurmPolicy) -> list[str]:
@@ -109,7 +161,7 @@ class SubprocessSlurmClient:
 
     def submit_worker(self, *, account: WorkerAccount, policy: SlurmPolicy) -> str:
         job_name = f"{policy.job_name_prefix}-{account.account_id}"
-        self._ensure_remote_bootstrap(account=account)
+        self._ensure_remote_bootstrap(account=account, policy=policy)
         assert account.spool_paths is not None
         worker_cmd = (
             "set -euo pipefail; "

@@ -7,7 +7,7 @@ Minimal 5% bootstrap of a daemon service for `.aedt` queue intake.
 - `.aedt` 원본은 처리 완료 후 원격/로컬에서 삭제한다.
 - 리포트 export는 단일 리포트가 아니라 해석 후 `모든 리포트`를 대상으로 한다.
 - 실행 구조는 `mainPC orchestrator + gate spool + 단일 계정 worker 풀(10)`으로 운영한다.
-- 저장소는 mainPC에서만 운영하고 gate/home에는 git clone 하지 않는다.
+- 저장소 운영 기준은 mainPC지만, worker bootstrap 시 gate 계정에 태그 기반 clone/check-out을 허용한다.
 
 ## 문서 체계
 - 작업 규칙: [AGENTS.md](AGENTS.md)
@@ -66,8 +66,9 @@ The runtime directories are created automatically under `var/`:
   - remote repo=`/home1/harry261/peetsfea-runner`
   - remote venv=`/home1/harry261/.peetsfea-venv`
   - submit 시 remote bootstrap 자동화:
-    - `~/peetsfea-runner` 미존재 시 생성 + mainPC에서 rsync 동기화
-    - `~/.peetsfea-venv` 미존재 시 `python3.12 -m venv`로 생성
+    - `~/peetsfea-runner` 미존재 시 `git clone https://github.com/Glaysia/peetsfea-runner`
+    - 매 submit bootstrap마다 `git fetch --tags --force` + `git checkout tags/v2026.03.02-gate1-r1`
+    - `~/.peetsfea-venv` 미존재 시 `python3.12` 우선, 없으면 conda/miniconda로 Python 3.12 확보 후 venv 생성
     - `uv`, `pyaedt==0.24.1`, editable 패키지 설치 보장
 - 장애 격리:
   - 계정별 degraded 상태를 추적하고, 정상 계정의 풀 관리는 계속 수행

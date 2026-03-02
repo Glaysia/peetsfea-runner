@@ -191,14 +191,24 @@ def test_subprocess_slurm_client_submit_uses_remote_worker_entrypoint(monkeypatc
     job_id = client.submit_worker(account=account, policy=policy)
 
     assert job_id == "12345"
-    assert len(calls) == 4
+    assert len(calls) == 6
     assert calls[0][0] == "ssh"
     assert "mkdir -p /home1/harry261/peetsfea-runner" in calls[0][2]
-    assert calls[1][0] == "rsync"
+    assert calls[1][0] == "ssh"
+    assert "git clone" in calls[1][2]
+    assert "git fetch --tags --force --prune" in calls[1][2]
+    assert "RELEASE_TAG=v2026.03.02-gate1-r1" in calls[1][2]
+    assert 'git checkout --force "tags/$RELEASE_TAG"' in calls[1][2]
     assert calls[2][0] == "ssh"
     assert "python3.12 -m venv" in calls[2][2]
+    assert "miniconda" in calls[2][2]
 
-    submit_args = calls[3]
+    assert calls[3][0] == "ssh"
+    assert "\"$VENV_PATH/bin/python\" -m uv pip install -q -e . pyaedt==0.24.1" in calls[3][2]
+    assert calls[4][0] == "ssh"
+    assert 'test -x "$VENV_PATH/bin/python"' in calls[4][2]
+
+    submit_args = calls[5]
     assert submit_args[0] == "ssh"
     assert submit_args[1] == "gate1-harry"
     command = submit_args[2]
@@ -260,11 +270,88 @@ def test_subprocess_slurm_client_bootstraps_once_per_account(monkeypatch: object
     client.submit_worker(account=account, policy=policy)
     client.submit_worker(account=account, policy=policy)
 
-    # first submit: ssh mkdir + rsync + ssh bootstrap + ssh sbatch
+    # first submit: ssh mkdir + ssh git bootstrap + ssh python bootstrap + ssh deps + ssh check + ssh sbatch
     # second submit: ssh sbatch only
-    assert len(calls) == 5
+    assert len(calls) == 7
     assert calls[0][0] == "ssh"
-    assert calls[1][0] == "rsync"
+    assert calls[1][0] == "ssh"
     assert calls[2][0] == "ssh"
     assert calls[3][0] == "ssh"
     assert calls[4][0] == "ssh"
+    assert calls[5][0] == "ssh"
+    assert calls[6][0] == "ssh"
+
+
+def test_subprocess_slurm_client_python_bootstrap_has_conda_fallback(monkeypatch: object) -> None:
+    calls: list[list[str]] = []
+
+    def _fake_run(args: list[str], capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+        _ = capture_output, text, check
+        calls.append(args)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="1001;cluster\n", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    client = SubprocessSlurmClient()
+    account = WorkerAccount(
+        account_id="acct-a",
+        ssh_alias="gate1-harry",
+        spool_paths=RemoteSpoolPaths(
+            inbox="/home1/harry261/peetsfea-spool/inbox",
+            claimed="/home1/harry261/peetsfea-spool/claimed",
+            results="/home1/harry261/peetsfea-spool/results",
+            failed="/home1/harry261/peetsfea-spool/failed",
+        ),
+    )
+    policy = SlurmPolicy(
+        partition="cpu2",
+        cores=32,
+        memory_gb=320,
+        job_internal_procs=8,
+        pool_target_per_account=10,
+    )
+
+    client.submit_worker(account=account, policy=policy)
+
+    assert len(calls) >= 3
+    python_bootstrap_cmd = calls[2][2]
+    assert "command -v python3.12" in python_bootstrap_cmd
+    assert "command -v conda" in python_bootstrap_cmd
+    assert "repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh" in python_bootstrap_cmd
+
+
+def test_subprocess_slurm_client_uses_policy_repo_url_and_release_tag(monkeypatch: object) -> None:
+    calls: list[list[str]] = []
+
+    def _fake_run(args: list[str], capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+        _ = capture_output, text, check
+        calls.append(args)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="1001;cluster\n", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    client = SubprocessSlurmClient()
+    account = WorkerAccount(
+        account_id="acct-a",
+        ssh_alias="gate1-harry",
+        spool_paths=RemoteSpoolPaths(
+            inbox="/home1/harry261/peetsfea-spool/inbox",
+            claimed="/home1/harry261/peetsfea-spool/claimed",
+            results="/home1/harry261/peetsfea-spool/results",
+            failed="/home1/harry261/peetsfea-spool/failed",
+        ),
+    )
+    policy = SlurmPolicy(
+        partition="cpu2",
+        cores=32,
+        memory_gb=320,
+        job_internal_procs=8,
+        pool_target_per_account=10,
+        repo_url="https://github.com/Glaysia/peetsfea-runner",
+        release_tag="v2026.03.02-gate1-r1",
+    )
+
+    client.submit_worker(account=account, policy=policy)
+
+    git_bootstrap_cmd = calls[1][2]
+    assert "https://github.com/Glaysia/peetsfea-runner" in git_bootstrap_cmd
+    assert "RELEASE_TAG=v2026.03.02-gate1-r1" in git_bootstrap_cmd
+    assert 'git checkout --force "tags/$RELEASE_TAG"' in git_bootstrap_cmd

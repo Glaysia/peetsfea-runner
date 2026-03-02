@@ -36,7 +36,7 @@
 - Slurm worker pool 유지(계정별 target 유지, degraded 우회)
 - HFSS worker 실행 계약 모듈(어댑터 인터페이스, report-only zip 패키징, cleanup)
 - Slurm `--wrap` -> 원격 `peetsfea_runner.remote_worker` 실행 연결
-- submit 시 원격 bootstrap 자동화(`repo/venv` 미존재 시 생성 + 동기화)
+- submit 시 원격 bootstrap 자동화(`repo/venv` 미존재 시 생성 + 태그 checkout)
 - Reconciler/Auditor(상태 불일치 보정, DONE zip 고아 등록, `.aedt` 잔존 감사)
 - DuckDB 스키마/이벤트 기록 및 daemon 루프 통합
 
@@ -55,6 +55,7 @@
 - 원격 worker bootstrap 정책:
   - 잡 시작마다 `python -m uv`로 의존성/패키지 최신화 수행
   - 버전 동기화는 `태그/릴리스` 기준으로 고정
+  - 원격 repo bootstrap은 `git clone/fetch --tags` 후 지정 태그 checkout으로 수행
 - PyAEDT 버전 정책:
   - `pyaedt==0.24.1` 고정
 

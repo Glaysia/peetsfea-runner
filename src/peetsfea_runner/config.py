@@ -11,6 +11,8 @@ class SlurmPolicy:
     memory_gb: int
     job_internal_procs: int
     pool_target_per_account: int
+    repo_url: str = "https://github.com/Glaysia/peetsfea-runner"
+    release_tag: str = "v2026.03.02-gate1-r1"
     job_name_prefix: str = "peetsfea-worker"
 
 

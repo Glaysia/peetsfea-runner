@@ -44,6 +44,8 @@ SLURM_POLICY = SlurmPolicy(
     memory_gb=320,
     job_internal_procs=8,
     pool_target_per_account=10,
+    repo_url="https://github.com/Glaysia/peetsfea-runner",
+    release_tag="v2026.03.02-gate1-r1",
 )
 
 CONFIG = RunnerConfig(
