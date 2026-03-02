@@ -264,7 +264,7 @@ def test_subprocess_slurm_client_submit_uses_remote_worker_entrypoint(monkeypatc
     assert calls[1][0] == "ssh"
     assert "git clone" in _ssh_remote_command(calls[1])
     assert "git fetch --tags --force --prune" in _ssh_remote_command(calls[1])
-    assert "RELEASE_TAG=v2026.03.03-gate1x3-pathfix-r1" in _ssh_remote_command(calls[1])
+    assert "RELEASE_TAG=v2026.03.03-proc8-core4-r1" in _ssh_remote_command(calls[1])
     assert 'git checkout --force "tags/$RELEASE_TAG"' in _ssh_remote_command(calls[1])
     assert calls[2][0] == "ssh"
     assert "python3.12 -m venv" in _ssh_remote_command(calls[2])
@@ -286,7 +286,7 @@ def test_subprocess_slurm_client_submit_uses_remote_worker_entrypoint(monkeypatc
     assert "module load ansys-electronics/v252" in command
     assert "python\" -m peetsfea_runner.remote_worker" in command
     assert "--spool-inbox /gpfs/home1/harry261/peetsfea-spool/inbox" in command
-    assert "--analysis-cores 8" in command
+    assert "--analysis-cores 4" in command
 
 
 def test_subprocess_slurm_client_submit_prefers_explicit_remote_paths(monkeypatch: object) -> None:
@@ -476,14 +476,14 @@ def test_subprocess_slurm_client_uses_policy_repo_url_and_release_tag(monkeypatc
         job_internal_procs=8,
         pool_target_per_account=10,
         repo_url="https://github.com/Glaysia/peetsfea-runner",
-        release_tag="v2026.03.03-gate1x3-pathfix-r1",
+        release_tag="v2026.03.03-proc8-core4-r1",
     )
 
     client.submit_worker(account=account, policy=policy)
 
     git_bootstrap_cmd = _ssh_remote_command(calls[1])
     assert "https://github.com/Glaysia/peetsfea-runner" in git_bootstrap_cmd
-    assert "RELEASE_TAG=v2026.03.03-gate1x3-pathfix-r1" in git_bootstrap_cmd
+    assert "RELEASE_TAG=v2026.03.03-proc8-core4-r1" in git_bootstrap_cmd
     assert 'git checkout --force "tags/$RELEASE_TAG"' in git_bootstrap_cmd
 
 

@@ -10,6 +10,7 @@ import subprocess
 import shutil
 import tempfile
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from time import sleep, time
@@ -492,19 +493,42 @@ class RemoteWorker:
         )
         return True
 
+    def _collect_claimed_batch(self, *, limit: int) -> list[Path]:
+        claimed_batch: list[Path] = []
+        for claimed_path in self._iter_claimed_aedt():
+            claimed_batch.append(claimed_path)
+            if len(claimed_batch) >= limit:
+                return claimed_batch
+
+        while len(claimed_batch) < limit:
+            claimed = self._claim_one()
+            if claimed is None:
+                break
+            _, claimed_path = claimed
+            claimed_batch.append(claimed_path)
+        return claimed_batch
+
     def process_once(self) -> bool:
         self._ensure_dirs()
-        preclaimed = self._iter_claimed_aedt()
-        if preclaimed:
-            claimed_path = preclaimed[0]
-            return self._process_claimed_task(task_id=claimed_path.stem, claimed_path=claimed_path)
-
-        claimed = self._claim_one()
-        if claimed is None:
+        worker_slots = max(1, int(self._config.internal_procs))
+        claimed_batch = self._collect_claimed_batch(limit=worker_slots)
+        if not claimed_batch:
             return False
 
-        task_id, claimed_path = claimed
-        return self._process_claimed_task(task_id=task_id, claimed_path=claimed_path)
+        if len(claimed_batch) == 1:
+            claimed_path = claimed_batch[0]
+            return self._process_claimed_task(task_id=claimed_path.stem, claimed_path=claimed_path)
+
+        processed = 0
+        with ThreadPoolExecutor(max_workers=len(claimed_batch)) as executor:
+            futures = [
+                executor.submit(self._process_claimed_task, task_id=claimed_path.stem, claimed_path=claimed_path)
+                for claimed_path in claimed_batch
+            ]
+            for future in as_completed(futures):
+                if future.result():
+                    processed += 1
+        return processed > 0
 
     def run_forever(self) -> int:
         handled = 0

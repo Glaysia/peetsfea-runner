@@ -376,6 +376,7 @@ class SubprocessSlurmClient:
         aedt_flag = ""
         if policy.aedt_executable_path:
             aedt_flag = f" --aedt-executable-path {shlex.quote(policy.aedt_executable_path)}"
+        analysis_cores = max(1, policy.cores // max(1, policy.job_internal_procs))
         worker_cmd = (
             "set -euo pipefail; "
             f"REPO_PATH={shlex.quote(remote_repo_path)}; "
@@ -392,7 +393,7 @@ class SubprocessSlurmClient:
             f"--spool-failed {shlex.quote(account.spool_paths.failed)} "
             f"--poll-sec {self._WORKER_POLL_SEC} "
             f"--internal-procs {policy.job_internal_procs} "
-            f"--analysis-cores {policy.job_internal_procs}"
+            f"--analysis-cores {analysis_cores}"
             f"{aedt_flag}"
         )
         wrap = "bash -lc " + shlex.quote(worker_cmd)

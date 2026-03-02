@@ -54,7 +54,7 @@
 - 계정당 worker 상한: `10`
 - worker 내부 동시 PyAEDT 프로세스: `8`
 - Slurm 파티션/자원: `cpu2`, `32 cores`, `320GB`
-- 배포 태그: `v2026.03.03-gate1x3-pathfix-r1`
+- 배포 태그: `v2026.03.03-proc8-core4-r1`
 - 리포트 export: 해석 후 `모든 리포트`를 출력
 - 결과 보존: mainPC에 `report-only zip` 1개만 보존
 - 원본 `.aedt`: 완료 후 원격/로컬에서 삭제

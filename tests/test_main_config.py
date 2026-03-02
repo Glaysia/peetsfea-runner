@@ -25,4 +25,4 @@ def test_worker_pool_target_is_10() -> None:
     assert CONFIG.slurm_policy.cores == 32
     assert CONFIG.slurm_policy.memory_gb == 320
     assert CONFIG.slurm_policy.repo_url == "https://github.com/Glaysia/peetsfea-runner"
-    assert CONFIG.slurm_policy.release_tag == "v2026.03.03-gate1x3-pathfix-r1"
+    assert CONFIG.slurm_policy.release_tag == "v2026.03.03-proc8-core4-r1"

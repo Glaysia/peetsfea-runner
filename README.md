@@ -30,7 +30,7 @@ Current rollout scope:
 - 계정별 원격 spool 경로는 `/gpfs/home1/<user>/peetsfea-spool/{inbox,claimed,results,failed}`를 사용한다.
 - 계정당 worker 목표 수는 `10`이다.
 - worker 내부 동시 PyAEDT 프로세스는 `8`이다.
-- 실행 태그는 `v2026.03.03-gate1x3-pathfix-r1`를 사용한다.
+- 실행 태그는 `v2026.03.03-proc8-core4-r1`를 사용한다.
 
 ## Run
 ```bash
@@ -68,7 +68,7 @@ The runtime directories are created automatically under `var/`:
   - remote repo=`/gpfs/home1/<user>/peetsfea-runner` (계정별 bootstrap에서 태그 checkout)
   - remote venv=`/gpfs/home1/<user>/.peetsfea-venv`
   - `submit_worker`는 `sbatch`로 계정별 worker pool을 유지한다.
-  - bootstrap은 `git clone/fetch --tags` 후 `v2026.03.03-gate1x3-pathfix-r1` checkout으로 고정한다.
+  - bootstrap은 `git clone/fetch --tags` 후 `v2026.03.03-proc8-core4-r1` checkout으로 고정한다.
 - 장애 격리:
   - 계정별 degraded 상태를 추적하고, 정상 계정의 풀 관리는 계속 수행
   - 업로드 단계는 degraded 계정을 제외한 건강한 계정으로만 라우팅

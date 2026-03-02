@@ -13,7 +13,7 @@ class SlurmPolicy:
     job_internal_procs: int
     pool_target_per_account: int
     repo_url: str = "https://github.com/Glaysia/peetsfea-runner"
-    release_tag: str = "v2026.03.03-gate1x3-pathfix-r1"
+    release_tag: str = "v2026.03.03-proc8-core4-r1"
     job_name_prefix: str = "peetsfea-worker"
     aedt_executable_path: str | None = None
     windows_launch_mode: Literal["interactive_task", "service"] = "interactive_task"
@@ -188,7 +188,7 @@ def build_gate1_multi_runner_config(project_root: Path) -> RunnerConfig:
         job_internal_procs=8,
         pool_target_per_account=10,
         repo_url="https://github.com/Glaysia/peetsfea-runner",
-        release_tag="v2026.03.03-gate1x3-pathfix-r1",
+        release_tag="v2026.03.03-proc8-core4-r1",
     )
     return RunnerConfig(
         base_dir=base_dir,
