@@ -7,10 +7,10 @@ def test_gate_accounts_configuration_is_fixed() -> None:
     assert len(ACCOUNTS) == 4
     aliases = tuple(account.ssh_alias for account in ACCOUNTS)
     assert aliases == ("gate1-harry", "gate1-hmlee31", "gate1-dhj02", "gate1-wjddn5916")
-    assert ACCOUNTS[0].spool_paths.inbox == "/home1/harry261/peetsfea-spool/inbox"
-    assert ACCOUNTS[1].spool_paths.inbox == "/home1/hmlee31/peetsfea-spool/inbox"
-    assert ACCOUNTS[2].spool_paths.inbox == "/home1/dhj02/peetsfea-spool/inbox"
-    assert ACCOUNTS[3].spool_paths.inbox == "/home1/wjddn5916/peetsfea-spool/inbox"
+    assert ACCOUNTS[0].spool_paths.inbox == "/gpfs/home1/harry261/peetsfea-spool/inbox"
+    assert ACCOUNTS[1].spool_paths.inbox == "/gpfs/home1/hmlee31/peetsfea-spool/inbox"
+    assert ACCOUNTS[2].spool_paths.inbox == "/gpfs/home1/dhj02/peetsfea-spool/inbox"
+    assert ACCOUNTS[3].spool_paths.inbox == "/gpfs/home1/wjddn5916/peetsfea-spool/inbox"
 
 
 

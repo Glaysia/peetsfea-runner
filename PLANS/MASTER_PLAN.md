@@ -55,7 +55,7 @@
 - 원격 worker 환경 전제(gate1 4계정):
   - 계정별 `~/.peetsfea-venv` 존재(없으면 bootstrap에서 생성)
   - 계정별 `~/peetsfea-runner` clone 존재(없으면 bootstrap에서 clone)
-  - spool 경로: `/home1/<user>/peetsfea-spool/{inbox,claimed,results,failed}`
+  - spool 경로: `/gpfs/home1/<user>/peetsfea-spool/{inbox,claimed,results,failed}`
 - 원격 worker bootstrap 정책:
   - 원격 repo bootstrap은 `git clone/fetch --tags` 후 지정 태그 checkout(`v2026.03.02-gate1-r1`)
   - python/venv/uv/pyaedt 설치 보장 후 worker 시작

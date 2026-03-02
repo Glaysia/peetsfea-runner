@@ -59,10 +59,10 @@
 - 결과 보존: mainPC에 `report-only zip` 1개만 보존
 - 원본 `.aedt`: 완료 후 원격/로컬에서 삭제
 - 저장소 운영 위치: repo는 `mainPC`를 기준으로 운영하되, worker bootstrap 용 원격 태그 clone은 허용
-- 다중 계정 운영 시 원격 spool: `/home1/<user>/peetsfea-spool/{inbox,claimed,results,failed}`
+- 다중 계정 운영 시 원격 spool: `/gpfs/home1/<user>/peetsfea-spool/{inbox,claimed,results,failed}`
 - 결과 회수: Collector가 gate `results/`를 스캔해 `done/`으로 원자 회수하며 중복 다운로드를 건너뛴다.
 - 운영 감사: Reconciler가 상태 불일치(고아 done zip 포함) 보정과 `.aedt` 잔존 감사(`delete_after_done`)를 수행
-- 원격 bootstrap 경로: 계정별 `/home1/<user>/{peetsfea-runner,.peetsfea-venv}`
+- 원격 bootstrap 경로: 계정별 `/gpfs/home1/<user>/{peetsfea-runner,.peetsfea-venv}`
 
 ## Discord 알림 규칙 (MCP)
 - 작업 시작/종료 시각은 셸 초 단위로 계산한다.
