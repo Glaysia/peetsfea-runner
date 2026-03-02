@@ -4,7 +4,11 @@ from enum import StrEnum
 
 
 class JobState(StrEnum):
-    QUEUED = "QUEUED"
-    STAGED = "STAGED"
+    NEW = "NEW"
+    PENDING = "PENDING"
+    UPLOADED = "UPLOADED"
+    FAILED_UPLOAD = "FAILED_UPLOAD"
+    DONE = "DONE"
+    FAILED = "FAILED"
     SKIPPED_DUPLICATE = "SKIPPED_DUPLICATE"
     FAILED_LOCAL = "FAILED_LOCAL"

@@ -16,6 +16,9 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
+worker = [
+  "pyaedt==0.24.1",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

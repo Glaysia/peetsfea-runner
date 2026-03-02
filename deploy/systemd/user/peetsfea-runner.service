@@ -4,8 +4,8 @@ After=default.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/harry/Projects/PythonProjects/Legacy/peetsfea/peetsfea-runner
-ExecStart=/home/harry/Projects/PythonProjects/Legacy/peetsfea/peetsfea-runner/.venv/bin/python -m peetsfea_runner.main
+WorkingDirectory=/home/harry/Projects/PythonProjects/peetsfea-runner
+ExecStart=/home/harry/Projects/PythonProjects/peetsfea-runner/.venv/bin/python -m peetsfea_runner.main
 Restart=always
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1

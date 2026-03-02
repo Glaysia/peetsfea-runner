@@ -4,17 +4,31 @@ import signal
 import threading
 from pathlib import Path
 
-from peetsfea_runner.config import RunnerConfig
+from peetsfea_runner.collector import ResultsCollector, SpoolResultsClient
+from peetsfea_runner.config import GateAccount, RunnerConfig
+from peetsfea_runner.reconciler import OperationsReconciler
+from peetsfea_runner.slurm_pool import SlurmClient, WorkerPoolManager
 from peetsfea_runner.store import JobStore
+from peetsfea_runner.uploader import SpoolUploadClient, UploadDispatcher
 from peetsfea_runner.watcher import QueueWatcher
 
 
 class RunnerService:
-    def __init__(self, config: RunnerConfig) -> None:
+    def __init__(
+        self,
+        config: RunnerConfig,
+        upload_client: SpoolUploadClient | None = None,
+        results_client: SpoolResultsClient | None = None,
+        slurm_client: SlurmClient | None = None,
+    ) -> None:
         self._config = config
         self._stop_event = threading.Event()
         self._store = JobStore(config.duckdb_path)
         self._watcher = QueueWatcher(config, self._store)
+        self._uploader = UploadDispatcher(config, self._store, client=upload_client)
+        self._collector = ResultsCollector(config, self._store, client=results_client)
+        self._worker_pool = WorkerPoolManager(config, client=slurm_client)
+        self._reconciler = OperationsReconciler(config, self._store)
 
     @property
     def stop_event(self) -> threading.Event:
@@ -31,10 +45,12 @@ class RunnerService:
     def ensure_runtime_directories(self) -> None:
         self._config.base_dir.mkdir(parents=True, exist_ok=True)
         queue_dirs: list[Path] = [
-            self._config.queue_dirs.inbox,
-            self._config.queue_dirs.staging,
+            self._config.queue_dirs.incoming,
+            self._config.queue_dirs.pending,
+            self._config.queue_dirs.uploaded,
             self._config.queue_dirs.done,
             self._config.queue_dirs.failed,
+            self._config.queue_dirs.state,
         ]
         for directory in queue_dirs:
             directory.mkdir(parents=True, exist_ok=True)
@@ -48,6 +64,14 @@ class RunnerService:
         loops = 0
         while not self._stop_event.is_set():
             processed = self._watcher.process_once()
+            processed += self._worker_pool.process_once()
+            healthy_ids = {account.account_id for account in self._worker_pool.healthy_accounts()}
+            preferred_accounts: tuple[GateAccount, ...] = tuple(
+                account for account in self._config.gate_accounts if account.account_id in healthy_ids
+            )
+            processed += self._uploader.process_once(preferred_accounts=preferred_accounts)
+            processed += self._collector.process_once(preferred_accounts=preferred_accounts)
+            processed += self._reconciler.process_once()
             wait_sec = self._config.poll_interval_sec if processed else self._config.idle_sleep_sec
             self._stop_event.wait(wait_sec)
 
