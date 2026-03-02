@@ -128,7 +128,7 @@ def test_collector_downloads_remote_result_and_updates_existing_job(tmp_path: Pa
     local_zip = config.queue_dirs.done / "collect-1.reports.zip"
     assert processed == 1
     assert local_zip.exists()
-    assert store.get_job_state("collect-1") == JobState.UPLOADED.value
+    assert store.get_job_state("collect-1") == JobState.DONE.value
     assert store.get_report_zip_local_path("collect-1") == str(local_zip)
     assert store.get_report_zip_remote_path("collect-1") == "/spool/results/collect-1.reports.zip"
 
@@ -168,6 +168,7 @@ def test_collector_skips_download_when_local_done_zip_exists(tmp_path: Path) -> 
 
     assert processed == 1
     assert client.download_calls == 0
+    assert store.get_job_state("collect-dup") == JobState.DONE.value
     assert store.get_report_zip_local_path("collect-dup") == str(local_zip)
     assert store.get_report_zip_remote_path("collect-dup") == "/spool/results/collect-dup.reports.zip"
 

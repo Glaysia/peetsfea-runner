@@ -53,12 +53,13 @@
 - 잡당 자원: `32코어`, `320GB`
 - 잡 내부 동시 PyAEDT 프로세스: `8`
 - 계정당 활성 Slurm 잡 상한: `10`
-- 계정 수: `5`
+- 계정 수: `1` (`gate1-harry`, 단계 확장 예정)
 - AEDT 실행 경로: `/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt`
 - 리포트 export: 해석 후 `모든 리포트`를 출력
 - 결과 보존: mainPC에 `report-only zip` 1개만 보존
 - 원본 `.aedt`: 완료 후 원격/로컬에서 삭제
 - 저장소 운영 위치: repo는 `mainPC`에서만 운영(계정 gate/home clone 금지)
+- 단일 계정 운영 시 원격 spool: `/home1/harry261/peetsfea-spool/{inbox,claimed,results,failed}`
 - 결과 회수: Collector가 gate `results/`를 스캔해 `done/`으로 원자 회수하며 중복 다운로드를 건너뛴다.
 - 운영 감사: Reconciler가 상태 불일치(고아 done zip 포함) 보정과 `.aedt` 잔존 감사(`delete_after_done`)를 수행
 

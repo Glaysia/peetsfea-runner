@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import shlex
 import subprocess
+from pathlib import Path
 from typing import Protocol
 
 from peetsfea_runner.config import RunnerConfig, SlurmPolicy, WorkerAccount
@@ -28,6 +29,14 @@ class SlurmClient(Protocol):
 
 
 class SubprocessSlurmClient:
+    _LOCAL_REPO_PATH = Path(__file__).resolve().parents[2]
+    _REMOTE_REPO_PATH = "/home1/harry261/peetsfea-runner"
+    _REMOTE_VENV_PATH = "/home1/harry261/.peetsfea-venv"
+    _WORKER_POLL_SEC = 2.0
+
+    def __init__(self) -> None:
+        self._bootstrapped_accounts: set[str] = set()
+
     def _run_or_raise(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(args, capture_output=True, text=True, check=False)
         if result.returncode == 0:
@@ -38,6 +47,59 @@ class SubprocessSlurmClient:
         detail = stderr or stdout or f"exit_code={result.returncode}"
         raise SlurmClientError(f"command={' '.join(args)}; detail={detail}")
 
+    def _ensure_remote_bootstrap(self, *, account: WorkerAccount) -> None:
+        if account.account_id in self._bootstrapped_accounts:
+            return
+        if account.spool_paths is None:
+            raise SlurmClientError(
+                f"account={account.account_id}; detail=missing spool_paths for remote worker bootstrap"
+            )
+
+        self._run_or_raise(
+            [
+                "ssh",
+                account.ssh_alias,
+                (
+                    "mkdir -p "
+                    f"{shlex.quote(self._REMOTE_REPO_PATH)} "
+                    f"{shlex.quote(account.spool_paths.inbox)} "
+                    f"{shlex.quote(account.spool_paths.claimed)} "
+                    f"{shlex.quote(account.spool_paths.results)} "
+                    f"{shlex.quote(account.spool_paths.failed)}"
+                ),
+            ]
+        )
+
+        self._run_or_raise(
+            [
+                "rsync",
+                "-az",
+                "--delete",
+                "--exclude",
+                ".git",
+                "--exclude",
+                ".venv",
+                "--exclude",
+                "__pycache__",
+                "--exclude",
+                ".pytest_cache",
+                f"{self._LOCAL_REPO_PATH}/",
+                f"{account.ssh_alias}:{self._REMOTE_REPO_PATH}/",
+            ]
+        )
+
+        bootstrap_cmd = (
+            "set -euo pipefail; "
+            f"VENV_PATH={shlex.quote(self._REMOTE_VENV_PATH)}; "
+            f"REPO_PATH={shlex.quote(self._REMOTE_REPO_PATH)}; "
+            'if [ ! -x "$VENV_PATH/bin/python" ]; then python3.12 -m venv "$VENV_PATH"; fi; '
+            '"$VENV_PATH/bin/python" -m ensurepip >/dev/null 2>&1 || true; '
+            '"$VENV_PATH/bin/python" -m pip install -q --disable-pip-version-check uv; '
+            '"$VENV_PATH/bin/python" -m uv pip install -q -e "$REPO_PATH" pyaedt==0.24.1'
+        )
+        self._run_or_raise(["ssh", account.ssh_alias, f"bash -lc {shlex.quote(bootstrap_cmd)}"])
+        self._bootstrapped_accounts.add(account.account_id)
+
     def query_workers(self, *, account: WorkerAccount, policy: SlurmPolicy) -> list[str]:
         job_name = f"{policy.job_name_prefix}-{account.account_id}"
         query_cmd = f"squeue -h -n {shlex.quote(job_name)} -o %A"
@@ -47,12 +109,26 @@ class SubprocessSlurmClient:
 
     def submit_worker(self, *, account: WorkerAccount, policy: SlurmPolicy) -> str:
         job_name = f"{policy.job_name_prefix}-{account.account_id}"
+        self._ensure_remote_bootstrap(account=account)
+        assert account.spool_paths is not None
+        worker_cmd = (
+            "set -euo pipefail; "
+            f"REPO_PATH={shlex.quote(self._REMOTE_REPO_PATH)}; "
+            f"VENV_PATH={shlex.quote(self._REMOTE_VENV_PATH)}; "
+            'if [ ! -d "$REPO_PATH" ]; then echo "missing repo: $REPO_PATH" >&2; exit 2; fi; '
+            'if [ ! -x "$VENV_PATH/bin/python" ]; then echo "missing venv python: $VENV_PATH/bin/python" >&2; exit 3; fi; '
+            'cd "$REPO_PATH"; '
+            '"$VENV_PATH/bin/python" -m peetsfea_runner.remote_worker '
+            f"--spool-inbox {shlex.quote(account.spool_paths.inbox)} "
+            f"--spool-claimed {shlex.quote(account.spool_paths.claimed)} "
+            f"--spool-results {shlex.quote(account.spool_paths.results)} "
+            f"--spool-failed {shlex.quote(account.spool_paths.failed)} "
+            f"--poll-sec {self._WORKER_POLL_SEC} "
+            f"--internal-procs {policy.job_internal_procs}"
+        )
         wrap = (
             "bash -lc "
-            + shlex.quote(
-                "echo peetsfea worker started; "
-                "sleep infinity"
-            )
+            + shlex.quote(worker_cmd)
         )
         submit_cmd = (
             "sbatch --parsable "

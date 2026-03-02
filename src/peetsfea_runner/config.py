@@ -33,6 +33,7 @@ class GateAccount:
 class WorkerAccount:
     account_id: str
     ssh_alias: str
+    spool_paths: RemoteSpoolPaths | None = None
 
 
 @dataclass(frozen=True)

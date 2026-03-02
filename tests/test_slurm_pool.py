@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from peetsfea_runner.config import (
@@ -10,7 +11,7 @@ from peetsfea_runner.config import (
     WorkerAccount,
     build_queue_dirs,
 )
-from peetsfea_runner.slurm_pool import SlurmClientError, WorkerPoolManager
+from peetsfea_runner.slurm_pool import SlurmClientError, SubprocessSlurmClient, WorkerPoolManager
 
 
 class FakeSlurmClient:
@@ -156,3 +157,114 @@ def test_worker_pool_submit_uses_fixed_slurm_policy(tmp_path: Path) -> None:
     assert used_policy.cores == 32
     assert used_policy.memory_gb == 320
     assert used_policy.job_internal_procs == 8
+
+
+def test_subprocess_slurm_client_submit_uses_remote_worker_entrypoint(monkeypatch: object) -> None:
+    calls: list[list[str]] = []
+
+    def _fake_run(args: list[str], capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+        _ = capture_output, text, check
+        calls.append(args)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="12345;cluster\n", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    client = SubprocessSlurmClient()
+    account = WorkerAccount(
+        account_id="acct-a",
+        ssh_alias="gate1-harry",
+        spool_paths=RemoteSpoolPaths(
+            inbox="/home1/harry261/peetsfea-spool/inbox",
+            claimed="/home1/harry261/peetsfea-spool/claimed",
+            results="/home1/harry261/peetsfea-spool/results",
+            failed="/home1/harry261/peetsfea-spool/failed",
+        ),
+    )
+    policy = SlurmPolicy(
+        partition="cpu2",
+        cores=32,
+        memory_gb=320,
+        job_internal_procs=8,
+        pool_target_per_account=10,
+    )
+
+    job_id = client.submit_worker(account=account, policy=policy)
+
+    assert job_id == "12345"
+    assert len(calls) == 4
+    assert calls[0][0] == "ssh"
+    assert "mkdir -p /home1/harry261/peetsfea-runner" in calls[0][2]
+    assert calls[1][0] == "rsync"
+    assert calls[2][0] == "ssh"
+    assert "python3.12 -m venv" in calls[2][2]
+
+    submit_args = calls[3]
+    assert submit_args[0] == "ssh"
+    assert submit_args[1] == "gate1-harry"
+    command = submit_args[2]
+    assert "sbatch --parsable" in command
+    assert "--partition cpu2" in command
+    assert "--cpus-per-task 32" in command
+    assert "--mem 320G" in command
+    assert "python\" -m peetsfea_runner.remote_worker" in command
+    assert "--spool-inbox /home1/harry261/peetsfea-spool/inbox" in command
+
+
+def test_subprocess_slurm_client_submit_requires_worker_spool_paths() -> None:
+    client = SubprocessSlurmClient()
+    account = WorkerAccount(account_id="acct-a", ssh_alias="gate1-harry")
+    policy = SlurmPolicy(
+        partition="cpu2",
+        cores=32,
+        memory_gb=320,
+        job_internal_procs=8,
+        pool_target_per_account=10,
+    )
+    try:
+        client.submit_worker(account=account, policy=policy)
+    except SlurmClientError as exc:
+        assert "missing spool_paths" in exc.message
+    else:
+        raise AssertionError("expected SlurmClientError")
+
+
+def test_subprocess_slurm_client_bootstraps_once_per_account(monkeypatch: object) -> None:
+    calls: list[list[str]] = []
+
+    def _fake_run(args: list[str], capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+        _ = capture_output, text, check
+        calls.append(args)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="1001;cluster\n", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    client = SubprocessSlurmClient()
+    account = WorkerAccount(
+        account_id="acct-a",
+        ssh_alias="gate1-harry",
+        spool_paths=RemoteSpoolPaths(
+            inbox="/home1/harry261/peetsfea-spool/inbox",
+            claimed="/home1/harry261/peetsfea-spool/claimed",
+            results="/home1/harry261/peetsfea-spool/results",
+            failed="/home1/harry261/peetsfea-spool/failed",
+        ),
+    )
+    policy = SlurmPolicy(
+        partition="cpu2",
+        cores=32,
+        memory_gb=320,
+        job_internal_procs=8,
+        pool_target_per_account=10,
+    )
+
+    client.submit_worker(account=account, policy=policy)
+    client.submit_worker(account=account, policy=policy)
+
+    # first submit: ssh mkdir + rsync + ssh bootstrap + ssh sbatch
+    # second submit: ssh sbatch only
+    assert len(calls) == 5
+    assert calls[0][0] == "ssh"
+    assert calls[1][0] == "rsync"
+    assert calls[2][0] == "ssh"
+    assert calls[3][0] == "ssh"
+    assert calls[4][0] == "ssh"

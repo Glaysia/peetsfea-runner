@@ -21,7 +21,7 @@
 - 잡당 자원: `32코어`, `320GB`
 - 잡 내부 동시 PyAEDT 프로세스: `8`
 - 계정당 활성 Slurm 잡 상한: `10`
-- 계정 수: `5`
+- 계정 수: `1` (`gate1-harry`, 단계 확장 예정)
 - AEDT 실행 경로: `/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt`
 - 리포트 export 정책: 해석 후 `모든 리포트` 출력
 - 결과 보존 정책: mainPC에 `report-only zip` 1개만 보존
@@ -35,11 +35,12 @@
 - gate 결과 zip 회수기(원자 다운로드/중복 skip)
 - Slurm worker pool 유지(계정별 target 유지, degraded 우회)
 - HFSS worker 실행 계약 모듈(어댑터 인터페이스, report-only zip 패키징, cleanup)
+- Slurm `--wrap` -> 원격 `peetsfea_runner.remote_worker` 실행 연결
+- submit 시 원격 bootstrap 자동화(`repo/venv` 미존재 시 생성 + 동기화)
 - Reconciler/Auditor(상태 불일치 보정, DONE zip 고아 등록, `.aedt` 잔존 감사)
 - DuckDB 스키마/이벤트 기록 및 daemon 루프 통합
 
 ### 미완료
-- 원격 Slurm worker 잡 내부와 HFSS worker 실제 연결
 - PyAEDT 실제 어댑터의 실환경 통합 테스트
 - DONE 승격 게이트의 원격 `.aedt` 삭제 이벤트 강제 검증 강화
 
@@ -48,8 +49,9 @@
   - `WorkingDirectory=/home/peetsmain/peetsfea-runner`
   - `ExecStart=/home/peetsmain/peetsfea-runner/.venv/bin/python -m peetsfea_runner.main`
 - 원격 worker 환경 전제:
-  - 각 원격 계정에 `~/.peetsfea-venv` 존재
-  - 각 원격 계정에 `~/peetsfea-runner` clone 존재
+  - `gate1-harry` 계정에 `~/.peetsfea-venv` 존재
+  - `gate1-harry` 계정에 `~/peetsfea-runner` clone 존재
+  - spool 경로: `/home1/harry261/peetsfea-spool/{inbox,claimed,results,failed}`
 - 원격 worker bootstrap 정책:
   - 잡 시작마다 `python -m uv`로 의존성/패키지 최신화 수행
   - 버전 동기화는 `태그/릴리스` 기준으로 고정

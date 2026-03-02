@@ -18,59 +18,23 @@ QUEUE_DIRS = build_queue_dirs(BASE_DIR)
 
 ACCOUNTS: tuple[GateAccount, ...] = (
     GateAccount(
-        account_id="account-01",
-        ssh_alias="gate-account-01",
+        account_id="harry261",
+        ssh_alias="gate1-harry",
         spool_paths=RemoteSpoolPaths(
-            inbox="/srv/peetsfea/account-01/spool/inbox",
-            claimed="/srv/peetsfea/account-01/spool/claimed",
-            results="/srv/peetsfea/account-01/spool/results",
-            failed="/srv/peetsfea/account-01/spool/failed",
-        ),
-    ),
-    GateAccount(
-        account_id="account-02",
-        ssh_alias="gate-account-02",
-        spool_paths=RemoteSpoolPaths(
-            inbox="/srv/peetsfea/account-02/spool/inbox",
-            claimed="/srv/peetsfea/account-02/spool/claimed",
-            results="/srv/peetsfea/account-02/spool/results",
-            failed="/srv/peetsfea/account-02/spool/failed",
-        ),
-    ),
-    GateAccount(
-        account_id="account-03",
-        ssh_alias="gate-account-03",
-        spool_paths=RemoteSpoolPaths(
-            inbox="/srv/peetsfea/account-03/spool/inbox",
-            claimed="/srv/peetsfea/account-03/spool/claimed",
-            results="/srv/peetsfea/account-03/spool/results",
-            failed="/srv/peetsfea/account-03/spool/failed",
-        ),
-    ),
-    GateAccount(
-        account_id="account-04",
-        ssh_alias="gate-account-04",
-        spool_paths=RemoteSpoolPaths(
-            inbox="/srv/peetsfea/account-04/spool/inbox",
-            claimed="/srv/peetsfea/account-04/spool/claimed",
-            results="/srv/peetsfea/account-04/spool/results",
-            failed="/srv/peetsfea/account-04/spool/failed",
-        ),
-    ),
-    GateAccount(
-        account_id="account-05",
-        ssh_alias="gate-account-05",
-        spool_paths=RemoteSpoolPaths(
-            inbox="/srv/peetsfea/account-05/spool/inbox",
-            claimed="/srv/peetsfea/account-05/spool/claimed",
-            results="/srv/peetsfea/account-05/spool/results",
-            failed="/srv/peetsfea/account-05/spool/failed",
+            inbox="/home1/harry261/peetsfea-spool/inbox",
+            claimed="/home1/harry261/peetsfea-spool/claimed",
+            results="/home1/harry261/peetsfea-spool/results",
+            failed="/home1/harry261/peetsfea-spool/failed",
         ),
     ),
 )
 
 WORKER_ACCOUNTS: tuple[WorkerAccount, ...] = tuple(
-    WorkerAccount(account_id=account.account_id, ssh_alias=account.ssh_alias)
+    WorkerAccount(
+        account_id=account.account_id,
+        ssh_alias=account.ssh_alias,
+        spool_paths=account.spool_paths,
+    )
     for account in ACCOUNTS
 )
 

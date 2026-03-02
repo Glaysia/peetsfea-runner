@@ -111,6 +111,7 @@ class ResultsCollector:
                 report_zip_local_path=str(local_path),
                 report_zip_remote_path=remote_path,
             )
+            self._store.update_state_by_task_id(task_id=task_id, state=JobState.DONE)
             return
 
         filename = f"{task_id}.aedt"
@@ -130,6 +131,7 @@ class ResultsCollector:
                 report_zip_local_path=str(local_path),
                 report_zip_remote_path=remote_path,
             )
+            self._store.update_state_by_task_id(task_id=task_id, state=JobState.DONE)
 
     def _collect_one(
         self,
