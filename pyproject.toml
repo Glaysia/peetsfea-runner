@@ -17,7 +17,7 @@ dev = [
   "pytest>=8.0",
 ]
 worker = [
-  "pyaedt==0.24.1",
+  "pyaedt==0.22.0",
 ]
 
 [tool.setuptools]

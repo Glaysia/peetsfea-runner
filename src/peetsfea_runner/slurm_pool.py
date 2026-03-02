@@ -200,7 +200,7 @@ class SubprocessSlurmClient:
             '"$VENV_PATH/bin/python" -m ensurepip >/dev/null 2>&1 || true; '
             '"$VENV_PATH/bin/python" -m pip install -q --disable-pip-version-check uv; '
             'cd "$REPO_PATH"; '
-            '"$VENV_PATH/bin/python" -m uv pip install -q -e . pyaedt==0.24.1'
+            '"$VENV_PATH/bin/python" -m uv pip install -q -e . pyaedt==0.22.0'
         )
         self._run_bootstrap_step_or_raise(
             code=E_BOOTSTRAP_DEPS,
@@ -247,7 +247,7 @@ class SubprocessSlurmClient:
             "else { throw 'python3.12 launcher not found on Windows host' } }; "
             "& ($venv + '/Scripts/python.exe') -m ensurepip | Out-Null; "
             "& ($venv + '/Scripts/python.exe') -m pip install --disable-pip-version-check uv | Out-Null; "
-            "& ($venv + '/Scripts/python.exe') -m uv pip install -e . pyaedt==0.24.1 | Out-Null"
+            "& ($venv + '/Scripts/python.exe') -m uv pip install -e . pyaedt==0.22.0 | Out-Null"
         )
         try:
             self._run_windows_powershell_or_raise(account=account, script=bootstrap_script)

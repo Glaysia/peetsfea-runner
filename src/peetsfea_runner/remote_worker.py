@@ -171,9 +171,19 @@ class PyAedtHfssAdapter(HfssAdapter):
         hfss_class = self._hfss_class
         assert app is not None and hfss_class is not None, "PyAEDT app is not initialized"
         assert isinstance(app, hfss_class), f"Unexpected HFSS app type: {type(app)!r}"
-        
-        result = app.solve_in_batch(cores=self._analysis_cores)
-        
+        setup_names: list[str]
+        try:
+            setup_names = [str(name) for name in app.setup_names]
+        except Exception:  # noqa: BLE001
+            setup_names = []
+        LOG.info(
+            "hfss_analyze_start setup_count=%d setup_names=%s cores=%d",
+            len(setup_names),
+            setup_names,
+            self._analysis_cores,
+        )
+        result = app.analyze(cores=self._analysis_cores)
+        LOG.info("hfss_analyze_done result=%r", result)
         if result is False:
             raise RuntimeError("PyAEDT analyze returned False")
 
@@ -188,11 +198,11 @@ class PyAedtHfssAdapter(HfssAdapter):
         assert isinstance(post, post_class), f"Unexpected PostProcessor type: {type(post)!r}"
 
         values = post.all_report_names
-        if callable(values):
-            values = values()
         if values is None:
             return []
-        return [str(item) for item in values]
+        names = [str(item) for item in values]
+        LOG.info("hfss_report_names count=%d names=%s", len(names), names)
+        return names
 
     def export_report(self, *, report_name: str, export_format: str, output_path: Path) -> None:
         app = self._app
@@ -348,6 +358,7 @@ class RemoteWorker:
         failure_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _process_claimed_task(self, *, task_id: str, claimed_path: Path) -> bool:
+        LOG.info("worker_task_start task_id=%s claimed_path=%s", task_id, claimed_path)
         work_dir = self._config.spool_claimed / ".work" / task_id
         task = HfssWorkerTask(
             task_id=task_id,
@@ -359,6 +370,12 @@ class RemoteWorker:
         adapter = self._adapter_factory()
         result = self._runner.run_task(task=task, adapter=adapter)
         if result.success:
+            LOG.info(
+                "worker_task_done task_id=%s success=true zip=%s exported_count=%d",
+                task_id,
+                result.report_zip_path,
+                len(result.exported_files),
+            )
             return True
 
         if claimed_path.exists():
@@ -370,6 +387,12 @@ class RemoteWorker:
                 claimed_path.unlink(missing_ok=True)
 
         self._write_failure_metadata(task_id=task_id, message=result.error_message or result.error_code or "unknown")
+        LOG.error(
+            "worker_task_done task_id=%s success=false error_code=%s error_message=%s",
+            task_id,
+            result.error_code,
+            result.error_message,
+        )
         return True
 
     def process_once(self) -> bool:

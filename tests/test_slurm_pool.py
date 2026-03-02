@@ -271,7 +271,7 @@ def test_subprocess_slurm_client_submit_uses_remote_worker_entrypoint(monkeypatc
     assert "miniconda" in _ssh_remote_command(calls[2])
 
     assert calls[3][0] == "ssh"
-    assert "\"$VENV_PATH/bin/python\" -m uv pip install -q -e . pyaedt==0.24.1" in _ssh_remote_command(calls[3])
+    assert "\"$VENV_PATH/bin/python\" -m uv pip install -q -e . pyaedt==0.22.0" in _ssh_remote_command(calls[3])
     assert calls[4][0] == "ssh"
     assert 'test -x "$VENV_PATH/bin/python"' in _ssh_remote_command(calls[4])
 

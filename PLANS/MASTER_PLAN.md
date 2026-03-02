@@ -64,7 +64,7 @@
   - worker python과 `ansysedt.exe`는 로그인 사용자 세션(Session 2)에서 실행되어야 한다.
   - Session 0 실행은 장애로 간주하고 degraded 처리한다.
 - PyAEDT 버전 정책:
-  - `pyaedt==0.24.1` 고정
+  - `pyaedt==0.22.0` 고정
 
 ## 단계별 실행 로드맵
 ### 즉시(Phase A)
@@ -78,7 +78,7 @@
   - no-interactive-session(`E_WIN_NO_INTERACTIVE_SESSION`) 명확화
   - launch health check 실패 시 stdout/stderr tail + Task last result 포함
 - bootstrap 이벤트/오류 코드 표준화 및 운영 로그 확장
-- `pyproject.toml`에 `pyaedt==0.24.1` 반영 및 설치 검증 경로 추가
+- `pyproject.toml`에 `pyaedt==0.22.0` 반영 및 설치 검증 경로 추가
 
 ### 중기(Phase C)
 - PyAEDT 어댑터를 실제 원격 worker 실행 경로에 연결
