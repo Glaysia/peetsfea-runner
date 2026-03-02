@@ -54,6 +54,12 @@ class _PostExportToFile:
         return str(path)
 
 
+class _AppAnalyzeFalse:
+    def analyze(self, **kwargs: object) -> bool:
+        _ = kwargs
+        return False
+
+
 def _build_config(tmp_path: Path) -> RemoteWorkerConfig:
     spool_root = tmp_path / "spool"
     return RemoteWorkerConfig(
@@ -118,7 +124,10 @@ def test_remote_worker_resumes_preclaimed_task_without_inbox_file(tmp_path: Path
 def test_pyaedt_adapter_export_report_uses_output_dir_signature(tmp_path: Path) -> None:
     adapter = PyAedtHfssAdapter(gui_mode=True)
     post = _PostExportToFile(create_file=True)
-    adapter._app = type("App", (), {"post": post})()
+    app = type("App", (), {"post": post})()
+    adapter._app = app
+    adapter._hfss_class = type(app)
+    adapter._load_post_processor_class = staticmethod(lambda: _PostExportToFile)  # type: ignore[method-assign]
 
     output_path = tmp_path / "safe_report.csv"
     adapter.export_report(report_name="Report S(1,1)", export_format="csv", output_path=output_path)
@@ -131,11 +140,23 @@ def test_pyaedt_adapter_export_report_uses_output_dir_signature(tmp_path: Path) 
 def test_pyaedt_adapter_export_report_raises_when_file_missing(tmp_path: Path) -> None:
     adapter = PyAedtHfssAdapter(gui_mode=True)
     post = _PostExportToFile(create_file=False)
-    adapter._app = type("App", (), {"post": post})()
+    app = type("App", (), {"post": post})()
+    adapter._app = app
+    adapter._hfss_class = type(app)
+    adapter._load_post_processor_class = staticmethod(lambda: _PostExportToFile)  # type: ignore[method-assign]
 
     output_path = tmp_path / "missing.csv"
     with pytest.raises(RuntimeError, match="no file found"):
         adapter.export_report(report_name="Report S(1,1)", export_format="csv", output_path=output_path)
+
+
+def test_pyaedt_adapter_analyze_raises_when_pyaedt_returns_false() -> None:
+    adapter = PyAedtHfssAdapter(gui_mode=True)
+    adapter._app = _AppAnalyzeFalse()
+    adapter._hfss_class = _AppAnalyzeFalse
+
+    with pytest.raises(RuntimeError, match="returned False"):
+        adapter.analyze()
 
 
 def test_remote_worker_main_writes_startup_banner(tmp_path: Path, monkeypatch: object) -> None:

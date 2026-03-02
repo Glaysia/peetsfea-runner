@@ -11,11 +11,15 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from time import sleep, time
-from typing import Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from peetsfea_runner.hfss_worker import AEDT_EXECUTABLE_PATH, HfssAdapter, HfssWorkerRunner, HfssWorkerTask
 
 LOG = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ansys.aedt.core.hfss import Hfss as HfssApp
+    from ansys.aedt.core.visualization.post.common import PostProcessorCommon
 
 
 @dataclass(frozen=True)
@@ -37,13 +41,30 @@ class PyAedtHfssAdapter(HfssAdapter):
         self._internal_procs = internal_procs
         self._analysis_cores = max(1, analysis_cores)
         self._gui_mode = gui_mode
-        self._app: object | None = None
+        self._app: HfssApp | None = None
+        self._hfss_class: type[Any] | None = None
         self._ansys_process: subprocess.Popen[bytes] | None = None
         self._attached_existing_desktop = False
 
     @staticmethod
     def _is_windows_exec(aedt_executable_path: str) -> bool:
         return aedt_executable_path.lower().endswith(".exe") or ":" in aedt_executable_path[:3]
+
+    @staticmethod
+    def _load_hfss_class() -> type[Any]:
+        try:
+            from pyaedt import Hfss as hfs_cls
+        except Exception:
+            from ansys.aedt.core import Hfss as hfs_cls  # type: ignore[import-not-found]
+        assert isinstance(hfs_cls, type), "PyAEDT Hfss class import failed"
+        return hfs_cls
+
+    @staticmethod
+    def _load_post_processor_class() -> type[Any]:
+        from ansys.aedt.core.visualization.post.common import PostProcessorCommon as post_cls
+
+        assert isinstance(post_cls, type), "PyAEDT PostProcessor class import failed"
+        return post_cls
 
     def _pick_free_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -81,38 +102,26 @@ class PyAedtHfssAdapter(HfssAdapter):
         return process
 
     def open_project(self, *, aedt_path: Path, aedt_executable_path: str) -> None:
-        hfs_cls = None
-        import_error: Exception | None = None
-
-        try:
-            from pyaedt import Hfss as _Hfss
-
-            hfs_cls = _Hfss
-        except Exception as exc:  # noqa: BLE001
-            import_error = exc
-
-        if hfs_cls is None:
-            try:
-                from ansys.aedt.core import Hfss as _Hfss  # type: ignore[import-not-found]
-
-                hfs_cls = _Hfss
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(f"Failed to import PyAEDT Hfss: {import_error or exc}") from exc
+        hfs_cls = self._load_hfss_class()
 
         if self._gui_mode:
             try:
-                self._app = hfs_cls(
+                app = hfs_cls(
                     project=str(aedt_path),
                     non_graphical=False,
                     new_desktop=False,
-                    close_on_exit=True,
+                    close_on_exit=False,
                     student_version=False,
                     remove_lock=True,
                 )
+                assert isinstance(app, hfs_cls), f"Unexpected HFSS app type: {type(app)!r}"
+                self._app = app
+                self._hfss_class = hfs_cls
                 self._attached_existing_desktop = True
                 return
             except Exception as exc:  # noqa: BLE001
                 self._app = None
+                self._hfss_class = None
                 self._attached_existing_desktop = False
                 if self._is_windows_exec(aedt_executable_path):
                     raise RuntimeError(
@@ -127,17 +136,20 @@ class PyAedtHfssAdapter(HfssAdapter):
             port=grpc_port,
         )
         try:
-            self._app = hfs_cls(
+            app = hfs_cls(
                 project=str(aedt_path),
                 non_graphical=not self._gui_mode,
                 new_desktop=False,
-                close_on_exit=True,
+                close_on_exit=False,
                 aedt_process_id=None,
                 student_version=False,
                 remove_lock=True,
                 machine="localhost",
                 port=grpc_port,
             )
+            assert isinstance(app, hfs_cls), f"Unexpected HFSS app type: {type(app)!r}"
+            self._app = app
+            self._hfss_class = hfs_cls
             self._attached_existing_desktop = False
         except Exception:  # noqa: BLE001
             self._stop_ansys_process(self._ansys_process)
@@ -145,98 +157,85 @@ class PyAedtHfssAdapter(HfssAdapter):
             raise
 
     def disable_auto_save(self) -> None:
-        app = self._require_app()
-        for method_name in ("autosave_disable", "disable_autosave"):
-            method = getattr(app, method_name, None)
-            if callable(method):
-                method()
-                return
+        app = self._app
+        hfss_class = self._hfss_class
+        assert app is not None and hfss_class is not None, "PyAEDT app is not initialized"
+        assert isinstance(app, hfss_class), f"Unexpected HFSS app type: {type(app)!r}"
+        try:
+            app.autosave_disable()
+        except AttributeError:
+            app.disable_autosave() # type: ignore
 
     def analyze(self) -> None:
-        app = self._require_app()
-        for method_name in ("analyze_all", "analyze"):
-            method = getattr(app, method_name, None)
-            if callable(method):
-                kwargs_candidates = (
-                    {"num_cores": self._analysis_cores, "num_tasks": 1},
-                    {"cores": self._analysis_cores, "tasks": 1},
-                    {"num_cores": self._analysis_cores},
-                    {"cores": self._analysis_cores},
-                    {},
-                )
-                for kwargs in kwargs_candidates:
-                    try:
-                        method(**kwargs)
-                        return
-                    except TypeError:
-                        continue
-        raise RuntimeError("PyAEDT app has no analyze method")
+        app = self._app
+        hfss_class = self._hfss_class
+        assert app is not None and hfss_class is not None, "PyAEDT app is not initialized"
+        assert isinstance(app, hfss_class), f"Unexpected HFSS app type: {type(app)!r}"
+        
+        result = app.solve_in_batch(cores=self._analysis_cores)
+        
+        if result is False:
+            raise RuntimeError("PyAEDT analyze returned False")
 
     def list_report_names(self) -> list[str]:
-        app = self._require_app()
-        post = getattr(app, "post", None)
-        if post is None:
-            return []
-        names = getattr(post, "all_report_names", None)
-        if callable(names):
-            values = names()
-        else:
-            values = names
+        app = self._app
+        hfss_class = self._hfss_class
+        assert app is not None and hfss_class is not None, "PyAEDT app is not initialized"
+        assert isinstance(app, hfss_class), f"Unexpected HFSS app type: {type(app)!r}"
+        post = app.post
+        post_class = self._load_post_processor_class()
+        assert post
+        assert isinstance(post, post_class), f"Unexpected PostProcessor type: {type(post)!r}"
+
+        values = post.all_report_names
+        if callable(values):
+            values = values()
         if values is None:
             return []
         return [str(item) for item in values]
 
     def export_report(self, *, report_name: str, export_format: str, output_path: Path) -> None:
-        app = self._require_app()
-        post = getattr(app, "post", None)
-        if post is None:
-            raise RuntimeError("PyAEDT app has no post processor")
+        app = self._app
+        hfss_class = self._hfss_class
+        assert app is not None and hfss_class is not None, "PyAEDT app is not initialized"
+        assert isinstance(app, hfss_class), f"Unexpected HFSS app type: {type(app)!r}"
+        post = app.post
+        assert post
+        post_class = self._load_post_processor_class()
+        assert isinstance(post, post_class), f"Unexpected PostProcessor type: {type(post)!r}"
 
         if not output_path.parent.exists():
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        export_method = getattr(post, "export_report_to_file", None)
-        if callable(export_method):
-            extension = export_format if export_format.startswith(".") else f".{export_format}"
-            try:
-                exported_path = export_method(
-                    output_dir=str(output_path.parent),
-                    plot_name=report_name,
-                    extension=extension,
-                )
-            except TypeError:
-                exported_path = export_method(str(output_path.parent), report_name, extension)
-
-            candidate_paths: list[Path] = []
-            if isinstance(exported_path, str) and exported_path:
-                candidate_paths.append(Path(exported_path))
-            candidate_paths.append(output_path.parent / f"{report_name}{extension}")
-            candidate_paths.append(output_path)
-
-            for candidate in candidate_paths:
-                if not candidate.exists():
-                    continue
-                if candidate != output_path:
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    if output_path.exists():
-                        output_path.unlink()
-                    candidate.replace(output_path)
-                return
-
-            raise RuntimeError(
-                f"Report export completed but no file found for report={report_name}, format={extension}"
+        extension = export_format if export_format.startswith(".") else f".{export_format}"
+        try:
+            exported_path = post.export_report_to_file(
+                output_dir=str(output_path.parent),
+                plot_name=report_name,
+                extension=extension,
             )
+        except TypeError:
+            exported_path = post.export_report_to_file(str(output_path.parent), report_name, extension)
 
-        export_method = getattr(post, "export_report_from_name", None)
-        if callable(export_method):
-            export_method(report_name, str(output_path))
-            if output_path.exists():
-                return
-            raise RuntimeError(
-                f"Report export completed but no file found for report={report_name}, path={output_path}"
-            )
+        candidate_paths: list[Path] = []
+        if isinstance(exported_path, str) and exported_path:
+            candidate_paths.append(Path(exported_path))
+        candidate_paths.append(output_path.parent / f"{report_name}{extension}")
+        candidate_paths.append(output_path)
 
-        raise RuntimeError("PyAEDT post has no report export method")
+        for candidate in candidate_paths:
+            if not candidate.exists():
+                continue
+            if candidate != output_path:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                if output_path.exists():
+                    output_path.unlink()
+                candidate.replace(output_path)
+            return
+
+        raise RuntimeError(
+            f"Report export completed but no file found for report={report_name}, format={extension}"
+        )
 
     def close(self) -> None:
         app = self._app
@@ -245,23 +244,16 @@ class PyAedtHfssAdapter(HfssAdapter):
             if app is None:
                 return
 
-            release = getattr(app, "release_desktop", None)
-            if callable(release):
-                try:
-                    release(close_projects=True, close_desktop=not self._attached_existing_desktop)
-                except TypeError:
-                    release()
-                finally:
-                    self._app = None
-                    self._attached_existing_desktop = False
-                return
-
-            close_desktop = getattr(app, "close_desktop", None)
-            if callable(close_desktop):
+            try:
+                app.release_desktop(close_projects=True, close_desktop=not self._attached_existing_desktop)
+            except TypeError:
+                app.release_desktop()
+            except AttributeError:
                 if not self._attached_existing_desktop:
-                    close_desktop()
+                    app.close_desktop()
 
             self._app = None
+            self._hfss_class = None
             self._attached_existing_desktop = False
         finally:
             self._stop_ansys_process(ansys_process)
@@ -276,12 +268,6 @@ class PyAedtHfssAdapter(HfssAdapter):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
-
-    def _require_app(self) -> object:
-        if self._app is None:
-            raise RuntimeError("PyAEDT app is not initialized")
-        return self._app
-
 
 class RemoteWorker:
     def __init__(
@@ -427,7 +413,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _write_json_log(path: Path, payload: dict[str, object]) -> None:
+def _write_json_log(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -448,7 +434,7 @@ def main() -> None:
         gui_mode=bool(args.gui),
     )
     runtime_var_dir = Path.cwd() / "var"
-    startup_payload: dict[str, object] = {
+    startup_payload: dict[str, Any] = {
         "pid": os.getpid(),
         "timestamp_ms": int(time() * 1000),
         "python_executable": str(Path(os.sys.executable)),
@@ -470,7 +456,7 @@ def main() -> None:
         processed = worker.run_forever()
         LOG.info("remote_worker_done processed=%d", processed)
     except Exception as exc:  # noqa: BLE001
-        fatal_payload: dict[str, object] = {
+        fatal_payload: dict[str, Any] = {
             "pid": os.getpid(),
             "timestamp_ms": int(time() * 1000),
             "error_type": type(exc).__name__,
