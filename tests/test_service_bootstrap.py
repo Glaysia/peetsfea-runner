@@ -45,6 +45,8 @@ class _FakeSlurmClient:
         self._jobs: dict[str, list[str]] = {}
         self._next_id = 1000
         self.submit_calls = 0
+        self.cancel_calls = 0
+        self.cancel_records: list[tuple[str, str]] = []
         self.query_fail_accounts: set[str] = set()
 
     def query_workers(self, *, account: WorkerAccount, policy: SlurmPolicy) -> list[str]:
@@ -62,6 +64,8 @@ class _FakeSlurmClient:
         return job_id
 
     def cancel_worker(self, *, account: WorkerAccount, slurm_job_id: str) -> None:
+        self.cancel_calls += 1
+        self.cancel_records.append((account.account_id, slurm_job_id))
         current = self._jobs.get(account.account_id, [])
         self._jobs[account.account_id] = [job for job in current if job != slurm_job_id]
 
@@ -164,6 +168,33 @@ def test_service_stops_on_signal_handler(tmp_path: Path) -> None:
     service._handle_signal(signal.SIGTERM, None)
 
     assert service.stop_event.is_set() is True
+    service.close()
+
+
+def test_service_stop_cancels_all_active_workers(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    slurm_client = _FakeSlurmClient()
+    slurm_client._jobs["acct-a"] = ["2001", "2002"]
+    slurm_client._jobs["acct-b"] = ["3001"]
+    service = RunnerService(config, slurm_client=slurm_client)
+
+    service.ensure_runtime_directories()
+    store = JobStore(config.duckdb_path)
+    store.initialize_schema()
+    store.close()
+
+    service._handle_signal(signal.SIGTERM, None)
+    service.run(register_signals=False, max_loops=1)
+
+    assert slurm_client.cancel_calls == 3
+    assert slurm_client.cancel_records == [
+        ("acct-a", "2001"),
+        ("acct-a", "2002"),
+        ("acct-b", "3001"),
+    ]
+    assert slurm_client._jobs["acct-a"] == []
+    assert slurm_client._jobs["acct-b"] == []
+
     service.close()
 
 

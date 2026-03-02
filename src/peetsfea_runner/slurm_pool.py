@@ -331,3 +331,27 @@ class WorkerPoolManager:
             self._log_snapshot(account_id=account.account_id, pool_actual=current_count)
 
         return processed
+
+    def cancel_all_workers(self) -> int:
+        processed = 0
+        for account in self._config.worker_accounts:
+            try:
+                active_job_ids = self._client.query_workers(account=account, policy=self._config.slurm_policy)
+            except SlurmClientError as exc:
+                self._mark_degraded(account_id=account.account_id, message=exc.message)
+                processed += 1
+                continue
+
+            self._mark_recovered(account_id=account.account_id)
+            for job_id in dict.fromkeys(active_job_ids):
+                try:
+                    self._client.cancel_worker(account=account, slurm_job_id=job_id)
+                except SlurmClientError as exc:
+                    self._mark_degraded(account_id=account.account_id, message=exc.message)
+                    processed += 1
+                    break
+
+                processed += 1
+                LOG.info("worker_cancelled_on_shutdown account=%s slurm_job_id=%s", account.account_id, job_id)
+
+        return processed

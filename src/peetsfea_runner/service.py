@@ -62,22 +62,26 @@ class RunnerService:
             self._register_signal_handlers()
 
         loops = 0
-        while not self._stop_event.is_set():
-            processed = self._watcher.process_once()
-            processed += self._worker_pool.process_once()
-            healthy_ids = {account.account_id for account in self._worker_pool.healthy_accounts()}
-            preferred_accounts: tuple[GateAccount, ...] = tuple(
-                account for account in self._config.gate_accounts if account.account_id in healthy_ids
-            )
-            processed += self._uploader.process_once(preferred_accounts=preferred_accounts)
-            processed += self._collector.process_once(preferred_accounts=preferred_accounts)
-            processed += self._reconciler.process_once()
-            wait_sec = self._config.poll_interval_sec if processed else self._config.idle_sleep_sec
-            self._stop_event.wait(wait_sec)
+        try:
+            while not self._stop_event.is_set():
+                processed = self._watcher.process_once()
+                processed += self._worker_pool.process_once()
+                healthy_ids = {account.account_id for account in self._worker_pool.healthy_accounts()}
+                preferred_accounts: tuple[GateAccount, ...] = tuple(
+                    account for account in self._config.gate_accounts if account.account_id in healthy_ids
+                )
+                processed += self._uploader.process_once(preferred_accounts=preferred_accounts)
+                processed += self._collector.process_once(preferred_accounts=preferred_accounts)
+                processed += self._reconciler.process_once()
+                wait_sec = self._config.poll_interval_sec if processed else self._config.idle_sleep_sec
+                self._stop_event.wait(wait_sec)
 
-            loops += 1
-            if max_loops is not None and loops >= max_loops:
-                break
+                loops += 1
+                if max_loops is not None and loops >= max_loops:
+                    break
+        finally:
+            if self._stop_event.is_set():
+                self._worker_pool.cancel_all_workers()
 
     def close(self) -> None:
         self._store.close()
