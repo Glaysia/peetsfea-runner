@@ -26,11 +26,11 @@ Minimal 5% bootstrap of a daemon service for `.aedt` queue intake.
 - systemd `--user` unit template
 
 Current rollout scope:
-- gate1 계정 4개(`gate1-harry`, `gate1-hmlee31`, `gate1-dhj02`, `gate1-wjddn5916`)를 사용한다.
+- gate1 계정 3개(`gate1-harry`, `gate1-hmlee31`, `gate1-dhj02`)를 사용한다.
 - 계정별 원격 spool 경로는 `/gpfs/home1/<user>/peetsfea-spool/{inbox,claimed,results,failed}`를 사용한다.
 - 계정당 worker 목표 수는 `10`이다.
 - worker 내부 동시 PyAEDT 프로세스는 `8`이다.
-- 실행 태그는 `v2026.03.02-gpfs-path-r1`를 사용한다.
+- 실행 태그는 `v2026.03.03-gate1x3-pathfix-r1`를 사용한다.
 
 ## Run
 ```bash
@@ -63,12 +63,12 @@ The runtime directories are created automatically under `var/`:
   - 목표 수보다 많으면 초과분 자동 취소
 - 고정 자원 정책:
   - partition=`cpu2`, cores=`32`, mem=`320GB`, internal_procs=`8`
-- Gate1 Linux 운영(4 accounts):
-  - ssh aliases=`gate1-harry`, `gate1-hmlee31`, `gate1-dhj02`, `gate1-wjddn5916`
+- Gate1 Linux 운영(3 accounts):
+  - ssh aliases=`gate1-harry`, `gate1-hmlee31`, `gate1-dhj02`
   - remote repo=`/gpfs/home1/<user>/peetsfea-runner` (계정별 bootstrap에서 태그 checkout)
   - remote venv=`/gpfs/home1/<user>/.peetsfea-venv`
   - `submit_worker`는 `sbatch`로 계정별 worker pool을 유지한다.
-  - bootstrap은 `git clone/fetch --tags` 후 `v2026.03.02-gpfs-path-r1` checkout으로 고정한다.
+  - bootstrap은 `git clone/fetch --tags` 후 `v2026.03.03-gate1x3-pathfix-r1` checkout으로 고정한다.
 - 장애 격리:
   - 계정별 degraded 상태를 추적하고, 정상 계정의 풀 관리는 계속 수행
   - 업로드 단계는 degraded 계정을 제외한 건강한 계정으로만 라우팅
@@ -76,6 +76,13 @@ The runtime directories are created automatically under `var/`:
 ## HFSS Worker Contract
 - 고정 AEDT 실행 경로:
   - `/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt`
+- Linux 런치 환경 강제:
+  - `source /etc/profile.d/modules.sh`
+  - `module load ansys-electronics/v252`
+  - `export LANG=en_US.UTF-8`
+  - `export LC_ALL=en_US.UTF-8`
+  - `unset LANGUAGE`
+  - `export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81`
 - 실행 순서:
   - `.aedt` 열기 -> 자동저장 비활성화 -> analyze -> 모든 리포트 export -> report-only zip 생성
 - 패키징 규약:

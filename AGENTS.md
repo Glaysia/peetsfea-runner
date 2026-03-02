@@ -50,11 +50,11 @@
 
 ## 운영 핵심 고정값 (합의 사항)
 - 현재 기본 프로필: `gate1` Linux 다중 계정
-- 계정 수: `4` (`gate1-harry`, `gate1-hmlee31`, `gate1-dhj02`, `gate1-wjddn5916`)
+- 계정 수: `3` (`gate1-harry`, `gate1-hmlee31`, `gate1-dhj02`)
 - 계정당 worker 상한: `10`
 - worker 내부 동시 PyAEDT 프로세스: `8`
 - Slurm 파티션/자원: `cpu2`, `32 cores`, `320GB`
-- 배포 태그: `v2026.03.02-gpfs-path-r1`
+- 배포 태그: `v2026.03.03-gate1x3-pathfix-r1`
 - 리포트 export: 해석 후 `모든 리포트`를 출력
 - 결과 보존: mainPC에 `report-only zip` 1개만 보존
 - 원본 `.aedt`: 완료 후 원격/로컬에서 삭제
@@ -63,6 +63,7 @@
 - 결과 회수: Collector가 gate `results/`를 스캔해 `done/`으로 원자 회수하며 중복 다운로드를 건너뛴다.
 - 운영 감사: Reconciler가 상태 불일치(고아 done zip 포함) 보정과 `.aedt` 잔존 감사(`delete_after_done`)를 수행
 - 원격 bootstrap 경로: 계정별 `/gpfs/home1/<user>/{peetsfea-runner,.peetsfea-venv}`
+- 원격 AEDT 런치 환경 강제: `LANG`, `LC_ALL`, `LANGUAGE`, `ANSYSLMD_LICENSE_FILE`를 코드에서 export/unset으로 고정
 
 ## Discord 알림 규칙 (MCP)
 - 작업 시작/종료 시각은 셸 초 단위로 계산한다.

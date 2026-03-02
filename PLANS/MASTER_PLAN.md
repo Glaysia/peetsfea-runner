@@ -18,11 +18,11 @@
 
 ## 운영 고정값
 - 현재 실행 프로필: `gate1` Linux 다중 계정
-- 계정 수: `4` (`gate1-harry`, `gate1-hmlee31`, `gate1-dhj02`, `gate1-wjddn5916`)
+- 계정 수: `3` (`gate1-harry`, `gate1-hmlee31`, `gate1-dhj02`)
 - 계정당 활성 worker 상한: `10`
 - worker 내부 동시 PyAEDT 프로세스: `8`
 - Slurm 파티션/자원: `cpu2`, `32 cores`, `320GB`
-- 배포 태그: `v2026.03.02-gpfs-path-r1`
+- 배포 태그: `v2026.03.03-gate1x3-pathfix-r1`
 - 리포트 export 정책: 해석 후 `모든 리포트` 출력
 - 결과 보존 정책: mainPC에 `report-only zip` 1개만 보존
 - 원본 `.aedt` 정책: 완료 후 원격/로컬 삭제
@@ -52,16 +52,22 @@
 - mainPC 서비스 실행 경로는 `harry` 계정 기준으로 고정:
   - `WorkingDirectory=/home/harry/Projects/PythonProjects/peetsfea-runner`
   - `ExecStart=/home/harry/Projects/PythonProjects/peetsfea-runner/.venv/bin/python -m peetsfea_runner.main`
-- 원격 worker 환경 전제(gate1 4계정):
+- 원격 worker 환경 전제(gate1 3계정):
   - 계정별 `~/.peetsfea-venv` 존재(없으면 bootstrap에서 생성)
   - 계정별 `~/peetsfea-runner` clone 존재(없으면 bootstrap에서 clone)
   - spool 경로: `/gpfs/home1/<user>/peetsfea-spool/{inbox,claimed,results,failed}`
 - 원격 worker bootstrap 정책:
-  - 원격 repo bootstrap은 `git clone/fetch --tags` 후 지정 태그 checkout(`v2026.03.02-gpfs-path-r1`)
+  - 원격 repo bootstrap은 `git clone/fetch --tags` 후 지정 태그 checkout(`v2026.03.03-gate1x3-pathfix-r1`)
   - python/venv/uv/pyaedt 설치 보장 후 worker 시작
 - Linux gate 정책:
   - worker는 계정별 Slurm job으로 구동한다.
   - 계정별 repo/venv 경로를 기준으로 bootstrap 및 실행한다.
+- AEDT 런치 환경 정책:
+  - Linux worker가 AEDT gRPC 시작 시 아래를 코드에서 강제한다:
+    - `export LANG=en_US.UTF-8`
+    - `export LC_ALL=en_US.UTF-8`
+    - `unset LANGUAGE`
+    - `export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81`
 - PyAEDT 버전 정책:
   - `pyaedt==0.22.0` 고정
 

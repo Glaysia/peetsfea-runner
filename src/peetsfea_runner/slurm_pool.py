@@ -117,6 +117,8 @@ class SubprocessSlurmClient:
 
     @staticmethod
     def _linux_remote_paths(account: WorkerAccount) -> tuple[str, str]:
+        if account.remote_repo_path and account.remote_venv_path:
+            return account.remote_repo_path, account.remote_venv_path
         if account.spool_paths is None:
             raise SlurmClientError(
                 f"account={account.account_id}; detail=missing spool_paths for remote worker bootstrap"
@@ -154,6 +156,15 @@ class SubprocessSlurmClient:
             self._bootstrapped_accounts.add(account.account_id)
             return
         remote_repo_path, remote_venv_path = self._linux_remote_paths(account)
+        assert account.spool_paths is not None
+        LOG.info(
+            "linux_bootstrap_paths account=%s ssh_alias=%s repo=%s venv=%s spool_inbox=%s",
+            account.account_id,
+            account.ssh_alias,
+            remote_repo_path,
+            remote_venv_path,
+            account.spool_paths.inbox,
+        )
 
         self._run_bootstrap_step_or_raise(
             code=E_BOOTSTRAP_GIT,
@@ -351,6 +362,17 @@ class SubprocessSlurmClient:
         self._ensure_remote_bootstrap(account=account, policy=policy)
         remote_repo_path, remote_venv_path = self._linux_remote_paths(account)
         assert account.spool_paths is not None
+        LOG.info(
+            "linux_submit_paths account=%s ssh_alias=%s repo=%s venv=%s spool_inbox=%s spool_claimed=%s spool_results=%s spool_failed=%s",
+            account.account_id,
+            account.ssh_alias,
+            remote_repo_path,
+            remote_venv_path,
+            account.spool_paths.inbox,
+            account.spool_paths.claimed,
+            account.spool_paths.results,
+            account.spool_paths.failed,
+        )
         aedt_flag = ""
         if policy.aedt_executable_path:
             aedt_flag = f" --aedt-executable-path {shlex.quote(policy.aedt_executable_path)}"

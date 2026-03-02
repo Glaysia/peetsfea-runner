@@ -241,10 +241,10 @@ def test_subprocess_slurm_client_submit_uses_remote_worker_entrypoint(monkeypatc
         account_id="acct-a",
         ssh_alias="gate1-harry",
         spool_paths=RemoteSpoolPaths(
-            inbox="/home1/harry261/peetsfea-spool/inbox",
-            claimed="/home1/harry261/peetsfea-spool/claimed",
-            results="/home1/harry261/peetsfea-spool/results",
-            failed="/home1/harry261/peetsfea-spool/failed",
+            inbox="/gpfs/home1/harry261/peetsfea-spool/inbox",
+            claimed="/gpfs/home1/harry261/peetsfea-spool/claimed",
+            results="/gpfs/home1/harry261/peetsfea-spool/results",
+            failed="/gpfs/home1/harry261/peetsfea-spool/failed",
         ),
     )
     policy = SlurmPolicy(
@@ -260,11 +260,11 @@ def test_subprocess_slurm_client_submit_uses_remote_worker_entrypoint(monkeypatc
     assert job_id == "12345"
     assert len(calls) == 6
     assert calls[0][0] == "ssh"
-    assert "mkdir -p /home1/harry261/peetsfea-runner" in _ssh_remote_command(calls[0])
+    assert "mkdir -p /gpfs/home1/harry261/peetsfea-runner" in _ssh_remote_command(calls[0])
     assert calls[1][0] == "ssh"
     assert "git clone" in _ssh_remote_command(calls[1])
     assert "git fetch --tags --force --prune" in _ssh_remote_command(calls[1])
-    assert "RELEASE_TAG=v2026.03.02-gate1-r1" in _ssh_remote_command(calls[1])
+    assert "RELEASE_TAG=v2026.03.03-gate1x3-pathfix-r1" in _ssh_remote_command(calls[1])
     assert 'git checkout --force "tags/$RELEASE_TAG"' in _ssh_remote_command(calls[1])
     assert calls[2][0] == "ssh"
     assert "python3.12 -m venv" in _ssh_remote_command(calls[2])
@@ -285,8 +285,69 @@ def test_subprocess_slurm_client_submit_uses_remote_worker_entrypoint(monkeypatc
     assert "--mem 320G" in command
     assert "module load ansys-electronics/v252" in command
     assert "python\" -m peetsfea_runner.remote_worker" in command
-    assert "--spool-inbox /home1/harry261/peetsfea-spool/inbox" in command
+    assert "--spool-inbox /gpfs/home1/harry261/peetsfea-spool/inbox" in command
     assert "--analysis-cores 8" in command
+
+
+def test_subprocess_slurm_client_submit_prefers_explicit_remote_paths(monkeypatch: object) -> None:
+    calls: list[list[str]] = []
+
+    def _fake_run(args: list[str], capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+        _ = capture_output, text, check
+        calls.append(args)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="12345;cluster\n", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    client = SubprocessSlurmClient()
+    account = WorkerAccount(
+        account_id="acct-b",
+        ssh_alias="gate1-hmlee31",
+        spool_paths=RemoteSpoolPaths(
+            inbox="/gpfs/home1/hmlee31/peetsfea-spool/inbox",
+            claimed="/gpfs/home1/hmlee31/peetsfea-spool/claimed",
+            results="/gpfs/home1/hmlee31/peetsfea-spool/results",
+            failed="/gpfs/home1/hmlee31/peetsfea-spool/failed",
+        ),
+        remote_repo_path="/gpfs/home1/hmlee31/custom-repo",
+        remote_venv_path="/gpfs/home1/hmlee31/custom-venv",
+    )
+    policy = SlurmPolicy(
+        partition="cpu2",
+        cores=32,
+        memory_gb=320,
+        job_internal_procs=8,
+        pool_target_per_account=10,
+    )
+
+    client.submit_worker(account=account, policy=policy)
+
+    assert len(calls) == 6
+    mkdir_cmd = _ssh_remote_command(calls[0])
+    submit_cmd = _ssh_remote_command(calls[5])
+    assert "mkdir -p /gpfs/home1/hmlee31/custom-repo" in mkdir_cmd
+    assert "/gpfs/home1/hmlee31/custom-venv" in _ssh_remote_command(calls[2])
+    assert "REPO_PATH=/gpfs/home1/hmlee31/custom-repo" in submit_cmd
+    assert "VENV_PATH=/gpfs/home1/hmlee31/custom-venv" in submit_cmd
+    assert "/gpfs/home1/harry261" not in submit_cmd
+
+
+def test_subprocess_slurm_client_linux_remote_paths_fallback_from_spool() -> None:
+    account = WorkerAccount(
+        account_id="acct-c",
+        ssh_alias="gate1-dhj02",
+        spool_paths=RemoteSpoolPaths(
+            inbox="/gpfs/home1/dhj02/peetsfea-spool/inbox",
+            claimed="/gpfs/home1/dhj02/peetsfea-spool/claimed",
+            results="/gpfs/home1/dhj02/peetsfea-spool/results",
+            failed="/gpfs/home1/dhj02/peetsfea-spool/failed",
+        ),
+    )
+
+    repo_path, venv_path = SubprocessSlurmClient._linux_remote_paths(account)
+
+    assert repo_path == "/gpfs/home1/dhj02/peetsfea-runner"
+    assert venv_path == "/gpfs/home1/dhj02/.peetsfea-venv"
 
 
 def test_subprocess_slurm_client_submit_requires_worker_spool_paths() -> None:
@@ -322,10 +383,10 @@ def test_subprocess_slurm_client_bootstraps_once_per_account(monkeypatch: object
         account_id="acct-a",
         ssh_alias="gate1-harry",
         spool_paths=RemoteSpoolPaths(
-            inbox="/home1/harry261/peetsfea-spool/inbox",
-            claimed="/home1/harry261/peetsfea-spool/claimed",
-            results="/home1/harry261/peetsfea-spool/results",
-            failed="/home1/harry261/peetsfea-spool/failed",
+            inbox="/gpfs/home1/harry261/peetsfea-spool/inbox",
+            claimed="/gpfs/home1/harry261/peetsfea-spool/claimed",
+            results="/gpfs/home1/harry261/peetsfea-spool/results",
+            failed="/gpfs/home1/harry261/peetsfea-spool/failed",
         ),
     )
     policy = SlurmPolicy(
@@ -365,10 +426,10 @@ def test_subprocess_slurm_client_python_bootstrap_has_conda_fallback(monkeypatch
         account_id="acct-a",
         ssh_alias="gate1-harry",
         spool_paths=RemoteSpoolPaths(
-            inbox="/home1/harry261/peetsfea-spool/inbox",
-            claimed="/home1/harry261/peetsfea-spool/claimed",
-            results="/home1/harry261/peetsfea-spool/results",
-            failed="/home1/harry261/peetsfea-spool/failed",
+            inbox="/gpfs/home1/harry261/peetsfea-spool/inbox",
+            claimed="/gpfs/home1/harry261/peetsfea-spool/claimed",
+            results="/gpfs/home1/harry261/peetsfea-spool/results",
+            failed="/gpfs/home1/harry261/peetsfea-spool/failed",
         ),
     )
     policy = SlurmPolicy(
@@ -402,10 +463,10 @@ def test_subprocess_slurm_client_uses_policy_repo_url_and_release_tag(monkeypatc
         account_id="acct-a",
         ssh_alias="gate1-harry",
         spool_paths=RemoteSpoolPaths(
-            inbox="/home1/harry261/peetsfea-spool/inbox",
-            claimed="/home1/harry261/peetsfea-spool/claimed",
-            results="/home1/harry261/peetsfea-spool/results",
-            failed="/home1/harry261/peetsfea-spool/failed",
+            inbox="/gpfs/home1/harry261/peetsfea-spool/inbox",
+            claimed="/gpfs/home1/harry261/peetsfea-spool/claimed",
+            results="/gpfs/home1/harry261/peetsfea-spool/results",
+            failed="/gpfs/home1/harry261/peetsfea-spool/failed",
         ),
     )
     policy = SlurmPolicy(
@@ -415,14 +476,14 @@ def test_subprocess_slurm_client_uses_policy_repo_url_and_release_tag(monkeypatc
         job_internal_procs=8,
         pool_target_per_account=10,
         repo_url="https://github.com/Glaysia/peetsfea-runner",
-        release_tag="v2026.03.02-gate1-r1",
+        release_tag="v2026.03.03-gate1x3-pathfix-r1",
     )
 
     client.submit_worker(account=account, policy=policy)
 
     git_bootstrap_cmd = _ssh_remote_command(calls[1])
     assert "https://github.com/Glaysia/peetsfea-runner" in git_bootstrap_cmd
-    assert "RELEASE_TAG=v2026.03.02-gate1-r1" in git_bootstrap_cmd
+    assert "RELEASE_TAG=v2026.03.03-gate1x3-pathfix-r1" in git_bootstrap_cmd
     assert 'git checkout --force "tags/$RELEASE_TAG"' in git_bootstrap_cmd
 
 

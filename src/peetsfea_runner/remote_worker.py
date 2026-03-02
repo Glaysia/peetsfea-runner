@@ -4,9 +4,11 @@ import argparse
 import json
 import logging
 import os
+import shlex
 import socket
 import subprocess
 import shutil
+import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +39,9 @@ class RemoteWorkerConfig:
 
 
 class PyAedtHfssAdapter(HfssAdapter):
+    _GRPC_START_TIMEOUT_SEC = 30.0
+    _GRPC_START_POLL_SEC = 0.5
+
     def __init__(self, *, internal_procs: int = 8, analysis_cores: int = 8, gui_mode: bool = False) -> None:
         self._internal_procs = internal_procs
         self._analysis_cores = max(1, analysis_cores)
@@ -71,34 +76,126 @@ class PyAedtHfssAdapter(HfssAdapter):
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
+    @staticmethod
+    def _tail_log(path: Path, *, max_lines: int = 80) -> str:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return ""
+        if not lines:
+            return ""
+        return "\n".join(lines[-max_lines:])
+
+    def _build_launch_failure_message(
+        self,
+        *,
+        reason: str,
+        command_summary: str,
+        returncode: int | None,
+        stdout_log_path: Path,
+        stderr_log_path: Path,
+    ) -> str:
+        stdout_tail = self._tail_log(stdout_log_path)
+        stderr_tail = self._tail_log(stderr_log_path)
+        return (
+            f"Failed to start ansysedt gRPC server; reason={reason}; returncode={returncode}; "
+            f"command={command_summary}; stdout_tail={stdout_tail!r}; stderr_tail={stderr_tail!r}"
+        )
+
+    def _wait_for_grpc_ready(
+        self,
+        *,
+        process: subprocess.Popen[bytes],
+        port: int,
+        timeout_sec: float,
+        poll_sec: float,
+        command_summary: str,
+        stdout_log_path: Path,
+        stderr_log_path: Path,
+    ) -> None:
+        deadline = time() + timeout_sec
+        while time() < deadline:
+            returncode = process.poll()
+            if returncode is not None:
+                raise RuntimeError(
+                    self._build_launch_failure_message(
+                        reason="process_exited_early",
+                        command_summary=command_summary,
+                        returncode=returncode,
+                        stdout_log_path=stdout_log_path,
+                        stderr_log_path=stderr_log_path,
+                    )
+                )
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    return
+            except OSError:
+                sleep(poll_sec)
+
+        returncode = process.poll()
+        if returncode is not None:
+            reason = "process_exited_during_startup_wait"
+        else:
+            reason = "startup_timeout_port_not_open"
+            self._stop_ansys_process(process)
+        raise RuntimeError(
+            self._build_launch_failure_message(
+                reason=reason,
+                command_summary=command_summary,
+                returncode=returncode,
+                stdout_log_path=stdout_log_path,
+                stderr_log_path=stderr_log_path,
+            )
+        )
+
     def _launch_ansys_grpc(self, *, aedt_executable_path: str, port: int) -> subprocess.Popen[bytes]:
         is_windows_exec = self._is_windows_exec(aedt_executable_path)
+        stdout_fd, stdout_tmp = tempfile.mkstemp(prefix="peetsfea-aedt-grpc-", suffix=".stdout.log")
+        stderr_fd, stderr_tmp = tempfile.mkstemp(prefix="peetsfea-aedt-grpc-", suffix=".stderr.log")
+        os.close(stdout_fd)
+        os.close(stderr_fd)
+        stdout_log_path = Path(stdout_tmp)
+        stderr_log_path = Path(stderr_tmp)
         if is_windows_exec:
             cmd = [aedt_executable_path]
             if not self._gui_mode:
                 cmd.append("-ng")
             cmd.extend(["-grpcsrv", str(port)])
-            process = subprocess.Popen(  # noqa: S603
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            command_summary = " ".join(shlex.quote(item) for item in cmd)
+            with stdout_log_path.open("wb") as stdout_handle, stderr_log_path.open("wb") as stderr_handle:
+                process = subprocess.Popen(  # noqa: S603
+                    cmd,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                )
         else:
             headless_arg = "" if self._gui_mode else "-ng "
             launch_cmd = (
                 "set -euo pipefail; "
                 "source /etc/profile.d/modules.sh >/dev/null 2>&1 || true; "
                 "module load ansys-electronics/v252; "
+                "export LANG=en_US.UTF-8; "
+                "export LC_ALL=en_US.UTF-8; "
+                "unset LANGUAGE; "
+                "export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81; "
                 f"exec {aedt_executable_path} {headless_arg}-grpcsrv {port}"
             )
-            process = subprocess.Popen(  # noqa: S603
-                ["bash", "-lc", launch_cmd],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        sleep(6.0)
-        if process.poll() is not None:
-            raise RuntimeError(f"Failed to start ansysedt gRPC server on port {port}")
+            command_summary = f"bash -lc {shlex.quote(launch_cmd)}"
+            with stdout_log_path.open("wb") as stdout_handle, stderr_log_path.open("wb") as stderr_handle:
+                process = subprocess.Popen(  # noqa: S603
+                    ["bash", "-lc", launch_cmd],
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                )
+        self._wait_for_grpc_ready(
+            process=process,
+            port=port,
+            timeout_sec=self._GRPC_START_TIMEOUT_SEC,
+            poll_sec=self._GRPC_START_POLL_SEC,
+            command_summary=command_summary,
+            stdout_log_path=stdout_log_path,
+            stderr_log_path=stderr_log_path,
+        )
         return process
 
     def open_project(self, *, aedt_path: Path, aedt_executable_path: str) -> None:
