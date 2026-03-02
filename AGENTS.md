@@ -41,7 +41,12 @@
   - `README.md`
   - `PLANS/*`
   - `AGENTS.md`
-  - 운영 절차 변경 시 `PLANS/OPERATIONS_RUNBOOK.md`도 함께 갱신한다.
+  - 운영 절차 변경 시 `PLANS/MASTER_PLAN.md`의 운영 절차 섹션도 함께 갱신한다.
+
+## 계획 문서 운용 원칙
+- 계획 문서 SSOT는 `PLANS/MASTER_PLAN.md`로 유지한다.
+- 신규 계획/합의는 먼저 `PLANS/MASTER_PLAN.md`에 반영한다.
+- 기존 계획 문서는 날짜 폴더(`PLANS/archive/YYYY-MM-DD/`)로 아카이브하고, 아카이브 문서는 원본 보존을 원칙으로 한다.
 
 ## 운영 핵심 고정값 (합의 사항)
 - Slurm 파티션: `cpu2`
