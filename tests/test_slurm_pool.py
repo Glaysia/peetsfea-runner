@@ -278,6 +278,7 @@ def test_subprocess_slurm_client_submit_uses_remote_worker_entrypoint(monkeypatc
     assert "module load ansys-electronics/v252" in command
     assert "python\" -m peetsfea_runner.remote_worker" in command
     assert "--spool-inbox /home1/harry261/peetsfea-spool/inbox" in command
+    assert "--analysis-cores 8" in command
 
 
 def test_subprocess_slurm_client_submit_requires_worker_spool_paths() -> None:
@@ -509,6 +510,8 @@ def test_subprocess_slurm_client_windows_submit_uses_interactive_task_scheduler(
     assert "InteractiveToken" in launch_script
     assert "LogonType Interactive -RunLevel Highest" in launch_script
     assert "-X faulthandler -m peetsfea_runner.remote_worker" in launch_script
+    assert "--internal-procs ' + $n + '" in launch_script
+    assert "--analysis-cores ' + $k + '" in launch_script
     assert r"C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe" in launch_script
 
 

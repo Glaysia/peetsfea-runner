@@ -26,17 +26,24 @@ class RemoteWorkerConfig:
     spool_failed: Path
     poll_sec: float = 2.0
     internal_procs: int = 8
+    analysis_cores: int = 8
     max_tasks: int | None = None
     aedt_executable_path: str = AEDT_EXECUTABLE_PATH
     gui_mode: bool = False
 
 
 class PyAedtHfssAdapter(HfssAdapter):
-    def __init__(self, *, internal_procs: int = 8, gui_mode: bool = False) -> None:
+    def __init__(self, *, internal_procs: int = 8, analysis_cores: int = 8, gui_mode: bool = False) -> None:
         self._internal_procs = internal_procs
+        self._analysis_cores = max(1, analysis_cores)
         self._gui_mode = gui_mode
         self._app: object | None = None
         self._ansys_process: subprocess.Popen[bytes] | None = None
+        self._attached_existing_desktop = False
+
+    @staticmethod
+    def _is_windows_exec(aedt_executable_path: str) -> bool:
+        return aedt_executable_path.lower().endswith(".exe") or ":" in aedt_executable_path[:3]
 
     def _pick_free_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -44,7 +51,7 @@ class PyAedtHfssAdapter(HfssAdapter):
             return int(sock.getsockname()[1])
 
     def _launch_ansys_grpc(self, *, aedt_executable_path: str, port: int) -> subprocess.Popen[bytes]:
-        is_windows_exec = aedt_executable_path.lower().endswith(".exe") or ":" in aedt_executable_path[:3]
+        is_windows_exec = self._is_windows_exec(aedt_executable_path)
         if is_windows_exec:
             cmd = [aedt_executable_path]
             if not self._gui_mode:
@@ -92,6 +99,28 @@ class PyAedtHfssAdapter(HfssAdapter):
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(f"Failed to import PyAEDT Hfss: {import_error or exc}") from exc
 
+        if self._gui_mode:
+            try:
+                self._app = hfs_cls(
+                    project=str(aedt_path),
+                    non_graphical=False,
+                    new_desktop=False,
+                    close_on_exit=False,
+                    student_version=False,
+                    remove_lock=True,
+                )
+                self._attached_existing_desktop = True
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._app = None
+                self._attached_existing_desktop = False
+                if self._is_windows_exec(aedt_executable_path):
+                    raise RuntimeError(
+                        "Failed to attach to existing ansysedt desktop "
+                        "(gui_mode=True, new_desktop=False). "
+                        "Launch ansysedt.exe in the interactive Windows session first."
+                    ) from exc
+
         grpc_port = self._pick_free_port()
         self._ansys_process = self._launch_ansys_grpc(
             aedt_executable_path=aedt_executable_path,
@@ -101,7 +130,7 @@ class PyAedtHfssAdapter(HfssAdapter):
             self._app = hfs_cls(
                 project=str(aedt_path),
                 non_graphical=not self._gui_mode,
-                new_desktop=True,
+                new_desktop=False,
                 close_on_exit=False,
                 aedt_process_id=None,
                 student_version=False,
@@ -109,6 +138,7 @@ class PyAedtHfssAdapter(HfssAdapter):
                 machine="localhost",
                 port=grpc_port,
             )
+            self._attached_existing_desktop = False
         except Exception:  # noqa: BLE001
             self._stop_ansys_process(self._ansys_process)
             self._ansys_process = None
@@ -127,8 +157,19 @@ class PyAedtHfssAdapter(HfssAdapter):
         for method_name in ("analyze_all", "analyze"):
             method = getattr(app, method_name, None)
             if callable(method):
-                method()
-                return
+                kwargs_candidates = (
+                    {"num_cores": self._analysis_cores, "num_tasks": 1},
+                    {"cores": self._analysis_cores, "tasks": 1},
+                    {"num_cores": self._analysis_cores},
+                    {"cores": self._analysis_cores},
+                    {},
+                )
+                for kwargs in kwargs_candidates:
+                    try:
+                        method(**kwargs)
+                        return
+                    except TypeError:
+                        continue
         raise RuntimeError("PyAEDT app has no analyze method")
 
     def list_report_names(self) -> list[str]:
@@ -180,18 +221,21 @@ class PyAedtHfssAdapter(HfssAdapter):
             release = getattr(app, "release_desktop", None)
             if callable(release):
                 try:
-                    release(close_projects=True, close_desktop=True)
+                    release(close_projects=True, close_desktop=not self._attached_existing_desktop)
                 except TypeError:
                     release()
                 finally:
                     self._app = None
+                    self._attached_existing_desktop = False
                 return
 
             close_desktop = getattr(app, "close_desktop", None)
             if callable(close_desktop):
-                close_desktop()
+                if not self._attached_existing_desktop:
+                    close_desktop()
 
             self._app = None
+            self._attached_existing_desktop = False
         finally:
             self._stop_ansys_process(ansys_process)
             self._ansys_process = None
@@ -227,6 +271,7 @@ class RemoteWorker:
         self._adapter_factory = adapter_factory if adapter_factory is not None else (
             lambda: PyAedtHfssAdapter(
                 internal_procs=config.internal_procs,
+                analysis_cores=config.analysis_cores,
                 gui_mode=config.gui_mode,
             )
         )
@@ -348,6 +393,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spool-failed", required=True)
     parser.add_argument("--poll-sec", type=float, default=2.0)
     parser.add_argument("--internal-procs", type=int, default=8)
+    parser.add_argument("--analysis-cores", type=int, default=8)
     parser.add_argument("--max-tasks", type=int, default=None)
     parser.add_argument("--aedt-executable-path", default=AEDT_EXECUTABLE_PATH)
     parser.add_argument("--gui", action="store_true")
@@ -369,6 +415,7 @@ def main() -> None:
         spool_failed=Path(args.spool_failed),
         poll_sec=args.poll_sec,
         internal_procs=args.internal_procs,
+        analysis_cores=args.analysis_cores,
         max_tasks=args.max_tasks,
         aedt_executable_path=args.aedt_executable_path,
         gui_mode=bool(args.gui),
@@ -384,6 +431,7 @@ def main() -> None:
         "spool_failed": str(config.spool_failed),
         "poll_sec": config.poll_sec,
         "internal_procs": config.internal_procs,
+        "analysis_cores": config.analysis_cores,
         "max_tasks": config.max_tasks,
         "aedt_executable_path": config.aedt_executable_path,
         "gui_mode": config.gui_mode,

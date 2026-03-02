@@ -97,7 +97,7 @@ def build_5600x2_runner_config(project_root: Path) -> RunnerConfig:
     )
     slurm_policy = SlurmPolicy(
         partition="debug-windows",
-        cores=1,
+        cores=6,
         memory_gb=16,
         job_internal_procs=6,
         pool_target_per_account=1,

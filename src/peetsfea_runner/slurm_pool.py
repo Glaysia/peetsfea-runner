@@ -346,7 +346,8 @@ class SubprocessSlurmClient:
             f"--spool-results {shlex.quote(account.spool_paths.results)} "
             f"--spool-failed {shlex.quote(account.spool_paths.failed)} "
             f"--poll-sec {self._WORKER_POLL_SEC} "
-            f"--internal-procs {policy.job_internal_procs}"
+            f"--internal-procs {policy.job_internal_procs} "
+            f"--analysis-cores {policy.job_internal_procs}"
             f"{aedt_flag}"
         )
         wrap = "bash -lc " + shlex.quote(worker_cmd)
@@ -376,8 +377,9 @@ class SubprocessSlurmClient:
         self._ensure_remote_bootstrap(account=account, policy=policy)
         assert account.spool_paths is not None
         aedt_executable_path = policy.aedt_executable_path or self._REMOTE_AEDT_PATH_WIN
-        # Windows debug host policy: never exceed 6 cores for a single AEDT task.
-        windows_internal_procs = min(policy.job_internal_procs, 6)
+        # Windows policy: single AEDT session, up to 6 solve cores.
+        windows_session_procs = 1
+        windows_analysis_cores = min(policy.job_internal_procs, 6)
 
         active = self._query_windows_workers(account=account, policy=policy)
         if active:
@@ -405,7 +407,8 @@ class SubprocessSlurmClient:
             f"'--spool-results',{self._ps_quote(account.spool_paths.results)},"
             f"'--spool-failed',{self._ps_quote(account.spool_paths.failed)},"
             f"'--poll-sec',{self._ps_quote(str(self._WORKER_POLL_SEC))},"
-            f"'--internal-procs',{self._ps_quote(str(windows_internal_procs))},"
+            f"'--internal-procs',{self._ps_quote(str(windows_session_procs))},"
+            f"'--analysis-cores',{self._ps_quote(str(windows_analysis_cores))},"
             f"'--aedt-executable-path',{self._ps_quote(aedt_executable_path)},"
             "'--gui'"
             "); "
@@ -454,7 +457,8 @@ class SubprocessSlurmClient:
         self._ensure_remote_bootstrap(account=account, policy=policy)
         assert account.spool_paths is not None
         aedt_executable_path = policy.aedt_executable_path or self._REMOTE_AEDT_PATH_WIN
-        windows_internal_procs = min(policy.job_internal_procs, 6)
+        windows_session_procs = 1
+        windows_analysis_cores = min(policy.job_internal_procs, 6)
         task_name = self._task_name_for_account(account_id=account.account_id, policy=policy)
         spool_pattern = self._windows_path_match_pattern(account.spool_paths.inbox)
 
@@ -477,7 +481,8 @@ class SubprocessSlurmClient:
             f"$f={self._ps_quote(account.spool_paths.failed)}; "
             f"$a={self._ps_quote(aedt_executable_path)}; "
             f"$o={self._ps_quote(str(self._WORKER_POLL_SEC))}; "
-            f"$n={self._ps_quote(str(windows_internal_procs))}; "
+            f"$n={self._ps_quote(str(windows_session_procs))}; "
+            f"$k={self._ps_quote(str(windows_analysis_cores))}; "
             "$py=($v + '/Scripts/python.exe'); "
             "if(!(Test-Path -LiteralPath $py)){ "
             f"throw {self._ps_quote(f'error_code={E_WIN_WORKER_PYTHON}; detail=missing python')} "
@@ -489,8 +494,12 @@ class SubprocessSlurmClient:
             "--spool-failed \"' + $f + '\" "
             "--poll-sec ' + $o + ' "
             "--internal-procs ' + $n + ' "
+            "--analysis-cores ' + $k + ' "
             "--aedt-executable-path \"' + $a + '\" "
             "--gui'); "
+            "$stale=Get-CimInstance Win32_Process -Filter \"Name='ansysedt.exe'\" | "
+            "Where-Object { $_.CommandLine -and $_.CommandLine -match '-grpcsrv' }; "
+            "foreach($x in $stale){ Stop-Process -Id $x.ProcessId -Force -ErrorAction SilentlyContinue }; "
             "$pr=$null; "
             "try{$pr=New-ScheduledTaskPrincipal -UserId $u -LogonType InteractiveToken -RunLevel Highest}"
             "catch{$pr=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Highest}; "
