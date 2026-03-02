@@ -3,22 +3,21 @@ from __future__ import annotations
 from peetsfea_runner.main import ACCOUNTS, CONFIG
 
 
-def test_single_gate_account_configuration_is_fixed() -> None:
-    assert len(ACCOUNTS) == 1
-    account = ACCOUNTS[0]
-    assert account.account_id == "win5600x2"
-    assert account.ssh_alias == "5600X2"
-    assert account.spool_paths.inbox == "C:/peetsfea-spool/inbox"
-    assert account.spool_paths.claimed == "C:/peetsfea-spool/claimed"
-    assert account.spool_paths.results == "C:/peetsfea-spool/results"
-    assert account.spool_paths.failed == "C:/peetsfea-spool/failed"
+def test_gate_accounts_configuration_is_fixed() -> None:
+    assert len(ACCOUNTS) == 4
+    aliases = tuple(account.ssh_alias for account in ACCOUNTS)
+    assert aliases == ("gate1-harry", "gate1-hmlee31", "gate1-dhj02", "gate1-wjddn5916")
+    assert ACCOUNTS[0].spool_paths.inbox == "/home1/harry261/peetsfea-spool/inbox"
+    assert ACCOUNTS[1].spool_paths.inbox == "/home1/hmlee31/peetsfea-spool/inbox"
+    assert ACCOUNTS[2].spool_paths.inbox == "/home1/dhj02/peetsfea-spool/inbox"
+    assert ACCOUNTS[3].spool_paths.inbox == "/home1/wjddn5916/peetsfea-spool/inbox"
 
 
 
 def test_worker_pool_target_is_10() -> None:
-    assert CONFIG.slurm_policy.pool_target_per_account == 1
+    assert CONFIG.slurm_policy.pool_target_per_account == 10
+    assert CONFIG.slurm_policy.job_internal_procs == 8
+    assert CONFIG.slurm_policy.cores == 32
+    assert CONFIG.slurm_policy.memory_gb == 320
     assert CONFIG.slurm_policy.repo_url == "https://github.com/Glaysia/peetsfea-runner"
-    assert CONFIG.slurm_policy.release_tag == "v2026.03.02-5600x2-r4"
-    assert CONFIG.slurm_policy.windows_launch_mode == "interactive_task"
-    assert CONFIG.slurm_policy.windows_task_name == "peetsfea-worker-win5600x2"
-    assert CONFIG.slurm_policy.windows_interactive_user == r"DESKTOP-L5CB36B\5600x2"
+    assert CONFIG.slurm_policy.release_tag == "v2026.03.02-gate1-r1"

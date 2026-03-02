@@ -6,7 +6,7 @@ Minimal 5% bootstrap of a daemon service for `.aedt` queue intake.
 - 최종 보존 산출물은 mainPC의 `report-only zip` 1개다.
 - `.aedt` 원본은 처리 완료 후 원격/로컬에서 삭제한다.
 - 리포트 export는 단일 리포트가 아니라 해석 후 `모든 리포트`를 대상으로 한다.
-- 현재 실행 구조는 `mainPC orchestrator + 5600X2 spool + 단일 worker(1)` GUI 디버그 모드다.
+- 현재 실행 구조는 `mainPC orchestrator + gate1 다중 계정 spool + 계정별 worker pool`이다.
 - 저장소 운영 기준은 mainPC지만, worker bootstrap 시 gate 계정에 태그 기반 clone/check-out을 허용한다.
 
 ## 문서 체계
@@ -26,10 +26,11 @@ Minimal 5% bootstrap of a daemon service for `.aedt` queue intake.
 - systemd `--user` unit template
 
 Current rollout scope:
-- 단일 계정 `win5600x2` (`5600X2`)를 사용한다.
-- 원격 spool 경로는 `C:/peetsfea-spool/{inbox,claimed,results,failed}`를 사용한다.
-- Windows worker는 Task Scheduler `InteractiveToken`으로 로그인 세션에서 실행한다.
-- 실행 태그는 `v2026.03.02-5600x2-r2`를 사용한다.
+- gate1 계정 4개(`gate1-harry`, `gate1-hmlee31`, `gate1-dhj02`, `gate1-wjddn5916`)를 사용한다.
+- 계정별 원격 spool 경로는 `/home1/<user>/peetsfea-spool/{inbox,claimed,results,failed}`를 사용한다.
+- 계정당 worker 목표 수는 `10`이다.
+- worker 내부 동시 PyAEDT 프로세스는 `8`이다.
+- 실행 태그는 `v2026.03.02-gate1-r1`를 사용한다.
 
 ## Run
 ```bash
@@ -62,14 +63,12 @@ The runtime directories are created automatically under `var/`:
   - 목표 수보다 많으면 초과분 자동 취소
 - 고정 자원 정책:
   - partition=`cpu2`, cores=`32`, mem=`320GB`, internal_procs=`8`
-- Windows GUI 디버그 운영(5600X2):
-  - ssh alias=`5600X2`
-  - remote repo=`C:/peetsfea-runner`
-  - remote venv=`C:/.peetsfea-venv`
-  - `submit_worker`는 Scheduled Task(`peetsfea-worker-win5600x2`)를 `InteractiveToken`으로 등록/시작한다.
-  - `query_workers`는 `remote_worker.pid` 우선 확인 후, `Win32_Process` 커맨드라인(`peetsfea_runner.remote_worker` + spool path)으로 PID를 복구한다.
-  - `cancel_worker`는 PID 종료 + orphan python 정리 + `Stop-ScheduledTask`/`Unregister-ScheduledTask`를 수행한다.
-  - bootstrap은 `git clone/fetch --tags` 후 `v2026.03.02-5600x2-r2` checkout으로 고정한다.
+- Gate1 Linux 운영(4 accounts):
+  - ssh aliases=`gate1-harry`, `gate1-hmlee31`, `gate1-dhj02`, `gate1-wjddn5916`
+  - remote repo=`/home1/<user>/peetsfea-runner` (계정별 bootstrap에서 태그 checkout)
+  - remote venv=`/home1/<user>/.peetsfea-venv`
+  - `submit_worker`는 `sbatch`로 계정별 worker pool을 유지한다.
+  - bootstrap은 `git clone/fetch --tags` 후 `v2026.03.02-gate1-r1` checkout으로 고정한다.
 - 장애 격리:
   - 계정별 degraded 상태를 추적하고, 정상 계정의 풀 관리는 계속 수행
   - 업로드 단계는 degraded 계정을 제외한 건강한 계정으로만 라우팅

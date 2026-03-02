@@ -119,3 +119,78 @@ def build_5600x2_runner_config(project_root: Path) -> RunnerConfig:
         worker_accounts=(worker_account,),
         slurm_policy=slurm_policy,
     )
+
+
+def build_gate1_multi_runner_config(project_root: Path) -> RunnerConfig:
+    base_dir = project_root / "var"
+    queue_dirs = build_queue_dirs(base_dir)
+    gate_accounts = (
+        GateAccount(
+            account_id="gate1-harry261",
+            ssh_alias="gate1-harry",
+            spool_paths=RemoteSpoolPaths(
+                inbox="/home1/harry261/peetsfea-spool/inbox",
+                claimed="/home1/harry261/peetsfea-spool/claimed",
+                results="/home1/harry261/peetsfea-spool/results",
+                failed="/home1/harry261/peetsfea-spool/failed",
+            ),
+        ),
+        GateAccount(
+            account_id="gate1-hmlee31",
+            ssh_alias="gate1-hmlee31",
+            spool_paths=RemoteSpoolPaths(
+                inbox="/home1/hmlee31/peetsfea-spool/inbox",
+                claimed="/home1/hmlee31/peetsfea-spool/claimed",
+                results="/home1/hmlee31/peetsfea-spool/results",
+                failed="/home1/hmlee31/peetsfea-spool/failed",
+            ),
+        ),
+        GateAccount(
+            account_id="gate1-dhj02",
+            ssh_alias="gate1-dhj02",
+            spool_paths=RemoteSpoolPaths(
+                inbox="/home1/dhj02/peetsfea-spool/inbox",
+                claimed="/home1/dhj02/peetsfea-spool/claimed",
+                results="/home1/dhj02/peetsfea-spool/results",
+                failed="/home1/dhj02/peetsfea-spool/failed",
+            ),
+        ),
+        GateAccount(
+            account_id="gate1-wjddn5916",
+            ssh_alias="gate1-wjddn5916",
+            spool_paths=RemoteSpoolPaths(
+                inbox="/home1/wjddn5916/peetsfea-spool/inbox",
+                claimed="/home1/wjddn5916/peetsfea-spool/claimed",
+                results="/home1/wjddn5916/peetsfea-spool/results",
+                failed="/home1/wjddn5916/peetsfea-spool/failed",
+            ),
+        ),
+    )
+    worker_accounts = tuple(
+        WorkerAccount(
+            account_id=account.account_id,
+            ssh_alias=account.ssh_alias,
+            spool_paths=account.spool_paths,
+        )
+        for account in gate_accounts
+    )
+    slurm_policy = SlurmPolicy(
+        partition="cpu2",
+        cores=32,
+        memory_gb=320,
+        job_internal_procs=8,
+        pool_target_per_account=10,
+        repo_url="https://github.com/Glaysia/peetsfea-runner",
+        release_tag="v2026.03.02-gate1-r1",
+    )
+    return RunnerConfig(
+        base_dir=base_dir,
+        poll_interval_sec=1.0,
+        idle_sleep_sec=5.0,
+        duckdb_path=queue_dirs.state / "runner.duckdb",
+        queue_dirs=queue_dirs,
+        gate_account=gate_accounts[0],
+        gate_accounts=gate_accounts,
+        worker_accounts=worker_accounts,
+        slurm_policy=slurm_policy,
+    )

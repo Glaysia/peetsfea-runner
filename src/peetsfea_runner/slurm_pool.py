@@ -5,6 +5,7 @@ import logging
 import re
 import shlex
 import subprocess
+from pathlib import PurePosixPath
 from typing import Protocol
 
 from peetsfea_runner.config import RunnerConfig, SlurmPolicy, WorkerAccount
@@ -45,8 +46,6 @@ class SlurmClient(Protocol):
 
 
 class SubprocessSlurmClient:
-    _REMOTE_REPO_PATH = "/home1/harry261/peetsfea-runner"
-    _REMOTE_VENV_PATH = "/home1/harry261/.peetsfea-venv"
     _REMOTE_REPO_PATH_WIN = "C:/peetsfea-runner"
     _REMOTE_VENV_PATH_WIN = "C:/.peetsfea-venv"
     _REMOTE_PID_PATH_WIN = "C:/peetsfea-runner/var/remote_worker.pid"
@@ -116,6 +115,28 @@ class SubprocessSlurmClient:
             return task_name
         return self._windows_task_name_by_account.get(account_id, self._DEFAULT_WIN_TASK_NAME)
 
+    @staticmethod
+    def _linux_remote_paths(account: WorkerAccount) -> tuple[str, str]:
+        if account.spool_paths is None:
+            raise SlurmClientError(
+                f"account={account.account_id}; detail=missing spool_paths for remote worker bootstrap"
+            )
+        inbox_path = PurePosixPath(account.spool_paths.inbox)
+        parts = inbox_path.parts
+        if "peetsfea-spool" not in parts:
+            raise SlurmClientError(
+                f"account={account.account_id}; detail=invalid spool inbox path: {account.spool_paths.inbox}"
+            )
+        spool_index = parts.index("peetsfea-spool")
+        if spool_index < 2:
+            raise SlurmClientError(
+                f"account={account.account_id}; detail=invalid spool inbox path: {account.spool_paths.inbox}"
+            )
+        home_path = PurePosixPath(*parts[:spool_index])
+        repo_path = str(home_path / "peetsfea-runner")
+        venv_path = str(home_path / ".peetsfea-venv")
+        return repo_path, venv_path
+
     def _run_windows_powershell_or_raise(self, *, account: WorkerAccount, script: str) -> subprocess.CompletedProcess[str]:
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         command = f"powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"
@@ -132,6 +153,7 @@ class SubprocessSlurmClient:
             self._ensure_remote_bootstrap_windows(account=account, policy=policy)
             self._bootstrapped_accounts.add(account.account_id)
             return
+        remote_repo_path, remote_venv_path = self._linux_remote_paths(account)
 
         self._run_bootstrap_step_or_raise(
             code=E_BOOTSTRAP_GIT,
@@ -139,7 +161,7 @@ class SubprocessSlurmClient:
                 remote_host=account.ssh_alias,
                 remote_command=(
                     "mkdir -p "
-                    f"{shlex.quote(self._REMOTE_REPO_PATH)} "
+                    f"{shlex.quote(remote_repo_path)} "
                     f"{shlex.quote(account.spool_paths.inbox)} "
                     f"{shlex.quote(account.spool_paths.claimed)} "
                     f"{shlex.quote(account.spool_paths.results)} "
@@ -150,7 +172,7 @@ class SubprocessSlurmClient:
 
         repo_cmd = (
             "set -euo pipefail; "
-            f"REPO_PATH={shlex.quote(self._REMOTE_REPO_PATH)}; "
+            f"REPO_PATH={shlex.quote(remote_repo_path)}; "
             f"REPO_URL={shlex.quote(policy.repo_url)}; "
             f"RELEASE_TAG={shlex.quote(policy.release_tag)}; "
             'if [ ! -d "$REPO_PATH/.git" ]; then '
@@ -169,7 +191,7 @@ class SubprocessSlurmClient:
 
         python_cmd = (
             "set -euo pipefail; "
-            f"VENV_PATH={shlex.quote(self._REMOTE_VENV_PATH)}; "
+            f"VENV_PATH={shlex.quote(remote_venv_path)}; "
             'if [ ! -x "$VENV_PATH/bin/python" ]; then '
             "if command -v python3.12 >/dev/null 2>&1; then "
             'python3.12 -m venv "$VENV_PATH"; '
@@ -195,8 +217,8 @@ class SubprocessSlurmClient:
 
         deps_cmd = (
             "set -euo pipefail; "
-            f"VENV_PATH={shlex.quote(self._REMOTE_VENV_PATH)}; "
-            f"REPO_PATH={shlex.quote(self._REMOTE_REPO_PATH)}; "
+            f"VENV_PATH={shlex.quote(remote_venv_path)}; "
+            f"REPO_PATH={shlex.quote(remote_repo_path)}; "
             '"$VENV_PATH/bin/python" -m ensurepip >/dev/null 2>&1 || true; '
             '"$VENV_PATH/bin/python" -m pip install -q --disable-pip-version-check uv; '
             'cd "$REPO_PATH"; '
@@ -209,7 +231,7 @@ class SubprocessSlurmClient:
 
         check_cmd = (
             "set -euo pipefail; "
-            f"VENV_PATH={shlex.quote(self._REMOTE_VENV_PATH)}; "
+            f"VENV_PATH={shlex.quote(remote_venv_path)}; "
             'test -x "$VENV_PATH/bin/python"'
         )
         self._run_bootstrap_step_or_raise(
@@ -327,14 +349,15 @@ class SubprocessSlurmClient:
             return self._submit_windows_worker(account=account, policy=policy)
         job_name = f"{policy.job_name_prefix}-{account.account_id}"
         self._ensure_remote_bootstrap(account=account, policy=policy)
+        remote_repo_path, remote_venv_path = self._linux_remote_paths(account)
         assert account.spool_paths is not None
         aedt_flag = ""
         if policy.aedt_executable_path:
             aedt_flag = f" --aedt-executable-path {shlex.quote(policy.aedt_executable_path)}"
         worker_cmd = (
             "set -euo pipefail; "
-            f"REPO_PATH={shlex.quote(self._REMOTE_REPO_PATH)}; "
-            f"VENV_PATH={shlex.quote(self._REMOTE_VENV_PATH)}; "
+            f"REPO_PATH={shlex.quote(remote_repo_path)}; "
+            f"VENV_PATH={shlex.quote(remote_venv_path)}; "
             'if [ ! -d "$REPO_PATH" ]; then echo "missing repo: $REPO_PATH" >&2; exit 2; fi; '
             'if [ ! -x "$VENV_PATH/bin/python" ]; then echo "missing venv python: $VENV_PATH/bin/python" >&2; exit 3; fi; '
             "source /etc/profile.d/modules.sh >/dev/null 2>&1 || true; "

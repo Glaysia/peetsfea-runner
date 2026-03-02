@@ -17,13 +17,12 @@
 - 모든 AEDT 애플리케이션 동시 지원.
 
 ## 운영 고정값
-- 현재 실행 프로필: `5600X2` Windows GUI 디버그
-- Windows 런처 모드: `Task Scheduler + InteractiveToken`
-- 계정 수: `1` (`win5600x2`)
-- 계정당 활성 worker 상한: `1`
-- worker 내부 동시 PyAEDT 프로세스: `6` (Windows 상한)
-- AEDT 실행 경로: `C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe`
-- 배포 태그: `v2026.03.02-5600x2-r2`
+- 현재 실행 프로필: `gate1` Linux 다중 계정
+- 계정 수: `4` (`gate1-harry`, `gate1-hmlee31`, `gate1-dhj02`, `gate1-wjddn5916`)
+- 계정당 활성 worker 상한: `10`
+- worker 내부 동시 PyAEDT 프로세스: `8`
+- Slurm 파티션/자원: `cpu2`, `32 cores`, `320GB`
+- 배포 태그: `v2026.03.02-gate1-r1`
 - 리포트 export 정책: 해석 후 `모든 리포트` 출력
 - 결과 보존 정책: mainPC에 `report-only zip` 1개만 보존
 - 원본 `.aedt` 정책: 완료 후 원격/로컬 삭제
@@ -38,10 +37,10 @@
 - HFSS worker 실행 계약 모듈(어댑터 인터페이스, report-only zip 패키징, cleanup)
 - Slurm `--wrap` -> 원격 `peetsfea_runner.remote_worker` 실행 연결
 - submit 시 원격 bootstrap 자동화(`repo/venv` 미존재 시 생성 + 태그 checkout)
-- Windows submit/query/cancel 계약:
-  - submit: Scheduled Task `InteractiveToken` 등록/시작
-  - query: pidfile 우선 + Win32_Process 커맨드라인 fallback
-  - cancel: PID 종료 + orphan python 종료 + Scheduled Task cleanup
+- Gate1 Linux submit/query/cancel 계약:
+  - submit: `sbatch` 기반 worker 제출
+  - query: `squeue` 기반 활성 worker 조회
+  - cancel: `scancel` 기반 worker 정리
 - Reconciler/Auditor(상태 불일치 보정, DONE zip 고아 등록, `.aedt` 잔존 감사)
 - DuckDB 스키마/이벤트 기록 및 daemon 루프 통합
 
@@ -53,16 +52,16 @@
 - mainPC 서비스 실행 경로는 `harry` 계정 기준으로 고정:
   - `WorkingDirectory=/home/harry/Projects/PythonProjects/peetsfea-runner`
   - `ExecStart=/home/harry/Projects/PythonProjects/peetsfea-runner/.venv/bin/python -m peetsfea_runner.main`
-- 원격 worker 환경 전제(5600X2):
-  - `C:/.peetsfea-venv` 존재(없으면 bootstrap에서 생성)
-  - `C:/peetsfea-runner` clone 존재(없으면 bootstrap에서 clone)
-  - spool 경로: `C:/peetsfea-spool/{inbox,claimed,results,failed}`
+- 원격 worker 환경 전제(gate1 4계정):
+  - 계정별 `~/.peetsfea-venv` 존재(없으면 bootstrap에서 생성)
+  - 계정별 `~/peetsfea-runner` clone 존재(없으면 bootstrap에서 clone)
+  - spool 경로: `/home1/<user>/peetsfea-spool/{inbox,claimed,results,failed}`
 - 원격 worker bootstrap 정책:
-  - 원격 repo bootstrap은 `git clone/fetch --tags` 후 지정 태그 checkout(`v2026.03.02-5600x2-r2`)
+  - 원격 repo bootstrap은 `git clone/fetch --tags` 후 지정 태그 checkout(`v2026.03.02-gate1-r1`)
   - python/venv/uv/pyaedt 설치 보장 후 worker 시작
-- Windows GUI 가시성 정책:
-  - worker python과 `ansysedt.exe`는 로그인 사용자 세션(Session 2)에서 실행되어야 한다.
-  - Session 0 실행은 장애로 간주하고 degraded 처리한다.
+- Linux gate 정책:
+  - worker는 계정별 Slurm job으로 구동한다.
+  - 계정별 repo/venv 경로를 기준으로 bootstrap 및 실행한다.
 - PyAEDT 버전 정책:
   - `pyaedt==0.22.0` 고정
 
@@ -73,10 +72,10 @@
 - 원격 bootstrap 계약(태그 기준 동기화 + `python -m uv`)을 코드/테스트 계약으로 반영
 
 ### 단기(Phase B)
-- Windows submit 경로 안정화:
-  - `Register-ScheduledTask`/`Start-ScheduledTask` 성공/실패 코드 표준화
-  - no-interactive-session(`E_WIN_NO_INTERACTIVE_SESSION`) 명확화
-  - launch health check 실패 시 stdout/stderr tail + Task last result 포함
+- gate1 다중 계정 submit 경로 안정화:
+  - 계정별 bootstrap 실패 원인 표준화
+  - submit/query/cancel 장애 시 degraded 전이 로그 강화
+  - launch health check 실패 시 stdout/stderr tail 포함
 - bootstrap 이벤트/오류 코드 표준화 및 운영 로그 확장
 - `pyproject.toml`에 `pyaedt==0.22.0` 반영 및 설치 검증 경로 추가
 
