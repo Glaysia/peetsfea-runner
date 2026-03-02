@@ -71,3 +71,44 @@ def build_queue_dirs(base_dir: Path) -> QueueDirs:
         failed=base_dir / "failed",
         state=base_dir / "state",
     )
+
+
+def build_5600x2_runner_config(project_root: Path) -> RunnerConfig:
+    base_dir = project_root / "var"
+    queue_dirs = build_queue_dirs(base_dir)
+    account = GateAccount(
+        account_id="win5600x2",
+        ssh_alias="5600X2",
+        spool_paths=RemoteSpoolPaths(
+            inbox="C:/peetsfea-spool/inbox",
+            claimed="C:/peetsfea-spool/claimed",
+            results="C:/peetsfea-spool/results",
+            failed="C:/peetsfea-spool/failed",
+        ),
+    )
+    worker_account = WorkerAccount(
+        account_id=account.account_id,
+        ssh_alias=account.ssh_alias,
+        spool_paths=account.spool_paths,
+    )
+    slurm_policy = SlurmPolicy(
+        partition="debug-windows",
+        cores=1,
+        memory_gb=16,
+        job_internal_procs=1,
+        pool_target_per_account=1,
+        repo_url="https://github.com/Glaysia/peetsfea-runner",
+        release_tag="v2026.03.02-5600x2-r1",
+        aedt_executable_path=r"C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe",
+    )
+    return RunnerConfig(
+        base_dir=base_dir,
+        poll_interval_sec=1.0,
+        idle_sleep_sec=5.0,
+        duckdb_path=queue_dirs.state / "runner.duckdb",
+        queue_dirs=queue_dirs,
+        gate_account=account,
+        gate_accounts=(account,),
+        worker_accounts=(worker_account,),
+        slurm_policy=slurm_policy,
+    )
