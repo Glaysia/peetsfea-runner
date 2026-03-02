@@ -243,6 +243,17 @@ class RemoteWorker:
     def _iter_inbox_aedt(self) -> list[Path]:
         return sorted(path for path in self._config.spool_inbox.rglob("*.aedt") if path.is_file())
 
+    def _iter_claimed_aedt(self) -> list[Path]:
+        claimed_files: list[Path] = []
+        for path in self._config.spool_claimed.rglob("*.aedt"):
+            if not path.is_file():
+                continue
+            # Ignore temporary workdir artifacts and only resume real claimed tasks.
+            if ".work" in path.parts:
+                continue
+            claimed_files.append(path)
+        return sorted(claimed_files)
+
     def _claim_one(self) -> tuple[str, Path] | None:
         for source in self._iter_inbox_aedt():
             task_id = source.stem
@@ -305,6 +316,11 @@ class RemoteWorker:
 
     def process_once(self) -> bool:
         self._ensure_dirs()
+        preclaimed = self._iter_claimed_aedt()
+        if preclaimed:
+            claimed_path = preclaimed[0]
+            return self._process_claimed_task(task_id=claimed_path.stem, claimed_path=claimed_path)
+
         claimed = self._claim_one()
         if claimed is None:
             return False

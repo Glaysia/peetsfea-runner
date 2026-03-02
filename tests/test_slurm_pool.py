@@ -12,7 +12,12 @@ from peetsfea_runner.config import (
     WorkerAccount,
     build_queue_dirs,
 )
-from peetsfea_runner.slurm_pool import SlurmClientError, SubprocessSlurmClient, WorkerPoolManager
+from peetsfea_runner.slurm_pool import (
+    E_WIN_NO_INTERACTIVE_SESSION,
+    SlurmClientError,
+    SubprocessSlurmClient,
+    WorkerPoolManager,
+)
 
 
 class FakeSlurmClient:
@@ -165,6 +170,52 @@ def test_worker_pool_submit_uses_fixed_slurm_policy(tmp_path: Path) -> None:
     assert used_policy.cores == 32
     assert used_policy.memory_gb == 320
     assert used_policy.job_internal_procs == 8
+
+
+def test_worker_pool_cancel_all_windows_forces_orphan_task_cleanup(tmp_path: Path) -> None:
+    base_dir = tmp_path / "var"
+    queue_dirs = build_queue_dirs(base_dir)
+    gate_account = GateAccount(
+        account_id="win5600x2",
+        ssh_alias="5600X2",
+        spool_paths=RemoteSpoolPaths(
+            inbox="C:/peetsfea-spool/inbox",
+            claimed="C:/peetsfea-spool/claimed",
+            results="C:/peetsfea-spool/results",
+            failed="C:/peetsfea-spool/failed",
+        ),
+    )
+    config = RunnerConfig(
+        base_dir=base_dir,
+        poll_interval_sec=0.01,
+        idle_sleep_sec=0.01,
+        duckdb_path=queue_dirs.state / "runner.duckdb",
+        queue_dirs=queue_dirs,
+        gate_account=gate_account,
+        gate_accounts=(gate_account,),
+        worker_accounts=(
+            WorkerAccount(
+                account_id="win5600x2",
+                ssh_alias="5600X2",
+                spool_paths=gate_account.spool_paths,
+            ),
+        ),
+        slurm_policy=SlurmPolicy(
+            partition="debug-windows",
+            cores=1,
+            memory_gb=16,
+            job_internal_procs=6,
+            pool_target_per_account=1,
+        ),
+    )
+    client = FakeSlurmClient()
+    client.jobs["win5600x2"] = []
+
+    manager = WorkerPoolManager(config, client=client)
+    processed = manager.cancel_all_workers()
+
+    assert processed == 1
+    assert client.cancel_records == [("win5600x2", "0")]
 
 
 def test_subprocess_slurm_client_submit_uses_remote_worker_entrypoint(monkeypatch: object) -> None:
@@ -400,9 +451,13 @@ def test_subprocess_slurm_client_windows_query_filters_non_numeric_lines(monkeyp
 
     assert lines == ["12888"]
     assert len(calls) == 1
+    query_script = _decode_powershell_script(calls[0][2])
+    assert "Get-CimInstance Win32_Process" in query_script
+    assert "peetsfea_runner.remote_worker" in query_script
+    assert "TASK_STATE=" in query_script
 
 
-def test_subprocess_slurm_client_windows_submit_uses_health_check_and_quoted_aedt_path(monkeypatch: object) -> None:
+def test_subprocess_slurm_client_windows_submit_uses_interactive_task_scheduler(monkeypatch: object) -> None:
     calls: list[list[str]] = []
 
     def _fake_run(args: list[str], capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
@@ -446,7 +501,90 @@ def test_subprocess_slurm_client_windows_submit_uses_health_check_and_quoted_aed
     assert pid == "13180"
     assert len(calls) == 3
     launch_script = _decode_powershell_script(calls[2][2])
-    assert "Start-Sleep -Seconds 3" in launch_script
+    assert "query user" in launch_script
+    assert "Start-Sleep -Seconds 4" in launch_script
     assert "worker_died_after_launch" in launch_script
-    assert "Invoke-CimMethod -ClassName Win32_Process -MethodName Create" in launch_script
+    assert "Start-Process -FilePath $python -ArgumentList $args" in launch_script
+    assert "Register-ScheduledTask" in launch_script
+    assert "Start-ScheduledTask" in launch_script
+    assert "InteractiveToken" in launch_script
+    assert "'-X','faulthandler'" in launch_script
     assert r"C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe" in launch_script
+
+
+def test_subprocess_slurm_client_windows_submit_fails_without_interactive_session(monkeypatch: object) -> None:
+    calls: list[list[str]] = []
+
+    def _fake_run(args: list[str], capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+        _ = capture_output, text, check
+        calls.append(args)
+        call_index = len(calls)
+        if call_index == 1:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if call_index == 2:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if call_index == 3:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=1,
+                stdout=f"error_code={E_WIN_NO_INTERACTIVE_SESSION}; detail=no session",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected call index {call_index}")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    client = SubprocessSlurmClient()
+    account = WorkerAccount(
+        account_id="win5600x2",
+        ssh_alias="5600X2",
+        spool_paths=RemoteSpoolPaths(
+            inbox="C:/peetsfea-spool/inbox",
+            claimed="C:/peetsfea-spool/claimed",
+            results="C:/peetsfea-spool/results",
+            failed="C:/peetsfea-spool/failed",
+        ),
+    )
+    policy = SlurmPolicy(
+        partition="debug-windows",
+        cores=1,
+        memory_gb=16,
+        job_internal_procs=6,
+        pool_target_per_account=1,
+    )
+
+    try:
+        client.submit_worker(account=account, policy=policy)
+    except SlurmClientError as exc:
+        assert E_WIN_NO_INTERACTIVE_SESSION in exc.message
+    else:
+        raise AssertionError("expected SlurmClientError")
+
+
+def test_subprocess_slurm_client_windows_cancel_cleans_scheduled_task(monkeypatch: object) -> None:
+    calls: list[list[str]] = []
+
+    def _fake_run(args: list[str], capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+        _ = capture_output, text, check
+        calls.append(args)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    client = SubprocessSlurmClient()
+    account = WorkerAccount(
+        account_id="win5600x2",
+        ssh_alias="5600X2",
+        spool_paths=RemoteSpoolPaths(
+            inbox="C:/peetsfea-spool/inbox",
+            claimed="C:/peetsfea-spool/claimed",
+            results="C:/peetsfea-spool/results",
+            failed="C:/peetsfea-spool/failed",
+        ),
+    )
+
+    client.cancel_worker(account=account, slurm_job_id="4242")
+
+    assert len(calls) == 1
+    cancel_script = _decode_powershell_script(calls[0][2])
+    assert "Stop-ScheduledTask -TaskName" in cancel_script
+    assert "Unregister-ScheduledTask -TaskName" in cancel_script
+    assert "Stop-Process -Id $workerPid" in cancel_script

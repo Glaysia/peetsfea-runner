@@ -26,6 +26,10 @@ E_WIN_WORKER_PYTHON = "E_WIN_WORKER_PYTHON"
 E_WIN_WORKER_IMPORT = "E_WIN_WORKER_IMPORT"
 E_WIN_WORKER_RUNTIME = "E_WIN_WORKER_RUNTIME"
 E_WIN_WORKER_NATIVE_CRASH = "E_WIN_WORKER_NATIVE_CRASH"
+E_WIN_NO_INTERACTIVE_SESSION = "E_WIN_NO_INTERACTIVE_SESSION"
+E_WIN_TASK_REGISTER = "E_WIN_TASK_REGISTER"
+E_WIN_TASK_START = "E_WIN_TASK_START"
+E_WIN_TASK_QUERY = "E_WIN_TASK_QUERY"
 
 
 class SlurmClient(Protocol):
@@ -47,9 +51,11 @@ class SubprocessSlurmClient:
     _REMOTE_PID_PATH_WIN = "C:/peetsfea-runner/var/remote_worker.pid"
     _REMOTE_AEDT_PATH_WIN = r"C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe"
     _WORKER_POLL_SEC = 2.0
+    _DEFAULT_WIN_TASK_NAME = "peetsfea-worker-win5600x2"
 
     def __init__(self) -> None:
         self._bootstrapped_accounts: set[str] = set()
+        self._windows_task_name_by_account: dict[str, str] = {}
 
     def _run_or_raise(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         try:
@@ -83,6 +89,21 @@ class SubprocessSlurmClient:
     @staticmethod
     def _extract_digit_lines(text: str) -> list[str]:
         return [line.strip() for line in text.splitlines() if re.fullmatch(r"\d+", line.strip() or "")]
+
+    @staticmethod
+    def _read_first_nonempty_line(text: str) -> str | None:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped:
+                return stripped
+        return None
+
+    def _task_name_for_account(self, *, account_id: str, policy: SlurmPolicy | None = None) -> str:
+        if policy is not None:
+            task_name = policy.windows_task_name.strip() if policy.windows_task_name.strip() else self._DEFAULT_WIN_TASK_NAME
+            self._windows_task_name_by_account[account_id] = task_name
+            return task_name
+        return self._windows_task_name_by_account.get(account_id, self._DEFAULT_WIN_TASK_NAME)
 
     def _run_windows_powershell_or_raise(self, *, account: WorkerAccount, script: str) -> subprocess.CompletedProcess[str]:
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
@@ -225,27 +246,68 @@ class SubprocessSlurmClient:
 
     def query_workers(self, *, account: WorkerAccount, policy: SlurmPolicy) -> list[str]:
         if self._is_windows_account(account):
-            return self._query_windows_workers(account=account)
+            return self._query_windows_workers(account=account, policy=policy)
         job_name = f"{policy.job_name_prefix}-{account.account_id}"
         query_cmd = f"squeue -h -n {shlex.quote(job_name)} -o %A"
         result = self._run_or_raise(["ssh", account.ssh_alias, query_cmd])
         lines = [line.strip() for line in result.stdout.splitlines()]
         return [line for line in lines if line]
 
-    def _query_windows_workers(self, *, account: WorkerAccount) -> list[str]:
+    def _query_windows_workers(self, *, account: WorkerAccount, policy: SlurmPolicy) -> list[str]:
+        assert account.spool_paths is not None
+        task_name = self._task_name_for_account(account_id=account.account_id, policy=policy)
+        spool_inbox = account.spool_paths.inbox
+        escaped_task_name = self._ps_quote(task_name)
+        escaped_spool_inbox = self._ps_quote(spool_inbox)
         query_script = (
             "$ErrorActionPreference='Stop'; "
             "$ProgressPreference='SilentlyContinue'; "
             f"$pidPath={self._ps_quote(self._REMOTE_PID_PATH_WIN)}; "
-            "if (!(Test-Path -LiteralPath $pidPath)) { exit 0 }; "
+            f"$taskName={escaped_task_name}; "
+            f"$spoolInbox={escaped_spool_inbox}; "
+            "$resolved=@(); "
+            "if (Test-Path -LiteralPath $pidPath) { "
             "$workerPid=(Get-Content -LiteralPath $pidPath -Raw).Trim(); "
-            "if (-not $workerPid) { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue; exit 0 }; "
+            "if ($workerPid) { "
             "$p=Get-Process -Id $workerPid -ErrorAction SilentlyContinue; "
-            "if ($null -eq $p) { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue; exit 0 }; "
-            "Write-Output $workerPid"
+            "if ($null -ne $p) { $resolved += [string]$workerPid } "
+            "else { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue } "
+            "} else { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue } "
+            "}; "
+            "if ($resolved.Count -eq 0) { "
+            "$candidates=Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+            "Where-Object { $_.CommandLine -and $_.CommandLine -match 'peetsfea_runner.remote_worker' -and $_.CommandLine -match [regex]::Escape($spoolInbox) }; "
+            "foreach($candidate in $candidates){ "
+            "$cp=Get-Process -Id $candidate.ProcessId -ErrorAction SilentlyContinue; "
+            "if($null -ne $cp){ $resolved += [string]$candidate.ProcessId } "
+            "}; "
+            "$resolved=$resolved | Select-Object -Unique; "
+            "if($resolved.Count -gt 0){ $resolved[0] | Set-Content -LiteralPath $pidPath -NoNewline } "
+            "}; "
+            "if ($resolved.Count -eq 0) { "
+            "$task=Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "
+            "if ($null -ne $task) { "
+            "$taskInfo=Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue; "
+            "if ($null -ne $taskInfo) { "
+            "Write-Output ('TASK_STATE=' + $taskInfo.State + ';TASK_LAST=' + $taskInfo.LastTaskResult) "
+            "} "
+            "} "
+            "}; "
+            "foreach($pid in $resolved){ Write-Output $pid }"
         )
-        result = self._run_windows_powershell_or_raise(account=account, script=query_script)
-        return self._extract_digit_lines(result.stdout)
+        try:
+            result = self._run_windows_powershell_or_raise(account=account, script=query_script)
+        except SlurmClientError as exc:
+            raise SlurmClientError(f"error_code={E_WIN_TASK_QUERY}; {exc.message}") from exc
+
+        lines = self._extract_digit_lines(result.stdout)
+        if lines:
+            return lines
+
+        first_line = self._read_first_nonempty_line(result.stdout)
+        if first_line and first_line.startswith("TASK_STATE="):
+            LOG.info("windows_task_idle account=%s detail=%s", account.account_id, first_line)
+        return []
 
     def submit_worker(self, *, account: WorkerAccount, policy: SlurmPolicy) -> str:
         if self._is_windows_account(account):
@@ -293,13 +355,18 @@ class SubprocessSlurmClient:
         return job_id_field
 
     def _submit_windows_worker(self, *, account: WorkerAccount, policy: SlurmPolicy) -> str:
+        if policy.windows_launch_mode == "service":
+            return self._submit_windows_worker_service(account=account, policy=policy)
+        return self._submit_windows_worker_interactive_task(account=account, policy=policy)
+
+    def _submit_windows_worker_service(self, *, account: WorkerAccount, policy: SlurmPolicy) -> str:
         self._ensure_remote_bootstrap(account=account, policy=policy)
         assert account.spool_paths is not None
         aedt_executable_path = policy.aedt_executable_path or self._REMOTE_AEDT_PATH_WIN
         # Windows debug host policy: never exceed 6 cores for a single AEDT task.
         windows_internal_procs = min(policy.job_internal_procs, 6)
 
-        active = self._query_windows_workers(account=account)
+        active = self._query_windows_workers(account=account, policy=policy)
         if active:
             return active[0]
 
@@ -318,6 +385,7 @@ class SubprocessSlurmClient:
             f"throw {self._ps_quote(f'error_code={E_WIN_WORKER_PYTHON}; detail=missing python: ')} + $python "
             "}; "
             "$args=@("
+            "'-X','faulthandler',"
             "'-m','peetsfea_runner.remote_worker',"
             f"'--spool-inbox',{self._ps_quote(account.spool_paths.inbox)},"
             f"'--spool-claimed',{self._ps_quote(account.spool_paths.claimed)},"
@@ -329,10 +397,7 @@ class SubprocessSlurmClient:
             "'--gui'"
             "); "
             "$quotedArgs=($args | ForEach-Object { '\"' + ($_ -replace '\"','\\\"') + '\"' }) -join ' '; "
-            "$commandLine="
-            "'cmd.exe /d /c cd /d \"' + $repo + '\" && \"' + $python + '\" ' + "
-            "$quotedArgs + "
-            "' 1>>\"' + $stdoutPath + '\" 2>>\"' + $stderrPath + '\"'; "
+            "$commandLine='\"' + $python + '\" ' + $quotedArgs; "
             "$result=Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
             "-Arguments @{CommandLine=$commandLine; CurrentDirectory=$repo}; "
             "if ($result.ReturnValue -ne 0 -or -not $result.ProcessId) { "
@@ -372,13 +437,148 @@ class SubprocessSlurmClient:
             )
         return job_id_field
 
+    def _submit_windows_worker_interactive_task(self, *, account: WorkerAccount, policy: SlurmPolicy) -> str:
+        self._ensure_remote_bootstrap(account=account, policy=policy)
+        assert account.spool_paths is not None
+        aedt_executable_path = policy.aedt_executable_path or self._REMOTE_AEDT_PATH_WIN
+        windows_internal_procs = min(policy.job_internal_procs, 6)
+        task_name = self._task_name_for_account(account_id=account.account_id, policy=policy)
+
+        active = self._query_windows_workers(account=account, policy=policy)
+        if active:
+            return active[0]
+
+        start_script = (
+            "$ErrorActionPreference='Stop'; "
+            "$ProgressPreference='SilentlyContinue'; "
+            f"$taskName={self._ps_quote(task_name)}; "
+            f"$interactiveUser={self._ps_quote(policy.windows_interactive_user)}; "
+            "$userLeaf=($interactiveUser -split '\\\\')[-1]; "
+            "$queryUserOutput=(query user 2>$null | Out-String); "
+            "if ([string]::IsNullOrWhiteSpace($queryUserOutput) -or "
+            "$queryUserOutput -notmatch ('(?im)^\\s*>?\\s*' + [regex]::Escape($userLeaf) + '\\s+')) { "
+            f"throw {self._ps_quote(f'error_code={E_WIN_NO_INTERACTIVE_SESSION}; detail=interactive session not found for user=')} + $interactiveUser "
+            "}; "
+            f"$repo={self._ps_quote(self._REMOTE_REPO_PATH_WIN)}; "
+            f"$venv={self._ps_quote(self._REMOTE_VENV_PATH_WIN)}; "
+            f"$pidPath={self._ps_quote(self._REMOTE_PID_PATH_WIN)}; "
+            f"$spoolInbox={self._ps_quote(account.spool_paths.inbox)}; "
+            "$pidDir=[System.IO.Path]::GetDirectoryName($pidPath); "
+            "if ($pidDir) { New-Item -ItemType Directory -Force -Path $pidDir | Out-Null }; "
+            "$stdoutPath=($pidDir + '/remote_worker.stdout.log'); "
+            "$stderrPath=($pidDir + '/remote_worker.stderr.log'); "
+            "$python=($venv + '/Scripts/python.exe'); "
+            "if (!(Test-Path -LiteralPath $python)) { "
+            f"throw {self._ps_quote(f'error_code={E_WIN_WORKER_PYTHON}; detail=missing python: ')} + $python "
+            "}; "
+            "$launcherScript=@'"
+            "$ErrorActionPreference='Stop'\n"
+            f"$repo={self._ps_quote(self._REMOTE_REPO_PATH_WIN)}\n"
+            f"$venv={self._ps_quote(self._REMOTE_VENV_PATH_WIN)}\n"
+            f"$pidPath={self._ps_quote(self._REMOTE_PID_PATH_WIN)}\n"
+            "$pidDir=[System.IO.Path]::GetDirectoryName($pidPath)\n"
+            "if($pidDir){ New-Item -ItemType Directory -Force -Path $pidDir | Out-Null }\n"
+            "$stdoutPath=($pidDir + '/remote_worker.stdout.log')\n"
+            "$stderrPath=($pidDir + '/remote_worker.stderr.log')\n"
+            "Remove-Item -LiteralPath $stdoutPath,$stderrPath -Force -ErrorAction SilentlyContinue\n"
+            "$python=($venv + '/Scripts/python.exe')\n"
+            "$args=@(\n"
+            "'-X','faulthandler',\n"
+            "'-m','peetsfea_runner.remote_worker',\n"
+            f"'--spool-inbox',{self._ps_quote(account.spool_paths.inbox)},\n"
+            f"'--spool-claimed',{self._ps_quote(account.spool_paths.claimed)},\n"
+            f"'--spool-results',{self._ps_quote(account.spool_paths.results)},\n"
+            f"'--spool-failed',{self._ps_quote(account.spool_paths.failed)},\n"
+            f"'--poll-sec',{self._ps_quote(str(self._WORKER_POLL_SEC))},\n"
+            f"'--internal-procs',{self._ps_quote(str(windows_internal_procs))},\n"
+            f"'--aedt-executable-path',{self._ps_quote(aedt_executable_path)},\n"
+            "'--gui'\n"
+            ")\n"
+            "$proc=Start-Process -FilePath $python -ArgumentList $args -WorkingDirectory $repo "
+            "-RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru\n"
+            "$proc.Id | Set-Content -LiteralPath $pidPath -NoNewline\n"
+            "'@; "
+            "$encodedLauncher=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launcherScript)); "
+            "$actionArgs='-NoProfile -NonInteractive -EncodedCommand ' + $encodedLauncher; "
+            "$action=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $actionArgs -WorkingDirectory $repo; "
+            "$principal=New-ScheduledTaskPrincipal -UserId $interactiveUser -LogonType InteractiveToken -RunLevel Highest; "
+            "$settings=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew; "
+            "try { "
+            "Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null; "
+            "Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null "
+            "} catch { "
+            f"throw {self._ps_quote(f'error_code={E_WIN_TASK_REGISTER}; detail=')} + $_.Exception.Message "
+            "}; "
+            "try { "
+            "Start-ScheduledTask -TaskName $taskName "
+            "} catch { "
+            f"throw {self._ps_quote(f'error_code={E_WIN_TASK_START}; detail=')} + $_.Exception.Message "
+            "}; "
+            "Start-Sleep -Seconds 4; "
+            "$workerPid=''; "
+            "if (Test-Path -LiteralPath $pidPath) { "
+            "$workerPid=(Get-Content -LiteralPath $pidPath -Raw).Trim() "
+            "}; "
+            "if (-not $workerPid) { "
+            "$candidates=Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+            "Where-Object { $_.CommandLine -and $_.CommandLine -match 'peetsfea_runner.remote_worker' -and $_.CommandLine -match [regex]::Escape($spoolInbox) }; "
+            "if ($candidates) { "
+            "$workerPid=[string]($candidates | Sort-Object CreationDate -Descending | Select-Object -First 1 -ExpandProperty ProcessId); "
+            "$workerPid | Set-Content -LiteralPath $pidPath -NoNewline "
+            "} "
+            "}; "
+            "$alive=$null; "
+            "if ($workerPid) { $alive=Get-Process -Id $workerPid -ErrorAction SilentlyContinue }; "
+            "if ($null -eq $alive) { "
+            "$stderrTail=''; if (Test-Path -LiteralPath $stderrPath) { $stderrTail=((Get-Content -LiteralPath $stderrPath -Tail 80) -join \"`n\") }; "
+            "$stdoutTail=''; if (Test-Path -LiteralPath $stdoutPath) { $stdoutTail=((Get-Content -LiteralPath $stdoutPath -Tail 80) -join \"`n\") }; "
+            "$taskInfo=Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue; "
+            "$taskState=''; $taskLast=''; "
+            "if ($null -ne $taskInfo) { $taskState=[string]$taskInfo.State; $taskLast=[string]$taskInfo.LastTaskResult }; "
+            f"$code={self._ps_quote(E_WIN_WORKER_RUNTIME)}; "
+            "if ($stderrTail -match 'ModuleNotFoundError|ImportError|No module named|Failed to import') { "
+            f"$code={self._ps_quote(E_WIN_WORKER_IMPORT)} "
+            "} elseif ([string]::IsNullOrWhiteSpace($stderrTail)) { "
+            f"$code={self._ps_quote(E_WIN_WORKER_NATIVE_CRASH)} "
+            "}; "
+            "throw ("
+            "'error_code=' + $code + "
+            "'; detail=worker_died_after_launch; task_state=' + $taskState + "
+            "'; task_last=' + $taskLast + "
+            "'; stdout_tail=' + $stdoutTail + "
+            "'; stderr_tail=' + $stderrTail"
+            "); "
+            "}; "
+            "Write-Output $workerPid"
+        )
+        result = self._run_windows_powershell_or_raise(account=account, script=start_script)
+        numeric_lines = self._extract_digit_lines(result.stdout)
+        job_id_field = numeric_lines[-1] if numeric_lines else ""
+        if not job_id_field:
+            raise SlurmClientError(
+                f"account={account.account_id}; detail=empty windows worker pid; stdout={result.stdout.strip()}"
+            )
+        return job_id_field
+
     def cancel_worker(self, *, account: WorkerAccount, slurm_job_id: str) -> None:
         if self._is_windows_account(account):
+            task_name = self._task_name_for_account(account_id=account.account_id)
+            spool_inbox = account.spool_paths.inbox if account.spool_paths is not None else ""
             stop_script = (
                 "$ErrorActionPreference='Stop'; "
+                "$ProgressPreference='SilentlyContinue'; "
                 f"$pidPath={self._ps_quote(self._REMOTE_PID_PATH_WIN)}; "
                 f"$workerPid={self._ps_quote(slurm_job_id)}; "
+                f"$taskName={self._ps_quote(task_name)}; "
+                f"$spoolInbox={self._ps_quote(spool_inbox)}; "
                 "Stop-Process -Id $workerPid -Force -ErrorAction SilentlyContinue; "
+                "if ($spoolInbox) { "
+                "$orphans=Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                "Where-Object { $_.CommandLine -and $_.CommandLine -match 'peetsfea_runner.remote_worker' -and $_.CommandLine -match [regex]::Escape($spoolInbox) }; "
+                "foreach($orphan in $orphans){ Stop-Process -Id $orphan.ProcessId -Force -ErrorAction SilentlyContinue } "
+                "}; "
+                "Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; "
+                "Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null; "
                 "if (Test-Path -LiteralPath $pidPath) { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue }"
             )
             self._run_windows_powershell_or_raise(account=account, script=stop_script)
@@ -391,6 +591,12 @@ class WorkerPoolManager:
         self._config = config
         self._client = client if client is not None else SubprocessSlurmClient()
         self._degraded_accounts: set[str] = set()
+
+    @staticmethod
+    def _is_windows_account(account: WorkerAccount) -> bool:
+        if account.spool_paths is None:
+            return False
+        return len(account.spool_paths.inbox) >= 2 and account.spool_paths.inbox[1] == ":"
 
     def is_degraded(self, account_id: str) -> bool:
         return account_id in self._degraded_accounts
@@ -527,7 +733,23 @@ class WorkerPoolManager:
                 continue
 
             self._mark_recovered(account_id=account.account_id)
-            for job_id in dict.fromkeys(active_job_ids):
+            deduped_job_ids = list(dict.fromkeys(active_job_ids))
+
+            # Windows interactive-task mode may leave a scheduled task behind even
+            # when the tracked pid is already gone. Force one cleanup pass.
+            if not deduped_job_ids and self._is_windows_account(account):
+                try:
+                    self._client.cancel_worker(account=account, slurm_job_id="0")
+                except SlurmClientError as exc:
+                    self._mark_degraded(account_id=account.account_id, message=exc.message)
+                    processed += 1
+                    continue
+
+                processed += 1
+                LOG.info("worker_cancelled_on_shutdown account=%s slurm_job_id=0", account.account_id)
+                continue
+
+            for job_id in deduped_job_ids:
                 try:
                     self._client.cancel_worker(account=account, slurm_job_id=job_id)
                 except SlurmClientError as exc:

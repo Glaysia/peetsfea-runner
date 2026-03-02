@@ -84,6 +84,21 @@ def test_remote_worker_writes_failure_metadata_when_execution_fails(tmp_path: Pa
     assert "analyze failed" in payload["message"]
 
 
+def test_remote_worker_resumes_preclaimed_task_without_inbox_file(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    claimed = config.spool_claimed / "task-3.aedt"
+    claimed.parent.mkdir(parents=True, exist_ok=True)
+    claimed.write_text("aedt")
+
+    worker = RemoteWorker(config, adapter_factory=lambda: _SuccessAdapter())
+    processed = worker.process_once()
+
+    assert processed is True
+    assert claimed.exists() is False
+    output_zip = config.spool_results / "task-3.reports.zip"
+    assert output_zip.exists()
+
+
 def test_remote_worker_main_writes_startup_banner(tmp_path: Path, monkeypatch: object) -> None:
     spool_root = tmp_path / "spool"
     for name in ("inbox", "claimed", "results", "failed"):

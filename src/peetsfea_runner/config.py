@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -15,6 +16,9 @@ class SlurmPolicy:
     release_tag: str = "v2026.03.02-gate1-r1"
     job_name_prefix: str = "peetsfea-worker"
     aedt_executable_path: str | None = None
+    windows_launch_mode: Literal["interactive_task", "service"] = "interactive_task"
+    windows_task_name: str = "peetsfea-worker-win5600x2"
+    windows_interactive_user: str = r"DESKTOP-L5CB36B\5600x2"
 
 
 @dataclass(frozen=True)
@@ -98,8 +102,11 @@ def build_5600x2_runner_config(project_root: Path) -> RunnerConfig:
         job_internal_procs=6,
         pool_target_per_account=1,
         repo_url="https://github.com/Glaysia/peetsfea-runner",
-        release_tag="v2026.03.02-5600x2-r1",
+        release_tag="v2026.03.02-5600x2-r2",
         aedt_executable_path=r"C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe",
+        windows_launch_mode="interactive_task",
+        windows_task_name="peetsfea-worker-win5600x2",
+        windows_interactive_user=r"DESKTOP-L5CB36B\5600x2",
     )
     return RunnerConfig(
         base_dir=base_dir,

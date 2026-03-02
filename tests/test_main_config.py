@@ -18,4 +18,7 @@ def test_single_gate_account_configuration_is_fixed() -> None:
 def test_worker_pool_target_is_10() -> None:
     assert CONFIG.slurm_policy.pool_target_per_account == 1
     assert CONFIG.slurm_policy.repo_url == "https://github.com/Glaysia/peetsfea-runner"
-    assert CONFIG.slurm_policy.release_tag == "v2026.03.02-5600x2-r1"
+    assert CONFIG.slurm_policy.release_tag == "v2026.03.02-5600x2-r2"
+    assert CONFIG.slurm_policy.windows_launch_mode == "interactive_task"
+    assert CONFIG.slurm_policy.windows_task_name == "peetsfea-worker-win5600x2"
+    assert CONFIG.slurm_policy.windows_interactive_user == r"DESKTOP-L5CB36B\5600x2"

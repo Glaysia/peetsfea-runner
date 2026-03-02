@@ -49,19 +49,21 @@
 - 기존 계획 문서는 날짜 폴더(`PLANS/archive/YYYY-MM-DD/`)로 아카이브하고, 아카이브 문서는 원본 보존을 원칙으로 한다.
 
 ## 운영 핵심 고정값 (합의 사항)
-- Slurm 파티션: `cpu2`
-- 잡당 자원: `32코어`, `320GB`
-- 잡 내부 동시 PyAEDT 프로세스: `8`
-- 계정당 활성 Slurm 잡 상한: `10`
-- 계정 수: `1` (`gate1-harry`, 단계 확장 예정)
-- AEDT 실행 경로: `/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt`
+- 현재 기본 프로필: `5600X2` Windows GUI 디버그
+- 계정 수: `1` (`win5600x2`, ssh alias `5600X2`)
+- worker 상한: `1`
+- worker 내부 동시 PyAEDT 프로세스: `6`
+- AEDT 실행 경로: `C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe`
+- Windows 런처: `Task Scheduler + InteractiveToken`
+- 배포 태그: `v2026.03.02-5600x2-r2`
 - 리포트 export: 해석 후 `모든 리포트`를 출력
 - 결과 보존: mainPC에 `report-only zip` 1개만 보존
 - 원본 `.aedt`: 완료 후 원격/로컬에서 삭제
 - 저장소 운영 위치: repo는 `mainPC`를 기준으로 운영하되, worker bootstrap 용 원격 태그 clone은 허용
-- 단일 계정 운영 시 원격 spool: `/home1/harry261/peetsfea-spool/{inbox,claimed,results,failed}`
+- 단일 계정 운영 시 원격 spool: `C:/peetsfea-spool/{inbox,claimed,results,failed}`
 - 결과 회수: Collector가 gate `results/`를 스캔해 `done/`으로 원자 회수하며 중복 다운로드를 건너뛴다.
 - 운영 감사: Reconciler가 상태 불일치(고아 done zip 포함) 보정과 `.aedt` 잔존 감사(`delete_after_done`)를 수행
+- GUI 가시성 점검: `ansysedt.exe` SessionId가 로그인 사용자 `explorer.exe` SessionId와 같아야 정상
 
 ## Discord 알림 규칙 (MCP)
 - 작업 시작/종료 시각은 셸 초 단위로 계산한다.

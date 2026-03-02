@@ -6,7 +6,7 @@ Minimal 5% bootstrap of a daemon service for `.aedt` queue intake.
 - 최종 보존 산출물은 mainPC의 `report-only zip` 1개다.
 - `.aedt` 원본은 처리 완료 후 원격/로컬에서 삭제한다.
 - 리포트 export는 단일 리포트가 아니라 해석 후 `모든 리포트`를 대상으로 한다.
-- 실행 구조는 `mainPC orchestrator + gate spool + 단일 계정 worker 풀(10)`으로 운영한다.
+- 현재 실행 구조는 `mainPC orchestrator + 5600X2 spool + 단일 worker(1)` GUI 디버그 모드다.
 - 저장소 운영 기준은 mainPC지만, worker bootstrap 시 gate 계정에 태그 기반 clone/check-out을 허용한다.
 
 ## 문서 체계
@@ -26,9 +26,10 @@ Minimal 5% bootstrap of a daemon service for `.aedt` queue intake.
 - systemd `--user` unit template
 
 Current rollout scope:
-- 단일 계정 `gate1-harry` (`harry261`)를 사용한다.
-- 원격 spool 경로는 `/home1/harry261/peetsfea-spool/{inbox,claimed,results,failed}`를 사용한다.
-- Slurm worker는 `peetsfea_runner.remote_worker`를 실행해 claimed 작업을 처리한다.
+- 단일 계정 `win5600x2` (`5600X2`)를 사용한다.
+- 원격 spool 경로는 `C:/peetsfea-spool/{inbox,claimed,results,failed}`를 사용한다.
+- Windows worker는 Task Scheduler `InteractiveToken`으로 로그인 세션에서 실행한다.
+- 실행 태그는 `v2026.03.02-5600x2-r2`를 사용한다.
 
 ## Run
 ```bash
@@ -61,15 +62,14 @@ The runtime directories are created automatically under `var/`:
   - 목표 수보다 많으면 초과분 자동 취소
 - 고정 자원 정책:
   - partition=`cpu2`, cores=`32`, mem=`320GB`, internal_procs=`8`
-- 단일 계정 운영:
-  - ssh alias=`gate1-harry`
-  - remote repo=`/home1/harry261/peetsfea-runner`
-  - remote venv=`/home1/harry261/.peetsfea-venv`
-  - submit 시 remote bootstrap 자동화:
-    - `~/peetsfea-runner` 미존재 시 `git clone https://github.com/Glaysia/peetsfea-runner`
-    - 매 submit bootstrap마다 `git fetch --tags --force` + `git checkout tags/v2026.03.02-gate1-r1`
-    - `~/.peetsfea-venv` 미존재 시 `python3.12` 우선, 없으면 conda/miniconda로 Python 3.12 확보 후 venv 생성
-    - `uv`, `pyaedt==0.24.1`, editable 패키지 설치 보장
+- Windows GUI 디버그 운영(5600X2):
+  - ssh alias=`5600X2`
+  - remote repo=`C:/peetsfea-runner`
+  - remote venv=`C:/.peetsfea-venv`
+  - `submit_worker`는 Scheduled Task(`peetsfea-worker-win5600x2`)를 `InteractiveToken`으로 등록/시작한다.
+  - `query_workers`는 `remote_worker.pid` 우선 확인 후, `Win32_Process` 커맨드라인(`peetsfea_runner.remote_worker` + spool path)으로 PID를 복구한다.
+  - `cancel_worker`는 PID 종료 + orphan python 정리 + `Stop-ScheduledTask`/`Unregister-ScheduledTask`를 수행한다.
+  - bootstrap은 `git clone/fetch --tags` 후 `v2026.03.02-5600x2-r2` checkout으로 고정한다.
 - 장애 격리:
   - 계정별 degraded 상태를 추적하고, 정상 계정의 풀 관리는 계속 수행
   - 업로드 단계는 degraded 계정을 제외한 건강한 계정으로만 라우팅
