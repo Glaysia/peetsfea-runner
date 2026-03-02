@@ -13,7 +13,7 @@ class SlurmPolicy:
     job_internal_procs: int
     pool_target_per_account: int
     repo_url: str = "https://github.com/Glaysia/peetsfea-runner"
-    release_tag: str = "v2026.03.02-gate1-r1"
+    release_tag: str = "v2026.03.02-gpfs-path-r1"
     job_name_prefix: str = "peetsfea-worker"
     aedt_executable_path: str | None = None
     windows_launch_mode: Literal["interactive_task", "service"] = "interactive_task"
@@ -129,40 +129,40 @@ def build_gate1_multi_runner_config(project_root: Path) -> RunnerConfig:
             account_id="gate1-harry261",
             ssh_alias="gate1-harry",
             spool_paths=RemoteSpoolPaths(
-                inbox="/home1/harry261/peetsfea-spool/inbox",
-                claimed="/home1/harry261/peetsfea-spool/claimed",
-                results="/home1/harry261/peetsfea-spool/results",
-                failed="/home1/harry261/peetsfea-spool/failed",
+                inbox="/gpfs/home1/harry261/peetsfea-spool/inbox",
+                claimed="/gpfs/home1/harry261/peetsfea-spool/claimed",
+                results="/gpfs/home1/harry261/peetsfea-spool/results",
+                failed="/gpfs/home1/harry261/peetsfea-spool/failed",
             ),
         ),
         GateAccount(
             account_id="gate1-hmlee31",
             ssh_alias="gate1-hmlee31",
             spool_paths=RemoteSpoolPaths(
-                inbox="/home1/hmlee31/peetsfea-spool/inbox",
-                claimed="/home1/hmlee31/peetsfea-spool/claimed",
-                results="/home1/hmlee31/peetsfea-spool/results",
-                failed="/home1/hmlee31/peetsfea-spool/failed",
+                inbox="/gpfs/home1/hmlee31/peetsfea-spool/inbox",
+                claimed="/gpfs/home1/hmlee31/peetsfea-spool/claimed",
+                results="/gpfs/home1/hmlee31/peetsfea-spool/results",
+                failed="/gpfs/home1/hmlee31/peetsfea-spool/failed",
             ),
         ),
         GateAccount(
             account_id="gate1-dhj02",
             ssh_alias="gate1-dhj02",
             spool_paths=RemoteSpoolPaths(
-                inbox="/home1/dhj02/peetsfea-spool/inbox",
-                claimed="/home1/dhj02/peetsfea-spool/claimed",
-                results="/home1/dhj02/peetsfea-spool/results",
-                failed="/home1/dhj02/peetsfea-spool/failed",
+                inbox="/gpfs/home1/dhj02/peetsfea-spool/inbox",
+                claimed="/gpfs/home1/dhj02/peetsfea-spool/claimed",
+                results="/gpfs/home1/dhj02/peetsfea-spool/results",
+                failed="/gpfs/home1/dhj02/peetsfea-spool/failed",
             ),
         ),
         GateAccount(
             account_id="gate1-wjddn5916",
             ssh_alias="gate1-wjddn5916",
             spool_paths=RemoteSpoolPaths(
-                inbox="/home1/wjddn5916/peetsfea-spool/inbox",
-                claimed="/home1/wjddn5916/peetsfea-spool/claimed",
-                results="/home1/wjddn5916/peetsfea-spool/results",
-                failed="/home1/wjddn5916/peetsfea-spool/failed",
+                inbox="/gpfs/home1/wjddn5916/peetsfea-spool/inbox",
+                claimed="/gpfs/home1/wjddn5916/peetsfea-spool/claimed",
+                results="/gpfs/home1/wjddn5916/peetsfea-spool/results",
+                failed="/gpfs/home1/wjddn5916/peetsfea-spool/failed",
             ),
         ),
     )
@@ -181,7 +181,7 @@ def build_gate1_multi_runner_config(project_root: Path) -> RunnerConfig:
         job_internal_procs=8,
         pool_target_per_account=10,
         repo_url="https://github.com/Glaysia/peetsfea-runner",
-        release_tag="v2026.03.02-gate1-r1",
+        release_tag="v2026.03.02-gpfs-path-r1",
     )
     return RunnerConfig(
         base_dir=base_dir,
