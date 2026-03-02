@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import logging
 import shlex
 import subprocess
@@ -46,7 +47,10 @@ class SubprocessSlurmClient:
         self._bootstrapped_accounts: set[str] = set()
 
     def _run_or_raise(self, args: list[str]) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(args, capture_output=True, text=True, check=False)
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, check=False, errors="replace")
+        except TypeError:
+            result = subprocess.run(args, capture_output=True, text=True, check=False)
         if result.returncode == 0:
             return result
 
@@ -72,7 +76,8 @@ class SubprocessSlurmClient:
         return "'" + value.replace("'", "''") + "'"
 
     def _run_windows_powershell_or_raise(self, *, account: WorkerAccount, script: str) -> subprocess.CompletedProcess[str]:
-        command = "powershell -NoProfile -Command " + shlex.quote(script)
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        command = f"powershell -NoProfile -EncodedCommand {encoded}"
         return self._run_or_raise(["ssh", account.ssh_alias, command])
 
     def _ensure_remote_bootstrap(self, *, account: WorkerAccount, policy: SlurmPolicy) -> None:
@@ -204,14 +209,10 @@ class SubprocessSlurmClient:
             "& ($venv + '/Scripts/python.exe') -m pip install --disable-pip-version-check uv | Out-Null; "
             "& ($venv + '/Scripts/python.exe') -m uv pip install -e . pyaedt==0.24.1 | Out-Null"
         )
-        self._run_bootstrap_step_or_raise(
-            code=E_BOOTSTRAP_GIT,
-            args=[
-                "ssh",
-                account.ssh_alias,
-                "powershell -NoProfile -Command " + shlex.quote(bootstrap_script),
-            ],
-        )
+        try:
+            self._run_windows_powershell_or_raise(account=account, script=bootstrap_script)
+        except SlurmClientError as exc:
+            raise SlurmClientError(f"error_code={E_BOOTSTRAP_GIT}; {exc.message}") from exc
 
     def query_workers(self, *, account: WorkerAccount, policy: SlurmPolicy) -> list[str]:
         if self._is_windows_account(account):
@@ -227,11 +228,11 @@ class SubprocessSlurmClient:
             "$ErrorActionPreference='Stop'; "
             f"$pidPath={self._ps_quote(self._REMOTE_PID_PATH_WIN)}; "
             "if (!(Test-Path -LiteralPath $pidPath)) { exit 0 }; "
-            "$pid=(Get-Content -LiteralPath $pidPath -Raw).Trim(); "
-            "if (-not $pid) { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue; exit 0 }; "
-            "$p=Get-Process -Id $pid -ErrorAction SilentlyContinue; "
+            "$workerPid=(Get-Content -LiteralPath $pidPath -Raw).Trim(); "
+            "if (-not $workerPid) { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue; exit 0 }; "
+            "$p=Get-Process -Id $workerPid -ErrorAction SilentlyContinue; "
             "if ($null -eq $p) { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue; exit 0 }; "
-            "Write-Output $pid"
+            "Write-Output $workerPid"
         )
         result = self._run_windows_powershell_or_raise(account=account, script=query_script)
         lines = [line.strip() for line in result.stdout.splitlines()]
@@ -286,6 +287,8 @@ class SubprocessSlurmClient:
         self._ensure_remote_bootstrap(account=account, policy=policy)
         assert account.spool_paths is not None
         aedt_executable_path = policy.aedt_executable_path or self._REMOTE_AEDT_PATH_WIN
+        # Windows debug host policy: never exceed 6 cores for a single AEDT task.
+        windows_internal_procs = min(policy.job_internal_procs, 6)
 
         active = self._query_windows_workers(account=account)
         if active:
@@ -296,6 +299,10 @@ class SubprocessSlurmClient:
             f"$repo={self._ps_quote(self._REMOTE_REPO_PATH_WIN)}; "
             f"$venv={self._ps_quote(self._REMOTE_VENV_PATH_WIN)}; "
             f"$pidPath={self._ps_quote(self._REMOTE_PID_PATH_WIN)}; "
+            "$pidDir=[System.IO.Path]::GetDirectoryName($pidPath); "
+            "if ($pidDir) { New-Item -ItemType Directory -Force -Path $pidDir | Out-Null }; "
+            "$stdoutPath=($pidDir + '/remote_worker.stdout.log'); "
+            "$stderrPath=($pidDir + '/remote_worker.stderr.log'); "
             "$python=($venv + '/Scripts/python.exe'); "
             "$args=@("
             "'-m','peetsfea_runner.remote_worker',"
@@ -304,11 +311,12 @@ class SubprocessSlurmClient:
             f"'--spool-results',{self._ps_quote(account.spool_paths.results)},"
             f"'--spool-failed',{self._ps_quote(account.spool_paths.failed)},"
             f"'--poll-sec',{self._ps_quote(str(self._WORKER_POLL_SEC))},"
-            f"'--internal-procs',{self._ps_quote(str(policy.job_internal_procs))},"
+            f"'--internal-procs',{self._ps_quote(str(windows_internal_procs))},"
             f"'--aedt-executable-path',{self._ps_quote(aedt_executable_path)},"
             "'--gui'"
             "); "
-            "$proc=Start-Process -FilePath $python -ArgumentList $args -WorkingDirectory $repo -PassThru; "
+            "$proc=Start-Process -FilePath $python -ArgumentList $args -WorkingDirectory $repo "
+            "-RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru; "
             "$proc.Id | Set-Content -LiteralPath $pidPath -NoNewline; "
             "Write-Output $proc.Id"
         )
@@ -323,8 +331,8 @@ class SubprocessSlurmClient:
             stop_script = (
                 "$ErrorActionPreference='Stop'; "
                 f"$pidPath={self._ps_quote(self._REMOTE_PID_PATH_WIN)}; "
-                f"$pid={self._ps_quote(slurm_job_id)}; "
-                "Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue; "
+                f"$workerPid={self._ps_quote(slurm_job_id)}; "
+                "Stop-Process -Id $workerPid -Force -ErrorAction SilentlyContinue; "
                 "if (Test-Path -LiteralPath $pidPath) { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue }"
             )
             self._run_windows_powershell_or_raise(account=account, script=stop_script)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import shlex
 import shutil
 import subprocess
@@ -45,8 +46,16 @@ class SubprocessSpoolResultsClient:
     def _ps_quote(path: str) -> str:
         return "'" + path.replace("'", "''") + "'"
 
+    @staticmethod
+    def _powershell_encoded(script: str) -> str:
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        return f"powershell -NoProfile -EncodedCommand {encoded}"
+
     def _run_or_raise(self, args: list[str]) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(args, capture_output=True, text=True, check=False)
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, check=False, errors="replace")
+        except TypeError:
+            result = subprocess.run(args, capture_output=True, text=True, check=False)
         if result.returncode == 0:
             return result
 
@@ -57,16 +66,13 @@ class SubprocessSpoolResultsClient:
 
     def list_result_zips(self, *, remote_host: str, remote_results_path: str) -> list[str]:
         if self._is_windows_path(remote_results_path):
-            list_cmd = (
-                "powershell -NoProfile -Command "
-                + shlex.quote(
-                    "if (Test-Path -LiteralPath "
-                    f"{self._ps_quote(remote_results_path)}) "
-                    "{ Get-ChildItem -LiteralPath "
-                    f"{self._ps_quote(remote_results_path)} "
-                    "-Recurse -File -Filter '*.reports.zip' | Sort-Object FullName | "
-                    "ForEach-Object { $_.FullName } }"
-                )
+            list_cmd = self._powershell_encoded(
+                "if (Test-Path -LiteralPath "
+                f"{self._ps_quote(remote_results_path)}) "
+                "{ Get-ChildItem -LiteralPath "
+                f"{self._ps_quote(remote_results_path)} "
+                "-Recurse -File -Filter '*.reports.zip' | Sort-Object FullName | "
+                "ForEach-Object { $_.FullName } }"
             )
         else:
             escaped_dir = shlex.quote(remote_results_path)

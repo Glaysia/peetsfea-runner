@@ -95,7 +95,7 @@ def build_5600x2_runner_config(project_root: Path) -> RunnerConfig:
         partition="debug-windows",
         cores=1,
         memory_gb=16,
-        job_internal_procs=1,
+        job_internal_procs=6,
         pool_target_per_account=1,
         repo_url="https://github.com/Glaysia/peetsfea-runner",
         release_tag="v2026.03.02-5600x2-r1",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import shlex
 import subprocess
 from hashlib import sha256
@@ -41,8 +42,16 @@ class SubprocessSpoolUploadClient:
     def _ps_quote(path: str) -> str:
         return "'" + path.replace("'", "''") + "'"
 
+    @staticmethod
+    def _powershell_encoded(script: str) -> str:
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        return f"powershell -NoProfile -EncodedCommand {encoded}"
+
     def _run_or_raise(self, args: list[str]) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(args, capture_output=True, text=True, check=False)
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, check=False, errors="replace")
+        except TypeError:
+            result = subprocess.run(args, capture_output=True, text=True, check=False)
         if result.returncode == 0:
             return result
 
@@ -53,13 +62,19 @@ class SubprocessSpoolUploadClient:
 
     def remote_file_exists(self, *, remote_host: str, remote_path: str) -> bool:
         if self._is_windows_path(remote_path):
-            check_cmd = (
-                "powershell -NoProfile -Command "
-                + shlex.quote(
-                    f"if (Test-Path -LiteralPath {self._ps_quote(remote_path)} -PathType Leaf) {{ exit 0 }} else {{ exit 1 }}"
-                )
+            check_cmd = self._powershell_encoded(
+                f"if (Test-Path -LiteralPath {self._ps_quote(remote_path)} -PathType Leaf) {{ exit 0 }} else {{ exit 1 }}"
             )
-            result = subprocess.run(["ssh", remote_host, check_cmd], capture_output=True, text=True, check=False)
+            try:
+                result = subprocess.run(
+                    ["ssh", remote_host, check_cmd],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    errors="replace",
+                )
+            except TypeError:
+                result = subprocess.run(["ssh", remote_host, check_cmd], capture_output=True, text=True, check=False)
             if result.returncode == 0:
                 return True
             if result.returncode == 1:
@@ -71,7 +86,16 @@ class SubprocessSpoolUploadClient:
             raise UploadClientError(f"command=ssh {remote_host} {check_cmd}; detail={detail}")
 
         check_cmd = f"test -f {shlex.quote(remote_path)}"
-        result = subprocess.run(["ssh", remote_host, check_cmd], capture_output=True, text=True, check=False)
+        try:
+            result = subprocess.run(
+                ["ssh", remote_host, check_cmd],
+                capture_output=True,
+                text=True,
+                check=False,
+                errors="replace",
+            )
+        except TypeError:
+            result = subprocess.run(["ssh", remote_host, check_cmd], capture_output=True, text=True, check=False)
         if result.returncode == 0:
             return True
         if result.returncode == 1:
@@ -89,17 +113,11 @@ class SubprocessSpoolUploadClient:
             remote_dir = str(PurePosixPath(remote_path).parent)
         tmp_remote_path = f"{remote_path}.part"
         if self._is_windows_path(remote_path):
-            mkdir_cmd = (
-                "powershell -NoProfile -Command "
-                + shlex.quote(
-                    f"New-Item -ItemType Directory -Force -Path {self._ps_quote(remote_dir)} | Out-Null"
-                )
+            mkdir_cmd = self._powershell_encoded(
+                f"New-Item -ItemType Directory -Force -Path {self._ps_quote(remote_dir)} | Out-Null"
             )
-            move_cmd = (
-                "powershell -NoProfile -Command "
-                + shlex.quote(
-                    f"Move-Item -LiteralPath {self._ps_quote(tmp_remote_path)} -Destination {self._ps_quote(remote_path)} -Force"
-                )
+            move_cmd = self._powershell_encoded(
+                f"Move-Item -LiteralPath {self._ps_quote(tmp_remote_path)} -Destination {self._ps_quote(remote_path)} -Force"
             )
         else:
             mkdir_cmd = f"mkdir -p {shlex.quote(remote_dir)}"
