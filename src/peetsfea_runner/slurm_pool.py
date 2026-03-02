@@ -169,6 +169,8 @@ class SubprocessSlurmClient:
             f"VENV_PATH={shlex.quote(self._REMOTE_VENV_PATH)}; "
             'if [ ! -d "$REPO_PATH" ]; then echo "missing repo: $REPO_PATH" >&2; exit 2; fi; '
             'if [ ! -x "$VENV_PATH/bin/python" ]; then echo "missing venv python: $VENV_PATH/bin/python" >&2; exit 3; fi; '
+            "source /etc/profile.d/modules.sh >/dev/null 2>&1 || true; "
+            "module load ansys-electronics/v252; "
             'cd "$REPO_PATH"; '
             '"$VENV_PATH/bin/python" -m peetsfea_runner.remote_worker '
             f"--spool-inbox {shlex.quote(account.spool_paths.inbox)} "
@@ -178,10 +180,7 @@ class SubprocessSlurmClient:
             f"--poll-sec {self._WORKER_POLL_SEC} "
             f"--internal-procs {policy.job_internal_procs}"
         )
-        wrap = (
-            "bash -lc "
-            + shlex.quote(worker_cmd)
-        )
+        wrap = "bash -lc " + shlex.quote(worker_cmd)
         submit_cmd = (
             "sbatch --parsable "
             f"--job-name {shlex.quote(job_name)} "
@@ -189,7 +188,7 @@ class SubprocessSlurmClient:
             f"--cpus-per-task {policy.cores} "
             f"--mem {policy.memory_gb}G "
             f"--export ALL,PEETSFEA_INTERNAL_PROCS={policy.job_internal_procs} "
-            f"--wrap {wrap}"
+            f"--wrap={shlex.quote(wrap)}"
         )
         result = self._run_or_raise(["ssh", account.ssh_alias, submit_cmd])
         job_id_field = result.stdout.strip().split(";", 1)[0]

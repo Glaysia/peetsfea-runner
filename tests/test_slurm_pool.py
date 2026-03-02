@@ -216,6 +216,7 @@ def test_subprocess_slurm_client_submit_uses_remote_worker_entrypoint(monkeypatc
     assert "--partition cpu2" in command
     assert "--cpus-per-task 32" in command
     assert "--mem 320G" in command
+    assert "module load ansys-electronics/v252" in command
     assert "python\" -m peetsfea_runner.remote_worker" in command
     assert "--spool-inbox /home1/harry261/peetsfea-spool/inbox" in command
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import socket
+import subprocess
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +31,29 @@ class PyAedtHfssAdapter(HfssAdapter):
     def __init__(self, *, internal_procs: int = 8) -> None:
         self._internal_procs = internal_procs
         self._app: object | None = None
+        self._ansys_process: subprocess.Popen[bytes] | None = None
+
+    def _pick_free_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def _launch_ansys_grpc(self, *, aedt_executable_path: str, port: int) -> subprocess.Popen[bytes]:
+        launch_cmd = (
+            "set -euo pipefail; "
+            "source /etc/profile.d/modules.sh >/dev/null 2>&1 || true; "
+            "module load ansys-electronics/v252; "
+            f"exec {aedt_executable_path} -ng -grpcsrv {port}"
+        )
+        process = subprocess.Popen(  # noqa: S603
+            ["bash", "-lc", launch_cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        sleep(6.0)
+        if process.poll() is not None:
+            raise RuntimeError(f"Failed to start ansysedt gRPC server on port {port}")
+        return process
 
     def open_project(self, *, aedt_path: Path, aedt_executable_path: str) -> None:
         hfs_cls = None
@@ -49,17 +74,27 @@ class PyAedtHfssAdapter(HfssAdapter):
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(f"Failed to import PyAEDT Hfss: {import_error or exc}") from exc
 
-        self._app = hfs_cls(
-            project=str(aedt_path),
-            non_graphical=True,
-            new_desktop_session=True,
-            close_on_exit=False,
-            aedt_process_id=None,
-            student_version=False,
-            specified_version=None,
-            aedt_exe_path=aedt_executable_path,
-            num_cores=self._internal_procs,
+        grpc_port = self._pick_free_port()
+        self._ansys_process = self._launch_ansys_grpc(
+            aedt_executable_path=aedt_executable_path,
+            port=grpc_port,
         )
+        try:
+            self._app = hfs_cls(
+                project=str(aedt_path),
+                non_graphical=True,
+                new_desktop=True,
+                close_on_exit=False,
+                aedt_process_id=None,
+                student_version=False,
+                remove_lock=True,
+                machine="localhost",
+                port=grpc_port,
+            )
+        except Exception:  # noqa: BLE001
+            self._stop_ansys_process(self._ansys_process)
+            self._ansys_process = None
+            raise
 
     def disable_auto_save(self) -> None:
         app = self._require_app()
@@ -119,24 +154,39 @@ class PyAedtHfssAdapter(HfssAdapter):
 
     def close(self) -> None:
         app = self._app
-        if app is None:
+        ansys_process = self._ansys_process
+        try:
+            if app is None:
+                return
+
+            release = getattr(app, "release_desktop", None)
+            if callable(release):
+                try:
+                    release(close_projects=True, close_desktop=True)
+                except TypeError:
+                    release()
+                finally:
+                    self._app = None
+                return
+
+            close_desktop = getattr(app, "close_desktop", None)
+            if callable(close_desktop):
+                close_desktop()
+
+            self._app = None
+        finally:
+            self._stop_ansys_process(ansys_process)
+            self._ansys_process = None
+
+    def _stop_ansys_process(self, process: subprocess.Popen[bytes] | None) -> None:
+        if process is None or process.poll() is not None:
             return
-
-        release = getattr(app, "release_desktop", None)
-        if callable(release):
-            try:
-                release(close_projects=True, close_desktop=True)
-            except TypeError:
-                release()
-            finally:
-                self._app = None
-            return
-
-        close_desktop = getattr(app, "close_desktop", None)
-        if callable(close_desktop):
-            close_desktop()
-
-        self._app = None
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
     def _require_app(self) -> object:
         if self._app is None:
