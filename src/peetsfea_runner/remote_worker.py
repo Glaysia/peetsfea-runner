@@ -105,7 +105,7 @@ class PyAedtHfssAdapter(HfssAdapter):
                     project=str(aedt_path),
                     non_graphical=False,
                     new_desktop=False,
-                    close_on_exit=False,
+                    close_on_exit=True,
                     student_version=False,
                     remove_lock=True,
                 )
@@ -131,7 +131,7 @@ class PyAedtHfssAdapter(HfssAdapter):
                 project=str(aedt_path),
                 non_graphical=not self._gui_mode,
                 new_desktop=False,
-                close_on_exit=False,
+                close_on_exit=True,
                 aedt_process_id=None,
                 student_version=False,
                 remove_lock=True,
@@ -197,17 +197,44 @@ class PyAedtHfssAdapter(HfssAdapter):
 
         export_method = getattr(post, "export_report_to_file", None)
         if callable(export_method):
+            extension = export_format if export_format.startswith(".") else f".{export_format}"
             try:
-                export_method(report_name, str(output_path))
-                return
+                exported_path = export_method(
+                    output_dir=str(output_path.parent),
+                    plot_name=report_name,
+                    extension=extension,
+                )
             except TypeError:
-                export_method(report_name, str(output_path), export_format)
+                exported_path = export_method(str(output_path.parent), report_name, extension)
+
+            candidate_paths: list[Path] = []
+            if isinstance(exported_path, str) and exported_path:
+                candidate_paths.append(Path(exported_path))
+            candidate_paths.append(output_path.parent / f"{report_name}{extension}")
+            candidate_paths.append(output_path)
+
+            for candidate in candidate_paths:
+                if not candidate.exists():
+                    continue
+                if candidate != output_path:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    if output_path.exists():
+                        output_path.unlink()
+                    candidate.replace(output_path)
                 return
+
+            raise RuntimeError(
+                f"Report export completed but no file found for report={report_name}, format={extension}"
+            )
 
         export_method = getattr(post, "export_report_from_name", None)
         if callable(export_method):
             export_method(report_name, str(output_path))
-            return
+            if output_path.exists():
+                return
+            raise RuntimeError(
+                f"Report export completed but no file found for report={report_name}, path={output_path}"
+            )
 
         raise RuntimeError("PyAEDT post has no report export method")
 

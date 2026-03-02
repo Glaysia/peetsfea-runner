@@ -5,8 +5,10 @@ import sys
 from pathlib import Path
 from zipfile import ZipFile
 
+import pytest
+
 from peetsfea_runner import remote_worker as remote_worker_module
-from peetsfea_runner.remote_worker import RemoteWorker, RemoteWorkerConfig
+from peetsfea_runner.remote_worker import PyAedtHfssAdapter, RemoteWorker, RemoteWorkerConfig
 
 
 class _SuccessAdapter:
@@ -36,6 +38,20 @@ class _SuccessAdapter:
 class _FailAnalyzeAdapter(_SuccessAdapter):
     def analyze(self) -> None:
         raise RuntimeError("analyze failed")
+
+
+class _PostExportToFile:
+    def __init__(self, *, create_file: bool) -> None:
+        self.create_file = create_file
+        self.calls: list[tuple[str, str, str]] = []
+
+    def export_report_to_file(self, output_dir: str, plot_name: str, extension: str) -> str:
+        self.calls.append((output_dir, plot_name, extension))
+        path = Path(output_dir) / f"{plot_name}{extension}"
+        if self.create_file:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("report")
+        return str(path)
 
 
 def _build_config(tmp_path: Path) -> RemoteWorkerConfig:
@@ -97,6 +113,29 @@ def test_remote_worker_resumes_preclaimed_task_without_inbox_file(tmp_path: Path
     assert claimed.exists() is False
     output_zip = config.spool_results / "task-3.reports.zip"
     assert output_zip.exists()
+
+
+def test_pyaedt_adapter_export_report_uses_output_dir_signature(tmp_path: Path) -> None:
+    adapter = PyAedtHfssAdapter(gui_mode=True)
+    post = _PostExportToFile(create_file=True)
+    adapter._app = type("App", (), {"post": post})()
+
+    output_path = tmp_path / "safe_report.csv"
+    adapter.export_report(report_name="Report S(1,1)", export_format="csv", output_path=output_path)
+
+    assert output_path.exists()
+    assert output_path.read_text(encoding="utf-8") == "report"
+    assert post.calls == [(str(tmp_path), "Report S(1,1)", ".csv")]
+
+
+def test_pyaedt_adapter_export_report_raises_when_file_missing(tmp_path: Path) -> None:
+    adapter = PyAedtHfssAdapter(gui_mode=True)
+    post = _PostExportToFile(create_file=False)
+    adapter._app = type("App", (), {"post": post})()
+
+    output_path = tmp_path / "missing.csv"
+    with pytest.raises(RuntimeError, match="no file found"):
+        adapter.export_report(report_name="Report S(1,1)", export_format="csv", output_path=output_path)
 
 
 def test_remote_worker_main_writes_startup_banner(tmp_path: Path, monkeypatch: object) -> None:

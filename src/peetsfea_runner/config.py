@@ -102,7 +102,7 @@ def build_5600x2_runner_config(project_root: Path) -> RunnerConfig:
         job_internal_procs=6,
         pool_target_per_account=1,
         repo_url="https://github.com/Glaysia/peetsfea-runner",
-        release_tag="v2026.03.02-5600x2-r2",
+        release_tag="v2026.03.02-5600x2-r4",
         aedt_executable_path=r"C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe",
         windows_launch_mode="interactive_task",
         windows_task_name="peetsfea-worker-win5600x2",
