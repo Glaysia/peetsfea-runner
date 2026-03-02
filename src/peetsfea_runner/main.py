@@ -46,6 +46,7 @@ SLURM_POLICY = SlurmPolicy(
     pool_target_per_account=1,
     repo_url="https://github.com/Glaysia/peetsfea-runner",
     release_tag="v2026.03.02-gate1-r2",
+    aedt_executable_path=r"C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe",
 )
 
 CONFIG = RunnerConfig(

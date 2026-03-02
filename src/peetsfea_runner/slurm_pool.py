@@ -243,6 +243,9 @@ class SubprocessSlurmClient:
         job_name = f"{policy.job_name_prefix}-{account.account_id}"
         self._ensure_remote_bootstrap(account=account, policy=policy)
         assert account.spool_paths is not None
+        aedt_flag = ""
+        if policy.aedt_executable_path:
+            aedt_flag = f" --aedt-executable-path {shlex.quote(policy.aedt_executable_path)}"
         worker_cmd = (
             "set -euo pipefail; "
             f"REPO_PATH={shlex.quote(self._REMOTE_REPO_PATH)}; "
@@ -259,6 +262,7 @@ class SubprocessSlurmClient:
             f"--spool-failed {shlex.quote(account.spool_paths.failed)} "
             f"--poll-sec {self._WORKER_POLL_SEC} "
             f"--internal-procs {policy.job_internal_procs}"
+            f"{aedt_flag}"
         )
         wrap = "bash -lc " + shlex.quote(worker_cmd)
         submit_cmd = (
@@ -281,6 +285,7 @@ class SubprocessSlurmClient:
     def _submit_windows_worker(self, *, account: WorkerAccount, policy: SlurmPolicy) -> str:
         self._ensure_remote_bootstrap(account=account, policy=policy)
         assert account.spool_paths is not None
+        aedt_executable_path = policy.aedt_executable_path or self._REMOTE_AEDT_PATH_WIN
 
         active = self._query_windows_workers(account=account)
         if active:
@@ -300,7 +305,7 @@ class SubprocessSlurmClient:
             f"'--spool-failed',{self._ps_quote(account.spool_paths.failed)},"
             f"'--poll-sec',{self._ps_quote(str(self._WORKER_POLL_SEC))},"
             f"'--internal-procs',{self._ps_quote(str(policy.job_internal_procs))},"
-            f"'--aedt-executable-path',{self._ps_quote(self._REMOTE_AEDT_PATH_WIN)},"
+            f"'--aedt-executable-path',{self._ps_quote(aedt_executable_path)},"
             "'--gui'"
             "); "
             "$proc=Start-Process -FilePath $python -ArgumentList $args -WorkingDirectory $repo -PassThru; "
