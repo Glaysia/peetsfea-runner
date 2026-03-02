@@ -501,14 +501,14 @@ def test_subprocess_slurm_client_windows_submit_uses_interactive_task_scheduler(
     assert pid == "13180"
     assert len(calls) == 3
     launch_script = _decode_powershell_script(calls[2][2])
-    assert "query user" in launch_script
     assert "Start-Sleep -Seconds 4" in launch_script
     assert "worker_died_after_launch" in launch_script
-    assert "Start-Process -FilePath $python -ArgumentList $args" in launch_script
+    assert "New-ScheduledTaskAction -Execute $py -Argument $arg" in launch_script
     assert "Register-ScheduledTask" in launch_script
     assert "Start-ScheduledTask" in launch_script
     assert "InteractiveToken" in launch_script
-    assert "'-X','faulthandler'" in launch_script
+    assert "LogonType Interactive -RunLevel Highest" in launch_script
+    assert "-X faulthandler -m peetsfea_runner.remote_worker" in launch_script
     assert r"C:\Program Files\ANSYS Inc\v252\AnsysEM\ansysedt.exe" in launch_script
 
 
