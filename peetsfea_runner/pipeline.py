@@ -84,6 +84,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
 
     run_id = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
     remote_run_dir = _join_remote_root(config.remote_root, run_id)
+    resolved_remote_run_dir = _resolve_remote_path(config, remote_run_dir)
 
     local_root = Path(config.local_artifacts_dir).expanduser().resolve()
     local_run_dir = local_root / run_id
@@ -104,7 +105,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         )
 
     try:
-        _prepare_remote_workspace(config, remote_run_dir)
+        _prepare_remote_workspace(config, resolved_remote_run_dir)
         with TemporaryDirectory(prefix="peetsfea_runner_") as tmpdir:
             tmpdir_path = Path(tmpdir)
             staged_project = tmpdir_path / "project.aedt"
@@ -113,18 +114,18 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             _upload_files(
                 config,
                 project_file=staged_project,
-                remote_run_dir=remote_run_dir,
+                remote_run_dir=resolved_remote_run_dir,
                 remote_script=remote_script,
             )
-        _run_remote_workflow_interactive(config, remote_run_dir=remote_run_dir, run_id=run_id)
-        _download_results(config, remote_run_dir=remote_run_dir, local_run_dir=local_run_dir)
-        _cleanup_remote_workspace(config, remote_run_dir=remote_run_dir)
+        _run_remote_workflow_interactive(config, remote_run_dir=resolved_remote_run_dir, run_id=run_id)
+        _download_results(config, remote_run_dir=resolved_remote_run_dir, local_run_dir=local_run_dir)
+        _cleanup_remote_workspace(config, remote_run_dir=resolved_remote_run_dir)
     except _WorkflowError as exc:
         return PipelineResult(
             success=False,
             exit_code=exc.exit_code,
             run_id=run_id,
-            remote_run_dir=remote_run_dir,
+            remote_run_dir=resolved_remote_run_dir,
             local_artifacts_dir=str(local_run_dir),
             summary=str(exc),
         )
@@ -133,7 +134,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         success=True,
         exit_code=EXIT_CODE_SUCCESS,
         run_id=run_id,
-        remote_run_dir=remote_run_dir,
+        remote_run_dir=resolved_remote_run_dir,
         local_artifacts_dir=str(local_run_dir),
         summary="Remote workflow completed successfully.",
     )
@@ -151,6 +152,49 @@ def _join_remote_root(remote_root: str, run_id: str) -> str:
     return run_id
 
 
+def _remote_path_for_shell(path: str) -> str:
+    if path == "~":
+        return "$HOME"
+    if path.startswith("~/"):
+        return f"$HOME/{path[2:]}"
+    return path
+
+
+def _resolve_remote_path(config: PipelineConfig, path: str) -> str:
+    if path == "~" or path.startswith("~/"):
+        remote_home = _get_remote_home(config)
+        if path == "~":
+            return remote_home
+        return f"{remote_home}/{path[2:]}"
+    return path
+
+
+def _get_remote_home(config: PipelineConfig) -> str:
+    result: dict[str, str] = {"home": ""}
+
+    def _query_home() -> None:
+        completed = subprocess.run(
+            ["ssh", config.host, "printf %s \"$HOME\""],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            stderr = (completed.stderr or "").strip()
+            stdout = (completed.stdout or "").strip()
+            details = stderr if stderr else stdout
+            if details:
+                raise _WorkflowError(f"ssh failed: {details}", exit_code=EXIT_CODE_SSH_FAILURE)
+            raise _WorkflowError("ssh failed while resolving remote home directory.", exit_code=EXIT_CODE_SSH_FAILURE)
+        home = (completed.stdout or "").strip()
+        if not home.startswith("/"):
+            raise _WorkflowError("Unable to resolve remote home directory.", exit_code=EXIT_CODE_SSH_FAILURE)
+        result["home"] = home
+
+    _run_with_retry("ssh", config.retry_count, _query_home)
+    return result["home"]
+
+
 class _WorkflowError(RuntimeError):
     def __init__(self, message: str, *, exit_code: int) -> None:
         super().__init__(message)
@@ -158,9 +202,11 @@ class _WorkflowError(RuntimeError):
 
 
 def _prepare_remote_workspace(config: PipelineConfig, remote_run_dir: str) -> None:
+    remote_path = _remote_path_for_shell(remote_run_dir)
+
     def _mkdir_remote() -> None:
         _run_subprocess(
-            ["ssh", config.host, f"mkdir -p {shlex.quote(remote_run_dir)}"],
+            ["ssh", config.host, f"mkdir -p {shlex.quote(remote_path)}"],
             stage="ssh",
             exit_code=EXIT_CODE_SSH_FAILURE,
         )
@@ -205,8 +251,9 @@ def _download_results(config: PipelineConfig, *, remote_run_dir: str, local_run_
 
 
 def _cleanup_remote_workspace(config: PipelineConfig, *, remote_run_dir: str) -> None:
+    remote_path = _remote_path_for_shell(remote_run_dir)
     _run_subprocess(
-        ["ssh", config.host, f"rm -rf {shlex.quote(remote_run_dir)}"],
+        ["ssh", config.host, f"rm -rf {shlex.quote(remote_path)}"],
         stage="remote cleanup",
         exit_code=EXIT_CODE_REMOTE_CLEANUP_FAILURE,
     )
@@ -215,6 +262,7 @@ def _cleanup_remote_workspace(config: PipelineConfig, *, remote_run_dir: str) ->
 def _run_remote_workflow_interactive(config: PipelineConfig, *, remote_run_dir: str, run_id: str) -> None:
     def _run_once() -> None:
         pexpect = _import_pexpect()
+        remote_path = _remote_path_for_shell(remote_run_dir)
         session = pexpect.spawn(f"ssh {config.host}", encoding="utf-8", timeout=60)
         try:
             _expect_prompt(session, timeout=60, stage="ssh")
@@ -224,7 +272,7 @@ def _run_remote_workflow_interactive(config: PipelineConfig, *, remote_run_dir: 
                 f"-c {config.cpus} --mem={config.mem} --time={config.time_limit} bash"
             )
             _run_interactive_command(session, srun_cmd, stage="srun", timeout=300)
-            _run_interactive_command(session, f"cd {shlex.quote(remote_run_dir)}", stage="srun", timeout=60)
+            _run_interactive_command(session, f"cd {shlex.quote(remote_path)}", stage="srun", timeout=60)
 
             session_name = f"aedt_{run_id}"
             quoted_script = shlex.quote(
@@ -362,11 +410,22 @@ def _build_remote_job_script_content() -> str:
         "  touch .env_initialized",
         "fi",
         "",
-        "python3 -m venv .venv",
-        "source .venv/bin/activate",
-        "python -m ensurepip --upgrade || true",
-        "python -m pip install --upgrade pip",
-        "python -m pip install pyaedt",
+        "VENV_DIR=\"$HOME/.peetsfea-runner-venv\"",
+        "if [ ! -x \"$VENV_DIR/bin/python\" ]; then",
+        "  echo \"[ERROR] Shared venv not found: $VENV_DIR\" >&2",
+        "  echo \"[ERROR] Run scripts/remote_bootstrap_install.sh first.\" >&2",
+        "  exit 1",
+        "fi",
+        "BASE_PREFIX=\"$($VENV_DIR/bin/python -c 'import sys; print(sys.base_prefix)')\"",
+        "export LD_LIBRARY_PATH=\"$BASE_PREFIX/lib:$HOME/miniconda3/lib:${LD_LIBRARY_PATH:-}\"",
+        "\"$VENV_DIR/bin/python\" -m ensurepip --upgrade || true",
+        "\"$VENV_DIR/bin/python\" -m pip install --upgrade pip",
+        "\"$VENV_DIR/bin/python\" -m pip install uv",
+        "if ! \"$VENV_DIR/bin/python\" -m uv --version >/dev/null 2>&1; then",
+        "  echo \"[ERROR] uv is not available in shared venv: $VENV_DIR\" >&2",
+        "  exit 1",
+        "fi",
+        "\"$VENV_DIR/bin/python\" -m uv pip install pyaedt==0.25.1",
         "cat > run_sim.py <<'PY'",
         "from __future__ import annotations",
         "",
@@ -377,6 +436,11 @@ def _build_remote_job_script_content() -> str:
         "from pathlib import Path",
         "",
         "from ansys.aedt.core import Hfss",
+        "",
+        "",
+        "AEDT_FILENAME: str = 'project.aedt'",
+        "USE_GRAPHIC: bool = False",
+        "ANSYS_EXECUTABLE: str = '/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt'",
         "",
         "",
         "def remove_lock_files(workdir: Path) -> None:",
@@ -395,7 +459,7 @@ def _build_remote_job_script_content() -> str:
         "",
         "",
         "def launch_ansys_grpc_server(port: int) -> subprocess.Popen:",
-        "    cmd = ['/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt', '-ng', '-grpcsrv', str(port)]",
+        "    cmd = [ANSYS_EXECUTABLE, '-ng', '-grpcsrv', str(port)]",
         "    process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
         "    time.sleep(6)",
         "    if process.poll() is not None:",
@@ -416,7 +480,7 @@ def _build_remote_job_script_content() -> str:
         "",
         "def main() -> None:",
         "    workdir = Path.cwd()",
-        "    project_file = workdir / 'project.aedt'",
+        "    project_file = workdir / AEDT_FILENAME",
         "    if not project_file.exists():",
         "        raise FileNotFoundError(f'AEDT file not found: {project_file}')",
         "",
@@ -424,17 +488,16 @@ def _build_remote_job_script_content() -> str:
         "    remove_lock_files(workdir)",
         "    grpc_port = get_available_port()",
         "    ansys_process = launch_ansys_grpc_server(grpc_port)",
-        "",
         "    hfss = None",
         "    try:",
         "        hfss = Hfss(",
-        "            non_graphical=True,",
-        "            new_desktop=True,",
+        "            non_graphical=(not USE_GRAPHIC),",
+        "            new_desktop=False,",
         "            machine='localhost',",
         "            port=grpc_port,",
         "            close_on_exit=True,",
         "        )",
-        "        hfss.solve_in_batch(file_name=str(project_file.resolve()), cores=cores, tasks=cores)",
+        "        hfss.solve_in_batch(file_name='./project.aedt', cores=cores, tasks=cores)",
         "        hfss.save_project()",
         "    finally:",
         "        if hfss is not None:",
@@ -445,7 +508,7 @@ def _build_remote_job_script_content() -> str:
         "if __name__ == '__main__':",
         "    main()",
         "PY",
-        "python run_sim.py",
+        "\"$VENV_DIR/bin/python\" run_sim.py",
     ]
     return "\n".join(lines) + "\n"
 
@@ -460,8 +523,10 @@ def _looks_like_single_window(output: str) -> bool:
     tokens = output.strip()
     if not tokens:
         return False
-    # Typical output is like "0$ bash"
-    return "$" in tokens and tokens.count("$") == 1
+    # screen -Q windows output format differs by environment:
+    # e.g. "0$ bash" or "0 main"
+    window_tokens = re.findall(r"(?:(?<=^)|(?<=\s))\d+\$?(?=\s)", tokens)
+    return len(window_tokens) == 1
 
 
 def _parse_exit_code(output: str) -> int:

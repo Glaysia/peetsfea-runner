@@ -1,0 +1,11 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Remote: Cleanup sim workspace",
+      "type": "shell",
+      "command": "ssh gate1-harry \"mkdir -p ~/aedt_runs && find ~/aedt_runs -mindepth 1 -maxdepth 1 ! -name .venv -exec rm -rf {} +\"",
+      "problemMatcher": []
+    }
+  ]
+}

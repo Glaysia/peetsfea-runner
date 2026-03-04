@@ -9,7 +9,8 @@
       "program": "${workspaceFolder}/runner.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "justMyCode": false
+      "justMyCode": false,
+      "postDebugTask": "Remote: Cleanup sim workspace"
     }
   ]
 }

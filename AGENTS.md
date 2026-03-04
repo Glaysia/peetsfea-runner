@@ -13,21 +13,11 @@
 ## Debug Policy
 
 1. 실행과 디버깅은 항상 `.vscode/launch.json`에 정의된 방식으로 수행한다.
-2. 디버깅 시 `debugmcp`에 붙어서 진행한다.
-3. 임의 실행 명령을 추가하지 않고 launch 설정을 기준으로 재현 가능하게 유지한다.
+2. 디버깅은 `pdb`를 기본 경로로 사용한다.
+3. 임의 실행 명령을 추가하지 않고 재현 가능한 방식으로 유지한다.
 
-`debugmcp` 설정 기준:
+`pdb` 실행 기준 예시:
 
-```json
-{
-  "mcpServers": {
-    "debugmcp": {
-      "autoApprove": [],
-      "disabled": false,
-      "timeout": 180,
-      "type": "sse",
-      "url": "http://localhost:3001/sse"
-    }
-  }
-}
+```bash
+.venv/bin/python -m pdb runner.py
 ```

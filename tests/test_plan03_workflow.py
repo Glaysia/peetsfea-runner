@@ -26,8 +26,16 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81", content)
         self.assertIn("module load ansys-electronics/v252", content)
         self.assertIn("if [ ! -f .env_initialized ]; then", content)
-        self.assertIn("python -m pip install pyaedt", content)
-        self.assertIn("python run_sim.py", content)
+        self.assertIn("VENV_DIR=\"$HOME/.peetsfea-runner-venv\"", content)
+        self.assertIn("Run scripts/remote_bootstrap_install.sh first.", content)
+        self.assertIn("BASE_PREFIX=\"$($VENV_DIR/bin/python -c 'import sys; print(sys.base_prefix)')\"", content)
+        self.assertIn("export LD_LIBRARY_PATH=\"$BASE_PREFIX/lib:$HOME/miniconda3/lib:${LD_LIBRARY_PATH:-}\"", content)
+        self.assertIn("\"$VENV_DIR/bin/python\" -m uv --version", content)
+        self.assertIn("\"$VENV_DIR/bin/python\" -m uv pip install pyaedt==0.25.1", content)
+        self.assertIn("\"$VENV_DIR/bin/python\" run_sim.py", content)
+        self.assertNotIn("python3 -m venv .venv", content)
+        self.assertNotIn("source .venv/bin/activate", content)
+        self.assertIn("new_desktop=False", content)
         self.assertIn("PEETS_CORES", content)
 
     def test_run_pipeline_remote_success_with_mocked_workflow(self) -> None:
