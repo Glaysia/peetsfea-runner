@@ -36,3 +36,5 @@
 2. 계산 노드에 `screen`, `python3`, `pip` 사용 가능
 3. `module load ansys-electronics/v252` 가능
 4. 라이선스 서버 `1055@172.16.10.81` 접근 가능
+
+다음 단계 로드맵 참조: [ROADMAP-post-05.md](./ROADMAP-post-05.md)
