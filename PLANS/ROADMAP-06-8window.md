@@ -1,69 +1,83 @@
-# ROADMAP 06: 1계정 1잡 1screen 8window
+# ROADMAP 06: 1계정 1잡 1screen 8window (wait-all 회수 우선)
 
 ## 목표/범위
 
 목표:
 
-1. 단일 Slurm 잡 내부 `screen` 1세션에 window 8개를 생성
-2. window당 `pyaedt` 1개, 코어 4개씩 총 8병렬 실행
-3. 결과 전량 다운로드 + 원격 정리(잔여 파일 0)
+1. 단일 Slurm 잡 내부 `screen` 1세션에 window 8개를 생성하고 동시에 실행한다.
+2. 8개 window를 모두 뿌린 뒤, 모든 window가 끝날 때까지 대기한다.
+3. 성공/실패와 무관하게 결과와 로그를 전량 다운로드한 뒤 배치를 종료한다.
+
+범위:
+
+1. 이번 단계는 1회 배치 실행만 다룬다.
+2. 상시 워커, 분석 자동화, 시스템 데몬 운영은 범위에서 제외한다.
 
 ## 아키텍처 변경점
 
-1. 단일 window 실행기를 multi-window 오케스트레이터로 확장
-2. window별 독립 작업 디렉토리(`case_01`~`case_08`) 도입
+1. 단일 window 실행기를 8-window 오케스트레이터로 확장한다.
+2. window별 독립 작업 디렉토리(`case_01`~`case_08`)를 도입한다.
+3. case 단위 상태 파일(`exit.code`, `run.log`)을 표준화한다.
 
 ## 인터페이스/API/스키마 변경
 
-1. 내부 설정 추가:
-   - `parallel_windows=8`
-   - `cores_per_window=4`
-2. 공개 API는 유지
+1. 공개 진입점은 `run_pipeline(config)` 단 하나를 유지한다.
+2. CLI 옵션/서브커맨드/추가 엔트리포인트는 추가하지 않는다.
+3. 내부 설정은 8-window 배치에 맞춰 확장 가능하나 함수 호출 경로는 유지한다.
 
 ## 실행 플로우
 
-1. 원격 run 디렉토리 생성
-2. case 디렉토리 8개 생성 및 입력 분배
-3. `screen -dmS <session>` 생성 후 window 8개 추가
-4. 각 window에서 독립 `runner` 실행
-5. window별 `exit.code` 집계
-6. 전체 결과 tar 생성/다운로드
-7. 원격 정리
+1. 원격 run 디렉토리 생성.
+2. `case_01`~`case_08` 디렉토리 생성 및 입력 `.aedt` 복제.
+3. `screen` 세션 1개 생성 후 window 8개 실행.
+4. 각 window가 독립적으로 실행하고 `exit.code`/`run.log` 생성.
+5. `fail-fast` 없이 8개 모두 종료될 때까지 `wait-all`.
+6. case별 `exit.code`를 집계하고 전체 요약 생성.
+7. 성공/실패 무관하게 결과 tar 생성 후 다운로드.
+8. 원격 정리 수행.
 
 ## 리소스 정책(코어/라이선스/계정/잡)
 
-1. 코어: `8 * 4 = 32` 고정
-2. 라이선스: 8동시 사용
-3. 계정: 1
-4. 잡: 1
+1. 코어: `8 * 4 = 32` 기준 유지.
+2. 라이선스: 8동시 사용 기준으로 운영.
+3. 계정: 1.
+4. 잡: 1.
 
 ## 실패 처리 및 복구 절차
 
-1. 개별 window 실패는 case 단위로 기록
-2. 실패 case 로그는 다운로드 후 `failed_cases.json`에 기록
-3. 모든 case 완료/실패 여부와 관계없이 원격 정리 수행
+1. 실패가 발생해도 즉시 중단하지 않고 `wait-all`을 유지한다.
+2. 모든 case 종료 후 성공/실패를 최종 집계한다.
+3. 결과 회수는 성공/실패와 무관하게 수행한다.
+4. 최종 결과는 `PipelineResult.summary`와 회수 산출물로 분석 가능해야 한다.
+
+## 산출물 표준
+
+1. case별 `exit.code`.
+2. case별 `run.log`.
+3. 공통 실행 로그(`remote_run.log` 등).
+4. 전체 요약(`summary` 또는 별도 집계 파일).
 
 ## 테스트/수용 기준
 
-1. 8 window 생성 검증
-2. case별 경로 충돌 없음 검증
-3. 성공 케이스 결과 누락 없음
-4. 실패 케이스 로그 수집 완료
-5. 원격 잔여 파일 0
+1. 8 window 생성 검증.
+2. `wait-all` 동작 검증(중간 실패가 있어도 종료 대기).
+3. 실패 case가 있어도 다운로드/회수 수행 검증.
+4. case별 `exit.code` 및 로그 누락 없음 검증.
+5. 원격 정리 완료 검증.
 
 ## 운영 체크리스트
 
-1. Slurm `-c 32` 확인
-2. 라이선스 여유 확인
-3. case별 입력/출력 경로 고유성 확인
+1. Slurm `-c 32` 확인.
+2. 라이선스 여유 확인.
+3. case별 경로 고유성 확인.
+4. 결과 아카이브에 실패 case 로그 포함 여부 확인.
 
 ## 롤백 기준
 
-1. 8병렬 성공률이 목표 미달이면 1window 모드로 즉시 롤백
+1. 8-window 배치가 안정 기준 미달이면 기존 1-window 배치로 롤백한다.
 
 ## 다음 단계 진입 조건
 
-1. 8병렬 E2E 3회 연속 성공
-2. 원격 정리 누락 0건
-3. [ROADMAP-07-80parallel-single-account.md](./ROADMAP-07-80parallel-single-account.md) 착수 승인
-
+1. 8-window E2E 3회 연속 수행에서 회수 누락 0건.
+2. `wait-all` 및 집계 정확성 검증 완료.
+3. [ROADMAP-07-80parallel-single-account.md](./ROADMAP-07-80parallel-single-account.md) 착수 승인.

@@ -497,7 +497,7 @@ def _build_remote_job_script_content() -> str:
         "            port=grpc_port,",
         "            close_on_exit=True,",
         "        )",
-        "        hfss.solve_in_batch(file_name='./project.aedt', cores=cores, tasks=cores)",
+        "        hfss.solve_in_batch(file_name='./project.aedt', cores=4, tasks=4)",
         "        hfss.save_project()",
         "    finally:",
         "        if hfss is not None:",

@@ -8,3 +8,5 @@ examples/
 **/*.egg-info/
 
 artifacts/
+
+.venv
