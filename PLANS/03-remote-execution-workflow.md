@@ -17,7 +17,7 @@
 
 ## Screen Internal One-Time Environment Setup
 
-아래 명령은 `screen` 세션 안에서 최초 1회만 실행한다.
+아래 명령은 매 `screen` 세션시작 시 실행한다.
 
 ```bash
 export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/AnsysEM
