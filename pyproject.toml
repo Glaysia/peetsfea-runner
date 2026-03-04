@@ -7,9 +7,10 @@ name = "peetsfea-runner"
 version = "0.1.0"
 description = "Function-only AEDT Slurm pipeline skeleton"
 requires-python = "==3.12"
-dependencies = []
+dependencies = [
+  "pexpect>=4.9",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["peetsfea_runner*"]
-
