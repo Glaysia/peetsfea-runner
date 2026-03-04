@@ -26,6 +26,9 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81", content)
         self.assertIn("module load ansys-electronics/v252", content)
         self.assertIn("if [ ! -f .env_initialized ]; then", content)
+        self.assertIn("python -m pip install pyaedt", content)
+        self.assertIn("python run_sim.py", content)
+        self.assertIn("PEETS_CORES", content)
 
     def test_run_pipeline_remote_success_with_mocked_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -43,6 +46,7 @@ class TestPlan03Workflow(unittest.TestCase):
                 patch("peetsfea_runner.pipeline._upload_files") as upload,
                 patch("peetsfea_runner.pipeline._run_remote_workflow_interactive") as interactive,
                 patch("peetsfea_runner.pipeline._download_results") as download,
+                patch("peetsfea_runner.pipeline._cleanup_remote_workspace") as cleanup,
             ):
                 result = run_pipeline(config)
 
@@ -52,6 +56,7 @@ class TestPlan03Workflow(unittest.TestCase):
             upload.assert_called_once()
             interactive.assert_called_once()
             download.assert_called_once()
+            cleanup.assert_called_once()
 
     def test_run_pipeline_remote_stage_failure_maps_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -72,12 +77,14 @@ class TestPlan03Workflow(unittest.TestCase):
                     "peetsfea_runner.pipeline._download_results",
                     side_effect=_WorkflowError("download failed", exit_code=EXIT_CODE_DOWNLOAD_FAILURE),
                 ),
+                patch("peetsfea_runner.pipeline._cleanup_remote_workspace") as cleanup,
             ):
                 result = run_pipeline(config)
 
             self.assertFalse(result.success)
             self.assertEqual(result.exit_code, EXIT_CODE_DOWNLOAD_FAILURE)
             self.assertIn("download failed", result.summary)
+            cleanup.assert_not_called()
 
     def test_retry_calls_action_again(self) -> None:
         from peetsfea_runner.pipeline import _run_with_retry

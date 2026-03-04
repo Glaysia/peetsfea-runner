@@ -6,3 +6,5 @@ examples/
 *.log
 
 **/*.egg-info/
+
+artifacts/

@@ -23,7 +23,7 @@
 
 ## Operational Acceptance Criteria
 
-1. 운영자가 태그를 지정해 `uv pip install git+...@<tag>` 설치 가능
+1. 운영자가 태그를 지정해 `~/.peetsfea-runner-venv/bin/python -m pip install "git+...@<tag>"` 설치 가능
 2. 원격 PC에서 함수 import 후 실행 가능
 3. `ssh -> srun --pty -> screen` 전체 단계 자동 수행
 4. 시뮬레이션 후 결과가 로컬 아티팩트 디렉토리에 존재

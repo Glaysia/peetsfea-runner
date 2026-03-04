@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ EXIT_CODE_SLURM_FAILURE: Final[int] = 11
 EXIT_CODE_SCREEN_FAILURE: Final[int] = 12
 EXIT_CODE_REMOTE_RUN_FAILURE: Final[int] = 13
 EXIT_CODE_DOWNLOAD_FAILURE: Final[int] = 14
+EXIT_CODE_REMOTE_CLEANUP_FAILURE: Final[int] = 15
 
 
 @dataclass(slots=True)
@@ -78,7 +80,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     if not isinstance(config, PipelineConfig):
         raise TypeError("config must be a PipelineConfig")
 
-    _ = config.validate()
+    project_file = config.validate()
 
     run_id = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
     remote_run_dir = _join_remote_root(config.remote_root, run_id)
@@ -105,10 +107,18 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         _prepare_remote_workspace(config, remote_run_dir)
         with TemporaryDirectory(prefix="peetsfea_runner_") as tmpdir:
             tmpdir_path = Path(tmpdir)
+            staged_project = tmpdir_path / "project.aedt"
+            shutil.copy2(project_file, staged_project)
             remote_script = _write_remote_job_script(tmpdir_path)
-            _upload_files(config, project_file=_, remote_run_dir=remote_run_dir, remote_script=remote_script)
+            _upload_files(
+                config,
+                project_file=staged_project,
+                remote_run_dir=remote_run_dir,
+                remote_script=remote_script,
+            )
         _run_remote_workflow_interactive(config, remote_run_dir=remote_run_dir, run_id=run_id)
         _download_results(config, remote_run_dir=remote_run_dir, local_run_dir=local_run_dir)
+        _cleanup_remote_workspace(config, remote_run_dir=remote_run_dir)
     except _WorkflowError as exc:
         return PipelineResult(
             success=False,
@@ -159,24 +169,15 @@ def _prepare_remote_workspace(config: PipelineConfig, remote_run_dir: str) -> No
 
 
 def _upload_files(config: PipelineConfig, *, project_file: Path, remote_run_dir: str, remote_script: Path) -> None:
-    repo_root = Path(__file__).resolve().parent.parent
     upload_targets = [
         str(project_file),
-        str((repo_root / "runner.py").resolve()),
-        str((repo_root / "pyproject.toml").resolve()),
         str(remote_script.resolve()),
     ]
-    package_dir = str((repo_root / "peetsfea_runner").resolve())
     remote_target = f"{config.host}:{remote_run_dir}/"
 
     def _scp_files() -> None:
         _run_subprocess(
             ["scp", *upload_targets, remote_target],
-            stage="scp upload",
-            exit_code=EXIT_CODE_SSH_FAILURE,
-        )
-        _run_subprocess(
-            ["scp", "-r", package_dir, remote_target],
             stage="scp upload",
             exit_code=EXIT_CODE_SSH_FAILURE,
         )
@@ -203,6 +204,14 @@ def _download_results(config: PipelineConfig, *, remote_run_dir: str, local_run_
     )
 
 
+def _cleanup_remote_workspace(config: PipelineConfig, *, remote_run_dir: str) -> None:
+    _run_subprocess(
+        ["ssh", config.host, f"rm -rf {shlex.quote(remote_run_dir)}"],
+        stage="remote cleanup",
+        exit_code=EXIT_CODE_REMOTE_CLEANUP_FAILURE,
+    )
+
+
 def _run_remote_workflow_interactive(config: PipelineConfig, *, remote_run_dir: str, run_id: str) -> None:
     def _run_once() -> None:
         pexpect = _import_pexpect()
@@ -218,7 +227,9 @@ def _run_remote_workflow_interactive(config: PipelineConfig, *, remote_run_dir: 
             _run_interactive_command(session, f"cd {shlex.quote(remote_run_dir)}", stage="srun", timeout=60)
 
             session_name = f"aedt_{run_id}"
-            quoted_script = shlex.quote("bash ./remote_job.sh > remote_run.log 2>&1; echo $? > exit.code")
+            quoted_script = shlex.quote(
+                f"PEETS_CORES={config.cpus} bash ./remote_job.sh > remote_run.log 2>&1; echo $? > exit.code"
+            )
             screen_cmd = f"screen -dmS {shlex.quote(session_name)} -t main bash -lc {quoted_script}"
             _run_interactive_command(session, screen_cmd, stage="screen", timeout=60)
 
@@ -246,7 +257,7 @@ def _run_remote_workflow_interactive(config: PipelineConfig, *, remote_run_dir: 
 
             _run_interactive_command(
                 session,
-                "tar -czf results.tgz .",
+                "tar --exclude='.venv' --exclude='results.tgz' --exclude='.env_initialized' -czf results.tgz .",
                 stage="remote run",
                 timeout=120,
             )
@@ -356,7 +367,85 @@ def _build_remote_job_script_content() -> str:
         "python -m ensurepip --upgrade || true",
         "python -m pip install --upgrade pip",
         "python -m pip install pyaedt",
-        "python runner.py",
+        "cat > run_sim.py <<'PY'",
+        "from __future__ import annotations",
+        "",
+        "import os",
+        "import socket",
+        "import subprocess",
+        "import time",
+        "from pathlib import Path",
+        "",
+        "from ansys.aedt.core import Hfss",
+        "",
+        "",
+        "def remove_lock_files(workdir: Path) -> None:",
+        "    for lock_file in workdir.glob('*.lock'):",
+        "        try:",
+        "            lock_file.unlink()",
+        "        except OSError as exc:",
+        "            raise OSError(f'Failed to remove lock file: {lock_file}') from exc",
+        "",
+        "",
+        "def get_available_port(host: str = '127.0.0.1') -> int:",
+        "    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:",
+        "        sock.bind((host, 0))",
+        "        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
+        "        return int(sock.getsockname()[1])",
+        "",
+        "",
+        "def launch_ansys_grpc_server(port: int) -> subprocess.Popen:",
+        "    cmd = ['/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt', '-ng', '-grpcsrv', str(port)]",
+        "    process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+        "    time.sleep(6)",
+        "    if process.poll() is not None:",
+        "        raise RuntimeError(f'Failed to start ansysedt gRPC server on port {port}')",
+        "    return process",
+        "",
+        "",
+        "def stop_process(process: subprocess.Popen) -> None:",
+        "    if process.poll() is not None:",
+        "        return",
+        "    process.terminate()",
+        "    try:",
+        "        process.wait(timeout=10)",
+        "    except subprocess.TimeoutExpired:",
+        "        process.kill()",
+        "        process.wait(timeout=5)",
+        "",
+        "",
+        "def main() -> None:",
+        "    workdir = Path.cwd()",
+        "    project_file = workdir / 'project.aedt'",
+        "    if not project_file.exists():",
+        "        raise FileNotFoundError(f'AEDT file not found: {project_file}')",
+        "",
+        "    cores = int(os.environ.get('PEETS_CORES', '32'))",
+        "    remove_lock_files(workdir)",
+        "    grpc_port = get_available_port()",
+        "    ansys_process = launch_ansys_grpc_server(grpc_port)",
+        "",
+        "    hfss = None",
+        "    try:",
+        "        hfss = Hfss(",
+        "            non_graphical=True,",
+        "            new_desktop=True,",
+        "            machine='localhost',",
+        "            port=grpc_port,",
+        "            close_on_exit=True,",
+        "        )",
+        "        hfss.solve_in_batch(file_name=str(project_file.resolve()), cores=cores, tasks=cores)",
+        "        hfss.save_project()",
+        "    finally:",
+        "        if hfss is not None:",
+        "            hfss.release_desktop(close_projects=True, close_desktop=True)",
+        "        stop_process(ansys_process)",
+        "",
+        "",
+        "if __name__ == '__main__':",
+        "    main()",
+        "PY",
+        "python run_sim.py",
     ]
     return "\n".join(lines) + "\n"
 
