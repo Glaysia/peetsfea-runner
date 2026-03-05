@@ -9,19 +9,23 @@ from peetsfea_runner.scheduler import JobSpec, calculate_effective_slots, run_jo
 
 
 class TestScheduler(unittest.TestCase):
-    def test_effective_slots_uses_min_formula(self) -> None:
-        slots = calculate_effective_slots(
-            max_jobs_per_account=10,
-            license_cap_per_account=80,
-            windows_per_job=8,
-        )
+    def test_effective_slots_uses_max_jobs_per_account(self) -> None:
+        slots = calculate_effective_slots(max_jobs_per_account=10)
         self.assertEqual(slots, 10)
 
     def test_run_jobs_with_slots_caps_max_inflight(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             jobs = [
-                JobSpec(job_id=f"job_{idx:04d}", job_index=idx, aedt_path=base / f"file_{idx}.aedt")
+                JobSpec(
+                    job_id=f"job_{idx:04d}",
+                    job_index=idx,
+                    input_path=base / f"file_{idx}.aedt",
+                    relative_path=Path(f"file_{idx}.aedt"),
+                    output_dir=base / f"out_{idx}.aedt_all",
+                    account_id="account_01",
+                    host_alias="gate1-harry",
+                )
                 for idx in range(1, 81)
             ]
 

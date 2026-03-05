@@ -3,134 +3,153 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import duckdb
 
-from peetsfea_runner import PipelineConfig, run_pipeline
+from peetsfea_runner import AccountConfig, PipelineConfig, run_pipeline
 from peetsfea_runner.pipeline import EXIT_CODE_SUCCESS, PipelineResult
+from peetsfea_runner.remote_job import CaseExecutionSummary, RemoteJobAttemptResult
 
 
 class TestPipelineApi(unittest.TestCase):
-    def test_defaults_match_roadmap07(self) -> None:
+    def test_defaults_match_roadmap09(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            input_dir = Path(tmpdir) / "inputs"
+            input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            (input_dir / "sample.aedt").write_text("placeholder", encoding="utf-8")
-
-            config = PipelineConfig(input_aedt_dir=str(input_dir))
-
-            self.assertEqual(config.host, "gate1-harry")
-            self.assertEqual(config.partition, "cpu2")
-            self.assertEqual(config.nodes, 1)
-            self.assertEqual(config.ntasks, 1)
-            self.assertEqual(config.cpus_per_job, 32)
-            self.assertEqual(config.mem, "320G")
-            self.assertEqual(config.time_limit, "05:00:00")
-            self.assertEqual(config.remote_root, "~/aedt_runs")
-            self.assertEqual(config.local_artifacts_dir, "./artifacts")
-            self.assertEqual(config.execute_remote, False)
-            self.assertEqual(config.max_jobs_per_account, 10)
-            self.assertEqual(config.windows_per_job, 8)
-            self.assertEqual(config.cores_per_window, 4)
-            self.assertEqual(config.license_cap_per_account, 80)
-            self.assertEqual(config.job_retry_count, 1)
-            self.assertEqual(config.scan_recursive, False)
-            self.assertEqual(config.metadata_db_path, "./peetsfea_runner.duckdb")
+            (input_dir / "sample.aedt").write_text("x", encoding="utf-8")
+            config = PipelineConfig(input_queue_dir=str(input_dir))
+            self.assertEqual(config.output_root_dir, "./output")
+            self.assertTrue(config.delete_input_after_upload)
+            self.assertEqual(config.delete_failed_quarantine_dir, "./output/_delete_failed")
+            self.assertTrue(config.license_observe_only)
+            self.assertEqual(len(config.accounts_registry), 1)
 
     def test_validate_rejects_missing_directory(self) -> None:
-        missing = Path(tempfile.gettempdir()) / "definitely_missing_dir_for_aedt_scan"
-        config = PipelineConfig(input_aedt_dir=str(missing))
+        missing = Path(tempfile.gettempdir()) / "missing_input_queue"
+        config = PipelineConfig(input_queue_dir=str(missing))
         with self.assertRaises(FileNotFoundError):
             config.validate()
 
-    def test_validate_rejects_non_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            file_path = Path(tmpdir) / "single.aedt"
-            file_path.write_text("placeholder", encoding="utf-8")
-            config = PipelineConfig(input_aedt_dir=str(file_path))
-            with self.assertRaises(ValueError):
-                config.validate()
-
     def test_validate_rejects_no_aedt_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            input_dir = Path(tmpdir) / "inputs"
+            input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            (input_dir / "not_aedt.txt").write_text("x", encoding="utf-8")
-            config = PipelineConfig(input_aedt_dir=str(input_dir))
+            (input_dir / "x.txt").write_text("x", encoding="utf-8")
+            config = PipelineConfig(input_queue_dir=str(input_dir))
             with self.assertRaises(ValueError):
                 config.validate()
 
-    def test_run_pipeline_fails_explicitly_when_no_aedt_files(self) -> None:
+    def test_dry_run_creates_mirrored_aedt_all_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            input_dir = Path(tmpdir) / "inputs"
-            input_dir.mkdir(parents=True, exist_ok=True)
-            (input_dir / "not_aedt.txt").write_text("x", encoding="utf-8")
-            config = PipelineConfig(input_aedt_dir=str(input_dir))
-            with self.assertRaises(ValueError):
-                run_pipeline(config)
-
-    def test_validate_non_recursive_scan_excludes_nested_aedt(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            input_dir = Path(tmpdir) / "inputs"
-            nested = input_dir / "nested"
+            input_dir = Path(tmpdir) / "in"
+            nested = input_dir / "a" / "b"
             nested.mkdir(parents=True, exist_ok=True)
-            top_file = input_dir / "top.aedt"
-            nested_file = nested / "nested.aedt"
-            top_file.write_text("top", encoding="utf-8")
-            nested_file.write_text("nested", encoding="utf-8")
-
-            config = PipelineConfig(input_aedt_dir=str(input_dir), scan_recursive=False)
-            files = config.validate()
-            self.assertEqual(files, [top_file.resolve()])
-
-    def test_validate_rejects_insufficient_cpus_for_layout(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            input_dir = Path(tmpdir) / "inputs"
-            input_dir.mkdir(parents=True, exist_ok=True)
-            (input_dir / "sample.aedt").write_text("placeholder", encoding="utf-8")
-            config = PipelineConfig(
-                input_aedt_dir=str(input_dir),
-                cpus_per_job=31,
-                windows_per_job=8,
-                cores_per_window=4,
-            )
-            with self.assertRaises(ValueError):
-                config.validate()
-
-    def test_run_pipeline_returns_success_result_for_dry_run(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            input_dir = Path(tmpdir) / "inputs"
-            input_dir.mkdir(parents=True, exist_ok=True)
-            (input_dir / "a_01.aedt").write_text("placeholder", encoding="utf-8")
-            (input_dir / "a_02.aedt").write_text("placeholder", encoding="utf-8")
-
-            output_root = Path(tmpdir) / "artifacts"
+            (nested / "foo.aedt").write_text("placeholder", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
             config = PipelineConfig(
-                input_aedt_dir=str(input_dir),
-                local_artifacts_dir=str(output_root),
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
                 metadata_db_path=str(db_path),
+                execute_remote=False,
             )
+
             result = run_pipeline(config)
 
+            expected = output_root / "a" / "b" / "foo.aedt.aedt_all"
+            self.assertTrue(expected.is_dir())
             self.assertIsInstance(result, PipelineResult)
             self.assertTrue(result.success)
             self.assertEqual(result.exit_code, EXIT_CODE_SUCCESS)
-            self.assertEqual(result.total_jobs, 2)
-            self.assertEqual(result.success_jobs, 2)
-            self.assertEqual(result.failed_jobs, 0)
-            self.assertEqual(result.quarantined_jobs, 0)
-            self.assertTrue(Path(result.local_artifacts_dir).is_dir())
-            self.assertTrue(db_path.exists())
-            self.assertIn("total_jobs=2", result.summary)
+            self.assertEqual(result.total_jobs, 1)
             self.assertIn("failed_job_ids=[]", result.summary)
 
+    def test_upload_success_deletes_input_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "foo.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=True,
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+            )
+
+            def _mock_attempt(*, on_upload_success=None, **kwargs):
+                if on_upload_success is not None:
+                    on_upload_success()
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=0,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=8, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+            ):
+                run_pipeline(config)
+
+            self.assertFalse(input_file.exists())
             conn = duckdb.connect(str(db_path))
             try:
-                job_count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-                self.assertEqual(job_count, 2)
+                state = conn.execute(
+                    "SELECT delete_final_state FROM file_lifecycle ORDER BY updated_at DESC LIMIT 1"
+                ).fetchone()[0]
             finally:
                 conn.close()
+            self.assertEqual(state, "DELETED")
+
+    def test_delete_failure_moves_to_quarantine(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "foo.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            quarantine_root = Path(tmpdir) / "delete_failed"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                delete_failed_quarantine_dir=str(quarantine_root),
+                metadata_db_path=str(db_path),
+                execute_remote=True,
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+            )
+
+            def _mock_attempt(*, on_upload_success=None, **kwargs):
+                if on_upload_success is not None:
+                    on_upload_success()
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=0,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=8, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("pathlib.Path.unlink", side_effect=OSError("locked")),
+            ):
+                run_pipeline(config)
+
+            quarantined_path = quarantine_root / "foo.aedt"
+            self.assertTrue(quarantined_path.exists())
 
 
 if __name__ == "__main__":

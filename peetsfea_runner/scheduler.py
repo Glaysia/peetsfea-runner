@@ -14,7 +14,11 @@ T = TypeVar("T")
 class JobSpec:
     job_id: str
     job_index: int
-    aedt_path: Path
+    input_path: Path
+    relative_path: Path
+    output_dir: Path
+    account_id: str
+    host_alias: str
 
 
 @dataclass(slots=True)
@@ -23,17 +27,10 @@ class ScheduledBatchResult(Generic[T]):
     max_inflight: int
 
 
-def calculate_effective_slots(*, max_jobs_per_account: int, license_cap_per_account: int, windows_per_job: int) -> int:
+def calculate_effective_slots(*, max_jobs_per_account: int) -> int:
     if max_jobs_per_account <= 0:
         raise ValueError("max_jobs_per_account must be > 0")
-    if license_cap_per_account <= 0:
-        raise ValueError("license_cap_per_account must be > 0")
-    if windows_per_job <= 0:
-        raise ValueError("windows_per_job must be > 0")
-    slots = min(max_jobs_per_account, license_cap_per_account // windows_per_job)
-    if slots <= 0:
-        raise ValueError("effective job slots must be >= 1")
-    return slots
+    return max_jobs_per_account
 
 
 def run_jobs_with_slots(

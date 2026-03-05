@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .constants import (
     EXIT_CODE_DOWNLOAD_FAILURE,
@@ -71,6 +71,7 @@ def run_remote_job_attempt(
     remote_job_dir: str,
     local_job_dir: Path,
     session_name: str,
+    on_upload_success: Callable[[], None] | None = None,
 ) -> RemoteJobAttemptResult:
     case_summary: CaseExecutionSummary | None = None
     local_job_dir.mkdir(parents=True, exist_ok=True)
@@ -93,6 +94,8 @@ def run_remote_job_attempt(
                 remote_job_dir=resolved_remote_job_dir,
                 remote_script=remote_script,
             )
+            if on_upload_success is not None:
+                on_upload_success()
         case_summary = _run_remote_workflow_interactive(
             config,
             remote_job_dir=resolved_remote_job_dir,

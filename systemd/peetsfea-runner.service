@@ -1,0 +1,25 @@
+[Unit]
+Description=Peets FEA Runner Worker (user service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/PythonProjects/peetsfea-runner
+Environment=PEETSFEA_INPUT_QUEUE_DIR=%h/Projects/PythonProjects/peetsfea-runner/input_queue
+Environment=PEETSFEA_OUTPUT_ROOT_DIR=%h/Projects/PythonProjects/peetsfea-runner/output
+Environment=PEETSFEA_DELETE_FAILED_DIR=%h/Projects/PythonProjects/peetsfea-runner/output/_delete_failed
+Environment=PEETSFEA_DB_PATH=%h/Projects/PythonProjects/peetsfea-runner/peetsfea_runner.duckdb
+Environment=PEETSFEA_ACCOUNT_ID=account_01
+Environment=PEETSFEA_HOST_ALIAS=gate1-harry
+Environment=PEETSFEA_MAX_JOBS_PER_ACCOUNT=10
+Environment=PEETSFEA_EXECUTE_REMOTE=true
+Environment=PEETSFEA_PARTITION=cpu2
+Environment=PEETSFEA_REMOTE_ROOT=~/aedt_runs
+Environment=PEETSFEA_POLL_SECONDS=30
+ExecStart=%h/Projects/PythonProjects/peetsfea-runner/.venv/bin/python -c "from peetsfea_runner.systemd_worker import run_user_worker_loop; run_user_worker_loop()"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

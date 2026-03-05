@@ -1,4 +1,3 @@
-examples/
 **/__pycache__/
 *.pyc
 *.pyo
@@ -7,9 +6,10 @@ examples/
 
 **/*.egg-info/
 
-artifacts/
-
 .venv
 
 *.duckdb
 *.duckdb.wal
+
+input_queue/*
+output/*
