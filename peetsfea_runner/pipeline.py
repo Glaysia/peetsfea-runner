@@ -35,6 +35,8 @@ class PipelineConfig:
     remote_root: str = "~/aedt_runs"
     local_artifacts_dir: str = "./artifacts"
     execute_remote: bool = False
+    parallel_windows: int = 8
+    cores_per_window: int = 4
 
     def validate(self) -> Path:
         candidate = Path(self.input_aedt_path).expanduser()
@@ -62,6 +64,11 @@ class PipelineConfig:
             raise ValueError("remote_root must not be empty")
         if not self.local_artifacts_dir.strip():
             raise ValueError("local_artifacts_dir must not be empty")
+        _ensure_positive("parallel_windows", self.parallel_windows)
+        _ensure_positive("cores_per_window", self.cores_per_window)
+        required_cpus = self.parallel_windows * self.cores_per_window
+        if self.cpus < required_cpus:
+            raise ValueError(f"cpus must be >= parallel_windows * cores_per_window ({required_cpus})")
 
         return candidate.resolve()
 
@@ -74,6 +81,17 @@ class PipelineResult:
     remote_run_dir: str
     local_artifacts_dir: str
     summary: str
+
+
+@dataclass(slots=True)
+class _CaseExecutionSummary:
+    success_cases: int
+    failed_cases: int
+    case_lines: list[str]
+
+    @property
+    def success(self) -> bool:
+        return self.failed_cases == 0
 
 
 def run_pipeline(config: PipelineConfig) -> PipelineResult:
@@ -104,6 +122,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             summary=summary,
         )
 
+    case_summary: _CaseExecutionSummary | None = None
     try:
         _prepare_remote_workspace(config, resolved_remote_run_dir)
         with TemporaryDirectory(prefix="peetsfea_runner_") as tmpdir:
@@ -117,7 +136,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 remote_run_dir=resolved_remote_run_dir,
                 remote_script=remote_script,
             )
-        _run_remote_workflow_interactive(config, remote_run_dir=resolved_remote_run_dir, run_id=run_id)
+        case_summary = _run_remote_workflow_interactive(config, remote_run_dir=resolved_remote_run_dir, run_id=run_id)
         _download_results(config, remote_run_dir=resolved_remote_run_dir, local_run_dir=local_run_dir)
         _cleanup_remote_workspace(config, remote_run_dir=resolved_remote_run_dir)
     except _WorkflowError as exc:
@@ -130,13 +149,32 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             summary=str(exc),
         )
 
+    if case_summary is not None and not case_summary.success:
+        failed_items = ", ".join(case_summary.case_lines)
+        return PipelineResult(
+            success=False,
+            exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+            run_id=run_id,
+            remote_run_dir=resolved_remote_run_dir,
+            local_artifacts_dir=str(local_run_dir),
+            summary=(
+                f"{config.parallel_windows} cases completed "
+                f"(success={case_summary.success_cases}, failed={case_summary.failed_cases}). "
+                f"failed_cases={failed_items}"
+            ),
+        )
+
     return PipelineResult(
         success=True,
         exit_code=EXIT_CODE_SUCCESS,
         run_id=run_id,
         remote_run_dir=resolved_remote_run_dir,
         local_artifacts_dir=str(local_run_dir),
-        summary="Remote workflow completed successfully.",
+        summary=(
+            f"{config.parallel_windows} cases completed "
+            f"(success={case_summary.success_cases if case_summary else 0}, "
+            f"failed={case_summary.failed_cases if case_summary else 0})."
+        ),
     )
 
 
@@ -259,7 +297,9 @@ def _cleanup_remote_workspace(config: PipelineConfig, *, remote_run_dir: str) ->
     )
 
 
-def _run_remote_workflow_interactive(config: PipelineConfig, *, remote_run_dir: str, run_id: str) -> None:
+def _run_remote_workflow_interactive(config: PipelineConfig, *, remote_run_dir: str, run_id: str) -> _CaseExecutionSummary:
+    result: dict[str, _CaseExecutionSummary] = {}
+
     def _run_once() -> None:
         pexpect = _import_pexpect()
         remote_path = _remote_path_for_shell(remote_run_dir)
@@ -275,33 +315,73 @@ def _run_remote_workflow_interactive(config: PipelineConfig, *, remote_run_dir: 
             _run_interactive_command(session, f"cd {shlex.quote(remote_path)}", stage="srun", timeout=60)
 
             session_name = f"aedt_{run_id}"
-            quoted_script = shlex.quote(
-                f"PEETS_CORES={config.cpus} bash ./remote_job.sh > remote_run.log 2>&1; echo $? > exit.code"
+            _run_interactive_command(
+                session,
+                f"for i in $(seq 1 {config.parallel_windows}); do "
+                "case_dir=$(printf 'case_%02d' \"$i\"); "
+                "mkdir -p \"$case_dir\"; "
+                "cp -f project.aedt \"$case_dir/project.aedt\"; "
+                "done",
+                stage="remote run",
+                timeout=120,
             )
-            screen_cmd = f"screen -dmS {shlex.quote(session_name)} -t main bash -lc {quoted_script}"
-            _run_interactive_command(session, screen_cmd, stage="screen", timeout=60)
+
+            first_window_cmd = _build_case_window_command(
+                case_index=1,
+                cores_per_window=config.cores_per_window,
+            )
+            _run_interactive_command(
+                session,
+                f"screen -dmS {shlex.quote(session_name)} -t case_01 bash -lc {shlex.quote(first_window_cmd)}",
+                stage="screen",
+                timeout=60,
+            )
+
+            for case_index in range(2, config.parallel_windows + 1):
+                case_name = f"case_{case_index:02d}"
+                case_cmd = _build_case_window_command(
+                    case_index=case_index,
+                    cores_per_window=config.cores_per_window,
+                )
+                _run_interactive_command(
+                    session,
+                    (
+                        f"screen -S {shlex.quote(session_name)} -X screen "
+                        f"-t {shlex.quote(case_name)} bash -lc {shlex.quote(case_cmd)}"
+                    ),
+                    stage="screen",
+                    timeout=60,
+                )
 
             windows_output = _run_interactive_command(
                 session, f"screen -S {shlex.quote(session_name)} -Q windows", stage="screen", timeout=60
             )
-            if not _looks_like_single_window(windows_output):
+            if _count_screen_windows(windows_output) != config.parallel_windows:
                 raise _WorkflowError("Screen window validation failed.", exit_code=EXIT_CODE_SCREEN_FAILURE)
 
             wait_timeout = _time_limit_to_seconds(config.time_limit) + 600
             _run_interactive_command(
                 session,
-                "while [ ! -f exit.code ]; do sleep 5; done",
+                _build_wait_all_command(config.parallel_windows),
                 stage="remote run",
                 timeout=wait_timeout,
             )
 
-            exit_code_output = _run_interactive_command(session, "cat exit.code", stage="remote run", timeout=30)
-            remote_exit = _parse_exit_code(exit_code_output)
-            if remote_exit != 0:
-                raise _WorkflowError(
-                    f"Remote simulation failed with exit code {remote_exit}.",
-                    exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
-                )
+            _run_interactive_command(
+                session,
+                _build_case_aggregation_command(config.parallel_windows),
+                stage="remote run",
+                timeout=60,
+            )
+            failed_count_output = _run_interactive_command(session, "cat failed.count", stage="remote run", timeout=30)
+            failed_count = _parse_exit_code(failed_count_output)
+            case_summary_output = _run_interactive_command(session, "cat case_summary.txt", stage="remote run", timeout=30)
+            case_lines = _parse_case_summary_lines(case_summary_output)
+            result["summary"] = _CaseExecutionSummary(
+                success_cases=config.parallel_windows - failed_count,
+                failed_cases=failed_count,
+                case_lines=case_lines,
+            )
 
             _run_interactive_command(
                 session,
@@ -322,6 +402,7 @@ def _run_remote_workflow_interactive(config: PipelineConfig, *, remote_run_dir: 
         _run_once,
         retryable_exit_codes={EXIT_CODE_SLURM_FAILURE},
     )
+    return result["summary"]
 
 
 def _import_pexpect():
@@ -418,14 +499,28 @@ def _build_remote_job_script_content() -> str:
         "fi",
         "BASE_PREFIX=\"$($VENV_DIR/bin/python -c 'import sys; print(sys.base_prefix)')\"",
         "export LD_LIBRARY_PATH=\"$BASE_PREFIX/lib:$HOME/miniconda3/lib:${LD_LIBRARY_PATH:-}\"",
-        "\"$VENV_DIR/bin/python\" -m ensurepip --upgrade || true",
-        "\"$VENV_DIR/bin/python\" -m pip install --upgrade pip",
-        "\"$VENV_DIR/bin/python\" -m pip install uv",
-        "if ! \"$VENV_DIR/bin/python\" -m uv --version >/dev/null 2>&1; then",
-        "  echo \"[ERROR] uv is not available in shared venv: $VENV_DIR\" >&2",
-        "  exit 1",
+        "DEPS_READY_MARKER=\"$VENV_DIR/.peets_deps_ready\"",
+        "DEPS_LOCK_DIR=\"$VENV_DIR/.peets_deps_lock\"",
+        "while ! mkdir \"$DEPS_LOCK_DIR\" 2>/dev/null; do",
+        "  sleep 1",
+        "done",
+        "cleanup_deps_lock() {",
+        "  rmdir \"$DEPS_LOCK_DIR\" 2>/dev/null || true",
+        "}",
+        "trap cleanup_deps_lock EXIT",
+        "if [ ! -f \"$DEPS_READY_MARKER\" ]; then",
+        "  \"$VENV_DIR/bin/python\" -m ensurepip --upgrade || true",
+        "  \"$VENV_DIR/bin/python\" -m pip install --upgrade pip",
+        "  \"$VENV_DIR/bin/python\" -m pip install uv",
+        "  if ! \"$VENV_DIR/bin/python\" -m uv --version >/dev/null 2>&1; then",
+        "    echo \"[ERROR] uv is not available in shared venv: $VENV_DIR\" >&2",
+        "    exit 1",
+        "  fi",
+        "  \"$VENV_DIR/bin/python\" -m uv pip install pyaedt==0.25.1",
+        "  touch \"$DEPS_READY_MARKER\"",
         "fi",
-        "\"$VENV_DIR/bin/python\" -m uv pip install pyaedt==0.25.1",
+        "trap - EXIT",
+        "cleanup_deps_lock",
         "cat > run_sim.py <<'PY'",
         "from __future__ import annotations",
         "",
@@ -497,8 +592,14 @@ def _build_remote_job_script_content() -> str:
         "            port=grpc_port,",
         "            close_on_exit=True,",
         "        )",
-        "        hfss.solve_in_batch(file_name='./project.aedt', cores=4, tasks=4)",
-        "        hfss.save_project()",
+        "        hfss.solve_in_batch(file_name='./project.aedt', cores=cores, tasks=cores)",
+        "        # Batch solve output is already persisted in project artifacts.",
+        "        # save_project() can intermittently fail on shared Ansoft temp path",
+        "        # even when simulation completed normally; treat it as non-fatal.",
+        "        try:",
+        "            hfss.save_project()",
+        "        except Exception as exc:",
+        "            print(f'[WARN] save_project failed but solve completed: {exc}')",
         "    finally:",
         "        if hfss is not None:",
         "            hfss.release_desktop(close_projects=True, close_desktop=True)",
@@ -519,14 +620,70 @@ def _write_remote_job_script(tmpdir: Path) -> Path:
     return script
 
 
-def _looks_like_single_window(output: str) -> bool:
+def _count_screen_windows(output: str) -> int:
     tokens = output.strip()
     if not tokens:
-        return False
+        return 0
     # screen -Q windows output format differs by environment:
     # e.g. "0$ bash" or "0 main"
     window_tokens = re.findall(r"(?:(?<=^)|(?<=\s))\d+\$?(?=\s)", tokens)
-    return len(window_tokens) == 1
+    return len(window_tokens)
+
+
+def _build_case_window_command(*, case_index: int, cores_per_window: int) -> str:
+    case_name = f"case_{case_index:02d}"
+    return (
+        f"cd {shlex.quote(case_name)} && "
+        f"PEETS_CORES={cores_per_window} bash ../remote_job.sh > run.log 2>&1; "
+        "echo $? > exit.code"
+    )
+
+
+def _build_wait_all_command(parallel_windows: int) -> str:
+    return (
+        "while true; do "
+        "done_count=0; "
+        f"for i in $(seq 1 {parallel_windows}); do "
+        "case_dir=$(printf 'case_%02d' \"$i\"); "
+        "[ -f \"$case_dir/exit.code\" ] && done_count=$((done_count+1)); "
+        "done; "
+        f"[ \"$done_count\" -eq {parallel_windows} ] && break; "
+        "sleep 5; "
+        "done"
+    )
+
+
+def _build_case_aggregation_command(parallel_windows: int) -> str:
+    return (
+        "rm -f case_summary.txt failed.count; "
+        "failed=0; "
+        f"for i in $(seq 1 {parallel_windows}); do "
+        "case_dir=$(printf 'case_%02d' \"$i\"); "
+        "code=$(cat \"$case_dir/exit.code\"); "
+        "echo \"$case_dir:$code\" >> case_summary.txt; "
+        "if [ \"$code\" -ne 0 ]; then failed=$((failed+1)); fi; "
+        "done; "
+        "echo \"$failed\" > failed.count"
+    )
+
+
+def _parse_case_summary_lines(output: str) -> list[str]:
+    lines = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if ":" not in line:
+            continue
+        case_name, code_value = line.split(":", 1)
+        case_name = case_name.strip()
+        code_value = code_value.strip()
+        if not case_name.startswith("case_"):
+            continue
+        if _parse_exit_code(code_value) == 0:
+            continue
+        lines.append(f"{case_name}:{code_value}")
+    return lines
 
 
 def _parse_exit_code(output: str) -> int:

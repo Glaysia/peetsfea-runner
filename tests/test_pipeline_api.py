@@ -26,6 +26,8 @@ class TestPipelineApi(unittest.TestCase):
             self.assertEqual(config.retry_count, 1)
             self.assertEqual(config.remote_root, "~/aedt_runs")
             self.assertEqual(config.local_artifacts_dir, "./artifacts")
+            self.assertEqual(config.parallel_windows, 8)
+            self.assertEqual(config.cores_per_window, 4)
 
     def test_validate_rejects_non_aedt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -62,7 +64,20 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIn(result.run_id, result.remote_run_dir)
             self.assertTrue(Path(result.local_artifacts_dir).is_dir())
 
+    def test_validate_rejects_insufficient_cpus_for_parallel_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sample = Path(tmpdir) / "sample.aedt"
+            sample.write_text("placeholder", encoding="utf-8")
+            config = PipelineConfig(
+                input_aedt_path=str(sample),
+                cpus=31,
+                parallel_windows=8,
+                cores_per_window=4,
+            )
+
+            with self.assertRaises(ValueError):
+                config.validate()
+
 
 if __name__ == "__main__":
     unittest.main()
-
