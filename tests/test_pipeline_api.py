@@ -10,6 +10,7 @@ import duckdb
 from peetsfea_runner import AccountConfig, PipelineConfig, run_pipeline
 from peetsfea_runner.pipeline import EXIT_CODE_SUCCESS, PipelineResult
 from peetsfea_runner.remote_job import CaseExecutionSummary, RemoteJobAttemptResult
+from peetsfea_runner.scheduler import AccountCapacitySnapshot
 
 
 class TestPipelineApi(unittest.TestCase):
@@ -18,12 +19,16 @@ class TestPipelineApi(unittest.TestCase):
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
             (input_dir / "sample.aedt").write_text("x", encoding="utf-8")
+            (input_dir / "sample.aedt.ready").write_text("", encoding="utf-8")
             config = PipelineConfig(input_queue_dir=str(input_dir))
             self.assertEqual(config.output_root_dir, "./output")
             self.assertTrue(config.delete_input_after_upload)
             self.assertEqual(config.delete_failed_quarantine_dir, "./output/_delete_failed")
             self.assertTrue(config.license_observe_only)
             self.assertEqual(len(config.accounts_registry), 1)
+            self.assertTrue(config.continuous_mode)
+            self.assertEqual(config.ready_sidecar_suffix, ".ready")
+            self.assertEqual(config.run_rotation_hours, 24)
 
     def test_validate_rejects_missing_directory(self) -> None:
         missing = Path(tempfile.gettempdir()) / "missing_input_queue"
@@ -36,7 +41,24 @@ class TestPipelineApi(unittest.TestCase):
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
             (input_dir / "x.txt").write_text("x", encoding="utf-8")
-            config = PipelineConfig(input_queue_dir=str(input_dir))
+            config = PipelineConfig(input_queue_dir=str(input_dir), continuous_mode=False)
+            with self.assertRaises(ValueError):
+                config.validate()
+
+    def test_validate_allows_empty_queue_in_continuous_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            config = PipelineConfig(input_queue_dir=str(input_dir), continuous_mode=True)
+            _input_root, _output_root, files, _accounts = config.validate()
+            self.assertEqual(files, [])
+
+    def test_validate_requires_ready_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            (input_dir / "foo.aedt").write_text("x", encoding="utf-8")
+            config = PipelineConfig(input_queue_dir=str(input_dir), continuous_mode=False)
             with self.assertRaises(ValueError):
                 config.validate()
 
@@ -46,6 +68,7 @@ class TestPipelineApi(unittest.TestCase):
             nested = input_dir / "a" / "b"
             nested.mkdir(parents=True, exist_ok=True)
             (nested / "foo.aedt").write_text("placeholder", encoding="utf-8")
+            (nested / "foo.aedt.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
             config = PipelineConfig(
@@ -71,6 +94,7 @@ class TestPipelineApi(unittest.TestCase):
             input_dir.mkdir(parents=True, exist_ok=True)
             input_file = input_dir / "foo.aedt"
             input_file.write_text("placeholder", encoding="utf-8")
+            (input_dir / "foo.aedt.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
             config = PipelineConfig(
@@ -97,6 +121,16 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=10,
+                    ),
+                ),
             ):
                 run_pipeline(config)
 
@@ -116,6 +150,7 @@ class TestPipelineApi(unittest.TestCase):
             input_dir.mkdir(parents=True, exist_ok=True)
             input_file = input_dir / "foo.aedt"
             input_file.write_text("placeholder", encoding="utf-8")
+            (input_dir / "foo.aedt.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             quarantine_root = Path(tmpdir) / "delete_failed"
             db_path = Path(tmpdir) / "state.duckdb"
@@ -145,6 +180,16 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
                 patch("pathlib.Path.unlink", side_effect=OSError("locked")),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=10,
+                    ),
+                ),
             ):
                 run_pipeline(config)
 

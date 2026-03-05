@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Sequence
 
 from .constants import (
     EXIT_CODE_DOWNLOAD_FAILURE,
@@ -59,6 +59,12 @@ class WorkflowError(RuntimeError):
         self.exit_code = exit_code
 
 
+@dataclass(slots=True, frozen=True)
+class WindowInput:
+    window_id: str
+    input_path: Path
+
+
 def _log_stage(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[peetsfea][{timestamp}] {message}", flush=True)
@@ -67,30 +73,41 @@ def _log_stage(message: str) -> None:
 def run_remote_job_attempt(
     *,
     config: RemoteJobConfig,
-    aedt_path: Path,
+    aedt_path: Path | None = None,
+    window_inputs: Sequence[WindowInput] | None = None,
     remote_job_dir: str,
     local_job_dir: Path,
     session_name: str,
     on_upload_success: Callable[[], None] | None = None,
 ) -> RemoteJobAttemptResult:
+    inputs = _normalize_window_inputs(
+        config=config,
+        aedt_path=aedt_path,
+        window_inputs=window_inputs,
+    )
+    case_count = len(inputs)
+
     case_summary: CaseExecutionSummary | None = None
     local_job_dir.mkdir(parents=True, exist_ok=True)
     resolved_remote_job_dir = _resolve_remote_path(config=config, path=remote_job_dir)
     _log_stage(
         "job attempt start "
-        f"session={session_name} aedt={aedt_path.name} remote_dir={remote_job_dir} "
+        f"session={session_name} window_count={case_count} remote_dir={remote_job_dir} "
         f"resolved_remote_dir={resolved_remote_job_dir}"
     )
     try:
         _prepare_remote_workspace(config, remote_job_dir=resolved_remote_job_dir)
         with TemporaryDirectory(prefix="peetsfea_runner_") as tmpdir:
             tmpdir_path = Path(tmpdir)
-            staged_project = tmpdir_path / "project.aedt"
-            shutil.copy2(aedt_path, staged_project)
+            staged_projects: list[Path] = []
+            for index, window in enumerate(inputs, start=1):
+                staged_project = tmpdir_path / f"project_{index:02d}.aedt"
+                shutil.copy2(window.input_path, staged_project)
+                staged_projects.append(staged_project)
             remote_script = _write_remote_job_script(tmpdir_path)
             _upload_files(
                 config,
-                project_file=staged_project,
+                project_files=staged_projects,
                 remote_job_dir=resolved_remote_job_dir,
                 remote_script=remote_script,
             )
@@ -100,6 +117,8 @@ def run_remote_job_attempt(
             config,
             remote_job_dir=resolved_remote_job_dir,
             session_name=session_name,
+            project_filenames=[project.name for project in staged_projects],
+            case_count=case_count,
         )
         _download_results(config, remote_job_dir=resolved_remote_job_dir, local_job_dir=local_job_dir)
         _cleanup_remote_workspace(config, remote_job_dir=resolved_remote_job_dir)
@@ -132,7 +151,7 @@ def run_remote_job_attempt(
             session_name=session_name,
             case_summary=case_summary,
             message=(
-                f"{config.windows_per_job} cases completed "
+                f"{case_count} cases completed "
                 f"(success={case_summary.success_cases}, failed={case_summary.failed_cases}). "
                 f"failed_cases={failed_items}"
             ),
@@ -146,7 +165,7 @@ def run_remote_job_attempt(
         session_name=session_name,
         case_summary=case_summary,
         message=(
-            f"{config.windows_per_job} cases completed "
+            f"{case_count} cases completed "
             f"(success={case_summary.success_cases}, failed={case_summary.failed_cases})."
         ),
         failed_case_lines=[],
@@ -215,11 +234,13 @@ def _prepare_remote_workspace(config: RemoteJobConfig, *, remote_job_dir: str) -
     )
 
 
-def _upload_files(config: RemoteJobConfig, *, project_file: Path, remote_job_dir: str, remote_script: Path) -> None:
+def _upload_files(config: RemoteJobConfig, *, project_files: Sequence[Path], remote_job_dir: str, remote_script: Path) -> None:
     remote_target = f"{config.host}:{remote_job_dir}/"
     _log_stage(f"upload files target={remote_target}")
+    upload_sources = [str(path) for path in project_files]
+    upload_sources.append(str(remote_script.resolve()))
     _run_subprocess(
-        ["scp", str(project_file), str(remote_script.resolve()), remote_target],
+        ["scp", *upload_sources, remote_target],
         stage="scp upload",
         exit_code=EXIT_CODE_SSH_FAILURE,
     )
@@ -256,7 +277,14 @@ def _run_remote_workflow_interactive(
     *,
     remote_job_dir: str,
     session_name: str,
+    project_filenames: Sequence[str],
+    case_count: int,
 ) -> CaseExecutionSummary:
+    if case_count <= 0:
+        raise WorkflowError("case_count must be > 0", exit_code=EXIT_CODE_REMOTE_RUN_FAILURE)
+    if len(project_filenames) != case_count:
+        raise WorkflowError("project_filenames length mismatch", exit_code=EXIT_CODE_REMOTE_RUN_FAILURE)
+
     pexpect = _import_pexpect()
     remote_path = _remote_path_for_shell(remote_job_dir)
     session = pexpect.spawn(f"ssh {config.host}", encoding="utf-8", timeout=60)
@@ -275,17 +303,20 @@ def _run_remote_workflow_interactive(
         _log_stage(f"srun prompt acquired session={session_name}")
         _run_interactive_command(session, f"cd {shlex.quote(remote_path)}", stage="srun", timeout=60)
 
+        prep_commands: list[str] = []
+        for case_index, source_name in enumerate(project_filenames, start=1):
+            case_name = f"case_{case_index:02d}"
+            prep_commands.append(f"mkdir -p {shlex.quote(case_name)}")
+            prep_commands.append(
+                f"cp -f {shlex.quote(source_name)} {shlex.quote(case_name)}/project.aedt"
+            )
         _run_interactive_command(
             session,
-            f"for i in $(seq 1 {config.windows_per_job}); do "
-            "case_dir=$(printf 'case_%02d' \"$i\"); "
-            "mkdir -p \"$case_dir\"; "
-            "cp -f project.aedt \"$case_dir/project.aedt\"; "
-            "done",
+            " && ".join(prep_commands),
             stage="remote run",
             timeout=120,
         )
-        _log_stage(f"case directories prepared session={session_name} windows={config.windows_per_job}")
+        _log_stage(f"case directories prepared session={session_name} windows={case_count}")
 
         first_window_cmd = _build_case_window_command(
             case_index=1,
@@ -298,7 +329,7 @@ def _run_remote_workflow_interactive(
             timeout=60,
         )
 
-        for case_index in range(2, config.windows_per_job + 1):
+        for case_index in range(2, case_count + 1):
             case_name = f"case_{case_index:02d}"
             case_cmd = _build_case_window_command(
                 case_index=case_index,
@@ -317,14 +348,14 @@ def _run_remote_workflow_interactive(
         windows_output = _run_interactive_command(
             session, f"screen -S {shlex.quote(session_name)} -Q windows", stage="screen", timeout=60
         )
-        if _count_screen_windows(windows_output) != config.windows_per_job:
+        if _count_screen_windows(windows_output) != case_count:
             raise WorkflowError("Screen window validation failed.", exit_code=EXIT_CODE_SCREEN_FAILURE)
-        _log_stage(f"screen windows validated session={session_name} count={config.windows_per_job}")
+        _log_stage(f"screen windows validated session={session_name} count={case_count}")
 
         wait_timeout = _time_limit_to_seconds(config.time_limit) + 600
         _run_interactive_command(
             session,
-            _build_wait_all_command(config.windows_per_job),
+            _build_wait_all_command(case_count),
             stage="remote run",
             timeout=wait_timeout,
         )
@@ -332,7 +363,7 @@ def _run_remote_workflow_interactive(
 
         _run_interactive_command(
             session,
-            _build_case_aggregation_command(config.windows_per_job),
+            _build_case_aggregation_command(case_count),
             stage="remote run",
             timeout=60,
         )
@@ -341,7 +372,7 @@ def _run_remote_workflow_interactive(
         case_summary_output = _run_interactive_command(session, "cat case_summary.txt", stage="remote run", timeout=30)
         case_lines = _parse_case_summary_lines(case_summary_output)
         summary = CaseExecutionSummary(
-            success_cases=config.windows_per_job - failed_count,
+            success_cases=case_count - failed_count,
             failed_cases=failed_count,
             case_lines=case_lines,
         )
@@ -405,6 +436,32 @@ def _run_subprocess(command: list[str], *, stage: str, exit_code: int) -> None:
         if details:
             raise WorkflowError(f"{stage} failed: {details}", exit_code=exit_code)
         raise WorkflowError(f"{stage} failed with return code {completed.returncode}", exit_code=exit_code)
+
+
+def _normalize_window_inputs(
+    *,
+    config: RemoteJobConfig,
+    aedt_path: Path | None,
+    window_inputs: Sequence[WindowInput] | None,
+) -> list[WindowInput]:
+    if aedt_path is None and window_inputs is None:
+        raise ValueError("Either aedt_path or window_inputs must be provided.")
+    if aedt_path is not None and window_inputs is not None:
+        raise ValueError("aedt_path and window_inputs are mutually exclusive.")
+
+    if window_inputs is not None:
+        normalized = list(window_inputs)
+        if not normalized:
+            raise ValueError("window_inputs must not be empty.")
+        if len(normalized) > config.windows_per_job:
+            raise ValueError(f"window_inputs must be <= windows_per_job ({config.windows_per_job}).")
+        return normalized
+
+    assert aedt_path is not None
+    return [
+        WindowInput(window_id=f"case_{index:02d}", input_path=aedt_path)
+        for index in range(1, config.windows_per_job + 1)
+    ]
 
 
 def _remote_path_for_shell(path: str) -> str:

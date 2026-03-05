@@ -85,6 +85,13 @@ def _build_config() -> PipelineConfig:
         execute_remote=_env_bool("PEETSFEA_EXECUTE_REMOTE", True),
         partition=os.getenv("PEETSFEA_PARTITION", "cpu2"),
         remote_root=os.getenv("PEETSFEA_REMOTE_ROOT", "~/aedt_runs"),
+        continuous_mode=_env_bool("PEETSFEA_CONTINUOUS_MODE", True),
+        ingest_poll_seconds=int(os.getenv("PEETSFEA_INGEST_POLL_SECONDS", "30")),
+        ready_sidecar_suffix=os.getenv("PEETSFEA_READY_SIDECAR_SUFFIX", ".ready"),
+        run_rotation_hours=int(os.getenv("PEETSFEA_RUN_ROTATION_HOURS", "24")),
+        pending_buffer_per_account=int(os.getenv("PEETSFEA_PENDING_BUFFER_PER_ACCOUNT", "3")),
+        capacity_scope=os.getenv("PEETSFEA_CAPACITY_SCOPE", "all_user_jobs"),
+        balance_metric=os.getenv("PEETSFEA_BALANCE_METRIC", "window_throughput"),
     )
 
 
@@ -129,9 +136,17 @@ def run_user_worker_loop() -> None:
         run_id=None,
         status="HEALTHY",
     )
+    store.append_event(
+        run_id="__worker__",
+        job_id="__worker__",
+        level="INFO",
+        stage="WORKER_LOOP_START",
+        message=f"poll_seconds={poll_seconds}",
+    )
 
+    last_run_id: str | None = None
     while True:
-        current_run_id: str | None = None
+        current_run_id: str | None = last_run_id
         try:
             store.upsert_worker_heartbeat(
                 service_name=service_name,
@@ -140,14 +155,29 @@ def run_user_worker_loop() -> None:
                 run_id=current_run_id,
                 status="HEALTHY",
             )
+            store.append_event(
+                run_id=current_run_id or "__worker__",
+                job_id="__worker__",
+                level="INFO",
+                stage="WORKER_LOOP_TICK",
+                message="run_pipeline start",
+            )
             result = run_pipeline(config)
             current_run_id = result.run_id
+            last_run_id = current_run_id
             store.upsert_worker_heartbeat(
                 service_name=service_name,
                 host=host,
                 pid=pid,
                 run_id=current_run_id,
                 status="HEALTHY",
+            )
+            store.append_event(
+                run_id=current_run_id,
+                job_id="__worker__",
+                level="INFO",
+                stage="WORKER_LOOP_OK",
+                message=result.summary,
             )
         except Exception as exc:  # pragma: no cover - runtime resilience path
             print(f"[peetsfea][worker] loop error: {exc}", flush=True)
@@ -157,5 +187,12 @@ def run_user_worker_loop() -> None:
                 pid=pid,
                 run_id=current_run_id,
                 status="DEGRADED",
+            )
+            store.append_event(
+                run_id=current_run_id or "__worker__",
+                job_id="__worker__",
+                level="ERROR",
+                stage="WORKER_LOOP_ERROR",
+                message=str(exc),
             )
         time.sleep(poll_seconds)

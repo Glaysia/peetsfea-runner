@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 
@@ -99,6 +99,7 @@ class StateStore:
                     CREATE TABLE IF NOT EXISTS file_lifecycle (
                         run_id TEXT NOT NULL,
                         job_id TEXT NOT NULL,
+                        window_id TEXT,
                         input_path TEXT NOT NULL,
                         input_deleted_at TEXT,
                         delete_retry_count INTEGER NOT NULL DEFAULT 0,
@@ -118,6 +119,60 @@ class StateStore:
                         run_id TEXT,
                         status TEXT NOT NULL,
                         PRIMARY KEY (service_name, host, pid)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS window_tasks (
+                        run_id TEXT NOT NULL,
+                        window_id TEXT NOT NULL,
+                        job_id TEXT,
+                        account_id TEXT,
+                        input_path TEXT NOT NULL,
+                        output_path TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        attempt_no INTEGER NOT NULL DEFAULT 0,
+                        failure_reason TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (run_id, window_id)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS window_events (
+                        run_id TEXT NOT NULL,
+                        window_id TEXT NOT NULL,
+                        level TEXT NOT NULL,
+                        stage TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        ts TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ingest_index (
+                        input_path TEXT PRIMARY KEY,
+                        ready_path TEXT NOT NULL,
+                        file_size BIGINT NOT NULL,
+                        file_mtime_ns BIGINT NOT NULL,
+                        discovered_at TEXT NOT NULL,
+                        state TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS account_capacity_snapshots (
+                        account_id TEXT NOT NULL,
+                        host TEXT NOT NULL,
+                        running_count INTEGER NOT NULL,
+                        pending_count INTEGER NOT NULL,
+                        allowed_submit INTEGER NOT NULL,
+                        ts TEXT NOT NULL
                     )
                     """
                 )
@@ -146,6 +201,7 @@ class StateStore:
                     )
                     """
                 )
+                conn.execute("ALTER TABLE file_lifecycle ADD COLUMN IF NOT EXISTS window_id TEXT")
             finally:
                 conn.close()
 
@@ -158,6 +214,55 @@ class StateStore:
                     "INSERT INTO runs (run_id, started_at, state) VALUES (?, ?, ?)",
                     [run_id, now, "RUNNING"],
                 )
+            finally:
+                conn.close()
+
+    def ensure_continuous_run(self, *, rotation_hours: int) -> str:
+        now = datetime.now(tz=timezone.utc)
+        now_iso = now.isoformat()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT run_id, started_at
+                    FROM runs
+                    WHERE state = 'RUNNING'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if row is not None:
+                    run_id = str(row[0])
+                    started_at_raw = row[1]
+                    started_at = datetime.fromisoformat(started_at_raw) if isinstance(started_at_raw, str) else now
+                    if started_at.tzinfo is None:
+                        started_at = started_at.replace(tzinfo=timezone.utc)
+                    if now - started_at < timedelta(hours=rotation_hours):
+                        return run_id
+                    conn.execute(
+                        """
+                        UPDATE runs
+                        SET finished_at = ?, state = ?, summary = ?
+                        WHERE run_id = ?
+                        """,
+                        [now_iso, "ROLLED", f"auto-rolled after {rotation_hours}h", run_id],
+                    )
+
+                new_run_id = now.strftime("%Y%m%d_%H%M%S")
+                conn.execute(
+                    "INSERT INTO runs (run_id, started_at, state) VALUES (?, ?, ?)",
+                    [new_run_id, now_iso, "RUNNING"],
+                )
+                return new_run_id
+            finally:
+                conn.close()
+
+    def update_run_summary(self, *, run_id: str, summary: str) -> None:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute("UPDATE runs SET summary = ? WHERE run_id = ?", [summary, run_id])
             finally:
                 conn.close()
 
@@ -187,11 +292,192 @@ class StateStore:
                 )
                 conn.execute(
                     """
-                    INSERT INTO file_lifecycle (run_id, job_id, input_path, updated_at)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO file_lifecycle (run_id, job_id, window_id, input_path, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    [run_id, job_id, input_path, now],
+                    [run_id, job_id, None, input_path, now],
                 )
+            finally:
+                conn.close()
+
+    def create_window_task(
+        self,
+        *,
+        run_id: str,
+        window_id: str,
+        input_path: str,
+        output_path: str,
+        account_id: str | None,
+        state: str = "QUEUED",
+    ) -> None:
+        now = _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO window_tasks (
+                        run_id, window_id, account_id, input_path, output_path, state, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [run_id, window_id, account_id, input_path, output_path, state, now, now],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO file_lifecycle (run_id, job_id, window_id, input_path, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [run_id, window_id, window_id, input_path, now],
+                )
+            finally:
+                conn.close()
+
+    def update_window_task(
+        self,
+        *,
+        run_id: str,
+        window_id: str,
+        state: str,
+        attempt_no: int | None = None,
+        job_id: str | None = None,
+        account_id: str | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
+        now = _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                fields: list[str] = ["state = ?", "updated_at = ?", "failure_reason = ?"]
+                values: list[object] = [state, now, failure_reason]
+                if attempt_no is not None:
+                    fields.append("attempt_no = ?")
+                    values.append(attempt_no)
+                if job_id is not None:
+                    fields.append("job_id = ?")
+                    values.append(job_id)
+                if account_id is not None:
+                    fields.append("account_id = ?")
+                    values.append(account_id)
+                values.extend([run_id, window_id])
+                conn.execute(
+                    f"UPDATE window_tasks SET {', '.join(fields)} WHERE run_id = ? AND window_id = ?",
+                    values,
+                )
+            finally:
+                conn.close()
+
+    def get_window_throughput_score(self, *, run_id: str, account_id: str) -> tuple[int, int]:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                completed_row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM window_tasks
+                    WHERE run_id = ? AND account_id = ? AND state IN ('SUCCEEDED', 'FAILED', 'QUARANTINED')
+                    """,
+                    [run_id, account_id],
+                ).fetchone()
+                inflight_row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM window_tasks
+                    WHERE run_id = ? AND account_id = ? AND state IN ('ASSIGNED', 'UPLOADING', 'RUNNING', 'COLLECTING')
+                    """,
+                    [run_id, account_id],
+                ).fetchone()
+            finally:
+                conn.close()
+        completed = int(completed_row[0]) if completed_row is not None else 0
+        inflight = int(inflight_row[0]) if inflight_row is not None else 0
+        return completed, inflight
+
+    def mark_ingest_state(self, *, input_path: str, state: str) -> None:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute("UPDATE ingest_index SET state = ? WHERE input_path = ?", [state, input_path])
+            finally:
+                conn.close()
+
+    def append_window_event(self, *, run_id: str, window_id: str, level: str, stage: str, message: str) -> None:
+        now = _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO window_events (run_id, window_id, level, stage, message, ts)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [run_id, window_id, level, stage, message, now],
+                )
+            finally:
+                conn.close()
+
+    def count_windows_by_state(self, *, run_id: str) -> dict[str, int]:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT state, COUNT(*)
+                    FROM window_tasks
+                    WHERE run_id = ?
+                    GROUP BY state
+                    """,
+                    [run_id],
+                ).fetchall()
+            finally:
+                conn.close()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def register_ingest_candidate(
+        self,
+        *,
+        input_path: str,
+        ready_path: str,
+        file_size: int,
+        file_mtime_ns: int,
+    ) -> bool:
+        now = _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT file_size, file_mtime_ns
+                    FROM ingest_index
+                    WHERE input_path = ?
+                    """,
+                    [input_path],
+                ).fetchone()
+                if row is not None:
+                    prev_size = int(row[0])
+                    prev_mtime = int(row[1])
+                    if prev_size == file_size and prev_mtime == file_mtime_ns:
+                        return False
+                    conn.execute(
+                        """
+                        UPDATE ingest_index
+                        SET ready_path = ?, file_size = ?, file_mtime_ns = ?, discovered_at = ?, state = ?
+                        WHERE input_path = ?
+                        """,
+                        [ready_path, file_size, file_mtime_ns, now, "QUEUED", input_path],
+                    )
+                    return True
+
+                conn.execute(
+                    """
+                    INSERT INTO ingest_index (
+                        input_path, ready_path, file_size, file_mtime_ns, discovered_at, state
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [input_path, ready_path, file_size, file_mtime_ns, now, "QUEUED"],
+                )
+                return True
             finally:
                 conn.close()
 
@@ -327,6 +613,22 @@ class StateStore:
             finally:
                 conn.close()
 
+    def mark_window_input_deleted(self, *, run_id: str, window_id: str, retry_count: int) -> None:
+        now = _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    UPDATE file_lifecycle
+                    SET input_deleted_at = ?, delete_retry_count = ?, delete_final_state = ?, updated_at = ?
+                    WHERE run_id = ? AND window_id = ?
+                    """,
+                    [now, retry_count, "DELETED", now, run_id, window_id],
+                )
+            finally:
+                conn.close()
+
     def mark_delete_retrying(self, *, run_id: str, job_id: str, retry_count: int) -> None:
         now = _utc_now_iso()
         with self._lock:
@@ -339,6 +641,22 @@ class StateStore:
                     WHERE run_id = ? AND job_id = ?
                     """,
                     [retry_count, "DELETE_RETRYING", now, run_id, job_id],
+                )
+            finally:
+                conn.close()
+
+    def mark_window_delete_retrying(self, *, run_id: str, window_id: str, retry_count: int) -> None:
+        now = _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    UPDATE file_lifecycle
+                    SET delete_retry_count = ?, delete_final_state = ?, updated_at = ?
+                    WHERE run_id = ? AND window_id = ?
+                    """,
+                    [retry_count, "DELETE_RETRYING", now, run_id, window_id],
                 )
             finally:
                 conn.close()
@@ -362,6 +680,29 @@ class StateStore:
                     WHERE run_id = ? AND job_id = ?
                     """,
                     [retry_count, "DELETE_QUARANTINED", quarantine_path, now, run_id, job_id],
+                )
+            finally:
+                conn.close()
+
+    def mark_window_delete_quarantined(
+        self,
+        *,
+        run_id: str,
+        window_id: str,
+        retry_count: int,
+        quarantine_path: str,
+    ) -> None:
+        now = _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    UPDATE file_lifecycle
+                    SET delete_retry_count = ?, delete_final_state = ?, quarantine_path = ?, updated_at = ?
+                    WHERE run_id = ? AND window_id = ?
+                    """,
+                    [retry_count, "DELETE_QUARANTINED", quarantine_path, now, run_id, window_id],
                 )
             finally:
                 conn.close()
@@ -411,6 +752,29 @@ class StateStore:
                         status = EXCLUDED.status
                     """,
                     [service_name, host, pid, now, run_id, status],
+                )
+            finally:
+                conn.close()
+
+    def record_account_capacity_snapshot(
+        self,
+        *,
+        account_id: str,
+        host: str,
+        running_count: int,
+        pending_count: int,
+        allowed_submit: int,
+    ) -> None:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO account_capacity_snapshots (
+                        account_id, host, running_count, pending_count, allowed_submit, ts
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [account_id, host, running_count, pending_count, allowed_submit, _utc_now_iso()],
                 )
             finally:
                 conn.close()

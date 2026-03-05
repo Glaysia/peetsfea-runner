@@ -35,6 +35,36 @@ class TestWebStatus(unittest.TestCase):
                 message="done",
             )
             store.mark_input_deleted(run_id="run_01", job_id="job_0001", retry_count=0)
+            store.create_window_task(
+                run_id="run_01",
+                window_id="w_001",
+                input_path="/in/a.aedt",
+                output_path="/out/a.aedt_all",
+                account_id="account_01",
+            )
+            store.update_window_task(
+                run_id="run_01",
+                window_id="w_001",
+                state="SUCCEEDED",
+                attempt_no=1,
+                job_id="job_0001",
+                account_id="account_01",
+            )
+            store.append_window_event(
+                run_id="run_01",
+                window_id="w_001",
+                level="INFO",
+                stage="SUCCEEDED",
+                message="window done",
+            )
+            store.mark_window_input_deleted(run_id="run_01", window_id="w_001", retry_count=0)
+            store.record_account_capacity_snapshot(
+                account_id="account_01",
+                host="gate1-harry",
+                running_count=1,
+                pending_count=0,
+                allowed_submit=12,
+            )
             store.upsert_worker_heartbeat(
                 service_name="peetsfea-runner",
                 host="host1",
@@ -52,11 +82,15 @@ class TestWebStatus(unittest.TestCase):
                 with urlopen(f"http://{host}:{port}/") as resp:
                     html = resp.read().decode("utf-8")
                 self.assertIn("Peets FEA Status Dashboard", html)
+                self.assertIn("Window(.aedt)", html)
 
                 with urlopen(f"http://{host}:{port}/api") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 self.assertIn("/api/worker/health", payload["endpoints"])
                 self.assertIn("/api/jobs/{id}/timeline", payload["endpoints"])
+                self.assertIn("/api/windows", payload["endpoints"])
+                self.assertIn("/api/windows/{id}/timeline", payload["endpoints"])
+                self.assertIn("/api/accounts/capacity", payload["endpoints"])
 
                 with urlopen(f"http://{host}:{port}/api/jobs") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -78,6 +112,11 @@ class TestWebStatus(unittest.TestCase):
                 self.assertEqual(payload["metrics"]["succeeded_jobs"], 1)
                 self.assertEqual(payload["metrics"]["active_jobs"], 0)
                 self.assertEqual(payload["metrics"]["queue_jobs"], 0)
+                self.assertEqual(payload["metrics"]["total_windows"], 1)
+                self.assertEqual(payload["metrics"]["succeeded_windows"], 1)
+                self.assertEqual(payload["metrics"]["quarantined_windows"], 0)
+                self.assertEqual(payload["metrics"]["delete_quarantined_windows"], 0)
+                self.assertEqual(len(payload["metrics"]["account_window_scores"]), 1)
 
                 with urlopen(f"http://{host}:{port}/api/runs/latest") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -90,14 +129,34 @@ class TestWebStatus(unittest.TestCase):
                     payload = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(payload["run"]["run_id"], "run_01")
                 self.assertTrue(any(x["status"] == "SUCCEEDED" for x in payload["run"]["status_counts"]))
+                self.assertTrue(any(x["state"] == "SUCCEEDED" for x in payload["run"]["window_state_counts"]))
 
                 with urlopen(f"http://{host}:{port}/api/runs/run_01/jobs") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(len(payload["jobs"]), 1)
 
+                with urlopen(f"http://{host}:{port}/api/windows") as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(payload["run_id"], "run_01")
+                self.assertEqual(len(payload["windows"]), 1)
+                self.assertEqual(payload["windows"][0]["window_id"], "w_001")
+
+                with urlopen(f"http://{host}:{port}/api/windows/w_001/timeline") as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(payload["window_task"]["window_id"], "w_001")
+                self.assertEqual(payload["attempt_summary"]["window_attempt_no"], 1)
+                self.assertEqual(payload["file_lifecycle"]["delete_final_state"], "DELETED")
+
+                with urlopen(f"http://{host}:{port}/api/accounts/capacity") as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(len(payload["accounts"]), 1)
+                self.assertEqual(payload["accounts"][0]["account_id"], "account_01")
+                self.assertEqual(payload["accounts"][0]["score"], 1)
+
                 with urlopen(f"http://{host}:{port}/api/events/recent") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
-                self.assertEqual(len(payload["events"]), 1)
+                self.assertGreaterEqual(len(payload["events"]), 2)
+                self.assertIn("source", payload["events"][0])
 
                 with urlopen(f"http://{host}:{port}/api/file-lifecycle/summary") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))

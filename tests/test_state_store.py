@@ -34,6 +34,10 @@ class TestStateStore(unittest.TestCase):
             self.assertIn("events", names)
             self.assertIn("file_lifecycle", names)
             self.assertIn("worker_heartbeat", names)
+            self.assertIn("window_tasks", names)
+            self.assertIn("window_events", names)
+            self.assertIn("ingest_index", names)
+            self.assertIn("account_capacity_snapshots", names)
 
     def test_job_lifecycle_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -133,6 +137,91 @@ class TestStateStore(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0][3], "run_02")
             self.assertEqual(rows[0][4], "DEGRADED")
+
+    def test_register_ingest_candidate_deduplicates_same_stat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+
+            first = store.register_ingest_candidate(
+                input_path="/in/a.aedt",
+                ready_path="/in/a.aedt.ready",
+                file_size=100,
+                file_mtime_ns=12345,
+            )
+            second = store.register_ingest_candidate(
+                input_path="/in/a.aedt",
+                ready_path="/in/a.aedt.ready",
+                file_size=100,
+                file_mtime_ns=12345,
+            )
+            changed = store.register_ingest_candidate(
+                input_path="/in/a.aedt",
+                ready_path="/in/a.aedt.ready",
+                file_size=101,
+                file_mtime_ns=12346,
+            )
+
+            self.assertTrue(first)
+            self.assertFalse(second)
+            self.assertTrue(changed)
+
+    def test_ensure_continuous_run_reuses_active_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            run1 = store.ensure_continuous_run(rotation_hours=24)
+            run2 = store.ensure_continuous_run(rotation_hours=24)
+            self.assertEqual(run1, run2)
+
+    def test_window_task_score_and_capacity_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            store.start_run("run_01")
+            store.create_window_task(
+                run_id="run_01",
+                window_id="w_001",
+                input_path="/in/a.aedt",
+                output_path="/out/a.aedt_all",
+                account_id="account_01",
+            )
+            store.update_window_task(
+                run_id="run_01",
+                window_id="w_001",
+                state="SUCCEEDED",
+                attempt_no=1,
+                job_id="job_0001",
+                account_id="account_01",
+            )
+            completed, inflight = store.get_window_throughput_score(run_id="run_01", account_id="account_01")
+            self.assertEqual(completed, 1)
+            self.assertEqual(inflight, 0)
+
+            store.record_account_capacity_snapshot(
+                account_id="account_01",
+                host="gate1-harry",
+                running_count=2,
+                pending_count=1,
+                allowed_submit=10,
+            )
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT running_count, pending_count, allowed_submit
+                    FROM account_capacity_snapshots
+                    ORDER BY ts DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(tuple(row), (2, 1, 10))
 
 
 if __name__ == "__main__":
