@@ -17,6 +17,16 @@ class TestWebStatus(unittest.TestCase):
             db_path = Path(tmpdir) / "state.duckdb"
             store = StateStore(db_path)
             store.initialize()
+            store.start_run("run_00")
+            store.create_job(
+                run_id="run_00",
+                job_id="job_old_0001",
+                input_path="/in/old.aedt",
+                output_path="/out/old.aedt_all",
+                account_id="account_01",
+            )
+            store.update_job_status(run_id="run_00", job_id="job_old_0001", status="FAILED", attempt_no=1)
+            store.finish_run("run_00", state="FAILED", summary="old")
             store.start_run("run_01")
             store.create_job(
                 run_id="run_01",
@@ -94,7 +104,7 @@ class TestWebStatus(unittest.TestCase):
 
                 with urlopen(f"http://{host}:{port}/api/jobs") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
-                self.assertEqual(len(payload["jobs"]), 1)
+                self.assertEqual(len(payload["jobs"]), 2)
 
                 with urlopen(f"http://{host}:{port}/api/jobs/job_0001") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))

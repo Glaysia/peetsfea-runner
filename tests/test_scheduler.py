@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from peetsfea_runner.scheduler import (
     AccountCapacitySnapshot,
@@ -78,6 +80,13 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(snapshot.running_count, 2)
         self.assertEqual(snapshot.pending_count, 2)
         self.assertEqual(snapshot.allowed_submit, (10 - 2) + (3 - 2))
+
+    def test_query_account_capacity_raises_on_command_timeout(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        with patch("peetsfea_runner.scheduler.subprocess.run") as run_mock:
+            run_mock.side_effect = subprocess.TimeoutExpired(cmd="ssh host-1", timeout=8)
+            with self.assertRaises(RuntimeError):
+                query_account_capacity(account=account, pending_buffer_per_account=3)
 
     def test_pick_balanced_account_uses_score_then_running_then_account_id(self) -> None:
         capacities = [

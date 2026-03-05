@@ -393,6 +393,42 @@ class StateStore:
         inflight = int(inflight_row[0]) if inflight_row is not None else 0
         return completed, inflight
 
+    def list_schedulable_window_tasks(self, *, run_id: str) -> list[tuple[str, str, str, int]]:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT window_id, input_path, output_path, attempt_no
+                    FROM window_tasks
+                    WHERE run_id = ?
+                      AND state IN ('QUEUED', 'RETRY_QUEUED')
+                    ORDER BY created_at, window_id
+                    """,
+                    [run_id],
+                ).fetchall()
+            finally:
+                conn.close()
+        return [(str(row[0]), str(row[1]), str(row[2]), int(row[3] or 0)) for row in rows]
+
+    def get_next_job_index(self, *, run_id: str) -> int:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                rows = conn.execute("SELECT job_id FROM jobs WHERE run_id = ?", [run_id]).fetchall()
+            finally:
+                conn.close()
+        max_index = 0
+        for row in rows:
+            job_id = str(row[0])
+            if not job_id.startswith("job_"):
+                continue
+            suffix = job_id[4:]
+            if not suffix.isdigit():
+                continue
+            max_index = max(max_index, int(suffix))
+        return max_index + 1
+
     def mark_ingest_state(self, *, input_path: str, state: str) -> None:
         with self._lock:
             conn = duckdb.connect(str(self.db_path))

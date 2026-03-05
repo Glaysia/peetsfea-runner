@@ -348,9 +348,16 @@ def _run_remote_workflow_interactive(
         windows_output = _run_interactive_command(
             session, f"screen -S {shlex.quote(session_name)} -Q windows", stage="screen", timeout=60
         )
-        if _count_screen_windows(windows_output) != case_count:
-            raise WorkflowError("Screen window validation failed.", exit_code=EXIT_CODE_SCREEN_FAILURE)
-        _log_stage(f"screen windows validated session={session_name} count={case_count}")
+        observed_windows = _count_screen_windows(windows_output)
+        if observed_windows != case_count:
+            # Some windows may finish very quickly and disappear before this probe.
+            # Continue and rely on exit.code aggregation for final case success/failure.
+            _log_stage(
+                "screen windows mismatch "
+                f"session={session_name} expected={case_count} observed={observed_windows}"
+            )
+        else:
+            _log_stage(f"screen windows validated session={session_name} count={case_count}")
 
         wait_timeout = _time_limit_to_seconds(config.time_limit) + 600
         _run_interactive_command(

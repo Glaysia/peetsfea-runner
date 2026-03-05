@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha1
 from pathlib import Path
+from typing import Callable
 
 from .constants import (
     EXIT_CODE_DOWNLOAD_FAILURE,
@@ -215,6 +216,116 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     remote_run_dir = _join_remote_root(config.remote_root, run_id)
     _log_stage(f"pipeline start run_id={run_id} total_inputs={len(aedt_files)} execute_remote={config.execute_remote}")
 
+    windows_batch_size = max(
+        config.windows_per_job,
+        config.windows_per_job * sum(max(1, account.max_jobs) for account in accounts),
+    )
+    queued_windows = _load_schedulable_windows(state_store=state_store, run_id=run_id, input_root=input_root)
+    total_windows = len(queued_windows)
+    discovered_count = 0
+    if queued_windows:
+        _log_stage(f"restored queued windows run_id={run_id} count={len(queued_windows)}")
+
+    def _capacity_log(snapshot: AccountCapacitySnapshot) -> None:
+        state_store.record_account_capacity_snapshot(
+            account_id=snapshot.account_id,
+            host=snapshot.host_alias,
+            running_count=snapshot.running_count,
+            pending_count=snapshot.pending_count,
+            allowed_submit=snapshot.allowed_submit,
+        )
+        _log_stage(
+            f"capacity account={snapshot.account_id} running={snapshot.running_count} "
+            f"pending={snapshot.pending_count} allowed_submit={snapshot.allowed_submit}"
+        )
+
+    def _capacity_error(account: AccountConfig, exc: Exception) -> None:
+        _log_stage(f"capacity query failed account={account.account_id} host={account.host_alias} reason={exc}")
+
+    def _bundle_submitted(bundle: BundleSpec) -> None:
+        completed, inflight = state_store.get_window_throughput_score(run_id=run_id, account_id=bundle.account_id)
+        _log_stage(
+            f"scheduler pick account={bundle.account_id} score={completed + inflight} windows={bundle.window_count}"
+        )
+        _log_stage(
+            f"bundle submitted job_id={bundle.job_id} account={bundle.account_id} window_count={bundle.window_count}"
+        )
+
+    outcomes: list[_BundleRuntimeOutcome] = []
+    max_inflight_jobs = 0
+    next_job_index = state_store.get_next_job_index(run_id=run_id)
+
+    def _current_completed_windows() -> dict[str, int]:
+        return {
+            account.account_id: state_store.get_window_throughput_score(run_id=run_id, account_id=account.account_id)[0]
+            for account in accounts
+        }
+
+    def _run_window_batch(window_batch: list[WindowTaskRef]) -> None:
+        nonlocal max_inflight_jobs, next_job_index
+        if not window_batch:
+            return
+        completed_windows = _current_completed_windows()
+        if config.execute_remote:
+            batch = run_window_bundles(
+                window_queue=window_batch,
+                accounts=accounts,
+                windows_per_job=config.windows_per_job,
+                pending_buffer_per_account=config.pending_buffer_per_account,
+                worker=lambda bundle: _run_bundle_with_retry(
+                    config=config,
+                    state_store=state_store,
+                    run_id=run_id,
+                    remote_run_dir=remote_run_dir,
+                    bundle=bundle,
+                ),
+                capacity_lookup=query_account_capacity,
+                initial_completed_windows=completed_windows,
+                job_index_start=next_job_index,
+                on_capacity_snapshot=_capacity_log,
+                on_capacity_error=_capacity_error,
+                on_bundle_submitted=_bundle_submitted,
+            )
+        else:
+            batch = run_window_bundles(
+                window_queue=window_batch,
+                accounts=accounts,
+                windows_per_job=config.windows_per_job,
+                pending_buffer_per_account=config.pending_buffer_per_account,
+                worker=lambda bundle: _run_dry_bundle(
+                    run_id=run_id,
+                    state_store=state_store,
+                    bundle=bundle,
+                ),
+                capacity_lookup=_local_capacity_lookup,
+                initial_completed_windows=completed_windows,
+                job_index_start=next_job_index,
+                on_capacity_snapshot=_capacity_log,
+                on_bundle_submitted=_bundle_submitted,
+            )
+        max_inflight_jobs = max(max_inflight_jobs, batch.max_inflight_jobs)
+        next_job_index += batch.submitted_jobs
+        outcomes.extend(batch.results)
+
+    def _flush_queued_windows(*, force: bool) -> None:
+        nonlocal queued_windows
+        while queued_windows and (force or len(queued_windows) >= windows_batch_size):
+            if force:
+                batch_windows = queued_windows
+                queued_windows = []
+            else:
+                batch_windows = queued_windows[:windows_batch_size]
+                queued_windows = queued_windows[windows_batch_size:]
+            _run_window_batch(batch_windows)
+
+    _flush_queued_windows(force=False)
+
+    def _on_window_enqueued(window: WindowTaskRef) -> None:
+        nonlocal total_windows
+        queued_windows.append(window)
+        total_windows += 1
+        _flush_queued_windows(force=False)
+
     windows, discovered_count = _ingest_window_queue(
         config=config,
         state_store=state_store,
@@ -222,9 +333,15 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         input_root=input_root,
         output_root=output_root,
         aedt_files=aedt_files,
+        on_window_enqueued=_on_window_enqueued,
     )
+    if windows:
+        queued_windows.extend(windows)
+        total_windows += len(windows)
 
-    if not windows:
+    _flush_queued_windows(force=True)
+
+    if total_windows == 0:
         summary = (
             f"total_windows=0 active_windows=0 success_windows=0 failed_windows=0 quarantined_windows=0 "
             f"active_jobs=0 ingest_discovered={discovered_count} ingest_enqueued=0"
@@ -252,72 +369,6 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             quarantined_windows=0,
         )
 
-    initial_completed_windows = {
-        account.account_id: state_store.get_window_throughput_score(run_id=run_id, account_id=account.account_id)[0]
-        for account in accounts
-    }
-
-    def _capacity_log(snapshot: AccountCapacitySnapshot) -> None:
-        state_store.record_account_capacity_snapshot(
-            account_id=snapshot.account_id,
-            host=snapshot.host_alias,
-            running_count=snapshot.running_count,
-            pending_count=snapshot.pending_count,
-            allowed_submit=snapshot.allowed_submit,
-        )
-        _log_stage(
-            f"capacity account={snapshot.account_id} running={snapshot.running_count} "
-            f"pending={snapshot.pending_count} allowed_submit={snapshot.allowed_submit}"
-        )
-
-    def _capacity_error(account: AccountConfig, exc: Exception) -> None:
-        _log_stage(f"capacity query failed account={account.account_id} host={account.host_alias} reason={exc}")
-
-    def _bundle_submitted(bundle: BundleSpec) -> None:
-        completed, inflight = state_store.get_window_throughput_score(run_id=run_id, account_id=bundle.account_id)
-        _log_stage(
-            f"scheduler pick account={bundle.account_id} score={completed + inflight} windows={bundle.window_count}"
-        )
-        _log_stage(
-            f"bundle submitted job_id={bundle.job_id} account={bundle.account_id} window_count={bundle.window_count}"
-        )
-
-    if config.execute_remote:
-        batch = run_window_bundles(
-            window_queue=windows,
-            accounts=accounts,
-            windows_per_job=config.windows_per_job,
-            pending_buffer_per_account=config.pending_buffer_per_account,
-            worker=lambda bundle: _run_bundle_with_retry(
-                config=config,
-                state_store=state_store,
-                run_id=run_id,
-                remote_run_dir=remote_run_dir,
-                bundle=bundle,
-            ),
-            capacity_lookup=query_account_capacity,
-            initial_completed_windows=initial_completed_windows,
-            on_capacity_snapshot=_capacity_log,
-            on_capacity_error=_capacity_error,
-            on_bundle_submitted=_bundle_submitted,
-        )
-    else:
-        batch = run_window_bundles(
-            window_queue=windows,
-            accounts=accounts,
-            windows_per_job=config.windows_per_job,
-            pending_buffer_per_account=config.pending_buffer_per_account,
-            worker=lambda bundle: _run_dry_bundle(
-                run_id=run_id,
-                state_store=state_store,
-                bundle=bundle,
-            ),
-            capacity_lookup=_local_capacity_lookup,
-            initial_completed_windows=initial_completed_windows,
-            on_capacity_snapshot=_capacity_log,
-            on_bundle_submitted=_bundle_submitted,
-        )
-
     orphan_cleanup_error: _WorkflowError | None = None
     if config.execute_remote:
         for account in accounts:
@@ -338,14 +389,13 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 orphan_cleanup_error = exc
                 _log_stage(f"orphan cleanup failed run_id={run_id} account={account.account_id} reason={exc}")
 
-    outcomes = sorted(batch.results, key=lambda item: item.job_id)
+    outcomes = sorted(outcomes, key=lambda item: item.job_id)
     total_jobs = len(outcomes)
     failed_jobs = sum(1 for item in outcomes if not item.success)
     quarantined_jobs = sum(1 for item in outcomes if item.quarantined)
     success_jobs = total_jobs - failed_jobs
     failed_job_ids = [item.job_id for item in outcomes if not item.success]
 
-    total_windows = len(windows)
     success_windows = sum(item.success_windows for item in outcomes)
     failed_windows = sum(item.failed_windows for item in outcomes)
     quarantined_windows = sum(item.quarantined_windows for item in outcomes)
@@ -367,7 +417,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         f"quarantined_jobs={quarantined_jobs} total_windows={total_windows} "
         f"active_windows=0 success_windows={success_windows} failed_windows={failed_windows} "
         f"quarantined_windows={quarantined_windows} failed_job_ids={failed_job_ids} "
-        f"active_jobs=0 max_inflight_jobs={batch.max_inflight_jobs}"
+        f"active_jobs=0 max_inflight_jobs={max_inflight_jobs}"
     )
     if orphan_cleanup_error is not None:
         summary = f"{summary} orphan_cleanup_error={orphan_cleanup_error}"
@@ -400,6 +450,28 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     )
 
 
+def _load_schedulable_windows(*, state_store: StateStore, run_id: str, input_root: Path) -> list[WindowTaskRef]:
+    windows: list[WindowTaskRef] = []
+    for window_id, input_path, output_path, attempt_no in state_store.list_schedulable_window_tasks(run_id=run_id):
+        input_ref = Path(input_path)
+        output_ref = Path(output_path)
+        try:
+            relative_path = input_ref.relative_to(input_root)
+        except Exception:
+            relative_path = Path(input_ref.name)
+        windows.append(
+            WindowTaskRef(
+                run_id=run_id,
+                window_id=window_id,
+                input_path=input_ref,
+                relative_path=Path(relative_path),
+                output_dir=output_ref,
+                attempt_no=max(1, attempt_no),
+            )
+        )
+    return windows
+
+
 def _ingest_window_queue(
     *,
     config: PipelineConfig,
@@ -408,6 +480,7 @@ def _ingest_window_queue(
     input_root: Path,
     output_root: Path,
     aedt_files: list[Path],
+    on_window_enqueued: Callable[[WindowTaskRef], None] | None = None,
 ) -> tuple[list[WindowTaskRef], int]:
     windows: list[WindowTaskRef] = []
     discovered_count = 0
@@ -428,7 +501,6 @@ def _ingest_window_queue(
             )
             if not inserted:
                 continue
-            state_store.mark_ingest_state(input_path=str(input_file), state="QUEUED")
 
         window_id = _build_window_id(relative_path=relative_path, mtime_ns=file_stat.st_mtime_ns)
         state_store.create_window_task(
@@ -445,16 +517,18 @@ def _ingest_window_queue(
             stage="QUEUED",
             message="ingested",
         )
-        windows.append(
-            WindowTaskRef(
-                run_id=run_id,
-                window_id=window_id,
-                input_path=input_file,
-                relative_path=relative_path,
-                output_dir=output_dir,
-                attempt_no=1,
-            )
+        window_ref = WindowTaskRef(
+            run_id=run_id,
+            window_id=window_id,
+            input_path=input_file,
+            relative_path=relative_path,
+            output_dir=output_dir,
+            attempt_no=1,
         )
+        if on_window_enqueued is None:
+            windows.append(window_ref)
+        else:
+            on_window_enqueued(window_ref)
 
     return windows, discovered_count
 
@@ -558,6 +632,8 @@ def _run_bundle_with_retry(
     local_artifacts_root = Path(config.local_artifacts_dir).expanduser().resolve()
     local_bundle_dir = local_artifacts_root / run_id / bundle.job_id
     local_bundle_dir.mkdir(parents=True, exist_ok=True)
+    retry_inputs_dir = local_bundle_dir / "_retry_inputs"
+    retry_inputs_dir.mkdir(parents=True, exist_ok=True)
     first_window = bundle.window_inputs[0]
     state_store.create_job(
         run_id=run_id,
@@ -586,6 +662,16 @@ def _run_bundle_with_retry(
         cores_per_window=config.cores_per_window,
     )
     pending_windows = list(bundle.window_inputs)
+    staged_input_paths: dict[str, Path] = {}
+    for window in pending_windows:
+        staged_path = retry_inputs_dir / f"{window.window_id}.aedt"
+        try:
+            if window.input_path.exists():
+                shutil.copy2(window.input_path, staged_path)
+                staged_input_paths[window.window_id] = staged_path
+        except OSError:
+            # Staging best-effort: retry can still use original path if it exists.
+            continue
     deleted_window_ids: set[str] = set()
     success_windows = 0
     failed_windows = 0
@@ -599,9 +685,47 @@ def _run_bundle_with_retry(
             break
         last_attempt_no = attempt
 
+        runnable_windows: list[WindowTaskRef] = []
+        for window in pending_windows:
+            source_path = staged_input_paths.get(window.window_id, window.input_path)
+            if source_path.exists():
+                runnable_windows.append(window)
+                continue
+            state_store.quarantine_job(
+                run_id=run_id,
+                job_id=window.window_id,
+                attempt=attempt,
+                reason=f"input missing: {window.input_path}",
+                exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+            )
+            state_store.update_window_task(
+                run_id=run_id,
+                window_id=window.window_id,
+                state="QUARANTINED",
+                attempt_no=attempt,
+                job_id=bundle.job_id,
+                account_id=bundle.account_id,
+                failure_reason=f"input missing: {window.input_path}",
+            )
+            state_store.append_window_event(
+                run_id=run_id,
+                window_id=window.window_id,
+                level="ERROR",
+                stage="QUARANTINED",
+                message=f"input missing: {window.input_path}",
+            )
+            state_store.mark_ingest_state(input_path=str(window.input_path), state="QUARANTINED")
+            quarantined_windows += 1
+
+        if not runnable_windows:
+            pending_windows = []
+            terminal_exit_code = EXIT_CODE_REMOTE_RUN_FAILURE
+            terminal_message = "all windows quarantined due to missing input files"
+            break
+
         session_name = _build_session_name(run_id, bundle.job_index, attempt)
         _log_stage(
-            f"job start job_id={bundle.job_id} attempt={attempt} session={session_name} windows={len(pending_windows)}"
+            f"job start job_id={bundle.job_id} attempt={attempt} session={session_name} windows={len(runnable_windows)}"
         )
         state_store.update_job_status(run_id=run_id, job_id=bundle.job_id, status="SUBMITTED", attempt_no=attempt)
         state_store.append_event(
@@ -609,10 +733,10 @@ def _run_bundle_with_retry(
             job_id=bundle.job_id,
             level="INFO",
             stage="SUBMITTED",
-            message=f"attempt={attempt} windows={len(pending_windows)}",
+            message=f"attempt={attempt} windows={len(runnable_windows)}",
         )
 
-        for window in pending_windows:
+        for window in runnable_windows:
             state_store.update_window_task(
                 run_id=run_id,
                 window_id=window.window_id,
@@ -638,7 +762,7 @@ def _run_bundle_with_retry(
                 config=config,
                 state_store=state_store,
                 run_id=run_id,
-                windows=pending_windows,
+                windows=runnable_windows,
                 deleted_window_ids=deleted_window_ids,
             )
 
@@ -646,7 +770,11 @@ def _run_bundle_with_retry(
             result = run_remote_job_attempt(
                 config=remote_cfg,
                 window_inputs=[
-                    WindowInput(window_id=window.window_id, input_path=window.input_path) for window in pending_windows
+                    WindowInput(
+                        window_id=window.window_id,
+                        input_path=staged_input_paths.get(window.window_id, window.input_path),
+                    )
+                    for window in runnable_windows
                 ],
                 remote_job_dir=_join_remote_root(
                     _join_remote_root(_join_remote_root(remote_run_dir, bundle.account_id), bundle.job_id),
@@ -686,12 +814,12 @@ def _run_bundle_with_retry(
         terminal_exit_code = result.exit_code
         terminal_message = result.message
 
-        failed_indices = _parse_failed_case_indices(result.failed_case_lines, len(pending_windows))
+        failed_indices = _parse_failed_case_indices(result.failed_case_lines, len(runnable_windows))
         if not result.success and not failed_indices:
-            failed_indices = set(range(len(pending_windows)))
+            failed_indices = set(range(len(runnable_windows)))
 
         retry_windows: list[WindowTaskRef] = []
-        for index, window in enumerate(pending_windows):
+        for index, window in enumerate(runnable_windows):
             if index in failed_indices:
                 state_store.mark_ingest_state(input_path=str(window.input_path), state="FAILED")
                 if attempt <= config.job_retry_count:

@@ -11,6 +11,7 @@ from peetsfea_runner import AccountConfig, PipelineConfig, run_pipeline
 from peetsfea_runner.pipeline import EXIT_CODE_SUCCESS, PipelineResult
 from peetsfea_runner.remote_job import CaseExecutionSummary, RemoteJobAttemptResult
 from peetsfea_runner.scheduler import AccountCapacitySnapshot
+from peetsfea_runner.state_store import StateStore
 
 
 class TestPipelineApi(unittest.TestCase):
@@ -87,6 +88,46 @@ class TestPipelineApi(unittest.TestCase):
             self.assertEqual(result.exit_code, EXIT_CODE_SUCCESS)
             self.assertEqual(result.total_jobs, 1)
             self.assertIn("failed_job_ids=[]", result.summary)
+
+    def test_continuous_mode_schedules_existing_queued_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            store.start_run("run_01")
+            store.create_window_task(
+                run_id="run_01",
+                window_id="w_backlog_0001",
+                input_path=str(input_dir / "backlog.aedt"),
+                output_path=str(output_root / "backlog.aedt.aedt_all"),
+                account_id=None,
+                state="QUEUED",
+            )
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=False,
+                continuous_mode=True,
+            )
+
+            result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.total_windows, 1)
+            self.assertEqual(result.total_jobs, 1)
+            conn = duckdb.connect(str(db_path))
+            try:
+                state = conn.execute(
+                    "SELECT state FROM window_tasks WHERE run_id = ? AND window_id = ?",
+                    ["run_01", "w_backlog_0001"],
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(state, "SUCCEEDED")
 
     def test_upload_success_deletes_input_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

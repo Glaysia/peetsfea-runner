@@ -618,21 +618,32 @@ def make_status_handler(*, db_path: Path):
 
             if parsed.path == "/api/metrics/throughput":
                 run_id = _first_str_param(params, "run_id") or _latest_run_id(db_path)
-                job_rows = _query(
-                    db_path,
-                    """
-                    SELECT
-                        COUNT(*) AS total_jobs,
-                        SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) AS succeeded_jobs,
-                        SUM(CASE WHEN status IN ('FAILED', 'QUARANTINED') THEN 1 ELSE 0 END) AS failed_jobs,
-                        SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END) AS active_jobs,
-                        SUM(CASE WHEN status IN ('PENDING', 'SUBMITTED') THEN 1 ELSE 0 END) AS queue_jobs
-                    FROM jobs
-                    """
-                )
-                total, succeeded, failed, active_jobs, queue_jobs = job_rows[0]
-                total_jobs = int(total or 0)
-                failed_jobs = int(failed or 0)
+                total_jobs = 0
+                succeeded_jobs = 0
+                failed_jobs = 0
+                active_jobs = 0
+                queue_jobs = 0
+                if run_id is not None:
+                    job_rows = _query(
+                        db_path,
+                        """
+                        SELECT
+                            COUNT(*) AS total_jobs,
+                            SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) AS succeeded_jobs,
+                            SUM(CASE WHEN status IN ('FAILED', 'QUARANTINED') THEN 1 ELSE 0 END) AS failed_jobs,
+                            SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END) AS active_jobs,
+                            SUM(CASE WHEN status IN ('PENDING', 'SUBMITTED') THEN 1 ELSE 0 END) AS queue_jobs
+                        FROM jobs
+                        WHERE run_id = ?
+                        """,
+                        [run_id],
+                    )
+                    total, succeeded, failed, active_jobs_raw, queue_jobs_raw = job_rows[0]
+                    total_jobs = int(total or 0)
+                    succeeded_jobs = int(succeeded or 0)
+                    failed_jobs = int(failed or 0)
+                    active_jobs = int(active_jobs_raw or 0)
+                    queue_jobs = int(queue_jobs_raw or 0)
                 failed_ratio = float(failed_jobs / total_jobs) if total_jobs > 0 else 0.0
 
                 total_windows = 0
@@ -682,10 +693,10 @@ def make_status_handler(*, db_path: Path):
                         "metrics": {
                             "run_id": run_id,
                             "total_jobs": total_jobs,
-                            "succeeded_jobs": int(succeeded or 0),
+                            "succeeded_jobs": succeeded_jobs,
                             "failed_jobs": failed_jobs,
-                            "active_jobs": int(active_jobs or 0),
-                            "queue_jobs": int(queue_jobs or 0),
+                            "active_jobs": active_jobs,
+                            "queue_jobs": queue_jobs,
                             "failed_ratio": failed_ratio,
                             "total_windows": total_windows,
                             "queued_windows": queued_windows,

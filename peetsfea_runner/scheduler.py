@@ -95,13 +95,39 @@ def query_account_capacity(
     account: AccountConfigLike,
     pending_buffer_per_account: int,
     run_command: Callable[[list[str]], tuple[int, str, str]] | None = None,
+    ssh_connect_timeout_seconds: int = 5,
+    command_timeout_seconds: int = 8,
 ) -> AccountCapacitySnapshot:
     if pending_buffer_per_account < 0:
         raise ValueError("pending_buffer_per_account must be >= 0")
+    if ssh_connect_timeout_seconds <= 0:
+        raise ValueError("ssh_connect_timeout_seconds must be > 0")
+    if command_timeout_seconds <= 0:
+        raise ValueError("command_timeout_seconds must be > 0")
 
-    command = ["ssh", account.host_alias, "squeue -u $USER -h -o \"%T\""]
+    command = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={ssh_connect_timeout_seconds}",
+        account.host_alias,
+        "squeue -u $USER -h -o \"%T\"",
+    ]
     if run_command is None:
-        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=command_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"capacity query timed out account={account.account_id} host={account.host_alias} "
+                f"timeout={command_timeout_seconds}s"
+            ) from exc
         return_code = completed.returncode
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
@@ -155,6 +181,7 @@ def run_window_bundles(
     worker: Callable[[BundleSpec], T],
     capacity_lookup: Callable[..., AccountCapacitySnapshot] = query_account_capacity,
     initial_completed_windows: dict[str, int] | None = None,
+    job_index_start: int = 1,
     max_workers: int | None = None,
     idle_sleep_seconds: float = 1.0,
     on_capacity_snapshot: Callable[[AccountCapacitySnapshot], None] | None = None,
@@ -169,6 +196,8 @@ def run_window_bundles(
         raise ValueError("idle_sleep_seconds must be > 0")
     if not accounts:
         raise ValueError("accounts must not be empty")
+    if job_index_start <= 0:
+        raise ValueError("job_index_start must be > 0")
 
     queue = deque(window_queue)
     completed_windows: dict[str, int] = dict(initial_completed_windows or {})
@@ -176,7 +205,7 @@ def run_window_bundles(
     results: list[T] = []
     max_inflight_jobs = 0
     submitted_jobs = 0
-    job_counter = 0
+    job_counter = job_index_start - 1
 
     if max_workers is None:
         max_workers = max(1, sum(max(1, account.max_jobs) for account in accounts))
