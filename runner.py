@@ -5,9 +5,9 @@ from peetsfea_runner import PipelineConfig, run_pipeline
 
 def main() -> None:
     workspace_root = Path(__file__).resolve().parent
-    input_aedt = workspace_root / "examples" / "sample.aedt"
+    input_dir = workspace_root / "examples"
     config = PipelineConfig(
-        input_aedt_path=str(input_aedt),
+        input_aedt_dir=str(input_dir),
         execute_remote=True
         )
     result = run_pipeline(config)

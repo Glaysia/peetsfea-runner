@@ -14,44 +14,48 @@
 
 ## 시나리오
 
-1. 시나리오 A: 8개 모두 성공.
-2. 시나리오 B: 일부 case 의도적 실패.
-3. 시나리오 C: 다운로드 지연/실패.
+1. 시나리오 A: 다중 잡(10슬롯) 모두 성공.
+2. 시나리오 B: 일부 잡 의도적 실패 + 재시도.
+3. 시나리오 C: 재시도 소진 후 격리.
+4. 시나리오 D: 다운로드 실패 분리 보고.
 
 ## 시나리오별 관찰 포인트
 
 1. 공통:
-   - 8 window가 실제로 생성되었는지.
-   - `wait-all` 루프가 조기 종료 없이 동작하는지.
-   - case별 `exit.code`가 정확히 수집되는지.
+   - 동시 실행 슬롯이 상한(기본 10)을 넘지 않는지.
+   - 잡별 8 window 집계가 완료되는지.
+   - 잡 상태전이(`PENDING -> SUBMITTED -> RUNNING -> COLLECTING -> SUCCEEDED|FAILED`)가 맞는지.
 2. A:
    - 전체 성공 판정.
    - 회수 파일 완전성.
 3. B:
-   - 전체 실패 판정.
-   - 실패 case 정보 summary 반영.
-   - 회수 동작 유지.
+   - 실패 잡만 재시도되는지.
+   - 실패 잡 정보 summary 반영.
+   - 다른 잡 진행이 지속되는지.
 4. C:
+   - 격리(`QUARANTINED`) 레코드 생성.
+   - 재시도 상한 이후 추가 실행 없음.
+5. D:
    - download 전용 오류 코드 매핑.
    - 실행 실패와 다운로드 실패 구분.
 
 ## 디버그 절차
 
 1. 브레이크포인트 후보:
-   - screen window 생성 직후
-   - wait-all 루프 진입/탈출 시점
-   - 집계 및 summary 생성 시점
-   - 다운로드 호출 직전/직후
+   - 슬롯 배정 직후
+   - 잡 단위 재시도 분기
+   - 격리 큐 전이 지점
+   - orphan 정리 호출 전/후
 2. 로그 확인:
-   - `remote_run.log`
-   - `case_XX/run.log`
-   - `case_XX/exit.code`
+   - `artifacts/<run_id>/<job_id>/case_XX/run.log`
+   - `artifacts/<run_id>/<job_id>/case_XX/exit.code`
+   - `peetsfea_runner.duckdb` (`runs/jobs/job_events/quarantine_jobs`)
 3. 결과 판정:
    - 기대값과 실제값 비교표 작성.
 
 ## 완료 기준
 
-1. 3개 시나리오에서 기대 결과와 실제 로그가 일치.
+1. 4개 시나리오에서 기대 결과와 실제 로그가 일치.
 2. 회수 누락 0건.
-3. 집계 문자열과 케이스 결과가 일관됨.
+3. 집계 문자열과 DuckDB 상태가 일관됨.
 4. 재현 명령과 절차가 문서만으로 재수행 가능.

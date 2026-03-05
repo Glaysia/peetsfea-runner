@@ -66,3 +66,9 @@
 2. 치명 장애(정리 누락/고아 세션) 0건
 3. [ROADMAP-08-550parallel-multi-account.md](./ROADMAP-08-550parallel-multi-account.md) 착수 승인
 
+## 구현 세부 문서
+
+1. [07-01-api-queue-duckdb.md](./07-01-api-queue-duckdb.md)
+2. [07-02-slot-scheduler-remote-job.md](./07-02-slot-scheduler-remote-job.md)
+3. [07-03-orphan-summary-acceptance.md](./07-03-orphan-summary-acceptance.md)
+4. [07-04-test-matrix-and-gates.md](./07-04-test-matrix-and-gates.md)

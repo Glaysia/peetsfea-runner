@@ -10,3 +10,6 @@ examples/
 artifacts/
 
 .venv
+
+*.duckdb
+*.duckdb.wal

@@ -9,6 +9,7 @@ description = "Function-only AEDT Slurm pipeline skeleton"
 requires-python = "==3.12.*"
 dependencies = [
   "pexpect>=4.9",
+  "duckdb>=1.4.4"
 ]
 
 [tool.setuptools.packages.find]

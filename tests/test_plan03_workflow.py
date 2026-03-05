@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import duckdb
+
 from peetsfea_runner import PipelineConfig, run_pipeline
 from peetsfea_runner.pipeline import (
     EXIT_CODE_DOWNLOAD_FAILURE,
@@ -19,6 +21,7 @@ from peetsfea_runner.pipeline import (
     _count_screen_windows,
     _parse_case_summary_lines,
 )
+from peetsfea_runner.remote_job import RemoteJobAttemptResult
 
 
 class TestPlan03Workflow(unittest.TestCase):
@@ -48,97 +51,138 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("PEETS_CORES", content)
         self.assertIn("save_project failed but solve completed", content)
 
-    def test_run_pipeline_remote_success_with_mocked_workflow(self) -> None:
+    def test_run_pipeline_remote_success_with_mocked_job_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            sample = Path(tmpdir) / "sample.aedt"
-            sample.write_text("placeholder", encoding="utf-8")
+            input_dir = Path(tmpdir) / "inputs"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            for idx in range(3):
+                (input_dir / f"sample_{idx}.aedt").write_text("placeholder", encoding="utf-8")
 
             config = PipelineConfig(
-                input_aedt_path=str(sample),
+                input_aedt_dir=str(input_dir),
                 execute_remote=True,
                 local_artifacts_dir=str(Path(tmpdir) / "artifacts"),
+                metadata_db_path=str(Path(tmpdir) / "state.duckdb"),
             )
 
             with (
-                patch("peetsfea_runner.pipeline._prepare_remote_workspace") as prepare,
-                patch("peetsfea_runner.pipeline._upload_files") as upload,
                 patch(
-                    "peetsfea_runner.pipeline._run_remote_workflow_interactive",
-                    return_value=_CaseExecutionSummary(success_cases=8, failed_cases=0, case_lines=[]),
-                ) as interactive,
-                patch("peetsfea_runner.pipeline._download_results") as download,
-                patch("peetsfea_runner.pipeline._cleanup_remote_workspace") as cleanup,
+                    "peetsfea_runner.pipeline.run_remote_job_attempt",
+                    return_value=RemoteJobAttemptResult(
+                        success=True,
+                        exit_code=EXIT_CODE_SUCCESS,
+                        session_name="mock",
+                        case_summary=_CaseExecutionSummary(success_cases=8, failed_cases=0, case_lines=[]),
+                        message="ok",
+                        failed_case_lines=[],
+                    ),
+                ) as mocked_attempt,
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session") as mocked_cleanup_session,
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run") as mocked_cleanup_run,
             ):
                 result = run_pipeline(config)
 
             self.assertTrue(result.success)
             self.assertEqual(result.exit_code, EXIT_CODE_SUCCESS)
-            prepare.assert_called_once()
-            upload.assert_called_once()
-            interactive.assert_called_once()
-            download.assert_called_once()
-            cleanup.assert_called_once()
+            self.assertEqual(result.total_jobs, 3)
+            self.assertEqual(result.success_jobs, 3)
+            self.assertEqual(result.failed_jobs, 0)
+            self.assertEqual(result.quarantined_jobs, 0)
+            self.assertIn("failed_job_ids=[]", result.summary)
+            self.assertEqual(mocked_attempt.call_count, 3)
+            self.assertEqual(mocked_cleanup_session.call_count, 3)
+            mocked_cleanup_run.assert_called_once()
 
-    def test_run_pipeline_remote_stage_failure_maps_exit_code(self) -> None:
+    def test_run_pipeline_retries_once_then_quarantines(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            sample = Path(tmpdir) / "sample.aedt"
-            sample.write_text("placeholder", encoding="utf-8")
+            input_dir = Path(tmpdir) / "inputs"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            (input_dir / "good.aedt").write_text("placeholder", encoding="utf-8")
+            (input_dir / "bad.aedt").write_text("placeholder", encoding="utf-8")
 
             config = PipelineConfig(
-                input_aedt_path=str(sample),
+                input_aedt_dir=str(input_dir),
                 execute_remote=True,
                 local_artifacts_dir=str(Path(tmpdir) / "artifacts"),
+                metadata_db_path=str(Path(tmpdir) / "state.duckdb"),
+                job_retry_count=1,
+            )
+
+            def _mock_attempt(*, remote_job_dir: str, **kwargs):
+                if remote_job_dir.endswith("/job_0001"):
+                    return RemoteJobAttemptResult(
+                        success=False,
+                        exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+                        session_name="bad",
+                        case_summary=_CaseExecutionSummary(success_cases=6, failed_cases=2, case_lines=["case_03:1"]),
+                        message="failed",
+                        failed_case_lines=["case_03:1"],
+                    )
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=EXIT_CODE_SUCCESS,
+                    session_name="good",
+                    case_summary=_CaseExecutionSummary(success_cases=8, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt) as mocked_attempt,
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+            ):
+                result = run_pipeline(config)
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.failed_jobs, 1)
+            self.assertEqual(result.quarantined_jobs, 1)
+            self.assertIn("job_0001", result.summary)
+            self.assertEqual(mocked_attempt.call_count, 3)
+            conn = duckdb.connect(str(Path(tmpdir) / "state.duckdb"))
+            try:
+                state = conn.execute(
+                    "SELECT state FROM jobs WHERE run_id = ? AND job_id = 'job_0001'",
+                    [result.run_id],
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(state, "QUARANTINED")
+
+    def test_run_pipeline_reports_download_failure_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "inputs"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            (input_dir / "bad.aedt").write_text("placeholder", encoding="utf-8")
+
+            config = PipelineConfig(
+                input_aedt_dir=str(input_dir),
+                execute_remote=True,
+                local_artifacts_dir=str(Path(tmpdir) / "artifacts"),
+                metadata_db_path=str(Path(tmpdir) / "state.duckdb"),
+                job_retry_count=0,
             )
 
             with (
-                patch("peetsfea_runner.pipeline._prepare_remote_workspace"),
-                patch("peetsfea_runner.pipeline._upload_files"),
-                patch("peetsfea_runner.pipeline._run_remote_workflow_interactive"),
                 patch(
-                    "peetsfea_runner.pipeline._download_results",
-                    side_effect=_WorkflowError("download failed", exit_code=EXIT_CODE_DOWNLOAD_FAILURE),
+                    "peetsfea_runner.pipeline.run_remote_job_attempt",
+                    return_value=RemoteJobAttemptResult(
+                        success=False,
+                        exit_code=EXIT_CODE_DOWNLOAD_FAILURE,
+                        session_name="bad",
+                        case_summary=_CaseExecutionSummary(success_cases=0, failed_cases=0, case_lines=[]),
+                        message="download failed",
+                        failed_case_lines=[],
+                    ),
                 ),
-                patch("peetsfea_runner.pipeline._cleanup_remote_workspace") as cleanup,
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
             ):
                 result = run_pipeline(config)
 
             self.assertFalse(result.success)
             self.assertEqual(result.exit_code, EXIT_CODE_DOWNLOAD_FAILURE)
-            self.assertIn("download failed", result.summary)
-            cleanup.assert_not_called()
-
-    def test_run_pipeline_downloads_even_if_cases_failed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            sample = Path(tmpdir) / "sample.aedt"
-            sample.write_text("placeholder", encoding="utf-8")
-
-            config = PipelineConfig(
-                input_aedt_path=str(sample),
-                execute_remote=True,
-                local_artifacts_dir=str(Path(tmpdir) / "artifacts"),
-            )
-
-            with (
-                patch("peetsfea_runner.pipeline._prepare_remote_workspace"),
-                patch("peetsfea_runner.pipeline._upload_files"),
-                patch(
-                    "peetsfea_runner.pipeline._run_remote_workflow_interactive",
-                    return_value=_CaseExecutionSummary(
-                        success_cases=6,
-                        failed_cases=2,
-                        case_lines=["case_03:1", "case_07:137"],
-                    ),
-                ),
-                patch("peetsfea_runner.pipeline._download_results") as download,
-                patch("peetsfea_runner.pipeline._cleanup_remote_workspace") as cleanup,
-            ):
-                result = run_pipeline(config)
-
-            self.assertFalse(result.success)
-            self.assertEqual(result.exit_code, EXIT_CODE_REMOTE_RUN_FAILURE)
-            self.assertIn("failed_cases=case_03:1, case_07:137", result.summary)
-            download.assert_called_once()
-            cleanup.assert_called_once()
+            self.assertIn("failed_jobs=1", result.summary)
 
     def test_retry_calls_action_again(self) -> None:
         from peetsfea_runner.pipeline import _run_with_retry

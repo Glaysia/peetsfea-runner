@@ -31,13 +31,20 @@
 2. `partition="cpu2"`
 3. `nodes=1`
 4. `ntasks=1`
-5. `cpus=32`
+5. `cpus_per_job=32`
 6. `mem="320G"`
 7. `time_limit="05:00:00"`
-8. `retry_count=1`
-9. `remote_root="~/aedt_runs"`
-10. `local_artifacts_dir="./artifacts"`
-11. `input_aedt_path`는 필수
+8. `remote_root="~/aedt_runs"`
+9. `local_artifacts_dir="./artifacts"`
+10. `execute_remote=False`
+11. `max_jobs_per_account=10`
+12. `windows_per_job=8`
+13. `cores_per_window=4`
+14. `license_cap_per_account=80`
+15. `job_retry_count=1`
+16. `scan_recursive=False`
+17. `metadata_db_path="./peetsfea_runner.duckdb"`
+18. `input_aedt_dir`는 필수
 
 `PipelineResult` 필드:
 
@@ -47,6 +54,10 @@
 4. `remote_run_dir: str`
 5. `local_artifacts_dir: str`
 6. `summary: str`
+7. `total_jobs: int`
+8. `success_jobs: int`
+9. `failed_jobs: int`
+10. `quarantined_jobs: int`
 
 ## Implementation Spec
 
@@ -56,14 +67,14 @@
 2. 원격 작업 디렉토리 생성
 3. `sample.aedt` + 실행 스크립트 업로드
 4. `ssh gate1-harry` 접속 (`pexpect`)
-5. `srun --pty -p cpu2 -N 1 -n 1 -c 32 --mem=320G --time=05:00:00 bash`
-6. 잡 내부 `screen` 세션 1개/윈도우 1개 생성 및 검증
-7. `screen` 내부 최초 1회 환경변수/모듈 초기화
-8. 원격 환경 자동 설치(venv + pip + pyaedt)
-9. 원격 시뮬레이션 실행(`run.py` 방식 로직 호출)
-10. 원격 결과 폴더 전체 압축
-11. 로컬 다운로드 및 정리
-12. `PipelineResult` 반환
+5. 1계정 작업 큐 생성(디렉토리 스캔 `.aedt`)
+6. 슬롯 계산(`min(max_jobs_per_account, license_cap_per_account // windows_per_job)`)
+7. 잡 단위 원격 실행(최대 10잡 동시)
+8. 잡 내부 `screen` 1세션 + 8윈도우 실행 및 집계
+9. 잡 실패 시 1회 재시도, 소진 시 격리(`QUARANTINED`)
+10. 결과 다운로드/원격 정리
+11. run_id 접두 orphan session 정리
+12. DuckDB 상태 저장 + `PipelineResult` 반환
 
 `screen` 내부 최초 1회 설정 명령(고정):
 
@@ -92,11 +103,12 @@ module load ansys-electronics/v252
 
 1. `PipelineConfig` 유효성 검사 실패/성공
 2. 정상 E2E 모의 흐름에서 `PipelineResult.success=True`
-3. `ssh` 1회 실패 후 재시도 성공
-4. `srun` 실패 시 종료코드 매핑 검증
-5. 원격 실행 실패 시에도 결과 회수 시도 검증
-6. `screen` 윈도우 수가 1이 아닐 때 실패 처리
-7. CLI 관련 파일/코드가 없는지 정적 검사
+3. 80개 입력에서 동시 실행 최대 10 검증
+4. 잡 실패 후 재시도 성공/실패(격리) 검증
+5. 일부 잡 실패 시 나머지 잡 계속 진행 검증
+6. 원격 실행 실패와 다운로드 실패 코드 구분 검증
+7. DuckDB 상태 레코드(`runs/jobs/job_events/quarantine_jobs`) 검증
+8. CLI 관련 파일/코드가 없는지 정적 검사
 
 ## Assumptions and Defaults
 
