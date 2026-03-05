@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -547,9 +547,11 @@ def make_status_handler(*, db_path: Path):
     return StatusHandler
 
 
-def start_status_server(*, db_path: str, host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
+def start_status_server(*, db_path: str, host: str = "127.0.0.1", port: int = 8765) -> HTTPServer:
     handler = make_status_handler(db_path=Path(db_path).expanduser().resolve())
-    server = ThreadingHTTPServer((host, port), handler)
+    # Keep the status API single-threaded to avoid DuckDB file-handle conflicts
+    # from concurrent dashboard polling requests.
+    server = HTTPServer((host, port), handler)
     return server
 
 
@@ -632,14 +634,12 @@ def _dashboard_html() -> str:
 
     async function refresh() {
       try {
-        const [health, m, latest, jobs, ev, fl] = await Promise.all([
-          fetchJson('/api/worker/health'),
-          fetchJson('/api/metrics/throughput'),
-          fetchJson('/api/runs/latest'),
-          fetchJson('/api/jobs?limit=200'),
-          fetchJson('/api/events/recent'),
-          fetchJson('/api/file-lifecycle/summary'),
-        ]);
+        const health = await fetchJson('/api/worker/health');
+        const m = await fetchJson('/api/metrics/throughput');
+        const latest = await fetchJson('/api/runs/latest');
+        const jobs = await fetchJson('/api/jobs?limit=200');
+        const ev = await fetchJson('/api/events/recent');
+        const fl = await fetchJson('/api/file-lifecycle/summary');
 
         const badge = document.getElementById('health-badge');
         badge.textContent = health.status;
