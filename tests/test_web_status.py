@@ -41,6 +41,14 @@ class TestWebStatus(unittest.TestCase):
             thread.start()
             try:
                 host, port = server.server_address
+                with urlopen(f"http://{host}:{port}/") as resp:
+                    html = resp.read().decode("utf-8")
+                self.assertIn("Peets FEA Status Dashboard", html)
+
+                with urlopen(f"http://{host}:{port}/api") as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                self.assertIn("/api/jobs", payload["endpoints"])
+
                 with urlopen(f"http://{host}:{port}/api/jobs") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(len(payload["jobs"]), 1)
@@ -53,6 +61,18 @@ class TestWebStatus(unittest.TestCase):
                     payload = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(payload["metrics"]["total_jobs"], 1)
                 self.assertEqual(payload["metrics"]["succeeded_jobs"], 1)
+
+                with urlopen(f"http://{host}:{port}/api/runs/latest") as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(payload["run"]["run_id"], "run_01")
+
+                with urlopen(f"http://{host}:{port}/api/events/recent") as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(len(payload["events"]), 1)
+
+                with urlopen(f"http://{host}:{port}/api/file-lifecycle/summary") as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                self.assertIn("file_lifecycle", payload)
             finally:
                 server.shutdown()
                 server.server_close()
