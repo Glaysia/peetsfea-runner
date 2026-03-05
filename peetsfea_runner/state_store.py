@@ -108,6 +108,19 @@ class StateStore:
                     )
                     """
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS worker_heartbeat (
+                        service_name TEXT NOT NULL,
+                        host TEXT NOT NULL,
+                        pid INTEGER NOT NULL,
+                        last_seen_ts TEXT NOT NULL,
+                        run_id TEXT,
+                        status TEXT NOT NULL,
+                        PRIMARY KEY (service_name, host, pid)
+                    )
+                    """
+                )
                 # Backward-compatible tables retained for existing tooling/queries.
                 conn.execute(
                     """
@@ -371,6 +384,33 @@ class StateStore:
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     [run_id, job_id, attempt, _utc_now_iso(), reason, exit_code],
+                )
+            finally:
+                conn.close()
+
+    def upsert_worker_heartbeat(
+        self,
+        *,
+        service_name: str,
+        host: str,
+        pid: int,
+        run_id: str | None,
+        status: str,
+    ) -> None:
+        now = _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO worker_heartbeat (service_name, host, pid, last_seen_ts, run_id, status)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (service_name, host, pid) DO UPDATE SET
+                        last_seen_ts = EXCLUDED.last_seen_ts,
+                        run_id = EXCLUDED.run_id,
+                        status = EXCLUDED.status
+                    """,
+                    [service_name, host, pid, now, run_id, status],
                 )
             finally:
                 conn.close()

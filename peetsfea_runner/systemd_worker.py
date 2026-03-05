@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import socket
 import time
 from pathlib import Path
 
 from .pipeline import AccountConfig, PipelineConfig, run_pipeline
+from .state_store import StateStore
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -49,9 +51,46 @@ def run_user_worker_loop() -> None:
     if poll_seconds <= 0:
         raise ValueError("PEETSFEA_POLL_SECONDS must be > 0")
 
+    config = _build_config()
+    store = StateStore(Path(config.metadata_db_path))
+    store.initialize()
+    service_name = os.getenv("PEETSFEA_WORKER_SERVICE_NAME", "peetsfea-runner")
+    host = socket.gethostname()
+    pid = os.getpid()
+    store.upsert_worker_heartbeat(
+        service_name=service_name,
+        host=host,
+        pid=pid,
+        run_id=None,
+        status="HEALTHY",
+    )
+
     while True:
+        current_run_id: str | None = None
         try:
-            run_user_worker_once()
+            store.upsert_worker_heartbeat(
+                service_name=service_name,
+                host=host,
+                pid=pid,
+                run_id=current_run_id,
+                status="HEALTHY",
+            )
+            result = run_pipeline(config)
+            current_run_id = result.run_id
+            store.upsert_worker_heartbeat(
+                service_name=service_name,
+                host=host,
+                pid=pid,
+                run_id=current_run_id,
+                status="HEALTHY",
+            )
         except Exception as exc:  # pragma: no cover - runtime resilience path
             print(f"[peetsfea][worker] loop error: {exc}", flush=True)
+            store.upsert_worker_heartbeat(
+                service_name=service_name,
+                host=host,
+                pid=pid,
+                run_id=current_run_id,
+                status="DEGRADED",
+            )
         time.sleep(poll_seconds)

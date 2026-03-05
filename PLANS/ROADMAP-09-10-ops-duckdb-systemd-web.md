@@ -47,6 +47,7 @@
 4. `artifacts(run_id, job_id, artifact_root, size_bytes, checksum, created_at)`
 5. `events(run_id, job_id, level, message, stage, ts)`
 6. `file_lifecycle(run_id, job_id, input_path, input_deleted_at, delete_retry_count, delete_final_state, quarantine_path, updated_at)`
+7. `worker_heartbeat(service_name, host, pid, last_seen_ts, run_id, status)`
 
 ## 입출력 매핑 규칙
 
@@ -62,7 +63,7 @@
 4. 삭제 실패 시 재시도 후 `_delete_failed/<relative_path>.aedt` 격리.
 5. 실행 완료 후 `*.aedt_all/`에 아티팩트 기록.
 6. 상태/이벤트/수명주기를 DuckDB에 반영.
-7. 웹 API(`/api/jobs`, `/api/jobs/{id}`, `/api/metrics/throughput`)로 조회.
+7. 웹 API(`/api/worker/health`, `/api/runs/{run_id}/summary`, `/api/jobs/{id}/timeline`)를 포함해 조회.
 8. `systemd --user` 워커에서 상시 반복 운영.
 
 ## 실패 처리 및 복구
@@ -81,7 +82,7 @@
 4. 단일 계정 80개 큐 소진/반복 동작 검증.
 5. 계정 비활성화 재큐잉 검증.
 6. DuckDB 스키마/이벤트/수명주기 무결성 검증.
-7. 웹 API 3종 응답 정확성 검증.
+7. 워커 heartbeat/stale 판정 및 웹 API 응답 정확성 검증.
 8. `systemd --user` 재시작 후 상태 복원 검증.
 
 ## 운영 체크리스트

@@ -33,6 +33,7 @@ class TestStateStore(unittest.TestCase):
             self.assertIn("artifacts", names)
             self.assertIn("events", names)
             self.assertIn("file_lifecycle", names)
+            self.assertIn("worker_heartbeat", names)
 
     def test_job_lifecycle_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -97,6 +98,41 @@ class TestStateStore(unittest.TestCase):
             self.assertEqual(lifecycle_state, "DELETE_QUARANTINED")
             self.assertEqual(attempts_count, 1)
             self.assertEqual(events_count, 1)
+
+    def test_worker_heartbeat_upsert(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            store.upsert_worker_heartbeat(
+                service_name="peetsfea-runner",
+                host="host1",
+                pid=1234,
+                run_id="run_01",
+                status="HEALTHY",
+            )
+            store.upsert_worker_heartbeat(
+                service_name="peetsfea-runner",
+                host="host1",
+                pid=1234,
+                run_id="run_02",
+                status="DEGRADED",
+            )
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT service_name, host, pid, run_id, status
+                    FROM worker_heartbeat
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][3], "run_02")
+            self.assertEqual(rows[0][4], "DEGRADED")
 
 
 if __name__ == "__main__":

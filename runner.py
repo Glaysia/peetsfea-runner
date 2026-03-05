@@ -12,7 +12,11 @@ def main() -> None:
         output_root_dir=str(output_root),
         delete_failed_quarantine_dir=str(workspace_root / "output" / "_delete_failed"),
         execute_remote=True,
-        accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),),
+        accounts_registry=(
+            AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),
+            AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
+            AccountConfig(account_id="account_03", host_alias="gate1-jji0930", max_jobs=10),
+        ),
     )
     result = run_pipeline(config)
     print(result.summary)
