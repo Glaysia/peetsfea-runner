@@ -3,12 +3,17 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import duckdb
 
 from peetsfea_runner import AccountConfig, PipelineConfig, run_pipeline
-from peetsfea_runner.pipeline import EXIT_CODE_SUCCESS, PipelineResult
+from peetsfea_runner.pipeline import (
+    EXIT_CODE_SUCCESS,
+    PipelineResult,
+    _materialize_window_outputs,
+)
 from peetsfea_runner.remote_job import CaseExecutionSummary, RemoteJobAttemptResult
 from peetsfea_runner.scheduler import AccountCapacitySnapshot
 from peetsfea_runner.state_store import StateStore
@@ -63,7 +68,7 @@ class TestPipelineApi(unittest.TestCase):
             with self.assertRaises(ValueError):
                 config.validate()
 
-    def test_dry_run_creates_mirrored_aedt_all_dirs(self) -> None:
+    def test_dry_run_creates_mirrored_out_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             nested = input_dir / "a" / "b"
@@ -81,8 +86,9 @@ class TestPipelineApi(unittest.TestCase):
 
             result = run_pipeline(config)
 
-            expected = output_root / "a" / "b" / "foo.aedt.aedt_all"
+            expected = output_root / "a" / "b" / "foo.aedt.out"
             self.assertTrue(expected.is_dir())
+            self.assertTrue((expected / "foo.aedt").is_file())
             self.assertIsInstance(result, PipelineResult)
             self.assertTrue(result.success)
             self.assertEqual(result.exit_code, EXIT_CODE_SUCCESS)
@@ -102,7 +108,7 @@ class TestPipelineApi(unittest.TestCase):
                 run_id="run_01",
                 window_id="w_backlog_0001",
                 input_path=str(input_dir / "backlog.aedt"),
-                output_path=str(output_root / "backlog.aedt.aedt_all"),
+                output_path=str(output_root / "backlog.aedt.out"),
                 account_id=None,
                 state="QUEUED",
             )
@@ -128,6 +134,68 @@ class TestPipelineApi(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(state, "SUCCEEDED")
+
+    def test_pipeline_dispatches_backlog_without_batch_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            for index in range(1, 3):
+                input_file = input_dir / f"sample_{index:02d}.aedt"
+                input_file.write_text("placeholder", encoding="utf-8")
+                Path(f"{input_file}.ready").write_text("", encoding="utf-8")
+
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=False,
+                continuous_mode=False,
+            )
+            dispatched_sizes: list[int] = []
+
+            def _mock_run_window_workers(*, window_queue, job_index_start, **kwargs):
+                dispatched_sizes.append(len(window_queue))
+                return SimpleNamespace(results=[], max_inflight_jobs=0, submitted_jobs=0)
+
+            with patch("peetsfea_runner.pipeline.run_window_workers", side_effect=_mock_run_window_workers):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.total_windows, 2)
+            self.assertEqual(dispatched_sizes, [2])
+
+    def test_continuous_mode_ingests_all_discovered_files_before_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            for index in range(1, 4):
+                input_file = input_dir / f"sample_{index:02d}.aedt"
+                input_file.write_text("placeholder", encoding="utf-8")
+                Path(f"{input_file}.ready").write_text("", encoding="utf-8")
+
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=False,
+                continuous_mode=True,
+            )
+            dispatched_sizes: list[int] = []
+
+            def _mock_run_window_workers(*, window_queue, job_index_start, **kwargs):
+                dispatched_sizes.append(len(window_queue))
+                return SimpleNamespace(results=[], max_inflight_jobs=0, submitted_jobs=0)
+
+            with patch("peetsfea_runner.pipeline.run_window_workers", side_effect=_mock_run_window_workers):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.total_windows, 3)
+            self.assertEqual(dispatched_sizes, [3])
 
     def test_upload_success_deletes_input_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -185,6 +253,169 @@ class TestPipelineApi(unittest.TestCase):
                 conn.close()
             self.assertEqual(state, "DELETED")
 
+    def test_remote_attempt_records_window_lifecycle_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "foo.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            (input_dir / "foo.aedt.ready").write_text("", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=True,
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+            )
+
+            def _mock_attempt(*, on_upload_success=None, **kwargs):
+                if on_upload_success is not None:
+                    on_upload_success()
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=0,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=1, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=10,
+                    ),
+                ),
+            ):
+                run_pipeline(config)
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                stages = [
+                    row[0]
+                    for row in conn.execute(
+                        """
+                        SELECT stage
+                        FROM window_events
+                        WHERE window_id IN (SELECT window_id FROM window_tasks LIMIT 1)
+                        """
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+
+            self.assertIn("ASSIGNED", stages)
+            self.assertIn("UPLOADING", stages)
+            self.assertIn("RUNNING", stages)
+            self.assertIn("SUCCEEDED", stages)
+
+    def test_materialize_window_outputs_mirrors_case_outputs_into_out_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            input_file = root / "nested" / "sample.aedt"
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            input_file.write_text("input", encoding="utf-8")
+            output_dir = root / "out" / "nested" / "sample.aedt.out"
+            local_bundle_dir = root / "bundle"
+            case_dir = local_bundle_dir / "case_01"
+            (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
+            (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
+            (case_dir / "project.aedt.q.complete").write_text("done", encoding="utf-8")
+            (case_dir / "project.aedtresults" / "trace.txt").write_text("trace", encoding="utf-8")
+            (case_dir / "run.log").write_text("log", encoding="utf-8")
+            (case_dir / "exit.code").write_text("0", encoding="utf-8")
+
+            _materialize_window_outputs(
+                local_bundle_dir=local_bundle_dir,
+                windows=[
+                    SimpleNamespace(
+                        input_path=input_file,
+                        output_dir=output_dir,
+                    )
+                ],
+            )
+
+            self.assertTrue((output_dir / "sample.aedt").is_file())
+            self.assertTrue((output_dir / "sample.aedt.q.complete").is_file())
+            self.assertTrue((output_dir / "sample.aedtresults").is_dir())
+            self.assertTrue((output_dir / "sample.aedtresults" / "trace.txt").is_file())
+            self.assertTrue((output_dir / "run.log").is_file())
+            self.assertTrue((output_dir / "exit.code").is_file())
+
+    def test_failed_remote_attempt_still_materializes_case_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "foo.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            (input_dir / "foo.aedt.ready").write_text("", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=True,
+                continuous_mode=False,
+                job_retry_count=0,
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+            )
+
+            def _mock_attempt(*, local_job_dir=None, on_upload_success=None, **kwargs):
+                if on_upload_success is not None:
+                    on_upload_success()
+                assert local_job_dir is not None
+                case_dir = Path(local_job_dir) / "case_01"
+                (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
+                (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
+                (case_dir / "project.aedt.q.complete").write_text("done", encoding="utf-8")
+                (case_dir / "run.log").write_text("log", encoding="utf-8")
+                (case_dir / "exit.code").write_text("1", encoding="utf-8")
+                ((case_dir / "project.aedtresults") / "trace.txt").write_text("trace", encoding="utf-8")
+                return RemoteJobAttemptResult(
+                    success=False,
+                    exit_code=1,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=0, failed_cases=1, case_lines=["case_01:1"]),
+                    message="failed",
+                    failed_case_lines=["case_01:1"],
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=10,
+                    ),
+                ),
+            ):
+                result = run_pipeline(config)
+
+            self.assertFalse(result.success)
+            out_dir = output_root / "foo.aedt.out"
+            self.assertTrue((out_dir / "foo.aedt").is_file())
+            self.assertTrue((out_dir / "foo.aedt.q.complete").is_file())
+            self.assertTrue((out_dir / "foo.aedtresults").is_dir())
+            self.assertTrue((out_dir / "run.log").is_file())
+            self.assertTrue((out_dir / "exit.code").is_file())
+
     def test_delete_failure_moves_to_quarantine(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
@@ -236,6 +467,59 @@ class TestPipelineApi(unittest.TestCase):
 
             quarantined_path = quarantine_root / "foo.aedt"
             self.assertTrue(quarantined_path.exists())
+
+    def test_remote_pipeline_caps_worker_jobs_at_account_max(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            for index in range(1, 86):
+                input_file = input_dir / f"sample_{index:03d}.aedt"
+                input_file.write_text("placeholder", encoding="utf-8")
+                Path(f"{input_file}.ready").write_text("", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=True,
+                continuous_mode=False,
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),),
+            )
+
+            def _mock_attempt(*, window_inputs=None, on_upload_success=None, **kwargs):
+                if on_upload_success is not None:
+                    on_upload_success()
+                case_count = len(window_inputs or [])
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=0,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=case_count, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=10,
+                    ),
+                ),
+            ):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.total_jobs, 10)
+            self.assertEqual(result.total_windows, 85)
 
 
 if __name__ == "__main__":

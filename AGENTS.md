@@ -21,3 +21,8 @@
 ```bash
 .venv/bin/python -m pdb runner.py
 ```
+
+## Systemd Rule
+
+1. `/home/peetsmain/.config/systemd/user/peetsfea-runner.service`는 심볼릭 링크를 풀지 말고 직접 수정하지 않는다.
+2. systemd service 변경이 필요하면 `/home/peetsmain/peetsfea-runner/systemd/peetsfea-runner.service`만 수정한다.

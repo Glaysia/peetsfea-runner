@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha1
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Callable
 
 from .constants import (
@@ -24,9 +25,14 @@ from .remote_job import (
     WorkflowError as _WorkflowError,
     _build_case_aggregation_command,
     _build_case_window_command,
+    _build_remote_dispatch_script_content,
     _build_remote_job_script_content,
     _build_wait_all_command,
     _count_screen_windows,
+    _extract_meaningful_remote_failure_details,
+    _has_remote_workflow_markers,
+    _parse_marked_case_summary_lines,
+    _parse_marked_failed_count,
     _parse_case_summary_lines,
     cleanup_orphan_session,
     cleanup_orphan_sessions_for_run,
@@ -37,7 +43,7 @@ from .scheduler import (
     BundleSpec,
     WindowTaskRef,
     query_account_capacity,
-    run_window_bundles,
+    run_window_workers,
 )
 from .state_store import StateStore
 
@@ -216,10 +222,6 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     remote_run_dir = _join_remote_root(config.remote_root, run_id)
     _log_stage(f"pipeline start run_id={run_id} total_inputs={len(aedt_files)} execute_remote={config.execute_remote}")
 
-    windows_batch_size = max(
-        config.windows_per_job,
-        config.windows_per_job * sum(max(1, account.max_jobs) for account in accounts),
-    )
     queued_windows = _load_schedulable_windows(state_store=state_store, run_id=run_id, input_root=input_root)
     total_windows = len(queued_windows)
     discovered_count = 0
@@ -267,7 +269,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             return
         completed_windows = _current_completed_windows()
         if config.execute_remote:
-            batch = run_window_bundles(
+            batch = run_window_workers(
                 window_queue=window_batch,
                 accounts=accounts,
                 windows_per_job=config.windows_per_job,
@@ -287,7 +289,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 on_bundle_submitted=_bundle_submitted,
             )
         else:
-            batch = run_window_bundles(
+            batch = run_window_workers(
                 window_queue=window_batch,
                 accounts=accounts,
                 windows_per_job=config.windows_per_job,
@@ -307,25 +309,22 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         next_job_index += batch.submitted_jobs
         outcomes.extend(batch.results)
 
-    def _flush_queued_windows(*, force: bool) -> None:
+    def _dispatch_queued_windows() -> None:
         nonlocal queued_windows
-        while queued_windows and (force or len(queued_windows) >= windows_batch_size):
-            if force:
-                batch_windows = queued_windows
-                queued_windows = []
-            else:
-                batch_windows = queued_windows[:windows_batch_size]
-                queued_windows = queued_windows[windows_batch_size:]
+        while queued_windows:
+            batch_windows = queued_windows
+            queued_windows = []
             _run_window_batch(batch_windows)
 
-    _flush_queued_windows(force=False)
+    _dispatch_queued_windows()
 
     def _on_window_enqueued(window: WindowTaskRef) -> None:
         nonlocal total_windows
         queued_windows.append(window)
         total_windows += 1
-        _flush_queued_windows(force=False)
+        _dispatch_queued_windows()
 
+    ingest_callback = None
     windows, discovered_count = _ingest_window_queue(
         config=config,
         state_store=state_store,
@@ -333,13 +332,13 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         input_root=input_root,
         output_root=output_root,
         aedt_files=aedt_files,
-        on_window_enqueued=_on_window_enqueued,
+        on_window_enqueued=ingest_callback,
     )
     if windows:
         queued_windows.extend(windows)
         total_windows += len(windows)
 
-    _flush_queued_windows(force=True)
+    _dispatch_queued_windows()
 
     if total_windows == 0:
         summary = (
@@ -487,7 +486,10 @@ def _ingest_window_queue(
 
     for input_file in aedt_files:
         relative_path = input_file.relative_to(input_root)
-        output_dir = output_root / relative_path.parent / f"{input_file.name}.aedt_all"
+        output_dir = _build_window_output_dir(
+            output_root=output_root,
+            relative_path=relative_path,
+        )
         ready_path = _ready_path_for_input(input_file, config.ready_sidecar_suffix)
         file_stat = input_file.stat()
         discovered_count += 1
@@ -556,7 +558,7 @@ def _run_dry_bundle(
         run_id=run_id,
         job_id=bundle.job_id,
         input_path=str(first_window.input_path),
-        output_path=str(first_window.output_dir.parent),
+        output_path=str(first_window.output_dir),
         account_id=bundle.account_id,
     )
     state_store.update_job_status(run_id=run_id, job_id=bundle.job_id, status="RUNNING", attempt_no=0)
@@ -569,7 +571,7 @@ def _run_dry_bundle(
     )
 
     for window in bundle.window_inputs:
-        window.output_dir.mkdir(parents=True, exist_ok=True)
+        _initialize_window_output_dir(window=window)
         state_store.update_window_task(
             run_id=run_id,
             window_id=window.window_id,
@@ -587,9 +589,9 @@ def _run_dry_bundle(
             message="execute_remote=False dry run",
         )
         state_store.mark_ingest_state(input_path=str(window.input_path), state="SUCCEEDED")
+        state_store.record_artifact(run_id=run_id, job_id=bundle.job_id, artifact_root=str(window.output_dir))
 
     state_store.update_job_status(run_id=run_id, job_id=bundle.job_id, status="SUCCEEDED", attempt_no=0)
-    state_store.record_artifact(run_id=run_id, job_id=bundle.job_id, artifact_root=str(first_window.output_dir.parent))
     state_store.append_event(
         run_id=run_id,
         job_id=bundle.job_id,
@@ -629,17 +631,12 @@ def _run_bundle_with_retry(
             quarantined_windows=0,
         )
 
-    local_artifacts_root = Path(config.local_artifacts_dir).expanduser().resolve()
-    local_bundle_dir = local_artifacts_root / run_id / bundle.job_id
-    local_bundle_dir.mkdir(parents=True, exist_ok=True)
-    retry_inputs_dir = local_bundle_dir / "_retry_inputs"
-    retry_inputs_dir.mkdir(parents=True, exist_ok=True)
     first_window = bundle.window_inputs[0]
     state_store.create_job(
         run_id=run_id,
         job_id=bundle.job_id,
         input_path=str(first_window.input_path),
-        output_path=str(local_bundle_dir),
+        output_path=str(first_window.output_dir),
         account_id=bundle.account_id,
     )
     state_store.append_event(
@@ -661,226 +658,90 @@ def _run_bundle_with_retry(
         windows_per_job=config.windows_per_job,
         cores_per_window=config.cores_per_window,
     )
-    pending_windows = list(bundle.window_inputs)
-    staged_input_paths: dict[str, Path] = {}
-    for window in pending_windows:
-        staged_path = retry_inputs_dir / f"{window.window_id}.aedt"
-        try:
-            if window.input_path.exists():
-                shutil.copy2(window.input_path, staged_path)
-                staged_input_paths[window.window_id] = staged_path
-        except OSError:
-            # Staging best-effort: retry can still use original path if it exists.
-            continue
-    deleted_window_ids: set[str] = set()
-    success_windows = 0
-    failed_windows = 0
-    quarantined_windows = 0
-    terminal_exit_code = EXIT_CODE_SUCCESS
-    terminal_message = "ok"
-    last_attempt_no = 0
-
-    for attempt in range(1, config.job_retry_count + 2):
-        if not pending_windows:
-            break
-        last_attempt_no = attempt
-
-        runnable_windows: list[WindowTaskRef] = []
+    with TemporaryDirectory(prefix=f"peetsfea_bundle_{bundle.job_id}_") as tmpdir:
+        local_bundle_dir = Path(tmpdir) / "bundle"
+        local_bundle_dir.mkdir(parents=True, exist_ok=True)
+        retry_inputs_dir = local_bundle_dir / "_retry_inputs"
+        retry_inputs_dir.mkdir(parents=True, exist_ok=True)
+        pending_windows = list(bundle.window_inputs)
+        staged_input_paths: dict[str, Path] = {}
         for window in pending_windows:
-            source_path = staged_input_paths.get(window.window_id, window.input_path)
-            if source_path.exists():
-                runnable_windows.append(window)
+            staged_path = retry_inputs_dir / f"{window.window_id}.aedt"
+            try:
+                if window.input_path.exists():
+                    shutil.copy2(window.input_path, staged_path)
+                    staged_input_paths[window.window_id] = staged_path
+            except OSError:
                 continue
-            state_store.quarantine_job(
-                run_id=run_id,
-                job_id=window.window_id,
-                attempt=attempt,
-                reason=f"input missing: {window.input_path}",
-                exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
-            )
-            state_store.update_window_task(
-                run_id=run_id,
-                window_id=window.window_id,
-                state="QUARANTINED",
-                attempt_no=attempt,
-                job_id=bundle.job_id,
-                account_id=bundle.account_id,
-                failure_reason=f"input missing: {window.input_path}",
-            )
-            state_store.append_window_event(
-                run_id=run_id,
-                window_id=window.window_id,
-                level="ERROR",
-                stage="QUARANTINED",
-                message=f"input missing: {window.input_path}",
-            )
-            state_store.mark_ingest_state(input_path=str(window.input_path), state="QUARANTINED")
-            quarantined_windows += 1
+        deleted_window_ids: set[str] = set()
+        success_windows = 0
+        failed_windows = 0
+        quarantined_windows = 0
+        terminal_exit_code = EXIT_CODE_SUCCESS
+        terminal_message = "ok"
+        last_attempt_no = 0
 
-        if not runnable_windows:
-            pending_windows = []
-            terminal_exit_code = EXIT_CODE_REMOTE_RUN_FAILURE
-            terminal_message = "all windows quarantined due to missing input files"
-            break
+        for attempt in range(1, config.job_retry_count + 2):
+            if not pending_windows:
+                break
+            last_attempt_no = attempt
 
-        session_name = _build_session_name(run_id, bundle.job_index, attempt)
-        _log_stage(
-            f"job start job_id={bundle.job_id} attempt={attempt} session={session_name} windows={len(runnable_windows)}"
-        )
-        state_store.update_job_status(run_id=run_id, job_id=bundle.job_id, status="SUBMITTED", attempt_no=attempt)
-        state_store.append_event(
-            run_id=run_id,
-            job_id=bundle.job_id,
-            level="INFO",
-            stage="SUBMITTED",
-            message=f"attempt={attempt} windows={len(runnable_windows)}",
-        )
-
-        for window in runnable_windows:
-            state_store.update_window_task(
-                run_id=run_id,
-                window_id=window.window_id,
-                state="RUNNING",
-                attempt_no=attempt,
-                job_id=bundle.job_id,
-                account_id=bundle.account_id,
-                failure_reason=None,
-            )
-            state_store.append_window_event(
-                run_id=run_id,
-                window_id=window.window_id,
-                level="INFO",
-                stage="RUNNING",
-                message=f"job={bundle.job_id} attempt={attempt}",
-            )
-
-        state_store.update_job_status(run_id=run_id, job_id=bundle.job_id, status="RUNNING", attempt_no=attempt)
-        attempt_id = state_store.start_attempt(run_id=run_id, job_id=bundle.job_id, attempt_no=attempt, node=bundle.host_alias)
-
-        def _delete_after_upload() -> None:
-            _delete_window_input_files(
-                config=config,
-                state_store=state_store,
-                run_id=run_id,
-                windows=runnable_windows,
-                deleted_window_ids=deleted_window_ids,
-            )
-
-        try:
-            result = run_remote_job_attempt(
-                config=remote_cfg,
-                window_inputs=[
-                    WindowInput(
-                        window_id=window.window_id,
-                        input_path=staged_input_paths.get(window.window_id, window.input_path),
-                    )
-                    for window in runnable_windows
-                ],
-                remote_job_dir=_join_remote_root(
-                    _join_remote_root(_join_remote_root(remote_run_dir, bundle.account_id), bundle.job_id),
-                    f"a{attempt}",
-                ),
-                local_job_dir=local_bundle_dir,
-                session_name=session_name,
-                on_upload_success=_delete_after_upload,
-            )
-        except Exception as exc:  # pragma: no cover
-            result = RemoteJobAttemptResult(
-                success=False,
-                exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
-                session_name=session_name,
-                case_summary=_CaseExecutionSummary(success_cases=0, failed_cases=0, case_lines=[]),
-                message=f"unexpected exception: {exc}",
-                failed_case_lines=[],
-            )
-
-        try:
-            cleanup_orphan_session(config=remote_cfg, session_name=session_name)
-        except _WorkflowError as cleanup_error:
-            state_store.append_event(
-                run_id=run_id,
-                job_id=bundle.job_id,
-                level="WARN",
-                stage="ORPHAN_CLEANUP_FAILED",
-                message=str(cleanup_error),
-            )
-
-        state_store.finish_attempt(
-            run_id=run_id,
-            attempt_id=attempt_id,
-            exit_code=result.exit_code,
-            error=None if result.success else result.message,
-        )
-        terminal_exit_code = result.exit_code
-        terminal_message = result.message
-
-        failed_indices = _parse_failed_case_indices(result.failed_case_lines, len(runnable_windows))
-        if not result.success and not failed_indices:
-            failed_indices = set(range(len(runnable_windows)))
-
-        retry_windows: list[WindowTaskRef] = []
-        for index, window in enumerate(runnable_windows):
-            if index in failed_indices:
-                state_store.mark_ingest_state(input_path=str(window.input_path), state="FAILED")
-                if attempt <= config.job_retry_count:
-                    state_store.update_window_task(
-                        run_id=run_id,
-                        window_id=window.window_id,
-                        state="RETRY_QUEUED",
-                        attempt_no=attempt,
-                        job_id=bundle.job_id,
-                        account_id=bundle.account_id,
-                        failure_reason=result.message,
-                    )
-                    state_store.append_window_event(
-                        run_id=run_id,
-                        window_id=window.window_id,
-                        level="WARN",
-                        stage="RETRY_QUEUED",
-                        message=f"attempt={attempt} reason={result.message}",
-                    )
-                    retry_windows.append(
-                        WindowTaskRef(
-                            run_id=window.run_id,
-                            window_id=window.window_id,
-                            input_path=window.input_path,
-                            relative_path=window.relative_path,
-                            output_dir=window.output_dir,
-                            attempt_no=window.attempt_no + 1,
-                        )
-                    )
-                else:
-                    state_store.quarantine_job(
-                        run_id=run_id,
-                        job_id=window.window_id,
-                        attempt=attempt,
-                        reason=result.message,
-                        exit_code=result.exit_code,
-                    )
-                    state_store.update_window_task(
-                        run_id=run_id,
-                        window_id=window.window_id,
-                        state="QUARANTINED",
-                        attempt_no=attempt,
-                        job_id=bundle.job_id,
-                        account_id=bundle.account_id,
-                        failure_reason=result.message,
-                    )
-                    state_store.append_window_event(
-                        run_id=run_id,
-                        window_id=window.window_id,
-                        level="ERROR",
-                        stage="QUARANTINED",
-                        message=result.message,
-                    )
-                    state_store.mark_ingest_state(input_path=str(window.input_path), state="QUARANTINED")
-                    quarantined_windows += 1
-            else:
-                window.output_dir.mkdir(parents=True, exist_ok=True)
+            runnable_windows: list[WindowTaskRef] = []
+            for window in pending_windows:
+                source_path = staged_input_paths.get(window.window_id, window.input_path)
+                if source_path.exists():
+                    runnable_windows.append(window)
+                    continue
+                state_store.quarantine_job(
+                    run_id=run_id,
+                    job_id=window.window_id,
+                    attempt=attempt,
+                    reason=f"input missing: {window.input_path}",
+                    exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+                )
                 state_store.update_window_task(
                     run_id=run_id,
                     window_id=window.window_id,
-                    state="SUCCEEDED",
+                    state="QUARANTINED",
+                    attempt_no=attempt,
+                    job_id=bundle.job_id,
+                    account_id=bundle.account_id,
+                    failure_reason=f"input missing: {window.input_path}",
+                )
+                state_store.append_window_event(
+                    run_id=run_id,
+                    window_id=window.window_id,
+                    level="ERROR",
+                    stage="QUARANTINED",
+                    message=f"input missing: {window.input_path}",
+                )
+                state_store.mark_ingest_state(input_path=str(window.input_path), state="QUARANTINED")
+                quarantined_windows += 1
+
+            if not runnable_windows:
+                pending_windows = []
+                terminal_exit_code = EXIT_CODE_REMOTE_RUN_FAILURE
+                terminal_message = "all windows quarantined due to missing input files"
+                break
+
+            session_name = _build_session_name(run_id, bundle.job_index, attempt)
+            _log_stage(
+                f"job start job_id={bundle.job_id} attempt={attempt} session={session_name} windows={len(runnable_windows)}"
+            )
+            state_store.update_job_status(run_id=run_id, job_id=bundle.job_id, status="SUBMITTED", attempt_no=attempt)
+            state_store.append_event(
+                run_id=run_id,
+                job_id=bundle.job_id,
+                level="INFO",
+                stage="SUBMITTED",
+                message=f"attempt={attempt} windows={len(runnable_windows)}",
+            )
+
+            for window in runnable_windows:
+                state_store.update_window_task(
+                    run_id=run_id,
+                    window_id=window.window_id,
+                    state="ASSIGNED",
                     attempt_no=attempt,
                     job_id=bundle.job_id,
                     account_id=bundle.account_id,
@@ -890,17 +751,188 @@ def _run_bundle_with_retry(
                     run_id=run_id,
                     window_id=window.window_id,
                     level="INFO",
-                    stage="SUCCEEDED",
+                    stage="ASSIGNED",
                     message=f"job={bundle.job_id} attempt={attempt}",
                 )
-                state_store.mark_ingest_state(input_path=str(window.input_path), state="SUCCEEDED")
-                success_windows += 1
 
-        if not retry_windows:
-            failed_windows = 0
-            break
-        pending_windows = retry_windows
-        _log_stage(f"job retry scheduled job_id={bundle.job_id} next_attempt={attempt + 1}")
+            _mark_window_lifecycle_stage(
+                state_store=state_store,
+                run_id=run_id,
+                windows=runnable_windows,
+                attempt_no=attempt,
+                job_id=bundle.job_id,
+                account_id=bundle.account_id,
+                state="UPLOADING",
+                message=f"job={bundle.job_id} attempt={attempt}",
+            )
+
+            state_store.update_job_status(run_id=run_id, job_id=bundle.job_id, status="RUNNING", attempt_no=attempt)
+            attempt_id = state_store.start_attempt(
+                run_id=run_id,
+                job_id=bundle.job_id,
+                attempt_no=attempt,
+                node=bundle.host_alias,
+            )
+
+            def _delete_after_upload() -> None:
+                _delete_window_input_files(
+                    config=config,
+                    state_store=state_store,
+                    run_id=run_id,
+                    windows=runnable_windows,
+                    deleted_window_ids=deleted_window_ids,
+                )
+                _mark_window_lifecycle_stage(
+                    state_store=state_store,
+                    run_id=run_id,
+                    windows=runnable_windows,
+                    attempt_no=attempt,
+                    job_id=bundle.job_id,
+                    account_id=bundle.account_id,
+                    state="RUNNING",
+                    message=f"job={bundle.job_id} attempt={attempt} uploaded",
+                )
+
+            try:
+                result = run_remote_job_attempt(
+                    config=remote_cfg,
+                    window_inputs=[
+                        WindowInput(
+                            window_id=window.window_id,
+                            input_path=staged_input_paths.get(window.window_id, window.input_path),
+                        )
+                        for window in runnable_windows
+                    ],
+                    remote_job_dir=_join_remote_root(
+                        _join_remote_root(_join_remote_root(remote_run_dir, bundle.account_id), bundle.job_id),
+                        f"a{attempt}",
+                    ),
+                    local_job_dir=local_bundle_dir,
+                    session_name=session_name,
+                    on_upload_success=_delete_after_upload,
+                )
+            except Exception as exc:  # pragma: no cover
+                result = RemoteJobAttemptResult(
+                    success=False,
+                    exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+                    session_name=session_name,
+                    case_summary=_CaseExecutionSummary(success_cases=0, failed_cases=0, case_lines=[]),
+                    message=f"unexpected exception: {exc}",
+                    failed_case_lines=[],
+                )
+            _materialize_window_outputs(
+                local_bundle_dir=local_bundle_dir,
+                windows=runnable_windows,
+                staged_input_paths=staged_input_paths,
+            )
+
+            try:
+                cleanup_orphan_session(config=remote_cfg, session_name=session_name)
+            except _WorkflowError as cleanup_error:
+                state_store.append_event(
+                    run_id=run_id,
+                    job_id=bundle.job_id,
+                    level="WARN",
+                    stage="ORPHAN_CLEANUP_FAILED",
+                    message=str(cleanup_error),
+                )
+
+            state_store.finish_attempt(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                exit_code=result.exit_code,
+                error=None if result.success else result.message,
+            )
+            terminal_exit_code = result.exit_code
+            terminal_message = result.message
+
+            failed_indices = _parse_failed_case_indices(result.failed_case_lines, len(runnable_windows))
+            if not result.success and not failed_indices:
+                failed_indices = set(range(len(runnable_windows)))
+
+            retry_windows: list[WindowTaskRef] = []
+            for index, window in enumerate(runnable_windows):
+                if index in failed_indices:
+                    state_store.mark_ingest_state(input_path=str(window.input_path), state="FAILED")
+                    if attempt <= config.job_retry_count:
+                        state_store.update_window_task(
+                            run_id=run_id,
+                            window_id=window.window_id,
+                            state="RETRY_QUEUED",
+                            attempt_no=attempt,
+                            job_id=bundle.job_id,
+                            account_id=bundle.account_id,
+                            failure_reason=result.message,
+                        )
+                        state_store.append_window_event(
+                            run_id=run_id,
+                            window_id=window.window_id,
+                            level="WARN",
+                            stage="RETRY_QUEUED",
+                            message=f"attempt={attempt} reason={result.message}",
+                        )
+                        retry_windows.append(
+                            WindowTaskRef(
+                                run_id=window.run_id,
+                                window_id=window.window_id,
+                                input_path=window.input_path,
+                                relative_path=window.relative_path,
+                                output_dir=window.output_dir,
+                                attempt_no=window.attempt_no + 1,
+                            )
+                        )
+                    else:
+                        state_store.quarantine_job(
+                            run_id=run_id,
+                            job_id=window.window_id,
+                            attempt=attempt,
+                            reason=result.message,
+                            exit_code=result.exit_code,
+                        )
+                        state_store.update_window_task(
+                            run_id=run_id,
+                            window_id=window.window_id,
+                            state="QUARANTINED",
+                            attempt_no=attempt,
+                            job_id=bundle.job_id,
+                            account_id=bundle.account_id,
+                            failure_reason=result.message,
+                        )
+                        state_store.append_window_event(
+                            run_id=run_id,
+                            window_id=window.window_id,
+                            level="ERROR",
+                            stage="QUARANTINED",
+                            message=result.message,
+                        )
+                        state_store.mark_ingest_state(input_path=str(window.input_path), state="QUARANTINED")
+                        quarantined_windows += 1
+                else:
+                    state_store.update_window_task(
+                        run_id=run_id,
+                        window_id=window.window_id,
+                        state="SUCCEEDED",
+                        attempt_no=attempt,
+                        job_id=bundle.job_id,
+                        account_id=bundle.account_id,
+                        failure_reason=None,
+                    )
+                    state_store.append_window_event(
+                        run_id=run_id,
+                        window_id=window.window_id,
+                        level="INFO",
+                        stage="SUCCEEDED",
+                        message=f"job={bundle.job_id} attempt={attempt}",
+                    )
+                    state_store.mark_ingest_state(input_path=str(window.input_path), state="SUCCEEDED")
+                    state_store.record_artifact(run_id=run_id, job_id=bundle.job_id, artifact_root=str(window.output_dir))
+                    success_windows += 1
+
+            if not retry_windows:
+                failed_windows = 0
+                break
+            pending_windows = retry_windows
+            _log_stage(f"job retry scheduled job_id={bundle.job_id} next_attempt={attempt + 1}")
 
     quarantined = quarantined_windows > 0
     success = (failed_windows == 0) and (quarantined_windows == 0)
@@ -912,7 +944,6 @@ def _run_bundle_with_retry(
         attempt_no=max(1, last_attempt_no),
         failure_reason=None if success else terminal_message,
     )
-    state_store.record_artifact(run_id=run_id, job_id=bundle.job_id, artifact_root=str(local_bundle_dir))
     state_store.append_event(
         run_id=run_id,
         job_id=bundle.job_id,
@@ -934,6 +965,48 @@ def _run_bundle_with_retry(
         failed_windows=failed_windows,
         quarantined_windows=quarantined_windows,
     )
+
+
+def _build_window_output_dir(*, output_root: Path, relative_path: Path) -> Path:
+    return output_root / relative_path.parent / f"{relative_path.name}.out"
+
+
+def _initialize_window_output_dir(*, window: WindowTaskRef, seed_input_path: Path | None = None) -> None:
+    if window.output_dir.exists():
+        shutil.rmtree(window.output_dir)
+    window.output_dir.mkdir(parents=True, exist_ok=True)
+    source_input = seed_input_path if seed_input_path is not None else window.input_path
+    if source_input.exists():
+        shutil.copy2(source_input, window.output_dir / window.input_path.name)
+
+
+def _materialize_window_outputs(
+    *,
+    local_bundle_dir: Path,
+    windows: list[WindowTaskRef],
+    staged_input_paths: dict[str, Path] | None = None,
+) -> None:
+    for index, window in enumerate(windows, start=1):
+        case_dir = local_bundle_dir / f"case_{index:02d}"
+        seed_input_path = None if staged_input_paths is None else staged_input_paths.get(window.window_id)
+        _initialize_window_output_dir(window=window, seed_input_path=seed_input_path)
+        if not case_dir.exists():
+            continue
+        for item in case_dir.iterdir():
+            if item.name == "tmp":
+                continue
+            target_name = _rename_case_output_name(case_name=item.name, input_name=window.input_path.name)
+            target_path = window.output_dir / target_name
+            if item.is_dir():
+                shutil.copytree(item, target_path, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target_path)
+
+
+def _rename_case_output_name(*, case_name: str, input_name: str) -> str:
+    if case_name.startswith("project.aedt"):
+        return f"{input_name}{case_name[len('project.aedt'):]}"
+    return case_name
 
 
 def _delete_window_input_files(
@@ -1018,6 +1091,36 @@ def _delete_window_input_file(
             message=str(quarantine_target),
         )
         state_store.mark_ingest_state(input_path=str(path), state="DELETE_QUARANTINED")
+
+
+def _mark_window_lifecycle_stage(
+    *,
+    state_store: StateStore,
+    run_id: str,
+    windows: list[WindowTaskRef],
+    attempt_no: int,
+    job_id: str,
+    account_id: str,
+    state: str,
+    message: str,
+) -> None:
+    for window in windows:
+        state_store.update_window_task(
+            run_id=run_id,
+            window_id=window.window_id,
+            state=state,
+            attempt_no=attempt_no,
+            job_id=job_id,
+            account_id=account_id,
+            failure_reason=None,
+        )
+        state_store.append_window_event(
+            run_id=run_id,
+            window_id=window.window_id,
+            level="INFO",
+            stage=state,
+            message=message,
+        )
 
 
 def _parse_failed_case_indices(case_lines: list[str], case_count: int) -> set[int]:

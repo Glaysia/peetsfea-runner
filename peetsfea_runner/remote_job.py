@@ -65,6 +65,24 @@ class WindowInput:
     input_path: Path
 
 
+@dataclass(slots=True)
+class _RemoteWorkflowResult:
+    case_summary: CaseExecutionSummary
+    archive_bytes: bytes
+
+
+@dataclass(slots=True)
+class _RemoteWorkflowSubmission:
+    stdout: str
+    stderr: str
+    return_code: int
+
+    @property
+    def combined_output(self) -> str:
+        parts = [part.strip() for part in (self.stdout, self.stderr) if part and part.strip()]
+        return "\n".join(parts).strip()
+
+
 def _log_stage(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[peetsfea][{timestamp}] {message}", flush=True)
@@ -87,7 +105,7 @@ def run_remote_job_attempt(
     )
     case_count = len(inputs)
 
-    case_summary: CaseExecutionSummary | None = None
+    workflow_result: _RemoteWorkflowResult | None = None
     local_job_dir.mkdir(parents=True, exist_ok=True)
     resolved_remote_job_dir = _resolve_remote_path(config=config, path=remote_job_dir)
     _log_stage(
@@ -105,22 +123,29 @@ def run_remote_job_attempt(
                 shutil.copy2(window.input_path, staged_project)
                 staged_projects.append(staged_project)
             remote_script = _write_remote_job_script(tmpdir_path)
+            remote_dispatch_script = _write_remote_dispatch_script(
+                tmpdir_path,
+                config=config,
+                remote_job_dir=resolved_remote_job_dir,
+                case_count=case_count,
+            )
             _upload_files(
                 config,
                 project_files=staged_projects,
                 remote_job_dir=resolved_remote_job_dir,
                 remote_script=remote_script,
+                remote_dispatch_script=remote_dispatch_script,
             )
             if on_upload_success is not None:
                 on_upload_success()
-        case_summary = _run_remote_workflow_interactive(
+        workflow_result = _run_remote_workflow_noninteractive(
             config,
             remote_job_dir=resolved_remote_job_dir,
-            session_name=session_name,
-            project_filenames=[project.name for project in staged_projects],
             case_count=case_count,
         )
-        _download_results(config, remote_job_dir=resolved_remote_job_dir, local_job_dir=local_job_dir)
+        local_archive = local_job_dir / "results.tgz"
+        local_archive.write_bytes(workflow_result.archive_bytes)
+        _extract_local_results_archive(local_job_dir=local_job_dir)
         _cleanup_remote_workspace(config, remote_job_dir=resolved_remote_job_dir)
     except WorkflowError as exc:
         _log_stage(f"job attempt failed session={session_name} exit_code={exc.exit_code} reason={exc}")
@@ -133,7 +158,7 @@ def run_remote_job_attempt(
             failed_case_lines=[],
         )
 
-    if case_summary is None:
+    if workflow_result is None:
         return RemoteJobAttemptResult(
             success=False,
             exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
@@ -143,6 +168,7 @@ def run_remote_job_attempt(
             failed_case_lines=[],
         )
 
+    case_summary = workflow_result.case_summary
     if not case_summary.success:
         failed_items = ", ".join(case_summary.case_lines)
         return RemoteJobAttemptResult(
@@ -173,26 +199,13 @@ def run_remote_job_attempt(
 
 
 def cleanup_orphan_session(*, config: RemoteJobConfig, session_name: str) -> None:
-    command = f"screen -S {shlex.quote(session_name)} -X quit || true"
-    _run_subprocess(
-        ["ssh", config.host, command],
-        stage="orphan cleanup",
-        exit_code=EXIT_CODE_REMOTE_CLEANUP_FAILURE,
-    )
+    # The primary remote execution path is non-interactive and no longer creates screen sessions.
+    return None
 
 
 def cleanup_orphan_sessions_for_run(*, config: RemoteJobConfig, run_id: str) -> None:
-    prefix = f"aedt_{run_id}_"
-    pattern = re.escape(prefix)
-    command = (
-        f"screen -ls | awk '$1 ~ /{pattern}/ {{print $1}}' | "
-        "while read -r sid; do screen -S \"$sid\" -X quit || true; done"
-    )
-    _run_subprocess(
-        ["ssh", config.host, command],
-        stage="orphan cleanup",
-        exit_code=EXIT_CODE_REMOTE_CLEANUP_FAILURE,
-    )
+    # The primary remote execution path is non-interactive and no longer creates screen sessions.
+    return None
 
 
 def _resolve_remote_path(*, config: RemoteJobConfig, path: str) -> str:
@@ -234,11 +247,19 @@ def _prepare_remote_workspace(config: RemoteJobConfig, *, remote_job_dir: str) -
     )
 
 
-def _upload_files(config: RemoteJobConfig, *, project_files: Sequence[Path], remote_job_dir: str, remote_script: Path) -> None:
+def _upload_files(
+    config: RemoteJobConfig,
+    *,
+    project_files: Sequence[Path],
+    remote_job_dir: str,
+    remote_script: Path,
+    remote_dispatch_script: Path,
+) -> None:
     remote_target = f"{config.host}:{remote_job_dir}/"
     _log_stage(f"upload files target={remote_target}")
     upload_sources = [str(path) for path in project_files]
     upload_sources.append(str(remote_script.resolve()))
+    upload_sources.append(str(remote_dispatch_script.resolve()))
     _run_subprocess(
         ["scp", *upload_sources, remote_target],
         stage="scp upload",
@@ -262,6 +283,15 @@ def _download_results(config: RemoteJobConfig, *, remote_job_dir: str, local_job
     )
 
 
+def _extract_local_results_archive(*, local_job_dir: Path) -> None:
+    local_archive = local_job_dir / "results.tgz"
+    _run_subprocess(
+        ["tar", "-xzf", str(local_archive), "-C", str(local_job_dir)],
+        stage="download extract",
+        exit_code=EXIT_CODE_DOWNLOAD_FAILURE,
+    )
+
+
 def _cleanup_remote_workspace(config: RemoteJobConfig, *, remote_job_dir: str) -> None:
     remote_path = _remote_path_for_shell(remote_job_dir)
     _log_stage(f"cleanup remote workspace path={remote_job_dir}")
@@ -272,170 +302,92 @@ def _cleanup_remote_workspace(config: RemoteJobConfig, *, remote_job_dir: str) -
     )
 
 
-def _run_remote_workflow_interactive(
+def _run_remote_workflow_noninteractive(
     config: RemoteJobConfig,
     *,
     remote_job_dir: str,
-    session_name: str,
-    project_filenames: Sequence[str],
     case_count: int,
-) -> CaseExecutionSummary:
+) -> _RemoteWorkflowResult:
     if case_count <= 0:
         raise WorkflowError("case_count must be > 0", exit_code=EXIT_CODE_REMOTE_RUN_FAILURE)
-    if len(project_filenames) != case_count:
-        raise WorkflowError("project_filenames length mismatch", exit_code=EXIT_CODE_REMOTE_RUN_FAILURE)
-
-    pexpect = _import_pexpect()
-    remote_path = _remote_path_for_shell(remote_job_dir)
-    session = pexpect.spawn(f"ssh {config.host}", encoding="utf-8", timeout=60)
-    try:
-        _log_stage(f"ssh spawned host={config.host} session={session_name}")
-        _log_stage(f"waiting ssh prompt session={session_name}")
-        _expect_prompt(session, timeout=60, stage="ssh")
-        _log_stage(f"ssh prompt acquired session={session_name}")
-
-        srun_cmd = (
-            f"srun --pty -p {config.partition} -N {config.nodes} -n {config.ntasks} "
-            f"-c {config.cpus_per_job} --mem={config.mem} --time={config.time_limit} bash"
-        )
-        _log_stage(f"launch srun session={session_name} partition={config.partition} cpus={config.cpus_per_job}")
-        _run_interactive_command(session, srun_cmd, stage="srun", timeout=300)
-        _log_stage(f"srun prompt acquired session={session_name}")
-        _run_interactive_command(session, f"cd {shlex.quote(remote_path)}", stage="srun", timeout=60)
-
-        prep_commands: list[str] = []
-        for case_index, source_name in enumerate(project_filenames, start=1):
-            case_name = f"case_{case_index:02d}"
-            prep_commands.append(f"mkdir -p {shlex.quote(case_name)}")
-            prep_commands.append(
-                f"cp -f {shlex.quote(source_name)} {shlex.quote(case_name)}/project.aedt"
-            )
-        _run_interactive_command(
-            session,
-            " && ".join(prep_commands),
-            stage="remote run",
-            timeout=120,
-        )
-        _log_stage(f"case directories prepared session={session_name} windows={case_count}")
-
-        first_window_cmd = _build_case_window_command(
-            case_index=1,
-            cores_per_window=config.cores_per_window,
-        )
-        _run_interactive_command(
-            session,
-            f"screen -dmS {shlex.quote(session_name)} -t case_01 bash -lc {shlex.quote(first_window_cmd)}",
-            stage="screen",
-            timeout=60,
-        )
-
-        for case_index in range(2, case_count + 1):
-            case_name = f"case_{case_index:02d}"
-            case_cmd = _build_case_window_command(
-                case_index=case_index,
-                cores_per_window=config.cores_per_window,
-            )
-            _run_interactive_command(
-                session,
-                (
-                    f"screen -S {shlex.quote(session_name)} -X screen "
-                    f"-t {shlex.quote(case_name)} bash -lc {shlex.quote(case_cmd)}"
-                ),
-                stage="screen",
-                timeout=60,
-            )
-
-        windows_output = _run_interactive_command(
-            session, f"screen -S {shlex.quote(session_name)} -Q windows", stage="screen", timeout=60
-        )
-        observed_windows = _count_screen_windows(windows_output)
-        if observed_windows != case_count:
-            # Some windows may finish very quickly and disappear before this probe.
-            # Continue and rely on exit.code aggregation for final case success/failure.
-            _log_stage(
-                "screen windows mismatch "
-                f"session={session_name} expected={case_count} observed={observed_windows}"
-            )
-        else:
-            _log_stage(f"screen windows validated session={session_name} count={case_count}")
-
-        wait_timeout = _time_limit_to_seconds(config.time_limit) + 600
-        _run_interactive_command(
-            session,
-            _build_wait_all_command(case_count),
-            stage="remote run",
-            timeout=wait_timeout,
-        )
-        _log_stage(f"wait-all completed session={session_name}")
-
-        _run_interactive_command(
-            session,
-            _build_case_aggregation_command(case_count),
-            stage="remote run",
-            timeout=60,
-        )
-        failed_count_output = _run_interactive_command(session, "cat failed.count", stage="remote run", timeout=30)
-        failed_count = _parse_exit_code(failed_count_output)
-        case_summary_output = _run_interactive_command(session, "cat case_summary.txt", stage="remote run", timeout=30)
-        case_lines = _parse_case_summary_lines(case_summary_output)
-        summary = CaseExecutionSummary(
+    submission = _submit_remote_workflow_noninteractive(
+        config=config,
+        remote_job_dir=remote_job_dir,
+    )
+    output = submission.combined_output
+    failed_count = _parse_marked_failed_count(output)
+    case_lines = _parse_marked_case_summary_lines(output)
+    return _RemoteWorkflowResult(
+        case_summary=CaseExecutionSummary(
             success_cases=case_count - failed_count,
             failed_cases=failed_count,
             case_lines=case_lines,
-        )
-
-        _run_interactive_command(
-            session,
-            "tar --exclude='.venv' --exclude='results.tgz' --exclude='.env_initialized' -czf results.tgz .",
-            stage="remote run",
-            timeout=120,
-        )
-        _log_stage(f"results archive created session={session_name}")
-        return summary
-    finally:
-        try:
-            session.sendline("exit")
-        except Exception:
-            pass
-        session.close(force=True)
+        ),
+        archive_bytes=_parse_marked_results_archive(output),
+    )
 
 
-def _import_pexpect():
+def _submit_remote_workflow_noninteractive(
+    config: RemoteJobConfig,
+    *,
+    remote_job_dir: str,
+) -> _RemoteWorkflowSubmission:
+    remote_path = _remote_path_for_shell(remote_job_dir)
+    command = f"cd {shlex.quote(remote_path)} && bash ./remote_dispatch.sh"
+    timeout_seconds = _time_limit_to_seconds(config.time_limit) + 900
+    _log_stage(f"launch non-interactive remote workflow host={config.host} path={remote_job_dir}")
+    completed = _run_completed_process_capture(
+        ["ssh", config.host, command],
+        stage="remote run",
+        exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+        timeout_seconds=timeout_seconds,
+    )
+    submission = _RemoteWorkflowSubmission(
+        stdout=completed.stdout or "",
+        stderr=completed.stderr or "",
+        return_code=completed.returncode,
+    )
+    _raise_for_remote_submission_failure(submission, stage="remote run")
+    return submission
+
+
+def _run_subprocess(command: list[str], *, stage: str, exit_code: int, timeout_seconds: int | None = None) -> None:
+    completed = _run_completed_process(command, stage=stage, exit_code=exit_code, timeout_seconds=timeout_seconds)
+    if completed.stdout or completed.stderr:
+        return None
+
+
+def _run_subprocess_capture(
+    command: list[str], *, stage: str, exit_code: int, timeout_seconds: int | None = None
+) -> str:
+    completed = _run_completed_process(command, stage=stage, exit_code=exit_code, timeout_seconds=timeout_seconds)
+    return (completed.stdout or "").strip()
+
+
+def _run_completed_process_capture(
+    command: list[str], *, stage: str, exit_code: int, timeout_seconds: int | None = None
+) -> subprocess.CompletedProcess[str]:
     try:
-        import pexpect
-    except ImportError as exc:  # pragma: no cover - dependency availability check
-        raise WorkflowError("pexpect is required for execute_remote=True.", exit_code=EXIT_CODE_SSH_FAILURE) from exc
-    return pexpect
+        return subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise WorkflowError(f"{stage} timed out after {timeout_seconds}s", exit_code=exit_code) from exc
 
 
-def _run_interactive_command(session, command: str, *, stage: str, timeout: int) -> str:
-    session.sendline(command)
-    return _expect_prompt(session, timeout=timeout, stage=stage)
-
-
-def _expect_prompt(session, *, timeout: int, stage: str) -> str:
-    pexpect = _import_pexpect()
-    prompt = r"[$#] "
-    idx = session.expect([prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=timeout)
-    if idx == 0:
-        return session.before or ""
-    if idx == 1:
-        raise _stage_error(stage, f"Timeout while waiting for prompt in stage '{stage}'.")
-    raise _stage_error(stage, f"Unexpected EOF in stage '{stage}'.")
-
-
-def _stage_error(stage: str, message: str) -> WorkflowError:
-    if stage == "ssh":
-        return WorkflowError(message, exit_code=EXIT_CODE_SSH_FAILURE)
-    if stage == "srun":
-        return WorkflowError(message, exit_code=EXIT_CODE_SLURM_FAILURE)
-    if stage == "screen":
-        return WorkflowError(message, exit_code=EXIT_CODE_SCREEN_FAILURE)
-    return WorkflowError(message, exit_code=EXIT_CODE_REMOTE_RUN_FAILURE)
-
-
-def _run_subprocess(command: list[str], *, stage: str, exit_code: int) -> None:
-    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+def _run_completed_process(
+    command: list[str], *, stage: str, exit_code: int, timeout_seconds: int | None = None
+) -> subprocess.CompletedProcess[str]:
+    completed = _run_completed_process_capture(
+        command,
+        stage=stage,
+        exit_code=exit_code,
+        timeout_seconds=timeout_seconds,
+    )
     if completed.returncode != 0:
         stderr = (completed.stderr or "").strip()
         stdout = (completed.stdout or "").strip()
@@ -443,6 +395,7 @@ def _run_subprocess(command: list[str], *, stage: str, exit_code: int) -> None:
         if details:
             raise WorkflowError(f"{stage} failed: {details}", exit_code=exit_code)
         raise WorkflowError(f"{stage} failed with return code {completed.returncode}", exit_code=exit_code)
+    return completed
 
 
 def _normalize_window_inputs(
@@ -460,8 +413,6 @@ def _normalize_window_inputs(
         normalized = list(window_inputs)
         if not normalized:
             raise ValueError("window_inputs must not be empty.")
-        if len(normalized) > config.windows_per_job:
-            raise ValueError(f"window_inputs must be <= windows_per_job ({config.windows_per_job}).")
         return normalized
 
     assert aedt_path is not None
@@ -486,7 +437,6 @@ def _build_remote_job_script_content() -> str:
         "",
         "if [ ! -f .env_initialized ]; then",
         "  export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/AnsysEM",
-        "  export SCREENDIR=\"$HOME/.screen\"",
         "  export LANG=en_US.UTF-8",
         "  export LC_ALL=en_US.UTF-8",
         "  unset LANGUAGE",
@@ -583,6 +533,9 @@ def _build_remote_job_script_content() -> str:
         "    if not project_file.exists():",
         "        raise FileNotFoundError(f'AEDT file not found: {project_file}')",
         "",
+        "    tmpdir = workdir / 'tmp'",
+        "    tmpdir.mkdir(parents=True, exist_ok=True)",
+        "    os.environ['TMPDIR'] = str(tmpdir)",
         "    cores = int(os.environ.get('PEETS_CORES', '32'))",
         "    remove_lock_files(workdir)",
         "    grpc_port = get_available_port()",
@@ -622,6 +575,102 @@ def _write_remote_job_script(tmpdir: Path) -> Path:
     script = tmpdir / "remote_job.sh"
     script.write_text(_build_remote_job_script_content(), encoding="utf-8")
     return script
+
+
+def _write_remote_dispatch_script(tmpdir: Path, *, config: RemoteJobConfig, remote_job_dir: str, case_count: int) -> Path:
+    script = tmpdir / "remote_dispatch.sh"
+    script.write_text(
+        _build_remote_dispatch_script_content(
+            config=config,
+            remote_job_dir=remote_job_dir,
+            case_count=case_count,
+        ),
+        encoding="utf-8",
+    )
+    return script
+
+
+def _build_remote_dispatch_script_content(*, config: RemoteJobConfig, remote_job_dir: str, case_count: int) -> str:
+    remote_path = _remote_path_for_shell(remote_job_dir)
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        f"REMOTE_JOB_DIR={shlex.quote(remote_path)}",
+        "cd \"$REMOTE_JOB_DIR\"",
+        "tar -czf - remote_job.sh project_*.aedt | \\",
+        "  " + _build_noninteractive_srun_command(
+            config=config,
+            remote_job_dir=remote_path,
+            case_count=case_count,
+        ),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _build_noninteractive_srun_command(*, config: RemoteJobConfig, remote_job_dir: str, case_count: int) -> str:
+    max_parallel = max(1, int(getattr(config, "windows_per_job", case_count)))
+    payload_lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "workdir=$(mktemp -d /tmp/peetsfea-slot.XXXXXX)",
+        "cleanup() { rm -rf \"$workdir\"; }",
+        "trap cleanup EXIT",
+        "cd \"$workdir\"",
+        "tar -xzf -",
+    ]
+    for case_index in range(1, case_count + 1):
+        case_name = f"case_{case_index:02d}"
+        source_name = f"project_{case_index:02d}.aedt"
+        payload_lines.extend(
+            [
+                f"mkdir -p {shlex.quote(case_name)}",
+                f"cp -f {shlex.quote(source_name)} {shlex.quote(case_name)}/project.aedt",
+            ]
+        )
+    payload_lines.extend(
+        [
+            f"max_parallel={max_parallel}",
+            "for i in $(seq 1 " + str(case_count) + "); do",
+            "  while [ \"$(jobs -pr | wc -l)\" -ge \"$max_parallel\" ]; do",
+            "    wait -n || true",
+            "  done",
+            "  case_dir=$(printf 'case_%02d' \"$i\")",
+            "  (",
+            "    cd \"$case_dir\"",
+            "    mkdir -p tmp",
+            "    export TMPDIR=\"$PWD/tmp\"",
+            f"    PEETS_CORES={config.cores_per_window} bash ../remote_job.sh > run.log 2>&1",
+            "    rc=$?",
+            "    echo \"$rc\" > exit.code",
+            "  ) &",
+            "done",
+            "while [ \"$(jobs -pr | wc -l)\" -gt 0 ]; do",
+            "  wait -n || true",
+            "done",
+        ]
+    )
+    payload_lines.extend(
+        [
+            _build_case_aggregation_command(case_count),
+            "archive_path=$(mktemp /tmp/peetsfea-results.XXXXXX.tgz)",
+            "cleanup_archive() { rm -f \"$archive_path\"; }",
+            "trap cleanup_archive EXIT",
+            "tar -czf \"$archive_path\" case_* case_summary.txt failed.count",
+            "printf '__PEETS_FAILED_COUNT__:%s\\n' \"$(cat failed.count)\"",
+            "printf '__PEETS_CASE_SUMMARY_BEGIN__\\n'",
+            "cat case_summary.txt",
+            "printf '__PEETS_CASE_SUMMARY_END__\\n'",
+            "printf '__PEETS_RESULTS_TGZ_BEGIN__\\n'",
+            "base64 -w0 \"$archive_path\"",
+            "printf '\\n__PEETS_RESULTS_TGZ_END__\\n'",
+        ]
+    )
+    payload = "\n".join(payload_lines)
+    return (
+        f"srun -D /tmp -p {config.partition} -N {config.nodes} -n {config.ntasks} "
+        f"-c {config.cpus_per_job} --mem={config.mem} --time={config.time_limit} "
+        f"bash -lc {shlex.quote(payload)}"
+    )
 
 
 def _count_screen_windows(output: str) -> int:
@@ -688,11 +737,88 @@ def _parse_case_summary_lines(output: str) -> list[str]:
     return lines
 
 
+def _parse_marked_failed_count(output: str) -> int:
+    match = re.search(r"__PEETS_FAILED_COUNT__:(-?\d+)", output)
+    if match is None:
+        raise WorkflowError("Unable to parse failed.count marker.", exit_code=EXIT_CODE_REMOTE_RUN_FAILURE)
+    return int(match.group(1))
+
+
+def _parse_marked_case_summary_lines(output: str) -> list[str]:
+    match = re.search(
+        r"__PEETS_CASE_SUMMARY_BEGIN__\n(?P<body>.*?)(?:\n)?__PEETS_CASE_SUMMARY_END__",
+        output,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise WorkflowError("Unable to parse case summary marker.", exit_code=EXIT_CODE_REMOTE_RUN_FAILURE)
+    return _parse_case_summary_lines(match.group("body"))
+
+
+def _parse_marked_results_archive(output: str) -> bytes:
+    match = re.search(
+        r"__PEETS_RESULTS_TGZ_BEGIN__\n(?P<body>.*?)(?:\n)?__PEETS_RESULTS_TGZ_END__",
+        output,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise WorkflowError("Unable to parse results archive marker.", exit_code=EXIT_CODE_DOWNLOAD_FAILURE)
+    try:
+        import base64
+
+        return base64.b64decode(match.group("body").strip(), validate=True)
+    except Exception as exc:
+        raise WorkflowError("Unable to decode results archive marker.", exit_code=EXIT_CODE_DOWNLOAD_FAILURE) from exc
+
+
 def _parse_exit_code(output: str) -> int:
     match = re.search(r"(-?\d+)", output)
     if match is None:
         raise WorkflowError("Unable to parse remote exit code.", exit_code=EXIT_CODE_REMOTE_RUN_FAILURE)
     return int(match.group(1))
+
+
+_SLURM_PROGRESS_PATTERNS = (
+    re.compile(r"^srun: job \d+ queued and waiting for resources$"),
+    re.compile(r"^srun: job \d+ has been allocated resources$"),
+)
+
+
+def _raise_for_remote_submission_failure(submission: _RemoteWorkflowSubmission, *, stage: str) -> None:
+    output = submission.combined_output
+    if _has_remote_workflow_markers(output):
+        return
+    if submission.return_code == 0:
+        return
+    details = _extract_meaningful_remote_failure_details(output)
+    if details:
+        raise WorkflowError(f"{stage} failed: {details}", exit_code=EXIT_CODE_REMOTE_RUN_FAILURE)
+    raise WorkflowError(
+        f"{stage} failed with return code {submission.return_code}",
+        exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+    )
+
+
+def _has_remote_workflow_markers(output: str) -> bool:
+    return (
+        "__PEETS_FAILED_COUNT__:" in output
+        and "__PEETS_CASE_SUMMARY_BEGIN__" in output
+        and "__PEETS_CASE_SUMMARY_END__" in output
+        and "__PEETS_RESULTS_TGZ_BEGIN__" in output
+        and "__PEETS_RESULTS_TGZ_END__" in output
+    )
+
+
+def _extract_meaningful_remote_failure_details(output: str) -> str:
+    lines: list[str] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if any(pattern.match(line) for pattern in _SLURM_PROGRESS_PATTERNS):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def _time_limit_to_seconds(value: str) -> int:

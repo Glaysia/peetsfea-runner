@@ -10,6 +10,7 @@
 
 *.duckdb
 *.duckdb.wal
+*.bak
 
 input_queue/*
 output/*

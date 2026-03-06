@@ -5,18 +5,19 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Projects/PythonProjects/peetsfea-runner
-Environment=PEETSFEA_INPUT_QUEUE_DIR=%h/Projects/PythonProjects/peetsfea-runner/input_queue
-Environment=PEETSFEA_OUTPUT_ROOT_DIR=%h/Projects/PythonProjects/peetsfea-runner/output
-Environment=PEETSFEA_DELETE_FAILED_DIR=%h/Projects/PythonProjects/peetsfea-runner/output/_delete_failed
-Environment=PEETSFEA_DB_PATH=%h/Projects/PythonProjects/peetsfea-runner/peetsfea_runner.duckdb
-Environment=PEETSFEA_ACCOUNTS=account_01@gate1-harry:10,account_02@gate1-dhj02:10,account_03@gate1-jji0930:10
+WorkingDirectory=%h/peetsfea-runner
+Environment=PEETSFEA_INPUT_QUEUE_DIR=%h/peetsfea-runner/input_queue
+Environment=PEETSFEA_OUTPUT_ROOT_DIR=%h/peetsfea-runner/output
+Environment=PEETSFEA_DELETE_FAILED_DIR=%h/peetsfea-runner/output/_delete_failed
+Environment=PEETSFEA_DB_PATH=%h/peetsfea-runner/peetsfea_runner.duckdb
+Environment=PEETSFEA_ACCOUNTS=account_01@gate1-harry:10
 Environment=PEETSFEA_EXECUTE_REMOTE=true
 Environment=PEETSFEA_PARTITION=cpu2
-Environment=PEETSFEA_REMOTE_ROOT=~/aedt_runs
+Environment=PEETSFEA_REMOTE_ROOT=/tmp/peetsfea-runner
 Environment=PEETSFEA_POLL_SECONDS=30
 Environment=PEETSFEA_CONTINUOUS_MODE=true
 Environment=PEETSFEA_INGEST_POLL_SECONDS=30
+Environment=PEETSFEA_DELETE_INPUT_AFTER_UPLOAD=false
 Environment=PEETSFEA_READY_SIDECAR_SUFFIX=.ready
 Environment=PEETSFEA_RUN_ROTATION_HOURS=24
 Environment=PEETSFEA_PENDING_BUFFER_PER_ACCOUNT=3
@@ -25,7 +26,7 @@ Environment=PEETSFEA_BALANCE_METRIC=window_throughput
 Environment=PEETSFEA_EMBED_WEB=true
 Environment=PEETSFEA_WEB_HOST=127.0.0.1
 Environment=PEETSFEA_WEB_PORT=8765
-ExecStart=%h/Projects/PythonProjects/peetsfea-runner/.venv/bin/python -c "from peetsfea_runner.systemd_worker import run_user_worker_loop; run_user_worker_loop()"
+ExecStart=%h/peetsfea-runner/.venv/bin/python -c "from peetsfea_runner.systemd_worker import run_user_worker_loop; run_user_worker_loop()"
 Restart=always
 RestartSec=5
 

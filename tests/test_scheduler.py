@@ -18,6 +18,7 @@ from peetsfea_runner.scheduler import (
     query_account_capacity,
     run_jobs_with_slots,
     run_window_bundles,
+    run_window_workers,
 )
 
 
@@ -164,6 +165,97 @@ class TestScheduler(unittest.TestCase):
             )
 
             self.assertEqual(batch.results, ["a2", "a2"])
+
+    def test_run_window_workers_caps_submitted_jobs_at_account_max(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            windows = [
+                WindowTaskRef(
+                    run_id="run_01",
+                    window_id=f"w_{idx:04d}",
+                    input_path=root / f"in_{idx}.aedt",
+                    relative_path=Path(f"in_{idx}.aedt"),
+                    output_dir=root / f"out_{idx}.aedt_all",
+                )
+                for idx in range(1, 86)
+            ]
+            account = _Account(account_id="a1", host_alias="h1", max_jobs=10)
+
+            batch = run_window_workers(
+                window_queue=windows,
+                accounts=[account],
+                windows_per_job=8,
+                pending_buffer_per_account=3,
+                worker=lambda bundle: bundle.window_count,
+                capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 0, 0, 10),
+            )
+
+            self.assertEqual(batch.submitted_jobs, 10)
+            self.assertEqual(sorted(batch.results), [8, 8, 8, 8, 8, 9, 9, 9, 9, 9])
+
+    def test_run_window_workers_respects_existing_running_and_pending_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            windows = [
+                WindowTaskRef(
+                    run_id="run_01",
+                    window_id=f"w_{idx:04d}",
+                    input_path=root / f"in_{idx}.aedt",
+                    relative_path=Path(f"in_{idx}.aedt"),
+                    output_dir=root / f"out_{idx}.aedt_all",
+                )
+                for idx in range(1, 13)
+            ]
+            account = _Account(account_id="a1", host_alias="h1", max_jobs=10)
+
+            batch = run_window_workers(
+                window_queue=windows,
+                accounts=[account],
+                windows_per_job=8,
+                pending_buffer_per_account=3,
+                worker=lambda bundle: bundle.window_count,
+                capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 7, 1, 2),
+            )
+
+            self.assertEqual(batch.submitted_jobs, 10)
+            self.assertEqual(sum(batch.results), 12)
+            self.assertLessEqual(batch.max_inflight_jobs, 2)
+
+    def test_run_window_workers_waits_until_worker_slot_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            windows = [
+                WindowTaskRef(
+                    run_id="run_01",
+                    window_id="w_0001",
+                    input_path=root / "in_1.aedt",
+                    relative_path=Path("in_1.aedt"),
+                    output_dir=root / "out_1.aedt_all",
+                )
+            ]
+            account = _Account(account_id="a1", host_alias="h1", max_jobs=1)
+            snapshot_calls = {"count": 0}
+
+            def _capacity_lookup(**_kwargs):
+                snapshot_calls["count"] += 1
+                if snapshot_calls["count"] == 1:
+                    return AccountCapacitySnapshot("a1", "h1", 1, 0, 0)
+                return AccountCapacitySnapshot("a1", "h1", 0, 0, 1)
+
+            with patch("peetsfea_runner.scheduler.time.sleep") as mocked_sleep:
+                batch = run_window_workers(
+                    window_queue=windows,
+                    accounts=[account],
+                    windows_per_job=8,
+                    pending_buffer_per_account=3,
+                    worker=lambda bundle: bundle.window_count,
+                    capacity_lookup=_capacity_lookup,
+                    idle_sleep_seconds=1.0,
+                )
+
+            self.assertGreaterEqual(mocked_sleep.call_count, 1)
+            self.assertEqual(batch.submitted_jobs, 1)
+            self.assertEqual(batch.results, [1])
 
 
 if __name__ == "__main__":
