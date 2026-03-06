@@ -820,7 +820,7 @@ def _run_bundle_with_retry(
                     message=f"unexpected exception: {exc}",
                     failed_case_lines=[],
                 )
-            _materialize_window_outputs(
+            materialized_window_ids = _materialize_window_outputs(
                 local_bundle_dir=local_bundle_dir,
                 windows=runnable_windows,
                 staged_input_paths=staged_input_paths,
@@ -849,10 +849,17 @@ def _run_bundle_with_retry(
             failed_indices = _parse_failed_case_indices(result.failed_case_lines, len(runnable_windows))
             if not result.success and not failed_indices:
                 failed_indices = set(range(len(runnable_windows)))
+            for index, window in enumerate(runnable_windows):
+                if window.window_id not in materialized_window_ids:
+                    failed_indices.add(index)
+                    if result.success:
+                        terminal_exit_code = EXIT_CODE_DOWNLOAD_FAILURE
+                        terminal_message = "output materialization missing"
 
             retry_windows: list[WindowTaskRef] = []
             for index, window in enumerate(runnable_windows):
                 if index in failed_indices:
+                    failure_message = terminal_message
                     state_store.mark_ingest_state(input_path=str(window.input_path), state="FAILED")
                     if attempt <= config.job_retry_count:
                         state_store.update_window_task(
@@ -862,14 +869,14 @@ def _run_bundle_with_retry(
                             attempt_no=attempt,
                             job_id=bundle.job_id,
                             account_id=bundle.account_id,
-                            failure_reason=result.message,
+                            failure_reason=failure_message,
                         )
                         state_store.append_window_event(
                             run_id=run_id,
                             window_id=window.window_id,
                             level="WARN",
                             stage="RETRY_QUEUED",
-                            message=f"attempt={attempt} reason={result.message}",
+                            message=f"attempt={attempt} reason={failure_message}",
                         )
                         retry_windows.append(
                             WindowTaskRef(
@@ -886,8 +893,8 @@ def _run_bundle_with_retry(
                             run_id=run_id,
                             job_id=window.window_id,
                             attempt=attempt,
-                            reason=result.message,
-                            exit_code=result.exit_code,
+                            reason=failure_message,
+                            exit_code=terminal_exit_code,
                         )
                         state_store.update_window_task(
                             run_id=run_id,
@@ -896,14 +903,14 @@ def _run_bundle_with_retry(
                             attempt_no=attempt,
                             job_id=bundle.job_id,
                             account_id=bundle.account_id,
-                            failure_reason=result.message,
+                            failure_reason=failure_message,
                         )
                         state_store.append_window_event(
                             run_id=run_id,
                             window_id=window.window_id,
                             level="ERROR",
                             stage="QUARANTINED",
-                            message=result.message,
+                            message=failure_message,
                         )
                         state_store.mark_ingest_state(input_path=str(window.input_path), state="QUARANTINED")
                         quarantined_windows += 1
@@ -985,13 +992,15 @@ def _materialize_window_outputs(
     local_bundle_dir: Path,
     windows: list[WindowTaskRef],
     staged_input_paths: dict[str, Path] | None = None,
-) -> None:
+) -> set[str]:
+    materialized_window_ids: set[str] = set()
     for index, window in enumerate(windows, start=1):
         case_dir = local_bundle_dir / f"case_{index:02d}"
-        seed_input_path = None if staged_input_paths is None else staged_input_paths.get(window.window_id)
-        _initialize_window_output_dir(window=window, seed_input_path=seed_input_path)
         if not case_dir.exists():
             continue
+        seed_input_path = None if staged_input_paths is None else staged_input_paths.get(window.window_id)
+        _initialize_window_output_dir(window=window, seed_input_path=seed_input_path)
+        copied_any = False
         for item in case_dir.iterdir():
             if item.name == "tmp":
                 continue
@@ -1001,6 +1010,10 @@ def _materialize_window_outputs(
                 shutil.copytree(item, target_path, dirs_exist_ok=True)
             else:
                 shutil.copy2(item, target_path)
+            copied_any = True
+        if copied_any:
+            materialized_window_ids.add(window.window_id)
+    return materialized_window_ids
 
 
 def _rename_case_output_name(*, case_name: str, input_name: str) -> str:

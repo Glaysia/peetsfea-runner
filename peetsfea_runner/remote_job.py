@@ -214,6 +214,12 @@ def _resolve_remote_path(*, config: RemoteJobConfig, path: str) -> str:
         if path == "~":
             return home
         return f"{home}/{path[2:]}"
+    if path == "/tmp/peetsfea-runner" or path.startswith("/tmp/peetsfea-runner/"):
+        remote_user = _get_remote_user(config=config)
+        scoped_root = f"/tmp/{remote_user}/peetsfea-runner"
+        if path == "/tmp/peetsfea-runner":
+            return scoped_root
+        return f"{scoped_root}{path[len('/tmp/peetsfea-runner'):]}"
     return path
 
 
@@ -235,6 +241,14 @@ def _get_remote_home(*, config: RemoteJobConfig) -> str:
     if not home.startswith("/"):
         raise WorkflowError("Unable to resolve remote home directory.", exit_code=EXIT_CODE_SSH_FAILURE)
     return home
+
+
+def _get_remote_user(*, config: RemoteJobConfig) -> str:
+    home = _get_remote_home(config=config)
+    user = Path(home).name.strip()
+    if not user:
+        raise WorkflowError("Unable to resolve remote user from home directory.", exit_code=EXIT_CODE_SSH_FAILURE)
+    return user
 
 
 def _prepare_remote_workspace(config: RemoteJobConfig, *, remote_job_dir: str) -> None:
@@ -446,10 +460,64 @@ def _build_remote_job_script_content() -> str:
         "fi",
         "",
         "VENV_DIR=\"$HOME/.peetsfea-runner-venv\"",
-        "if [ ! -x \"$VENV_DIR/bin/python\" ]; then",
-        "  echo \"[ERROR] Shared venv not found: $VENV_DIR\" >&2",
-        "  echo \"[ERROR] Run scripts/remote_bootstrap_install.sh first.\" >&2",
+        "MINICONDA_DIR=\"$HOME/miniconda3\"",
+        "CONDA_ENV_NAME=\"peetsfea-runner-py312\"",
+        "CONDA_PYTHON_PATH=\"$MINICONDA_DIR/envs/$CONDA_ENV_NAME/bin/python\"",
+        "download_miniconda_installer() {",
+        "  installer_path=\"$1\"",
+        "  url=\"https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh\"",
+        "  if command -v curl >/dev/null 2>&1; then",
+        "    curl -fsSL \"$url\" -o \"$installer_path\"",
+        "    return 0",
+        "  fi",
+        "  if command -v wget >/dev/null 2>&1; then",
+        "    wget -qO \"$installer_path\" \"$url\"",
+        "    return 0",
+        "  fi",
+        "  echo \"[ERROR] curl or wget is required to install Miniconda3\" >&2",
         "  exit 1",
+        "}",
+        "ensure_miniconda() {",
+        "  if [ -x \"$MINICONDA_DIR/bin/conda\" ]; then",
+        "    return 0",
+        "  fi",
+        "  installer_path=$(mktemp /tmp/miniconda_installer.XXXXXX.sh)",
+        "  download_miniconda_installer \"$installer_path\"",
+        "  bash \"$installer_path\" -b -p \"$MINICONDA_DIR\"",
+        "  rm -f \"$installer_path\"",
+        "}",
+        "ensure_conda_python312() {",
+        "  if [ -x \"$CONDA_PYTHON_PATH\" ]; then",
+        "    major_minor=\"$($CONDA_PYTHON_PATH -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")')\"",
+        "    if [ \"$major_minor\" = \"3.12\" ]; then",
+        "      return 0",
+        "    fi",
+        "  fi",
+        "  \"$MINICONDA_DIR/bin/conda\" create -y -n \"$CONDA_ENV_NAME\" python=3.12",
+        "}",
+        "ensure_runner_venv() {",
+        "  recreate=0",
+        "  if [ -d \"$VENV_DIR\" ]; then",
+        "    if [ ! -x \"$VENV_DIR/bin/python\" ]; then",
+        "      recreate=1",
+        "    else",
+        "      major_minor=\"$($VENV_DIR/bin/python -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")')\"",
+        "      if [ \"$major_minor\" != \"3.12\" ]; then",
+        "        recreate=1",
+        "      fi",
+        "    fi",
+        "  else",
+        "    recreate=1",
+        "  fi",
+        "  if [ \"$recreate\" -eq 1 ]; then",
+        "    rm -rf \"$VENV_DIR\"",
+        "    \"$CONDA_PYTHON_PATH\" -m venv \"$VENV_DIR\"",
+        "  fi",
+        "}",
+        "if [ ! -x \"$VENV_DIR/bin/python\" ]; then",
+        "  ensure_miniconda",
+        "  ensure_conda_python312",
+        "  ensure_runner_venv",
         "fi",
         "BASE_PREFIX=\"$($VENV_DIR/bin/python -c 'import sys; print(sys.base_prefix)')\"",
         "export LD_LIBRARY_PATH=\"$BASE_PREFIX/lib:$HOME/miniconda3/lib:${LD_LIBRARY_PATH:-}\"",
@@ -639,8 +707,11 @@ def _build_noninteractive_srun_command(*, config: RemoteJobConfig, remote_job_di
             "    cd \"$case_dir\"",
             "    mkdir -p tmp",
             "    export TMPDIR=\"$PWD/tmp\"",
-            f"    PEETS_CORES={config.cores_per_window} bash ../remote_job.sh > run.log 2>&1",
-            "    rc=$?",
+            f"    if PEETS_CORES={config.cores_per_window} bash ../remote_job.sh > run.log 2>&1; then",
+            "      rc=0",
+            "    else",
+            "      rc=$?",
+            "    fi",
             "    echo \"$rc\" > exit.code",
             "  ) &",
             "done",
@@ -710,7 +781,12 @@ def _build_case_aggregation_command(parallel_windows: int) -> str:
         "failed=0; "
         f"for i in $(seq 1 {parallel_windows}); do "
         "case_dir=$(printf 'case_%02d' \"$i\"); "
+        "if [ -f \"$case_dir/exit.code\" ]; then "
         "code=$(cat \"$case_dir/exit.code\"); "
+        "else "
+        "code=97; "
+        "echo \"$code\" > \"$case_dir/exit.code\"; "
+        "fi; "
         "echo \"$case_dir:$code\" >> case_summary.txt; "
         "if [ \"$code\" -ne 0 ]; then failed=$((failed+1)); fi; "
         "done; "

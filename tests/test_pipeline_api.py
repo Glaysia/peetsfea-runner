@@ -416,6 +416,57 @@ class TestPipelineApi(unittest.TestCase):
             self.assertTrue((out_dir / "run.log").is_file())
             self.assertTrue((out_dir / "exit.code").is_file())
 
+    def test_successful_remote_attempt_without_case_output_is_not_marked_succeeded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "foo.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            (input_dir / "foo.aedt.ready").write_text("", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=True,
+                continuous_mode=False,
+                job_retry_count=0,
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+            )
+
+            def _mock_attempt(*, on_upload_success=None, **kwargs):
+                if on_upload_success is not None:
+                    on_upload_success()
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=0,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=1, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=10,
+                    ),
+                ),
+            ):
+                result = run_pipeline(config)
+
+            self.assertFalse(result.success)
+            self.assertFalse((output_root / "foo.aedt.out").exists())
+
     def test_delete_failure_moves_to_quarantine(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"

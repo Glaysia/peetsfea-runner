@@ -19,6 +19,7 @@ from peetsfea_runner.pipeline import (
     _parse_case_summary_lines,
     _run_with_retry,
 )
+from peetsfea_runner.remote_job import _resolve_remote_path
 
 
 class TestPlan03Workflow(unittest.TestCase):
@@ -30,6 +31,10 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("unset LANGUAGE", content)
         self.assertIn("export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81", content)
         self.assertIn("module load ansys-electronics/v252", content)
+        self.assertIn("MINICONDA_DIR=\"$HOME/miniconda3\"", content)
+        self.assertIn("ensure_miniconda() {", content)
+        self.assertIn("ensure_conda_python312() {", content)
+        self.assertIn("ensure_runner_venv() {", content)
         self.assertIn("\"$VENV_DIR/bin/python\" run_sim.py", content)
         self.assertIn("os.environ['TMPDIR'] = str(tmpdir)", content)
 
@@ -55,6 +60,8 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("__PEETS_FAILED_COUNT__", content)
         self.assertIn("max_parallel=8", content)
         self.assertIn("wait -n || true", content)
+        self.assertIn("if PEETS_CORES=4 bash ../remote_job.sh > run.log 2>&1; then", content)
+        self.assertIn("echo \"$rc\" > exit.code", content)
         self.assertIn("archive_path=$(mktemp /tmp/peetsfea-results.", content)
         self.assertIn('tar -czf "$archive_path" case_* case_summary.txt failed.count', content)
         self.assertNotIn("tar --exclude='.venv' --exclude='results.tgz' --exclude='.env_initialized' -czf results.tgz .", content)
@@ -105,7 +112,10 @@ class TestPlan03Workflow(unittest.TestCase):
 
     def test_wait_all_and_aggregation_commands_contain_parallel_window_count(self) -> None:
         self.assertIn("seq 1 8", _build_wait_all_command(8))
-        self.assertIn("seq 1 8", _build_case_aggregation_command(8))
+        command = _build_case_aggregation_command(8)
+        self.assertIn("seq 1 8", command)
+        self.assertIn('if [ -f "$case_dir/exit.code" ]; then', command)
+        self.assertIn('code=97; echo "$code" > "$case_dir/exit.code";', command)
 
     def test_case_window_command_contains_case_name_and_core_count(self) -> None:
         command = _build_case_window_command(case_index=3, cores_per_window=4)
@@ -147,6 +157,20 @@ class TestPlan03Workflow(unittest.TestCase):
             "real failure line\n"
         )
         self.assertEqual(_extract_meaningful_remote_failure_details(output), "real failure line")
+
+    def test_tmp_remote_root_is_scoped_per_remote_user(self) -> None:
+        class _Cfg:
+            host = "gate1-dhj02"
+
+        with patch("peetsfea_runner.remote_job._get_remote_home", return_value="/home/dhj02"):
+            resolved = _resolve_remote_path(
+                config=_Cfg(),
+                path="/tmp/peetsfea-runner/20260306_115056/account_02/job_0011/a2",
+            )
+        self.assertEqual(
+            resolved,
+            "/tmp/dhj02/peetsfea-runner/20260306_115056/account_02/job_0011/a2",
+        )
 
 
 if __name__ == "__main__":
