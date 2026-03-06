@@ -26,3 +26,15 @@
 
 1. `/home/peetsmain/.config/systemd/user/peetsfea-runner.service`는 심볼릭 링크를 풀지 말고 직접 수정하지 않는다.
 2. systemd service 변경이 필요하면 `/home/peetsmain/peetsfea-runner/systemd/peetsfea-runner.service`만 수정한다.
+
+## DB Reset Rule
+
+1. 매 단계 전환에서 서비스를 끄는 경우, `/home/peetsmain/peetsfea-runner/peetsfea_runner.duckdb`를 삭제한다.
+2. 서비스 동작에 영향을 주는 주요 코드 변경사항이 있는 경우, 다음 실행 전에 `/home/peetsmain/peetsfea-runner/peetsfea_runner.duckdb`를 삭제한다.
+3. DB 삭제는 service가 완전히 내려간 뒤에만 수행한다.
+
+## Input Source Rule
+
+1. `/home/peetsmain/peetsfea-runner/original` 아래 파일은 실제로 최종 돌려야 하는 무거운 `.aedt` 원본으로 취급한다.
+2. `PLANS/roadmap1`부터 `PLANS/roadmap5`의 모든 로드맵이 완수되기 전까지는 `/home/peetsmain/peetsfea-runner/examples/sample.aedt`를 여러 개 복사해서 테스트, 재현, 서비스 검증에 사용한다.
+3. `original` 아래의 무거운 `.aedt` 파일은 모든 로드맵 완료 후 최종 검증 단계에서만 사용한다.
