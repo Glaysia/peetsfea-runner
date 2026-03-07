@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -10,11 +11,15 @@ from unittest.mock import patch
 
 from peetsfea_runner.scheduler import (
     AccountCapacitySnapshot,
+    AccountReadinessSnapshot,
+    bootstrap_account_runtime,
     JobSpec,
     WindowTaskRef,
     calculate_effective_slots,
     parse_squeue_state_counts,
     pick_balanced_account,
+    query_account_preflight,
+    query_account_readiness,
     query_account_capacity,
     run_jobs_with_slots,
     run_window_bundles,
@@ -27,6 +32,16 @@ class _Account:
     account_id: str
     host_alias: str
     max_jobs: int
+
+
+@dataclass(slots=True)
+class _WorkerOutcome:
+    name: str
+    requeue_windows: tuple[WindowTaskRef, ...] = ()
+
+    @property
+    def terminal_worker(self) -> bool:
+        return bool(self.requeue_windows)
 
 
 class TestScheduler(unittest.TestCase):
@@ -88,6 +103,86 @@ class TestScheduler(unittest.TestCase):
             run_mock.side_effect = subprocess.TimeoutExpired(cmd="ssh host-1", timeout=8)
             with self.assertRaises(RuntimeError):
                 query_account_capacity(account=account, pending_buffer_per_account=3)
+
+    def test_query_account_readiness_reports_ready_snapshot(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_readiness(
+            account=account,
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_READY__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1\n",
+                "",
+            ),
+        )
+        self.assertEqual(
+            snapshot,
+            AccountReadinessSnapshot(
+                account_id="a1",
+                host_alias="host-1",
+                ready=True,
+                status="READY",
+                reason="ok",
+                home_ok=True,
+                runtime_path_ok=True,
+                venv_ok=True,
+                python_ok=True,
+                module_ok=True,
+                binaries_ok=True,
+                ansys_ok=True,
+            ),
+        )
+
+    def test_query_account_readiness_reports_blocked_checks(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_readiness(
+            account=account,
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_READY__:home=1 runtime=1 venv=0 python=0 module=1 binaries=1 ansys=0\n",
+                "",
+            ),
+        )
+        self.assertFalse(snapshot.ready)
+        self.assertEqual(snapshot.status, "DISABLED_FOR_DISPATCH")
+        self.assertEqual(snapshot.reason, "venv,python,ansys")
+
+    def test_query_account_readiness_marks_bootstrap_required_for_missing_runtime(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_readiness(
+            account=account,
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_READY__:home=1 runtime=1 venv=0 python=0 module=1 binaries=1 ansys=1\n",
+                "",
+            ),
+        )
+        self.assertFalse(snapshot.ready)
+        self.assertEqual(snapshot.status, "BOOTSTRAP_REQUIRED")
+        self.assertEqual(snapshot.reason, "venv,python")
+
+    def test_query_account_preflight_reports_missing_uv_and_pyaedt(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_preflight(
+            account=account,
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1 uv=0 pyaedt=0\n",
+                "",
+            ),
+        )
+        self.assertFalse(snapshot.ready)
+        self.assertEqual(snapshot.status, "PREFLIGHT_FAILED")
+        self.assertEqual(snapshot.reason, "uv,pyaedt")
+        self.assertFalse(snapshot.uv_ok)
+        self.assertFalse(snapshot.pyaedt_ok)
+
+    def test_bootstrap_account_runtime_requires_success_marker(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        output = bootstrap_account_runtime(
+            account=account,
+            run_command=lambda _cmd: (0, "__PEETSFEA_BOOTSTRAP__:ok\n", ""),
+        )
+        self.assertIn("__PEETSFEA_BOOTSTRAP__:ok", output)
 
     def test_pick_balanced_account_uses_score_then_running_then_account_id(self) -> None:
         capacities = [
@@ -190,8 +285,9 @@ class TestScheduler(unittest.TestCase):
                 capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 0, 0, 10),
             )
 
-            self.assertEqual(batch.submitted_jobs, 10)
-            self.assertEqual(sorted(batch.results), [8, 8, 8, 8, 8, 9, 9, 9, 9, 9])
+            self.assertEqual(batch.submitted_jobs, 11)
+            self.assertEqual(sorted(batch.results), [5, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8])
+            self.assertLessEqual(batch.max_inflight_jobs, 10)
 
     def test_run_window_workers_respects_existing_running_and_pending_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -219,6 +315,35 @@ class TestScheduler(unittest.TestCase):
 
             self.assertEqual(batch.submitted_jobs, 10)
             self.assertEqual(sum(batch.results), 12)
+            self.assertLessEqual(batch.max_inflight_jobs, 2)
+
+    def test_run_window_workers_submits_replacement_bundle_from_backlog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            windows = [
+                WindowTaskRef(
+                    run_id="run_01",
+                    window_id=f"w_{idx:04d}",
+                    input_path=root / f"in_{idx}.aedt",
+                    relative_path=Path(f"in_{idx}.aedt"),
+                    output_dir=root / f"out_{idx}.aedt_all",
+                )
+                for idx in range(1, 18)
+            ]
+            account = _Account(account_id="a1", host_alias="h1", max_jobs=2)
+
+            batch = run_window_workers(
+                window_queue=windows,
+                accounts=[account],
+                windows_per_job=8,
+                pending_buffer_per_account=3,
+                worker=lambda bundle: bundle.window_count,
+                capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 0, 0, 2),
+                max_workers=2,
+            )
+
+            self.assertEqual(batch.submitted_jobs, 3)
+            self.assertEqual(sorted(batch.results), [1, 8, 8])
             self.assertLessEqual(batch.max_inflight_jobs, 2)
 
     def test_run_window_workers_waits_until_worker_slot_is_available(self) -> None:
@@ -256,6 +381,63 @@ class TestScheduler(unittest.TestCase):
             self.assertGreaterEqual(mocked_sleep.call_count, 1)
             self.assertEqual(batch.submitted_jobs, 1)
             self.assertEqual(batch.results, [1])
+
+    def test_run_window_workers_recovers_terminal_worker_with_replacement_before_run_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            initial_windows = [
+                WindowTaskRef(
+                    run_id="run_01",
+                    window_id=f"w_{idx:04d}",
+                    input_path=root / f"in_{idx}.aedt",
+                    relative_path=Path(f"in_{idx}.aedt"),
+                    output_dir=root / f"out_{idx}.aedt_all",
+                )
+                for idx in range(1, 3)
+            ]
+            recovery_window = WindowTaskRef(
+                run_id="run_01",
+                window_id="w_9999",
+                input_path=root / "recovery.aedt",
+                relative_path=Path("recovery.aedt"),
+                output_dir=root / "recovery.aedt_all",
+                attempt_no=2,
+            )
+            account = _Account(account_id="a1", host_alias="h1", max_jobs=2)
+            submitted_job_ids: list[str] = []
+            recovery_submitted = threading.Event()
+
+            def _on_bundle_submitted(bundle):
+                submitted_job_ids.append(bundle.job_id)
+                if bundle.job_id == "job_0003":
+                    recovery_submitted.set()
+
+            def _worker(bundle):
+                if bundle.job_id == "job_0001":
+                    return _WorkerOutcome(name=bundle.job_id, requeue_windows=(recovery_window,))
+                if bundle.job_id == "job_0002":
+                    self.assertTrue(recovery_submitted.wait(timeout=2))
+                    return _WorkerOutcome(name=bundle.job_id)
+                return _WorkerOutcome(name=bundle.job_id)
+
+            batch = run_window_workers(
+                window_queue=initial_windows,
+                accounts=[account],
+                windows_per_job=1,
+                pending_buffer_per_account=3,
+                worker=_worker,
+                capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 0, 0, 2),
+                max_workers=2,
+                on_bundle_submitted=_on_bundle_submitted,
+                recovery_windows_lookup=lambda _bundle, outcome: outcome.requeue_windows,
+                terminal_bundle_lookup=lambda _bundle, outcome: outcome.terminal_worker,
+            )
+
+            self.assertEqual(submitted_job_ids, ["job_0001", "job_0002", "job_0003"])
+            self.assertEqual(batch.submitted_jobs, 3)
+            self.assertEqual(batch.terminal_jobs, 1)
+            self.assertEqual(batch.replacement_jobs, 1)
+            self.assertLessEqual(batch.max_inflight_jobs, 2)
 
 
 if __name__ == "__main__":

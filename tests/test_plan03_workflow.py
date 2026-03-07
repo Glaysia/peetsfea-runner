@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+from peetsfea_runner.constants import EXIT_CODE_DOWNLOAD_FAILURE, EXIT_CODE_REMOTE_CLEANUP_FAILURE
 from peetsfea_runner.pipeline import (
     EXIT_CODE_REMOTE_RUN_FAILURE,
     _WorkflowError,
@@ -19,7 +20,7 @@ from peetsfea_runner.pipeline import (
     _parse_case_summary_lines,
     _run_with_retry,
 )
-from peetsfea_runner.remote_job import _resolve_remote_path
+from peetsfea_runner.remote_job import _categorize_failure, _resolve_remote_path
 
 
 class TestPlan03Workflow(unittest.TestCase):
@@ -157,6 +158,32 @@ class TestPlan03Workflow(unittest.TestCase):
             "real failure line\n"
         )
         self.assertEqual(_extract_meaningful_remote_failure_details(output), "real failure line")
+
+    def test_failure_category_taxonomy(self) -> None:
+        self.assertEqual(
+            _categorize_failure(exit_code=EXIT_CODE_REMOTE_RUN_FAILURE, message="preflight failed", failed_case_lines=[]),
+            "readiness",
+        )
+        self.assertEqual(
+            _categorize_failure(exit_code=EXIT_CODE_DOWNLOAD_FAILURE, message="archive decode failed", failed_case_lines=[]),
+            "collect",
+        )
+        self.assertEqual(
+            _categorize_failure(
+                exit_code=EXIT_CODE_REMOTE_CLEANUP_FAILURE,
+                message="cleanup failed",
+                failed_case_lines=[],
+            ),
+            "cleanup",
+        )
+        self.assertEqual(
+            _categorize_failure(exit_code=EXIT_CODE_REMOTE_RUN_FAILURE, message="failed", failed_case_lines=["case_01:1"]),
+            "solve",
+        )
+        self.assertEqual(
+            _categorize_failure(exit_code=EXIT_CODE_REMOTE_RUN_FAILURE, message="ssh failed", failed_case_lines=[]),
+            "launch",
+        )
 
     def test_tmp_remote_root_is_scoped_per_remote_user(self) -> None:
         class _Cfg:

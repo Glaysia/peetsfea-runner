@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import subprocess
 import time
 from collections import deque
@@ -68,15 +69,39 @@ class AccountCapacitySnapshot:
     allowed_submit: int
 
 
+@dataclass(slots=True, frozen=True)
+class AccountReadinessSnapshot:
+    account_id: str
+    host_alias: str
+    ready: bool
+    status: str
+    reason: str
+    home_ok: bool
+    runtime_path_ok: bool
+    venv_ok: bool
+    python_ok: bool
+    module_ok: bool
+    binaries_ok: bool
+    ansys_ok: bool
+    uv_ok: bool = False
+    pyaedt_ok: bool = False
+
+
 @dataclass(slots=True)
 class BalancedBatchResult(Generic[T]):
     results: list[T]
     max_inflight_jobs: int
     submitted_jobs: int
+    terminal_jobs: int = 0
+    replacement_jobs: int = 0
 
 
 RUNNING_STATES = frozenset({"R", "CG", "RUNNING", "COMPLETING"})
 PENDING_STATES = frozenset({"PD", "PENDING"})
+
+_READINESS_MARKER = "__PEETSFEA_READY__:"
+_PREFLIGHT_MARKER = "__PEETSFEA_PREFLIGHT__:"
+_BOOTSTRAP_MARKER = "__PEETSFEA_BOOTSTRAP__:ok"
 
 
 def parse_squeue_state_counts(lines: Sequence[str]) -> tuple[int, int, dict[str, int]]:
@@ -152,6 +177,429 @@ def query_account_capacity(
         pending_count=pending_count,
         allowed_submit=allowed_submit,
     )
+
+
+def _parse_readiness_marker(*, account: AccountConfigLike, text: str) -> AccountReadinessSnapshot:
+    marker_line = next((line.strip() for line in text.splitlines() if line.strip().startswith(_READINESS_MARKER)), None)
+    if marker_line is None:
+        raise RuntimeError(f"readiness check failed account={account.account_id}: missing readiness marker")
+
+    values: dict[str, bool] = {}
+    for chunk in marker_line[len(_READINESS_MARKER) :].split():
+        if "=" not in chunk:
+            continue
+        key, raw_value = chunk.split("=", 1)
+        values[key.strip()] = raw_value.strip() == "1"
+
+    home_ok = values.get("home", False)
+    runtime_path_ok = values.get("runtime", False)
+    venv_ok = values.get("venv", False)
+    python_ok = values.get("python", False)
+    module_ok = values.get("module", False)
+    binaries_ok = values.get("binaries", False)
+    ansys_ok = values.get("ansys", False)
+    bootstrap_needed = not runtime_path_ok or not venv_ok or not python_ok or not binaries_ok
+    hard_blocked = not home_ok or not module_ok or not ansys_ok
+    failed_checks = [
+        check_name
+        for check_name, check_ok in (
+            ("home", home_ok),
+            ("runtime_path", runtime_path_ok),
+            ("venv", venv_ok),
+            ("python", python_ok),
+            ("module", module_ok),
+            ("binaries", binaries_ok),
+            ("ansys", ansys_ok),
+        )
+        if not check_ok
+    ]
+    ready = not failed_checks
+    if ready:
+        status = "READY"
+        reason = "ok"
+    elif bootstrap_needed and not hard_blocked:
+        status = "BOOTSTRAP_REQUIRED"
+        reason = ",".join(failed_checks)
+    else:
+        status = "DISABLED_FOR_DISPATCH"
+        reason = ",".join(failed_checks)
+    return AccountReadinessSnapshot(
+        account_id=account.account_id,
+        host_alias=account.host_alias,
+        ready=ready,
+        status=status,
+        reason=reason,
+        home_ok=home_ok,
+        runtime_path_ok=runtime_path_ok,
+        venv_ok=venv_ok,
+        python_ok=python_ok,
+        module_ok=module_ok,
+        binaries_ok=binaries_ok,
+        ansys_ok=ansys_ok,
+    )
+
+
+def query_account_readiness(
+    *,
+    account: AccountConfigLike,
+    run_command: Callable[[list[str]], tuple[int, str, str]] | None = None,
+    ssh_connect_timeout_seconds: int = 5,
+    command_timeout_seconds: int = 12,
+) -> AccountReadinessSnapshot:
+    if ssh_connect_timeout_seconds <= 0:
+        raise ValueError("ssh_connect_timeout_seconds must be > 0")
+    if command_timeout_seconds <= 0:
+        raise ValueError("command_timeout_seconds must be > 0")
+
+    remote_script = """
+set +e
+HOME_OK=0
+RUNTIME_OK=0
+VENV_OK=0
+PYTHON_OK=0
+MODULE_OK=0
+BINARIES_OK=0
+ANSYS_OK=0
+if [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
+  HOME_OK=1
+  RUNTIME_OK=1
+fi
+if [ -d "$HOME/.peetsfea-runner-venv" ]; then
+  VENV_OK=1
+fi
+if [ -x "$HOME/.peetsfea-runner-venv/bin/python" ]; then
+  PYTHON_OK=1
+fi
+if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+  BINARIES_OK=1
+fi
+if [ -r /etc/profile.d/modules.sh ]; then
+  . /etc/profile.d/modules.sh >/dev/null 2>&1 || true
+fi
+if command -v module >/dev/null 2>&1; then
+  module load ansys-electronics/v252 >/dev/null 2>&1 && MODULE_OK=1
+fi
+if command -v ansysedt >/dev/null 2>&1 || command -v ansysedtsv >/dev/null 2>&1 || command -v electronicsdesktop >/dev/null 2>&1; then
+  ANSYS_OK=1
+fi
+printf '__PEETSFEA_READY__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK"
+"""
+    command = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={ssh_connect_timeout_seconds}",
+        account.host_alias,
+        f"bash -lc {shlex.quote(remote_script)}",
+    ]
+    if run_command is None:
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=command_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"readiness check timed out account={account.account_id} host={account.host_alias} "
+                f"timeout={command_timeout_seconds}s"
+            ) from exc
+        return_code = completed.returncode
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+    else:
+        return_code, stdout, stderr = run_command(command)
+
+    combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
+    if combined_output:
+        snapshot = _parse_readiness_marker(account=account, text=combined_output)
+        if return_code != 0 and snapshot.ready:
+            raise RuntimeError(
+                f"readiness check failed account={account.account_id}: "
+                f"{(stderr or stdout).strip() or f'return code={return_code}'}"
+            )
+        return snapshot
+
+    details = (stderr or stdout).strip()
+    if not details:
+        details = f"return code={return_code}"
+    raise RuntimeError(f"readiness check failed account={account.account_id}: {details}")
+
+
+def _parse_preflight_marker(*, account: AccountConfigLike, text: str) -> AccountReadinessSnapshot:
+    marker_line = next((line.strip() for line in text.splitlines() if line.strip().startswith(_PREFLIGHT_MARKER)), None)
+    if marker_line is None:
+        raise RuntimeError(f"preflight check failed account={account.account_id}: missing preflight marker")
+
+    values: dict[str, bool] = {}
+    for chunk in marker_line[len(_PREFLIGHT_MARKER) :].split():
+        if "=" not in chunk:
+            continue
+        key, raw_value = chunk.split("=", 1)
+        values[key.strip()] = raw_value.strip() == "1"
+
+    home_ok = values.get("home", False)
+    runtime_path_ok = values.get("runtime", False)
+    venv_ok = values.get("venv", False)
+    python_ok = values.get("python", False)
+    module_ok = values.get("module", False)
+    binaries_ok = values.get("binaries", False)
+    ansys_ok = values.get("ansys", False)
+    uv_ok = values.get("uv", False)
+    pyaedt_ok = values.get("pyaedt", False)
+    failed_checks = [
+        check_name
+        for check_name, check_ok in (
+            ("home", home_ok),
+            ("runtime_path", runtime_path_ok),
+            ("venv", venv_ok),
+            ("python", python_ok),
+            ("module", module_ok),
+            ("binaries", binaries_ok),
+            ("ansys", ansys_ok),
+            ("uv", uv_ok),
+            ("pyaedt", pyaedt_ok),
+        )
+        if not check_ok
+    ]
+    ready = not failed_checks
+    return AccountReadinessSnapshot(
+        account_id=account.account_id,
+        host_alias=account.host_alias,
+        ready=ready,
+        status="READY" if ready else "PREFLIGHT_FAILED",
+        reason="ok" if ready else ",".join(failed_checks),
+        home_ok=home_ok,
+        runtime_path_ok=runtime_path_ok,
+        venv_ok=venv_ok,
+        python_ok=python_ok,
+        module_ok=module_ok,
+        binaries_ok=binaries_ok,
+        ansys_ok=ansys_ok,
+        uv_ok=uv_ok,
+        pyaedt_ok=pyaedt_ok,
+    )
+
+
+def query_account_preflight(
+    *,
+    account: AccountConfigLike,
+    run_command: Callable[[list[str]], tuple[int, str, str]] | None = None,
+    ssh_connect_timeout_seconds: int = 5,
+    command_timeout_seconds: int = 20,
+) -> AccountReadinessSnapshot:
+    if ssh_connect_timeout_seconds <= 0:
+        raise ValueError("ssh_connect_timeout_seconds must be > 0")
+    if command_timeout_seconds <= 0:
+        raise ValueError("command_timeout_seconds must be > 0")
+
+    remote_script = """
+set +e
+HOME_OK=0
+RUNTIME_OK=0
+VENV_OK=0
+PYTHON_OK=0
+MODULE_OK=0
+BINARIES_OK=0
+ANSYS_OK=0
+UV_OK=0
+PYAEDT_OK=0
+VENV_DIR="$HOME/.peetsfea-runner-venv"
+if [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
+  HOME_OK=1
+  RUNTIME_OK=1
+fi
+if [ -d "$VENV_DIR" ]; then
+  VENV_OK=1
+fi
+if [ -x "$VENV_DIR/bin/python" ]; then
+  PYTHON_OK=1
+fi
+if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+  BINARIES_OK=1
+fi
+if [ -r /etc/profile.d/modules.sh ]; then
+  . /etc/profile.d/modules.sh >/dev/null 2>&1 || true
+fi
+if command -v module >/dev/null 2>&1; then
+  module load ansys-electronics/v252 >/dev/null 2>&1 && MODULE_OK=1
+fi
+if command -v ansysedt >/dev/null 2>&1 || command -v ansysedtsv >/dev/null 2>&1 || [ -x /opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt ]; then
+  ANSYS_OK=1
+fi
+if [ "$PYTHON_OK" -eq 1 ] && "$VENV_DIR/bin/python" -m uv --version >/dev/null 2>&1; then
+  UV_OK=1
+fi
+if [ "$PYTHON_OK" -eq 1 ] && "$VENV_DIR/bin/python" -c "import ansys.aedt.core" >/dev/null 2>&1; then
+  PYAEDT_OK=1
+fi
+printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK"
+"""
+    command = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={ssh_connect_timeout_seconds}",
+        account.host_alias,
+        f"bash -lc {shlex.quote(remote_script)}",
+    ]
+    if run_command is None:
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=command_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"preflight check timed out account={account.account_id} host={account.host_alias} "
+                f"timeout={command_timeout_seconds}s"
+            ) from exc
+        return_code = completed.returncode
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+    else:
+        return_code, stdout, stderr = run_command(command)
+
+    combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
+    if combined_output:
+        snapshot = _parse_preflight_marker(account=account, text=combined_output)
+        if return_code != 0 and snapshot.ready:
+            raise RuntimeError(
+                f"preflight check failed account={account.account_id}: "
+                f"{(stderr or stdout).strip() or f'return code={return_code}'}"
+            )
+        return snapshot
+
+    details = (stderr or stdout).strip()
+    if not details:
+        details = f"return code={return_code}"
+    raise RuntimeError(f"preflight check failed account={account.account_id}: {details}")
+
+
+def bootstrap_account_runtime(
+    *,
+    account: AccountConfigLike,
+    run_command: Callable[[list[str]], tuple[int, str, str]] | None = None,
+    ssh_connect_timeout_seconds: int = 5,
+    command_timeout_seconds: int = 900,
+) -> str:
+    if ssh_connect_timeout_seconds <= 0:
+        raise ValueError("ssh_connect_timeout_seconds must be > 0")
+    if command_timeout_seconds <= 0:
+        raise ValueError("command_timeout_seconds must be > 0")
+
+    remote_script = """
+set -euo pipefail
+VENV_DIR="$HOME/.peetsfea-runner-venv"
+MINICONDA_DIR="$HOME/miniconda3"
+CONDA_ENV_NAME="peetsfea-runner-py312"
+CONDA_PYTHON_PATH="$MINICONDA_DIR/envs/$CONDA_ENV_NAME/bin/python"
+DEPS_READY_MARKER="$VENV_DIR/.peets_deps_ready"
+if [ -r /etc/profile.d/modules.sh ]; then
+  . /etc/profile.d/modules.sh >/dev/null 2>&1 || true
+fi
+download_miniconda_installer() {
+  installer_path="$1"
+  url="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$installer_path"
+    return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO "$installer_path" "$url"
+    return 0
+  fi
+  echo "[ERROR] curl or wget is required to install Miniconda3" >&2
+  exit 1
+}
+ensure_miniconda() {
+  if [ -x "$MINICONDA_DIR/bin/conda" ]; then
+    return 0
+  fi
+  installer_path=$(mktemp /tmp/miniconda_installer.XXXXXX.sh)
+  download_miniconda_installer "$installer_path"
+  bash "$installer_path" -b -p "$MINICONDA_DIR"
+  rm -f "$installer_path"
+}
+ensure_conda_python312() {
+  if [ -x "$CONDA_PYTHON_PATH" ]; then
+    major_minor="$($CONDA_PYTHON_PATH -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    if [ "$major_minor" = "3.12" ]; then
+      return 0
+    fi
+  fi
+  "$MINICONDA_DIR/bin/conda" create -y -n "$CONDA_ENV_NAME" python=3.12
+}
+ensure_runner_venv() {
+  recreate=0
+  if [ -d "$VENV_DIR" ]; then
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+      recreate=1
+    else
+      major_minor="$($VENV_DIR/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+      if [ "$major_minor" != "3.12" ]; then
+        recreate=1
+      fi
+    fi
+  else
+    recreate=1
+  fi
+  if [ "$recreate" -eq 1 ]; then
+    rm -rf "$VENV_DIR"
+    "$CONDA_PYTHON_PATH" -m venv "$VENV_DIR"
+  fi
+}
+ensure_miniconda
+ensure_conda_python312
+ensure_runner_venv
+"$VENV_DIR/bin/python" -m ensurepip --upgrade || true
+"$VENV_DIR/bin/python" -m pip install --upgrade pip
+"$VENV_DIR/bin/python" -m pip install uv
+"$VENV_DIR/bin/python" -m uv pip install pyaedt==0.25.1
+touch "$DEPS_READY_MARKER"
+printf '__PEETSFEA_BOOTSTRAP__:ok\\n'
+"""
+    command = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={ssh_connect_timeout_seconds}",
+        account.host_alias,
+        f"bash -lc {shlex.quote(remote_script)}",
+    ]
+    if run_command is None:
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=command_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"bootstrap timed out account={account.account_id} host={account.host_alias} "
+                f"timeout={command_timeout_seconds}s"
+            ) from exc
+        return_code = completed.returncode
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+    else:
+        return_code, stdout, stderr = run_command(command)
+
+    output = "\n".join(part for part in (stdout, stderr) if part).strip()
+    if return_code != 0 or _BOOTSTRAP_MARKER not in output:
+        details = output or f"return code={return_code}"
+        raise RuntimeError(f"bootstrap failed account={account.account_id}: {details}")
+    return output
 
 
 def pick_balanced_account(
@@ -306,6 +754,8 @@ def run_window_workers(
     on_capacity_snapshot: Callable[[AccountCapacitySnapshot], None] | None = None,
     on_bundle_submitted: Callable[[BundleSpec], None] | None = None,
     on_capacity_error: Callable[[AccountConfigLike, Exception], None] | None = None,
+    recovery_windows_lookup: Callable[[BundleSpec, T], Sequence[WindowTaskRef]] | None = None,
+    terminal_bundle_lookup: Callable[[BundleSpec, T], bool] | None = None,
 ) -> BalancedBatchResult[T]:
     if windows_per_job <= 0:
         raise ValueError("windows_per_job must be > 0")
@@ -339,30 +789,67 @@ def run_window_workers(
     if not account_order:
         raise RuntimeError("Unable to allocate worker targets.")
 
-    worker_inputs: list[list[WindowTaskRef]] = [[] for _ in range(len(account_order))]
-    for index, window in enumerate(window_queue):
-        worker_inputs[index % len(account_order)].append(window)
-
     if max_workers is None:
         max_workers = max(1, len(account_order))
     else:
         max_workers = max(1, max_workers)
 
+    queue = deque(window_queue)
+    worker_inputs: list[list[WindowTaskRef]] = [[] for _ in range(len(account_order))]
+    for worker_index in range(len(account_order)):
+        if not queue:
+            break
+        worker_inputs[worker_index].append(queue.popleft())
+    while queue:
+        progressed = False
+        for assigned in worker_inputs:
+            if not queue:
+                break
+            if len(assigned) >= windows_per_job:
+                continue
+            assigned.append(queue.popleft())
+            progressed = True
+        if not progressed:
+            break
+
     bundles: list[BundleSpec] = []
+    target_workers_by_account: dict[str, int] = {}
     job_counter = job_index_start - 1
     for worker_index, account in enumerate(account_order):
         assigned = worker_inputs[worker_index]
         if not assigned:
             continue
+        target_workers_by_account[account.account_id] = target_workers_by_account.get(account.account_id, 0) + 1
         job_counter += 1
-        bundle = BundleSpec(
-            job_id=f"job_{job_counter:04d}",
-            job_index=job_counter,
-            account_id=account.account_id,
-            host_alias=account.host_alias,
-            window_inputs=tuple(assigned),
+        bundles.append(
+            BundleSpec(
+                job_id=f"job_{job_counter:04d}",
+                job_index=job_counter,
+                account_id=account.account_id,
+                host_alias=account.host_alias,
+                window_inputs=tuple(assigned),
+            )
         )
-        bundles.append(bundle)
+
+    backlog_owner_index = 0
+    while queue:
+        account = account_order[backlog_owner_index % len(account_order)]
+        assigned: list[WindowTaskRef] = []
+        while queue and len(assigned) < windows_per_job:
+            assigned.append(queue.popleft())
+        if not assigned:
+            break
+        job_counter += 1
+        bundles.append(
+            BundleSpec(
+                job_id=f"job_{job_counter:04d}",
+                job_index=job_counter,
+                account_id=account.account_id,
+                host_alias=account.host_alias,
+                window_inputs=tuple(assigned),
+            )
+        )
+        backlog_owner_index += 1
 
     pending_bundles_by_account: dict[str, deque[BundleSpec]] = {}
     for bundle in bundles:
@@ -372,6 +859,32 @@ def run_window_workers(
     inflight_workers: dict[str, int] = {}
     results: list[T] = []
     max_inflight_jobs = 0
+    submitted_jobs = 0
+    terminal_jobs = 0
+    replacement_jobs = 0
+
+    def _queue_bundles_for_account(*, account: AccountConfigLike, windows: Sequence[WindowTaskRef]) -> int:
+        nonlocal job_counter
+        queued_jobs = 0
+        recovery_queue = deque(windows)
+        while recovery_queue:
+            assigned: list[WindowTaskRef] = []
+            while recovery_queue and len(assigned) < windows_per_job:
+                assigned.append(recovery_queue.popleft())
+            if not assigned:
+                break
+            job_counter += 1
+            pending_bundles_by_account.setdefault(account.account_id, deque()).append(
+                BundleSpec(
+                    job_id=f"job_{job_counter:04d}",
+                    job_index=job_counter,
+                    account_id=account.account_id,
+                    host_alias=account.host_alias,
+                    window_inputs=tuple(assigned),
+                )
+            )
+            queued_jobs += 1
+        return queued_jobs
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_bundle: dict[Future[T], BundleSpec] = {}
@@ -380,10 +893,19 @@ def run_window_workers(
             done_futures = [future for future in tuple(future_to_bundle) if future.done()]
             for future in done_futures:
                 bundle = future_to_bundle.pop(future)
-                results.append(future.result())
+                result = future.result()
+                results.append(result)
                 inflight_windows[bundle.account_id] = max(0, inflight_windows.get(bundle.account_id, 0) - bundle.window_count)
                 inflight_workers[bundle.account_id] = max(0, inflight_workers.get(bundle.account_id, 0) - 1)
                 completed_windows[bundle.account_id] = completed_windows.get(bundle.account_id, 0) + bundle.window_count
+                if terminal_bundle_lookup is not None and terminal_bundle_lookup(bundle, result):
+                    terminal_jobs += 1
+                if recovery_windows_lookup is not None:
+                    recovery_windows = list(recovery_windows_lookup(bundle, result))
+                    if recovery_windows:
+                        account = next((item for item in accounts if item.account_id == bundle.account_id), None)
+                        if account is not None:
+                            replacement_jobs += _queue_bundles_for_account(account=account, windows=recovery_windows)
 
             snapshots: list[AccountCapacitySnapshot] = []
             for account in accounts:
@@ -409,13 +931,16 @@ def run_window_workers(
                 snapshot = snapshot_by_account.get(account.account_id)
                 if snapshot is None:
                     continue
+                target_workers = target_workers_by_account.get(account.account_id, 0)
+                if target_workers <= 0:
+                    continue
                 external_occupied = max(
                     0,
                     max(0, snapshot.running_count) + max(0, snapshot.pending_count) - inflight_workers.get(account.account_id, 0),
                 )
                 available_workers = max(
                     0,
-                    account.max_jobs - external_occupied - inflight_workers.get(account.account_id, 0),
+                    target_workers - external_occupied - inflight_workers.get(account.account_id, 0),
                 )
                 while queue and available_workers > 0 and len(future_to_bundle) < max_workers:
                     bundle = queue.popleft()
@@ -425,6 +950,7 @@ def run_window_workers(
                     inflight_workers[bundle.account_id] = inflight_workers.get(bundle.account_id, 0) + 1
                     available_workers -= 1
                     submitted_any = True
+                    submitted_jobs += 1
                     max_inflight_jobs = max(max_inflight_jobs, len(future_to_bundle))
                     if on_bundle_submitted is not None:
                         on_bundle_submitted(bundle)
@@ -442,7 +968,9 @@ def run_window_workers(
     return BalancedBatchResult(
         results=results,
         max_inflight_jobs=max_inflight_jobs,
-        submitted_jobs=len(bundles),
+        submitted_jobs=submitted_jobs,
+        terminal_jobs=terminal_jobs,
+        replacement_jobs=replacement_jobs,
     )
 
 

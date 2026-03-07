@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -9,13 +10,29 @@ from urllib.parse import parse_qs, urlparse
 
 import duckdb
 
+from peetsfea_runner.state_store import _GLOBAL_DUCKDB_LOCK
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    return max(minimum, value)
+
 
 def _query(db_path: Path, sql: str, params: list[object] | None = None) -> list[tuple]:
-    conn = duckdb.connect(str(db_path))
-    try:
-        return conn.execute(sql, params or []).fetchall()
-    finally:
-        conn.close()
+    # Serialize DuckDB access across the embedded web server and the worker
+    # loop to avoid in-process connection configuration conflicts.
+    with _GLOBAL_DUCKDB_LOCK:
+        conn = duckdb.connect(str(db_path))
+        try:
+            return conn.execute(sql, params or []).fetchall()
+        finally:
+            conn.close()
 
 
 def _latest_run_id(db_path: Path) -> str | None:
@@ -113,6 +130,343 @@ def _account_window_scores(db_path: Path, *, run_id: str | None) -> list[dict[st
     return scores
 
 
+def _account_window_live_stats(db_path: Path, *, run_id: str | None) -> dict[str, dict[str, int]]:
+    if run_id is None:
+        return {}
+    rows = _query(
+        db_path,
+        """
+        SELECT
+            account_id,
+            SUM(CASE WHEN state IN ('ASSIGNED', 'UPLOADING', 'RUNNING', 'COLLECTING') THEN 1 ELSE 0 END) AS active_slots,
+            SUM(CASE WHEN state IN ('SUCCEEDED', 'FAILED', 'QUARANTINED') THEN 1 ELSE 0 END) AS completed_slots,
+            SUM(CASE WHEN state = 'SUCCEEDED' THEN 1 ELSE 0 END) AS succeeded_slots,
+            SUM(CASE WHEN state = 'FAILED' THEN 1 ELSE 0 END) AS failed_slots,
+            SUM(CASE WHEN state = 'QUARANTINED' THEN 1 ELSE 0 END) AS quarantined_slots
+        FROM window_tasks
+        WHERE run_id = ? AND account_id IS NOT NULL
+        GROUP BY account_id
+        ORDER BY account_id
+        """,
+        [run_id],
+    )
+    stats: dict[str, dict[str, int]] = {}
+    for row in rows:
+        stats[str(row[0])] = {
+            "active_slots": int(row[1] or 0),
+            "completed_slots": int(row[2] or 0),
+            "succeeded_slots": int(row[3] or 0),
+            "failed_slots": int(row[4] or 0),
+            "quarantined_windows": int(row[5] or 0),
+        }
+    return stats
+
+
+def _configured_account_worker_targets() -> dict[str, int]:
+    raw_accounts = os.getenv("PEETSFEA_ACCOUNTS", "").strip()
+    default_max_jobs = _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10)
+    targets: dict[str, int] = {}
+    if not raw_accounts:
+        return targets
+    for chunk in raw_accounts.split(","):
+        entry = chunk.strip()
+        if not entry:
+            continue
+        account_part = entry
+        max_jobs = default_max_jobs
+        if ":" in entry:
+            account_part, raw_max_jobs = entry.rsplit(":", 1)
+            try:
+                max_jobs = max(1, int(raw_max_jobs.strip()))
+            except ValueError:
+                max_jobs = default_max_jobs
+        account_id = account_part.split("@", 1)[0].strip()
+        if account_id:
+            targets[account_id] = max_jobs
+    return targets
+
+
+def _latest_account_readiness(db_path: Path) -> dict[str, dict[str, object]]:
+    rows = _query(
+        db_path,
+        """
+        SELECT
+            account_id,
+            host,
+            ready,
+            status,
+            reason,
+            home_ok,
+            runtime_path_ok,
+            venv_ok,
+            python_ok,
+            module_ok,
+            binaries_ok,
+            ansys_ok,
+            uv_ok,
+            pyaedt_ok,
+            ts
+        FROM (
+            SELECT
+                account_id,
+                host,
+                ready,
+                status,
+                reason,
+                home_ok,
+                runtime_path_ok,
+                venv_ok,
+                python_ok,
+                module_ok,
+                binaries_ok,
+                ansys_ok,
+                uv_ok,
+                pyaedt_ok,
+                ts,
+                ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY ts DESC) AS rn
+            FROM account_readiness_snapshots
+        ) ranked
+        WHERE rn = 1
+        ORDER BY account_id
+        """,
+    )
+    readiness: dict[str, dict[str, object]] = {}
+    for row in rows:
+        readiness[str(row[0])] = {
+            "account_id": row[0],
+            "host": row[1],
+            "ready": bool(row[2]),
+            "status": row[3],
+            "reason": row[4],
+            "checks": {
+                "home_ok": bool(row[5]),
+                "runtime_path_ok": bool(row[6]),
+                "venv_ok": bool(row[7]),
+                "python_ok": bool(row[8]),
+                "module_ok": bool(row[9]),
+                "binaries_ok": bool(row[10]),
+                "ansys_ok": bool(row[11]),
+                "uv_ok": bool(row[12]),
+                "pyaedt_ok": bool(row[13]),
+            },
+            "ts": row[14],
+        }
+    return readiness
+
+
+def _configured_capacity_targets() -> dict[str, int]:
+    windows_per_job = _env_int("PEETSFEA_WINDOWS_PER_JOB", 8)
+    raw_accounts = os.getenv("PEETSFEA_ACCOUNTS", "").strip()
+    configured_accounts = 0
+    configured_worker_jobs = 0
+    if raw_accounts:
+        for chunk in raw_accounts.split(","):
+            entry = chunk.strip()
+            if not entry:
+                continue
+            configured_accounts += 1
+            max_jobs = 10
+            if ":" in entry:
+                try:
+                    max_jobs = int(entry.rsplit(":", 1)[1].strip())
+                except ValueError:
+                    max_jobs = 10
+            configured_worker_jobs += max(1, max_jobs)
+    else:
+        configured_accounts = 1
+        configured_worker_jobs = _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10)
+
+    scaling_accounts = _env_int("PEETSFEA_SCALING_TARGET_ACCOUNTS", 5)
+    scaling_jobs_per_account = _env_int("PEETSFEA_SCALING_TARGET_MAX_JOBS_PER_ACCOUNT", 10)
+    return {
+        "configured_accounts": configured_accounts,
+        "configured_worker_jobs": configured_worker_jobs,
+        "windows_per_job": windows_per_job,
+        "configured_target_slots": configured_worker_jobs * windows_per_job,
+        "scaling_accounts": scaling_accounts,
+        "scaling_worker_jobs": scaling_accounts * scaling_jobs_per_account,
+        "expansion_target_slots": scaling_accounts * scaling_jobs_per_account * windows_per_job,
+    }
+
+
+def _throughput_kpi_payload(
+    *,
+    queued_windows: int,
+    active_windows: int,
+    active_workers: int,
+    pending_workers: int,
+) -> dict[str, object]:
+    targets = _configured_capacity_targets()
+    demand_slots = queued_windows + active_windows
+    configured_target_slots = int(targets["configured_target_slots"])
+    configured_worker_jobs = int(targets["configured_worker_jobs"])
+    effective_target_slots = min(configured_target_slots, demand_slots) if demand_slots > 0 else 0
+    active_slot_shortfall = max(effective_target_slots - active_windows, 0)
+    worker_shortfall = max(configured_worker_jobs - active_workers, 0)
+    scheduled_worker_shortfall = max(configured_worker_jobs - (active_workers + pending_workers), 0)
+    input_limited = demand_slots < configured_target_slots
+    if demand_slots == 0:
+        throughput_mode = "IDLE"
+    elif active_slot_shortfall == 0 and input_limited:
+        throughput_mode = "INPUT_LIMITED"
+    elif active_slot_shortfall == 0:
+        throughput_mode = "AT_CAPACITY"
+    elif input_limited:
+        throughput_mode = "INPUT_LIMITED"
+    else:
+        throughput_mode = "CAPACITY_SHORTFALL"
+
+    return {
+        **targets,
+        "demand_slots": demand_slots,
+        "effective_target_slots": effective_target_slots,
+        "active_slot_shortfall": active_slot_shortfall,
+        "active_workers": active_workers,
+        "pending_workers": pending_workers,
+        "worker_shortfall": worker_shortfall,
+        "scheduled_worker_shortfall": scheduled_worker_shortfall,
+        "recovery_backlog_windows": queued_windows,
+        "input_limited": input_limited,
+        "capacity_limited": (not input_limited) and active_slot_shortfall > 0,
+        "throughput_mode": throughput_mode,
+        "configured_slot_utilization": (float(active_windows) / configured_target_slots) if configured_target_slots else 0.0,
+        "effective_slot_utilization": (float(active_windows) / effective_target_slots) if effective_target_slots else 0.0,
+    }
+
+
+def _account_live_status(
+    *,
+    readiness_ready: object,
+    running_count: int,
+    pending_count: int,
+    target_workers: int,
+) -> str:
+    if readiness_ready is False:
+        return "BLOCKED"
+    if running_count >= target_workers:
+        return "AT_TARGET"
+    if (running_count + pending_count) >= target_workers:
+        return "FILLING"
+    if running_count > 0 or pending_count > 0:
+        return "UNDER_CAPACITY"
+    return "IDLE"
+
+
+_ACCOUNT_RE = re.compile(r"account=(account_[0-9]+)")
+
+
+def _extract_account_id(*, entity_id: str | None, message: str, source: str) -> str | None:
+    if source == "JOB" and entity_id and entity_id.startswith("job_"):
+        return None
+    match = _ACCOUNT_RE.search(message)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _classify_ops_event(*, stage: str, level: str, message: str, account_id: str | None) -> dict[str, object]:
+    normalized_stage = stage.upper()
+    normalized_level = level.upper()
+    category = "info"
+    alertable = False
+    severity = normalized_level
+
+    if normalized_stage in {"WORKER_LOOP_BLOCKED"} or "READINESS" in normalized_stage:
+        category = "readiness"
+        alertable = True
+        severity = "WARN" if normalized_level == "INFO" else normalized_level
+    elif normalized_stage in {"WORKER_LOOP_RECOVERING"} or "RECOVER" in normalized_stage:
+        category = "recovery"
+        alertable = True
+        severity = "WARN" if normalized_level == "INFO" else normalized_level
+    elif normalized_stage in {"QUARANTINED", "DELETE_QUARANTINED"}:
+        category = "quarantine"
+        alertable = True
+        severity = "ERROR" if normalized_level == "INFO" else normalized_level
+    elif normalized_stage in {"WORKER_LOOP_ERROR"} or normalized_level == "ERROR":
+        category = "failure"
+        alertable = True
+        severity = "ERROR"
+    elif normalized_stage.startswith("FAILURE_") or "COLLECT" in normalized_stage or "CLEANUP" in normalized_stage:
+        category = "failure"
+        alertable = True
+        severity = "ERROR" if normalized_level == "INFO" else normalized_level
+    elif normalized_stage in {"ACCOUNT_BOOTSTRAP_START", "ACCOUNT_BOOTSTRAP_OK"}:
+        category = "bootstrap"
+        alertable = False
+    elif normalized_stage in {"DELETE_PENDING", "DELETE_RETAINED", "INPUT_DELETED"}:
+        category = "lifecycle"
+        alertable = normalized_stage == "DELETE_QUARANTINED"
+    common_key = f"{category}:{account_id or 'global'}:{normalized_stage}"
+    return {
+        "category": category,
+        "alertable": alertable,
+        "severity": severity,
+        "common_key": common_key,
+    }
+
+
+def _alertable_event_summary(
+    *,
+    events: list[dict[str, object]],
+    throughput_kpi: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    alerts: list[dict[str, object]] = []
+    if throughput_kpi and bool(throughput_kpi.get("capacity_limited")):
+        alerts.append(
+            {
+                "alert_key": "CAPACITY_SHORTFALL",
+                "severity": "WARN",
+                "category": "capacity",
+                "account_id": None,
+                "message": (
+                    f"worker_gap={throughput_kpi.get('scheduled_worker_shortfall', 0)} "
+                    f"slot_shortfall={throughput_kpi.get('active_slot_shortfall', 0)} "
+                    f"mode={throughput_kpi.get('throughput_mode')}"
+                ),
+            }
+        )
+
+    readiness_accounts = sorted(
+        {
+            str(event["account_id"])
+            for event in events
+            if event.get("category") == "readiness" and event.get("account_id")
+        }
+    )
+    for account_id in readiness_accounts:
+        alerts.append(
+            {
+                "alert_key": "READINESS_BLOCKED",
+                "severity": "WARN",
+                "category": "readiness",
+                "account_id": account_id,
+                "message": f"readiness blocked for {account_id}",
+            }
+        )
+
+    quarantine_counts: dict[str, int] = {}
+    for event in events:
+        if event.get("category") != "quarantine":
+            continue
+        account_id = str(event.get("account_id") or "global")
+        quarantine_counts[account_id] = quarantine_counts.get(account_id, 0) + 1
+    for account_id, count in sorted(quarantine_counts.items()):
+        if count < 2:
+            continue
+        alerts.append(
+            {
+                "alert_key": "QUARANTINE_BURST",
+                "severity": "ERROR",
+                "category": "quarantine",
+                "account_id": None if account_id == "global" else account_id,
+                "message": f"recent quarantine burst count={count}",
+            }
+        )
+
+    return alerts
+
+
 def _parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -162,6 +516,7 @@ def _worker_health_payload(db_path: Path, *, stale_threshold: int) -> dict[str, 
         return {
             "status": "STALE",
             "reason": "no heartbeat",
+            "worker_status": None,
             "stale_threshold_seconds": stale_threshold,
             "last_heartbeat_ts": None,
             "heartbeat_age_seconds": None,
@@ -174,14 +529,21 @@ def _worker_health_payload(db_path: Path, *, stale_threshold: int) -> dict[str, 
         }
 
     row = hb_rows[0]
+    worker_status = row[5]
     heartbeat_age = _age_seconds(row[3])
     is_stale = heartbeat_age is None or heartbeat_age > stale_threshold
     if is_stale:
         status = "STALE"
         reason = "old heartbeat"
-    elif row[5] == "DEGRADED":
+    elif worker_status == "DEGRADED":
         status = "DEGRADED"
         reason = "recent errors"
+    elif worker_status == "BLOCKED":
+        status = "HEALTHY"
+        reason = "autorecovery blocked by readiness"
+    elif worker_status == "RECOVERING":
+        status = "HEALTHY"
+        reason = "autorecovery active"
     else:
         status = "HEALTHY"
         reason = "ok"
@@ -189,6 +551,7 @@ def _worker_health_payload(db_path: Path, *, stale_threshold: int) -> dict[str, 
     return {
         "status": status,
         "reason": reason,
+        "worker_status": worker_status,
         "stale_threshold_seconds": stale_threshold,
         "last_heartbeat_ts": row[3],
         "heartbeat_age_seconds": heartbeat_age,
@@ -399,7 +762,10 @@ def make_status_handler(*, db_path: Path):
             if parsed.path == "/api/accounts/capacity":
                 run_id = _first_str_param(params, "run_id") or _latest_run_id(db_path)
                 score_map = {item["account_id"]: item for item in _account_window_scores(db_path, run_id=run_id)}
-                rows = _query(
+                live_window_map = _account_window_live_stats(db_path, run_id=run_id)
+                target_worker_map = _configured_account_worker_targets()
+                windows_per_job = int(_configured_capacity_targets()["windows_per_job"])
+                capacity_rows = _query(
                     db_path,
                     """
                     SELECT account_id, host, running_count, pending_count, allowed_submit, ts
@@ -418,20 +784,81 @@ def make_status_handler(*, db_path: Path):
                     ORDER BY account_id
                     """,
                 )
+                readiness_map = _latest_account_readiness(db_path)
+                capacity_map = {
+                    str(row[0]): {
+                        "account_id": row[0],
+                        "host": row[1],
+                        "running_count": int(row[2] or 0),
+                        "pending_count": int(row[3] or 0),
+                        "allowed_submit": int(row[4] or 0),
+                        "ts": row[5],
+                    }
+                    for row in capacity_rows
+                }
+                account_ids = sorted(set(capacity_map) | set(readiness_map))
                 self._send_json(
                     {
                         "run_id": run_id,
                         "accounts": [
                             {
-                                "account_id": row[0],
-                                "host": row[1],
-                                "running_count": int(row[2] or 0),
-                                "pending_count": int(row[3] or 0),
-                                "allowed_submit": int(row[4] or 0),
-                                "score": int(score_map.get(row[0], {}).get("score", 0)),
-                                "ts": row[5],
+                                "account_id": account_id,
+                                "host": str(
+                                    capacity_map.get(account_id, {}).get("host")
+                                    or readiness_map.get(account_id, {}).get("host")
+                                    or ""
+                                ),
+                                "running_count": int(capacity_map.get(account_id, {}).get("running_count", 0)),
+                                "pending_count": int(capacity_map.get(account_id, {}).get("pending_count", 0)),
+                                "allowed_submit": int(capacity_map.get(account_id, {}).get("allowed_submit", 0)),
+                                "score": int(score_map.get(account_id, {}).get("score", 0)),
+                                "configured_worker_jobs": int(target_worker_map.get(account_id, _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10))),
+                                "configured_target_slots": int(
+                                    target_worker_map.get(account_id, _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10))
+                                )
+                                * windows_per_job,
+                                "active_slots": int(live_window_map.get(account_id, {}).get("active_slots", 0)),
+                                "completed_slots": int(live_window_map.get(account_id, {}).get("completed_slots", 0)),
+                                "succeeded_slots": int(live_window_map.get(account_id, {}).get("succeeded_slots", 0)),
+                                "failed_slots": int(live_window_map.get(account_id, {}).get("failed_slots", 0)),
+                                "quarantined_windows": int(
+                                    live_window_map.get(account_id, {}).get("quarantined_windows", 0)
+                                ),
+                                "active_worker_shortfall": max(
+                                    int(target_worker_map.get(account_id, _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10)))
+                                    - int(capacity_map.get(account_id, {}).get("running_count", 0)),
+                                    0,
+                                ),
+                                "scheduled_worker_shortfall": max(
+                                    int(target_worker_map.get(account_id, _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10)))
+                                    - (
+                                        int(capacity_map.get(account_id, {}).get("running_count", 0))
+                                        + int(capacity_map.get(account_id, {}).get("pending_count", 0))
+                                    ),
+                                    0,
+                                ),
+                                "active_slot_shortfall": max(
+                                    int(target_worker_map.get(account_id, _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10)))
+                                    * windows_per_job
+                                    - int(live_window_map.get(account_id, {}).get("active_slots", 0)),
+                                    0,
+                                ),
+                                "live_status": _account_live_status(
+                                    readiness_ready=readiness_map.get(account_id, {}).get("ready"),
+                                    running_count=int(capacity_map.get(account_id, {}).get("running_count", 0)),
+                                    pending_count=int(capacity_map.get(account_id, {}).get("pending_count", 0)),
+                                    target_workers=int(
+                                        target_worker_map.get(account_id, _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10))
+                                    ),
+                                ),
+                                "readiness_ready": readiness_map.get(account_id, {}).get("ready"),
+                                "readiness_status": readiness_map.get(account_id, {}).get("status"),
+                                "readiness_reason": readiness_map.get(account_id, {}).get("reason"),
+                                "readiness_checks": readiness_map.get(account_id, {}).get("checks"),
+                                "ts": capacity_map.get(account_id, {}).get("ts")
+                                or readiness_map.get(account_id, {}).get("ts"),
                             }
-                            for row in rows
+                            for account_id in account_ids
                         ],
                     }
                 )
@@ -687,6 +1114,12 @@ def make_status_handler(*, db_path: Path):
                         [run_id],
                     )
                     delete_quarantined_windows = int(delete_rows[0][0] or 0)
+                throughput_kpi = _throughput_kpi_payload(
+                    queued_windows=queued_windows,
+                    active_windows=active_windows,
+                    active_workers=active_jobs,
+                    pending_workers=queue_jobs,
+                )
 
                 self._send_json(
                     {
@@ -705,6 +1138,7 @@ def make_status_handler(*, db_path: Path):
                             "failed_windows": failed_windows,
                             "quarantined_windows": quarantined_windows,
                             "delete_quarantined_windows": delete_quarantined_windows,
+                            "throughput_kpi": throughput_kpi,
                             "account_window_scores": _account_window_scores(db_path, run_id=run_id),
                         }
                     }
@@ -861,38 +1295,103 @@ def make_status_handler(*, db_path: Path):
 
             if parsed.path == "/api/events/recent":
                 limit = _first_int_param(params, "limit", default=200, minimum=1)
+                scope_run_id = _first_str_param(params, "run_id") or _latest_run_id(db_path)
+                query = """
+                    SELECT run_id, entity_id, level, stage, message, ts, source, account_id
+                    FROM (
+                        SELECT e.run_id, e.job_id AS entity_id, e.level, e.stage, e.message, e.ts, 'JOB' AS source, j.account_id
+                        FROM events
+                        AS e
+                        LEFT JOIN jobs AS j
+                        ON e.run_id = j.run_id AND e.job_id = j.job_id
+                        UNION ALL
+                        SELECT w.run_id, w.window_id AS entity_id, w.level, w.stage, w.message, w.ts, 'WINDOW' AS source, wt.account_id
+                        FROM window_events
+                        AS w
+                        LEFT JOIN window_tasks AS wt
+                        ON w.run_id = wt.run_id AND w.window_id = wt.window_id
+                    ) AS merged
+                """
+                query_params: list[object] = []
+                if scope_run_id is not None:
+                    query += " WHERE run_id = ?"
+                    query_params.append(scope_run_id)
+                query += " ORDER BY ts DESC LIMIT ?"
+                query_params.append(limit)
                 rows = _query(
                     db_path,
-                    """
-                    SELECT run_id, entity_id, level, stage, message, ts, source
-                    FROM (
-                        SELECT run_id, job_id AS entity_id, level, stage, message, ts, 'JOB' AS source
-                        FROM events
-                        UNION ALL
-                        SELECT run_id, window_id AS entity_id, level, stage, message, ts, 'WINDOW' AS source
-                        FROM window_events
-                    ) AS merged
-                    ORDER BY ts DESC
-                    LIMIT ?
-                    """,
-                    [limit],
+                    query,
+                    query_params,
                 )
+                throughput_kpi: dict[str, object] | None = None
+                if scope_run_id is not None:
+                    window_rows = _query(
+                        db_path,
+                        """
+                        SELECT
+                            SUM(CASE WHEN state IN ('QUEUED', 'RETRY_QUEUED') THEN 1 ELSE 0 END),
+                            SUM(CASE WHEN state IN ('ASSIGNED', 'UPLOADING', 'RUNNING', 'COLLECTING') THEN 1 ELSE 0 END)
+                        FROM window_tasks
+                        WHERE run_id = ?
+                        """,
+                        [scope_run_id],
+                    )
+                    job_rows = _query(
+                        db_path,
+                        """
+                        SELECT
+                            SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END),
+                            SUM(CASE WHEN status IN ('PENDING', 'SUBMITTED') THEN 1 ELSE 0 END)
+                        FROM jobs
+                        WHERE run_id = ?
+                        """,
+                        [scope_run_id],
+                    )
+                    queued_windows = int(window_rows[0][0] or 0)
+                    active_windows = int(window_rows[0][1] or 0)
+                    active_workers = int(job_rows[0][0] or 0)
+                    pending_workers = int(job_rows[0][1] or 0)
+                    throughput_kpi = _throughput_kpi_payload(
+                        queued_windows=queued_windows,
+                        active_windows=active_windows,
+                        active_workers=active_workers,
+                        pending_workers=pending_workers,
+                    )
+
+                events: list[dict[str, object]] = []
+                for row in rows:
+                    account_id = row[7] or _extract_account_id(
+                        entity_id=row[1],
+                        message=str(row[4] or ""),
+                        source=str(row[6]),
+                    )
+                    classification = _classify_ops_event(
+                        stage=str(row[3] or ""),
+                        level=str(row[2] or ""),
+                        message=str(row[4] or ""),
+                        account_id=str(account_id) if account_id is not None else None,
+                    )
+                    events.append(
+                        {
+                            "run_id": row[0],
+                            "entity_id": row[1],
+                            "job_id": row[1] if row[6] == "JOB" else None,
+                            "window_id": row[1] if row[6] == "WINDOW" else None,
+                            "source": row[6],
+                            "account_id": account_id,
+                            "level": row[2],
+                            "stage": row[3],
+                            "message": row[4],
+                            "ts": row[5],
+                            **classification,
+                        }
+                    )
                 self._send_json(
                     {
-                        "events": [
-                            {
-                                "run_id": row[0],
-                                "entity_id": row[1],
-                                "job_id": row[1] if row[6] == "JOB" else None,
-                                "window_id": row[1] if row[6] == "WINDOW" else None,
-                                "source": row[6],
-                                "level": row[2],
-                                "stage": row[3],
-                                "message": row[4],
-                                "ts": row[5],
-                            }
-                            for row in rows
-                        ]
+                        "run_id": scope_run_id,
+                        "events": events,
+                        "throughput_kpi": throughput_kpi,
+                        "alerts": _alertable_event_summary(events=events, throughput_kpi=throughput_kpi),
                     }
                 )
                 return
@@ -975,6 +1474,7 @@ def _dashboard_html() -> str:
       <div class="k">Worker Health</div>
       <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
         <span id="health-badge" class="badge">-</span>
+        <span class="muted">worker state: <code id="health-worker-state">-</code></span>
         <span class="muted">run: <code id="health-run">-</code></span>
         <span class="muted">heartbeat age: <code id="health-age">-</code>s</span>
         <span class="muted">last event age: <code id="event-age">-</code>s</span>
@@ -983,6 +1483,14 @@ def _dashboard_html() -> str:
     </div>
 
     <div class="grid">
+      <div class="card"><div class="k">Target Workers</div><div class="v" id="worker-target">-</div></div>
+      <div class="card"><div class="k">Live Workers</div><div class="v" id="worker-live">-</div></div>
+      <div class="card"><div class="k">Pending Workers</div><div class="v" id="worker-pending">-</div></div>
+      <div class="card"><div class="k">Worker Gap</div><div class="v" id="worker-gap">-</div></div>
+      <div class="card"><div class="k">Target Slots</div><div class="v" id="slot-target">-</div></div>
+      <div class="card"><div class="k">Needed Slots</div><div class="v" id="slot-needed">-</div></div>
+      <div class="card"><div class="k">Slot Shortfall</div><div class="v" id="slot-shortfall">-</div></div>
+      <div class="card"><div class="k">Throughput Mode</div><div class="v" id="slot-mode" style="font-size:15px;">-</div></div>
       <div class="card"><div class="k">Queued Windows</div><div class="v" id="w-queued">-</div></div>
       <div class="card"><div class="k">Active Windows</div><div class="v" id="w-active">-</div></div>
       <div class="card"><div class="k">Succeeded Windows</div><div class="v" id="w-succ">-</div></div>
@@ -1003,10 +1511,17 @@ def _dashboard_html() -> str:
       </div>
       <div class="row">
         <table>
-          <thead><tr><th>account</th><th>host</th><th>R</th><th>PD</th><th>allow</th><th>score</th><th>ts</th></tr></thead>
+          <thead><tr><th>account</th><th>host</th><th>ready</th><th>live</th><th>target</th><th>R</th><th>PD</th><th>allow</th><th>actS</th><th>doneS</th><th>quar</th><th>gapS</th><th>reason</th><th>ts</th></tr></thead>
           <tbody id="accounts-body"></tbody>
         </table>
       </div>
+    </div>
+
+    <div class="row">
+      <table>
+        <thead><tr><th>alert</th><th>severity</th><th>category</th><th>account</th><th>message</th></tr></thead>
+        <tbody id="alerts-body"></tbody>
+      </table>
     </div>
 
     <div class="row">
@@ -1036,11 +1551,20 @@ def _dashboard_html() -> str:
         const badge = document.getElementById('health-badge');
         badge.textContent = health.status;
         badge.className = 'badge badge-' + health.status;
+        document.getElementById('health-worker-state').textContent = health.worker_status || '-';
         document.getElementById('health-run').textContent = health.run_id || '-';
         document.getElementById('health-age').textContent = health.heartbeat_age_seconds ?? '-';
         document.getElementById('event-age').textContent = health.last_event_age_seconds ?? '-';
         document.getElementById('health-reason').textContent = health.reason || '-';
 
+        document.getElementById('worker-target').textContent = metrics.metrics.throughput_kpi.configured_worker_jobs;
+        document.getElementById('worker-live').textContent = metrics.metrics.throughput_kpi.active_workers;
+        document.getElementById('worker-pending').textContent = metrics.metrics.throughput_kpi.pending_workers;
+        document.getElementById('worker-gap').textContent = metrics.metrics.throughput_kpi.scheduled_worker_shortfall;
+        document.getElementById('slot-target').textContent = metrics.metrics.throughput_kpi.configured_target_slots;
+        document.getElementById('slot-needed').textContent = metrics.metrics.throughput_kpi.effective_target_slots;
+        document.getElementById('slot-shortfall').textContent = metrics.metrics.throughput_kpi.active_slot_shortfall;
+        document.getElementById('slot-mode').textContent = metrics.metrics.throughput_kpi.throughput_mode;
         document.getElementById('w-queued').textContent = metrics.metrics.queued_windows;
         document.getElementById('w-active').textContent = metrics.metrics.active_windows;
         document.getElementById('w-succ').textContent = metrics.metrics.succeeded_windows;
@@ -1074,13 +1598,34 @@ def _dashboard_html() -> str:
           tr.innerHTML = `
             <td>${esc(a.account_id)}</td>
             <td>${esc(a.host)}</td>
+            <td>${esc(a.readiness_status || '-')}</td>
+            <td>${esc(a.live_status || '-')}</td>
+            <td>${esc(a.configured_worker_jobs)}</td>
             <td>${esc(a.running_count)}</td>
             <td>${esc(a.pending_count)}</td>
             <td>${esc(a.allowed_submit)}</td>
-            <td>${esc(a.score)}</td>
+            <td>${esc(a.active_slots)}</td>
+            <td>${esc(a.completed_slots)}</td>
+            <td>${esc(a.quarantined_windows)}</td>
+            <td>${esc(a.active_slot_shortfall)}</td>
+            <td>${esc(a.readiness_reason || '-')}</td>
             <td>${esc(a.ts)}</td>
           `;
           accountsBody.appendChild(tr);
+        }
+
+        const alertsBody = document.getElementById('alerts-body');
+        alertsBody.innerHTML = '';
+        for (const a of (events.alerts || [])) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${esc(a.alert_key)}</td>
+            <td>${esc(a.severity)}</td>
+            <td>${esc(a.category)}</td>
+            <td>${esc(a.account_id)}</td>
+            <td>${esc(a.message)}</td>
+          `;
+          alertsBody.appendChild(tr);
         }
 
         const eventsBody = document.getElementById('events-body');

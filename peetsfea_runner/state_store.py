@@ -8,6 +8,9 @@ from threading import Lock
 import duckdb
 
 
+_GLOBAL_DUCKDB_LOCK = Lock()
+
+
 def _utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
@@ -19,7 +22,7 @@ class StateStore:
 
     def __post_init__(self) -> None:
         self.db_path = self.db_path.expanduser().resolve()
-        self._lock = Lock()
+        self._lock = _GLOBAL_DUCKDB_LOCK
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     def initialize(self) -> None:
@@ -157,6 +160,9 @@ class StateStore:
                     CREATE TABLE IF NOT EXISTS ingest_index (
                         input_path TEXT PRIMARY KEY,
                         ready_path TEXT NOT NULL,
+                        ready_present BOOLEAN NOT NULL DEFAULT FALSE,
+                        ready_mode TEXT NOT NULL DEFAULT 'SIDECAR',
+                        ready_error TEXT,
                         file_size BIGINT NOT NULL,
                         file_mtime_ns BIGINT NOT NULL,
                         discovered_at TEXT NOT NULL,
@@ -172,6 +178,27 @@ class StateStore:
                         running_count INTEGER NOT NULL,
                         pending_count INTEGER NOT NULL,
                         allowed_submit INTEGER NOT NULL,
+                        ts TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS account_readiness_snapshots (
+                        account_id TEXT NOT NULL,
+                        host TEXT NOT NULL,
+                        ready BOOLEAN NOT NULL,
+                        status TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        home_ok BOOLEAN NOT NULL,
+                        runtime_path_ok BOOLEAN NOT NULL,
+                        venv_ok BOOLEAN NOT NULL,
+                        python_ok BOOLEAN NOT NULL,
+                        module_ok BOOLEAN NOT NULL,
+                        binaries_ok BOOLEAN NOT NULL,
+                        ansys_ok BOOLEAN NOT NULL,
+                        uv_ok BOOLEAN NOT NULL DEFAULT FALSE,
+                        pyaedt_ok BOOLEAN NOT NULL DEFAULT FALSE,
                         ts TEXT NOT NULL
                     )
                     """
@@ -202,6 +229,13 @@ class StateStore:
                     """
                 )
                 conn.execute("ALTER TABLE file_lifecycle ADD COLUMN IF NOT EXISTS window_id TEXT")
+                conn.execute("ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS uv_ok BOOLEAN DEFAULT FALSE")
+                conn.execute(
+                    "ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS pyaedt_ok BOOLEAN DEFAULT FALSE"
+                )
+                conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_present BOOLEAN DEFAULT FALSE")
+                conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_mode TEXT DEFAULT 'SIDECAR'")
+                conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_error TEXT")
             finally:
                 conn.close()
 
@@ -474,6 +508,9 @@ class StateStore:
         *,
         input_path: str,
         ready_path: str,
+        ready_present: bool,
+        ready_mode: str,
+        ready_error: str | None,
         file_size: int,
         file_mtime_ns: int,
     ) -> bool:
@@ -483,7 +520,7 @@ class StateStore:
             try:
                 row = conn.execute(
                     """
-                    SELECT file_size, file_mtime_ns
+                    SELECT file_size, file_mtime_ns, ready_present, ready_mode, COALESCE(ready_error, '')
                     FROM ingest_index
                     WHERE input_path = ?
                     """,
@@ -492,26 +529,64 @@ class StateStore:
                 if row is not None:
                     prev_size = int(row[0])
                     prev_mtime = int(row[1])
+                    prev_ready_present = bool(row[2])
+                    prev_ready_mode = str(row[3])
+                    prev_ready_error = str(row[4]) or None
                     if prev_size == file_size and prev_mtime == file_mtime_ns:
+                        if (
+                            prev_ready_present != ready_present
+                            or prev_ready_mode != ready_mode
+                            or prev_ready_error != ready_error
+                        ):
+                            conn.execute(
+                                """
+                                UPDATE ingest_index
+                                SET ready_path = ?, ready_present = ?, ready_mode = ?, ready_error = ?, discovered_at = ?
+                                WHERE input_path = ?
+                                """,
+                                [ready_path, ready_present, ready_mode, ready_error, now, input_path],
+                            )
                         return False
                     conn.execute(
                         """
                         UPDATE ingest_index
-                        SET ready_path = ?, file_size = ?, file_mtime_ns = ?, discovered_at = ?, state = ?
+                        SET ready_path = ?, ready_present = ?, ready_mode = ?, ready_error = ?,
+                            file_size = ?, file_mtime_ns = ?, discovered_at = ?, state = ?
                         WHERE input_path = ?
                         """,
-                        [ready_path, file_size, file_mtime_ns, now, "QUEUED", input_path],
+                        [
+                            ready_path,
+                            ready_present,
+                            ready_mode,
+                            ready_error,
+                            file_size,
+                            file_mtime_ns,
+                            now,
+                            "READY",
+                            input_path,
+                        ],
                     )
                     return True
 
                 conn.execute(
                     """
                     INSERT INTO ingest_index (
-                        input_path, ready_path, file_size, file_mtime_ns, discovered_at, state
+                        input_path, ready_path, ready_present, ready_mode, ready_error,
+                        file_size, file_mtime_ns, discovered_at, state
                     )
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    [input_path, ready_path, file_size, file_mtime_ns, now, "QUEUED"],
+                    [
+                        input_path,
+                        ready_path,
+                        ready_present,
+                        ready_mode,
+                        ready_error,
+                        file_size,
+                        file_mtime_ns,
+                        now,
+                        "READY",
+                    ],
                 )
                 return True
             finally:
@@ -665,6 +740,38 @@ class StateStore:
             finally:
                 conn.close()
 
+    def mark_window_delete_pending(self, *, run_id: str, window_id: str) -> None:
+        now = _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    UPDATE file_lifecycle
+                    SET delete_final_state = ?, updated_at = ?
+                    WHERE run_id = ? AND window_id = ?
+                    """,
+                    ["DELETE_PENDING", now, run_id, window_id],
+                )
+            finally:
+                conn.close()
+
+    def mark_window_delete_retained(self, *, run_id: str, window_id: str) -> None:
+        now = _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    UPDATE file_lifecycle
+                    SET delete_final_state = ?, updated_at = ?
+                    WHERE run_id = ? AND window_id = ?
+                    """,
+                    ["RETAINED", now, run_id, window_id],
+                )
+            finally:
+                conn.close()
+
     def mark_delete_retrying(self, *, run_id: str, job_id: str, retry_count: int) -> None:
         now = _utc_now_iso()
         with self._lock:
@@ -811,6 +918,68 @@ class StateStore:
                     ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     [account_id, host, running_count, pending_count, allowed_submit, _utc_now_iso()],
+                )
+            finally:
+                conn.close()
+
+    def record_account_readiness_snapshot(
+        self,
+        *,
+        account_id: str,
+        host: str,
+        ready: bool,
+        status: str,
+        reason: str,
+        home_ok: bool,
+        runtime_path_ok: bool,
+        venv_ok: bool,
+        python_ok: bool,
+        module_ok: bool,
+        binaries_ok: bool,
+        ansys_ok: bool,
+        uv_ok: bool = False,
+        pyaedt_ok: bool = False,
+    ) -> None:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO account_readiness_snapshots (
+                        account_id,
+                        host,
+                        ready,
+                        status,
+                        reason,
+                        home_ok,
+                        runtime_path_ok,
+                        venv_ok,
+                        python_ok,
+                        module_ok,
+                        binaries_ok,
+                        ansys_ok,
+                        uv_ok,
+                        pyaedt_ok,
+                        ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        account_id,
+                        host,
+                        ready,
+                        status,
+                        reason,
+                        home_ok,
+                        runtime_path_ok,
+                        venv_ok,
+                        python_ok,
+                        module_ok,
+                        binaries_ok,
+                        ansys_ok,
+                        uv_ok,
+                        pyaedt_ok,
+                        _utc_now_iso(),
+                    ],
                 )
             finally:
                 conn.close()

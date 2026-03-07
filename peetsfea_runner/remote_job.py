@@ -51,12 +51,15 @@ class RemoteJobAttemptResult:
     case_summary: CaseExecutionSummary
     message: str
     failed_case_lines: list[str]
+    failure_category: str | None = None
 
 
 class WorkflowError(RuntimeError):
-    def __init__(self, message: str, *, exit_code: int) -> None:
+    def __init__(self, message: str, *, exit_code: int, stdout: str = "", stderr: str = "") -> None:
         super().__init__(message)
         self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 @dataclass(slots=True, frozen=True)
@@ -69,6 +72,7 @@ class WindowInput:
 class _RemoteWorkflowResult:
     case_summary: CaseExecutionSummary
     archive_bytes: bytes
+    submission: _RemoteWorkflowSubmission
 
 
 @dataclass(slots=True)
@@ -148,6 +152,20 @@ def run_remote_job_attempt(
         _extract_local_results_archive(local_job_dir=local_job_dir)
         _cleanup_remote_workspace(config, remote_job_dir=resolved_remote_job_dir)
     except WorkflowError as exc:
+        failure_category = _categorize_failure(
+            exit_code=exc.exit_code,
+            message=str(exc),
+            failed_case_lines=[],
+        )
+        _write_failure_artifacts(
+            local_job_dir=local_job_dir,
+            exit_code=exc.exit_code,
+            failure_category=failure_category,
+            message=str(exc),
+            failed_case_lines=[],
+            stdout=exc.stdout,
+            stderr=exc.stderr,
+        )
         _log_stage(f"job attempt failed session={session_name} exit_code={exc.exit_code} reason={exc}")
         return RemoteJobAttemptResult(
             success=False,
@@ -156,6 +174,7 @@ def run_remote_job_attempt(
             case_summary=CaseExecutionSummary(success_cases=0, failed_cases=0, case_lines=[]),
             message=str(exc),
             failed_case_lines=[],
+            failure_category=failure_category,
         )
 
     if workflow_result is None:
@@ -166,7 +185,21 @@ def run_remote_job_attempt(
             case_summary=CaseExecutionSummary(success_cases=0, failed_cases=0, case_lines=[]),
             message="Case summary missing.",
             failed_case_lines=[],
+            failure_category="collect",
         )
+
+    _write_failure_artifacts(
+        local_job_dir=local_job_dir,
+        exit_code=0 if workflow_result.case_summary.success else EXIT_CODE_REMOTE_RUN_FAILURE,
+        failure_category="solve" if not workflow_result.case_summary.success else None,
+        message=(
+            f"{case_count} cases completed "
+            f"(success={workflow_result.case_summary.success_cases}, failed={workflow_result.case_summary.failed_cases})."
+        ),
+        failed_case_lines=workflow_result.case_summary.case_lines,
+        stdout=workflow_result.submission.stdout,
+        stderr=workflow_result.submission.stderr,
+    )
 
     case_summary = workflow_result.case_summary
     if not case_summary.success:
@@ -182,6 +215,7 @@ def run_remote_job_attempt(
                 f"failed_cases={failed_items}"
             ),
             failed_case_lines=case_summary.case_lines,
+            failure_category="solve",
         )
 
     _log_stage(f"job attempt success session={session_name}")
@@ -338,6 +372,7 @@ def _run_remote_workflow_noninteractive(
             case_lines=case_lines,
         ),
         archive_bytes=_parse_marked_results_archive(output),
+        submission=submission,
     )
 
 
@@ -407,8 +442,18 @@ def _run_completed_process(
         stdout = (completed.stdout or "").strip()
         details = stderr if stderr else stdout
         if details:
-            raise WorkflowError(f"{stage} failed: {details}", exit_code=exit_code)
-        raise WorkflowError(f"{stage} failed with return code {completed.returncode}", exit_code=exit_code)
+            raise WorkflowError(
+                f"{stage} failed: {details}",
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        raise WorkflowError(
+            f"{stage} failed with return code {completed.returncode}",
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+        )
     return completed
 
 
@@ -868,10 +913,17 @@ def _raise_for_remote_submission_failure(submission: _RemoteWorkflowSubmission, 
         return
     details = _extract_meaningful_remote_failure_details(output)
     if details:
-        raise WorkflowError(f"{stage} failed: {details}", exit_code=EXIT_CODE_REMOTE_RUN_FAILURE)
+        raise WorkflowError(
+            f"{stage} failed: {details}",
+            exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+            stdout=submission.stdout,
+            stderr=submission.stderr,
+        )
     raise WorkflowError(
         f"{stage} failed with return code {submission.return_code}",
         exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+        stdout=submission.stdout,
+        stderr=submission.stderr,
     )
 
 
@@ -895,6 +947,46 @@ def _extract_meaningful_remote_failure_details(output: str) -> str:
             continue
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+def _categorize_failure(*, exit_code: int, message: str, failed_case_lines: Sequence[str]) -> str:
+    normalized = message.lower()
+    if "readiness" in normalized or "preflight" in normalized or "bootstrap" in normalized:
+        return "readiness"
+    if exit_code == EXIT_CODE_REMOTE_CLEANUP_FAILURE or "cleanup" in normalized:
+        return "cleanup"
+    if exit_code == EXIT_CODE_DOWNLOAD_FAILURE or "archive" in normalized or "download" in normalized:
+        return "collect"
+    if failed_case_lines:
+        return "solve"
+    return "launch"
+
+
+def _write_failure_artifacts(
+    *,
+    local_job_dir: Path,
+    exit_code: int,
+    failure_category: str | None,
+    message: str,
+    failed_case_lines: Sequence[str],
+    stdout: str,
+    stderr: str,
+) -> None:
+    local_job_dir.mkdir(parents=True, exist_ok=True)
+    (local_job_dir / "bundle.exit.code").write_text(str(exit_code), encoding="utf-8")
+    if stdout:
+        (local_job_dir / "remote_stdout.log").write_text(stdout, encoding="utf-8")
+    if stderr:
+        (local_job_dir / "remote_stderr.log").write_text(stderr, encoding="utf-8")
+    combined = "\n".join(part for part in (stdout.strip(), stderr.strip()) if part)
+    if combined:
+        (local_job_dir / "remote_submission.log").write_text(combined + "\n", encoding="utf-8")
+    if failure_category:
+        (local_job_dir / "failure_category.txt").write_text(failure_category, encoding="utf-8")
+    if message:
+        (local_job_dir / "failure_reason.txt").write_text(message, encoding="utf-8")
+    if failed_case_lines:
+        (local_job_dir / "failed_case_lines.txt").write_text("\n".join(failed_case_lines) + "\n", encoding="utf-8")
 
 
 def _time_limit_to_seconds(value: str) -> int:

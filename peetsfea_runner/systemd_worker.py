@@ -4,9 +4,10 @@ import os
 import socket
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from .pipeline import AccountConfig, PipelineConfig, run_pipeline
+from .pipeline import AccountConfig, PipelineConfig, PipelineResult, run_pipeline
 from .state_store import StateStore
 from .web_status import start_status_server
 
@@ -16,6 +17,28 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+@dataclass(slots=True)
+class _WorkerRuntimeState:
+    run_id: str | None = None
+    status: str = "IDLE"
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def set(self, *, run_id: str | None, status: str) -> None:
+        with self._lock:
+            self.run_id = run_id
+            self.status = status
+
+    def snapshot(self) -> tuple[str | None, str]:
+        with self._lock:
+            return self.run_id, self.status
+
+
+@dataclass(slots=True)
+class _AutorecoveryControlState:
+    last_stage: str | None = None
+    last_emit_monotonic: float = 0.0
 
 
 def _parse_accounts_from_env() -> tuple[AccountConfig, ...]:
@@ -88,6 +111,9 @@ def _build_config() -> PipelineConfig:
         continuous_mode=_env_bool("PEETSFEA_CONTINUOUS_MODE", True),
         ingest_poll_seconds=int(os.getenv("PEETSFEA_INGEST_POLL_SECONDS", "30")),
         ready_sidecar_suffix=os.getenv("PEETSFEA_READY_SIDECAR_SUFFIX", ".ready"),
+        windows_per_job=int(os.getenv("PEETSFEA_WINDOWS_PER_JOB", "8")),
+        cores_per_window=int(os.getenv("PEETSFEA_CORES_PER_WINDOW", "4")),
+        worker_requeue_limit=int(os.getenv("PEETSFEA_WORKER_REQUEUE_LIMIT", "1")),
         run_rotation_hours=int(os.getenv("PEETSFEA_RUN_ROTATION_HOURS", "24")),
         pending_buffer_per_account=int(os.getenv("PEETSFEA_PENDING_BUFFER_PER_ACCOUNT", "3")),
         capacity_scope=os.getenv("PEETSFEA_CAPACITY_SCOPE", "all_user_jobs"),
@@ -111,6 +137,170 @@ def _start_embedded_web_if_enabled() -> None:
     print(f"[peetsfea][web] embedded status server listening on http://{host}:{port}", flush=True)
 
 
+def _heartbeat_once(
+    *,
+    store: StateStore,
+    service_name: str,
+    host: str,
+    pid: int,
+    runtime_state: _WorkerRuntimeState,
+) -> None:
+    run_id, status = runtime_state.snapshot()
+    store.upsert_worker_heartbeat(
+        service_name=service_name,
+        host=host,
+        pid=pid,
+        run_id=run_id,
+        status=status,
+    )
+
+
+def _heartbeat_loop(
+    *,
+    store: StateStore,
+    service_name: str,
+    host: str,
+    pid: int,
+    runtime_state: _WorkerRuntimeState,
+    stop_event: threading.Event,
+    interval_seconds: int,
+) -> None:
+    _heartbeat_once(
+        store=store,
+        service_name=service_name,
+        host=host,
+        pid=pid,
+        runtime_state=runtime_state,
+    )
+    while not stop_event.wait(interval_seconds):
+        _heartbeat_once(
+            store=store,
+            service_name=service_name,
+            host=host,
+            pid=pid,
+            runtime_state=runtime_state,
+        )
+
+
+def _run_worker_iteration(
+    *,
+    config: PipelineConfig,
+    store: StateStore,
+    runtime_state: _WorkerRuntimeState,
+    control_state: _AutorecoveryControlState | None = None,
+    autorecovery_min_interval_seconds: int = 60,
+) -> PipelineResult:
+    current_run_id, _status = runtime_state.snapshot()
+    if config.continuous_mode:
+        current_run_id = store.ensure_continuous_run(rotation_hours=config.run_rotation_hours)
+    runtime_state.set(run_id=current_run_id, status="ACTIVE")
+    store.append_event(
+        run_id=current_run_id or "__worker__",
+        job_id="__worker__",
+        level="INFO",
+        stage="WORKER_LOOP_ACTIVE",
+        message="run_pipeline start",
+    )
+    result = run_pipeline(config)
+    _apply_post_iteration_status(
+        store=store,
+        runtime_state=runtime_state,
+        result=result,
+        control_state=control_state,
+        autorecovery_min_interval_seconds=autorecovery_min_interval_seconds,
+    )
+    return result
+
+
+def _apply_post_iteration_status(
+    *,
+    store: StateStore,
+    runtime_state: _WorkerRuntimeState,
+    result: PipelineResult,
+    control_state: _AutorecoveryControlState | None,
+    autorecovery_min_interval_seconds: int,
+) -> None:
+    if result.blocked:
+        status = "BLOCKED"
+        stage = "WORKER_LOOP_BLOCKED"
+        level = "WARN"
+        message = (
+            f"blocked_accounts={list(result.blocked_accounts)} "
+            f"readiness_blocked_windows={result.readiness_blocked_windows}"
+        )
+    elif result.recovery_needed:
+        status = "RECOVERING"
+        stage = "WORKER_LOOP_RECOVERING"
+        level = "WARN"
+        message = (
+            f"terminal_jobs={result.terminal_jobs} replacement_jobs={result.replacement_jobs} "
+            f"failed_jobs={result.failed_jobs} quarantined_jobs={result.quarantined_jobs} "
+            f"failed_windows={result.failed_windows} quarantined_windows={result.quarantined_windows}"
+        )
+    elif result.total_windows == 0:
+        status = "IDLE"
+        stage = "WORKER_LOOP_IDLE"
+        level = "INFO"
+        message = result.summary
+    else:
+        status = "IDLE"
+        stage = "WORKER_LOOP_OK"
+        level = "INFO"
+        message = result.summary
+
+    runtime_state.set(run_id=result.run_id, status=status)
+
+    if _should_emit_control_event(
+        control_state=control_state,
+        stage=stage,
+        autorecovery_min_interval_seconds=autorecovery_min_interval_seconds,
+    ):
+        store.append_event(
+            run_id=result.run_id,
+            job_id="__worker__",
+            level=level,
+            stage=stage,
+            message=message,
+        )
+
+
+def _should_emit_control_event(
+    *,
+    control_state: _AutorecoveryControlState | None,
+    stage: str,
+    autorecovery_min_interval_seconds: int,
+) -> bool:
+    if control_state is None:
+        return True
+    if stage not in {"WORKER_LOOP_RECOVERING", "WORKER_LOOP_BLOCKED"}:
+        control_state.last_stage = stage
+        control_state.last_emit_monotonic = time.monotonic()
+        return True
+
+    now = time.monotonic()
+    if control_state.last_stage != stage or (
+        now - control_state.last_emit_monotonic
+    ) >= max(1, autorecovery_min_interval_seconds):
+        control_state.last_stage = stage
+        control_state.last_emit_monotonic = now
+        return True
+    return False
+
+
+def _next_poll_seconds_for_result(
+    *,
+    result: PipelineResult,
+    base_poll_seconds: int,
+    recovery_poll_seconds: int,
+    blocked_poll_seconds: int,
+) -> int:
+    if result.blocked:
+        return blocked_poll_seconds
+    if result.recovery_needed:
+        return recovery_poll_seconds
+    return base_poll_seconds
+
+
 def run_user_worker_once() -> None:
     config = _build_config()
     result = run_pipeline(config)
@@ -121,6 +311,18 @@ def run_user_worker_loop() -> None:
     poll_seconds = int(os.getenv("PEETSFEA_POLL_SECONDS", "30"))
     if poll_seconds <= 0:
         raise ValueError("PEETSFEA_POLL_SECONDS must be > 0")
+    heartbeat_seconds = int(os.getenv("PEETSFEA_HEARTBEAT_SECONDS", "15"))
+    if heartbeat_seconds <= 0:
+        raise ValueError("PEETSFEA_HEARTBEAT_SECONDS must be > 0")
+    recovery_poll_seconds = int(os.getenv("PEETSFEA_RECOVERY_POLL_SECONDS", "5"))
+    if recovery_poll_seconds <= 0:
+        raise ValueError("PEETSFEA_RECOVERY_POLL_SECONDS must be > 0")
+    blocked_poll_seconds = int(os.getenv("PEETSFEA_BLOCKED_POLL_SECONDS", str(poll_seconds)))
+    if blocked_poll_seconds <= 0:
+        raise ValueError("PEETSFEA_BLOCKED_POLL_SECONDS must be > 0")
+    autorecovery_min_interval_seconds = int(os.getenv("PEETSFEA_AUTORECOVERY_MIN_INTERVAL_SECONDS", "60"))
+    if autorecovery_min_interval_seconds <= 0:
+        raise ValueError("PEETSFEA_AUTORECOVERY_MIN_INTERVAL_SECONDS must be > 0")
 
     config = _build_config()
     _start_embedded_web_if_enabled()
@@ -129,70 +331,66 @@ def run_user_worker_loop() -> None:
     service_name = os.getenv("PEETSFEA_WORKER_SERVICE_NAME", "peetsfea-runner")
     host = socket.gethostname()
     pid = os.getpid()
-    store.upsert_worker_heartbeat(
-        service_name=service_name,
-        host=host,
-        pid=pid,
-        run_id=None,
-        status="HEALTHY",
+    runtime_state = _WorkerRuntimeState()
+    control_state = _AutorecoveryControlState()
+    stop_event = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        kwargs={
+            "store": store,
+            "service_name": service_name,
+            "host": host,
+            "pid": pid,
+            "runtime_state": runtime_state,
+            "stop_event": stop_event,
+            "interval_seconds": heartbeat_seconds,
+        },
+        daemon=True,
+        name="peetsfea-heartbeat",
     )
+    heartbeat_thread.start()
     store.append_event(
         run_id="__worker__",
         job_id="__worker__",
         level="INFO",
         stage="WORKER_LOOP_START",
-        message=f"poll_seconds={poll_seconds}",
+        message=(
+            f"poll_seconds={poll_seconds} heartbeat_seconds={heartbeat_seconds} "
+            f"recovery_poll_seconds={recovery_poll_seconds} blocked_poll_seconds={blocked_poll_seconds} "
+            f"autorecovery_min_interval_seconds={autorecovery_min_interval_seconds}"
+        ),
     )
 
-    last_run_id: str | None = None
-    while True:
-        current_run_id: str | None = last_run_id
-        try:
-            store.upsert_worker_heartbeat(
-                service_name=service_name,
-                host=host,
-                pid=pid,
-                run_id=current_run_id,
-                status="HEALTHY",
-            )
-            store.append_event(
-                run_id=current_run_id or "__worker__",
-                job_id="__worker__",
-                level="INFO",
-                stage="WORKER_LOOP_TICK",
-                message="run_pipeline start",
-            )
-            result = run_pipeline(config)
-            current_run_id = result.run_id
-            last_run_id = current_run_id
-            store.upsert_worker_heartbeat(
-                service_name=service_name,
-                host=host,
-                pid=pid,
-                run_id=current_run_id,
-                status="HEALTHY",
-            )
-            store.append_event(
-                run_id=current_run_id,
-                job_id="__worker__",
-                level="INFO",
-                stage="WORKER_LOOP_OK",
-                message=result.summary,
-            )
-        except Exception as exc:  # pragma: no cover - runtime resilience path
-            print(f"[peetsfea][worker] loop error: {exc}", flush=True)
-            store.upsert_worker_heartbeat(
-                service_name=service_name,
-                host=host,
-                pid=pid,
-                run_id=current_run_id,
-                status="DEGRADED",
-            )
-            store.append_event(
-                run_id=current_run_id or "__worker__",
-                job_id="__worker__",
-                level="ERROR",
-                stage="WORKER_LOOP_ERROR",
-                message=str(exc),
-            )
-        time.sleep(poll_seconds)
+    try:
+        while True:
+            current_run_id, _status = runtime_state.snapshot()
+            sleep_seconds = poll_seconds
+            try:
+                result = _run_worker_iteration(
+                    config=config,
+                    store=store,
+                    runtime_state=runtime_state,
+                    control_state=control_state,
+                    autorecovery_min_interval_seconds=autorecovery_min_interval_seconds,
+                )
+                print(result.summary, flush=True)
+                sleep_seconds = _next_poll_seconds_for_result(
+                    result=result,
+                    base_poll_seconds=poll_seconds,
+                    recovery_poll_seconds=recovery_poll_seconds,
+                    blocked_poll_seconds=blocked_poll_seconds,
+                )
+            except Exception as exc:  # pragma: no cover - runtime resilience path
+                print(f"[peetsfea][worker] loop error: {exc}", flush=True)
+                runtime_state.set(run_id=current_run_id, status="DEGRADED")
+                store.append_event(
+                    run_id=current_run_id or "__worker__",
+                    job_id="__worker__",
+                    level="ERROR",
+                    stage="WORKER_LOOP_ERROR",
+                    message=str(exc),
+                )
+            time.sleep(sleep_seconds)
+    finally:  # pragma: no cover - service shutdown path
+        stop_event.set()
+        heartbeat_thread.join(timeout=2)

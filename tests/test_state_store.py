@@ -147,18 +147,27 @@ class TestStateStore(unittest.TestCase):
             first = store.register_ingest_candidate(
                 input_path="/in/a.aedt",
                 ready_path="/in/a.aedt.ready",
+                ready_present=True,
+                ready_mode="SIDECAR",
+                ready_error=None,
                 file_size=100,
                 file_mtime_ns=12345,
             )
             second = store.register_ingest_candidate(
                 input_path="/in/a.aedt",
                 ready_path="/in/a.aedt.ready",
+                ready_present=True,
+                ready_mode="SIDECAR",
+                ready_error=None,
                 file_size=100,
                 file_mtime_ns=12345,
             )
             changed = store.register_ingest_candidate(
                 input_path="/in/a.aedt",
                 ready_path="/in/a.aedt.ready",
+                ready_present=True,
+                ready_mode="SIDECAR",
+                ready_error=None,
                 file_size=101,
                 file_mtime_ns=12346,
             )
@@ -166,6 +175,47 @@ class TestStateStore(unittest.TestCase):
             self.assertTrue(first)
             self.assertFalse(second)
             self.assertTrue(changed)
+
+    def test_register_ingest_candidate_updates_ready_metadata_without_requeue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+
+            first = store.register_ingest_candidate(
+                input_path="/in/a.aedt",
+                ready_path="/in/a.aedt.ready",
+                ready_present=False,
+                ready_mode="INTERNAL_ONLY",
+                ready_error="read-only",
+                file_size=100,
+                file_mtime_ns=12345,
+            )
+            second = store.register_ingest_candidate(
+                input_path="/in/a.aedt",
+                ready_path="/in/a.aedt.ready",
+                ready_present=True,
+                ready_mode="SIDECAR",
+                ready_error=None,
+                file_size=100,
+                file_mtime_ns=12345,
+            )
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT ready_present, ready_mode, ready_error, state
+                    FROM ingest_index
+                    WHERE input_path = '/in/a.aedt'
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertTrue(first)
+            self.assertFalse(second)
+            self.assertEqual((bool(row[0]), row[1], row[2], row[3]), (True, "SIDECAR", None, "READY"))
 
     def test_ensure_continuous_run_reuses_active_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -175,6 +225,36 @@ class TestStateStore(unittest.TestCase):
             run1 = store.ensure_continuous_run(rotation_hours=24)
             run2 = store.ensure_continuous_run(rotation_hours=24)
             self.assertEqual(run1, run2)
+
+    def test_window_delete_lifecycle_can_mark_pending_and_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            store.start_run("run_01")
+            store.create_window_task(
+                run_id="run_01",
+                window_id="w_001",
+                input_path="/in/a.aedt",
+                output_path="/out/a.aedt.out",
+                account_id=None,
+            )
+            store.mark_window_delete_pending(run_id="run_01", window_id="w_001")
+            store.mark_window_delete_retained(run_id="run_01", window_id="w_001")
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT delete_final_state
+                    FROM file_lifecycle
+                    WHERE run_id = 'run_01' AND window_id = 'w_001'
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(row[0], "RETAINED")
 
     def test_window_task_score_and_capacity_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

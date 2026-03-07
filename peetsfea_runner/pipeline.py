@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from hashlib import sha1
 from pathlib import Path
@@ -40,8 +40,12 @@ from .remote_job import (
 )
 from .scheduler import (
     AccountCapacitySnapshot,
+    AccountReadinessSnapshot,
     BundleSpec,
     WindowTaskRef,
+    bootstrap_account_runtime,
+    query_account_preflight,
+    query_account_readiness,
     query_account_capacity,
     run_window_workers,
 )
@@ -59,6 +63,14 @@ class AccountConfig:
     host_alias: str
     max_jobs: int = 10
     enabled: bool = True
+
+
+@dataclass(slots=True, frozen=True)
+class _ReadyArtifactState:
+    ready_path: Path
+    ready_present: bool
+    ready_mode: str
+    ready_error: str | None = None
 
 
 @dataclass(slots=True)
@@ -83,6 +95,7 @@ class PipelineConfig:
     windows_per_job: int = 8
     cores_per_window: int = 4
     job_retry_count: int = 1
+    worker_requeue_limit: int = 1
     scan_recursive: bool = True
     # License policy
     license_observe_only: bool = True
@@ -120,6 +133,8 @@ class PipelineConfig:
         _ensure_positive("run_rotation_hours", self.run_rotation_hours)
         if self.job_retry_count < 0:
             raise ValueError("job_retry_count must be >= 0")
+        if self.worker_requeue_limit < 0:
+            raise ValueError("worker_requeue_limit must be >= 0")
         if self.pending_buffer_per_account < 0:
             raise ValueError("pending_buffer_per_account must be >= 0")
         if self.capacity_scope != "all_user_jobs":
@@ -157,7 +172,8 @@ class PipelineConfig:
                 [p.resolve() for p in input_root.glob("*") if p.is_file() and p.suffix.lower() == ".aedt"],
                 key=lambda p: str(p.relative_to(input_root)).lower(),
             )
-        files = [path for path in files if _ready_path_for_input(path, self.ready_sidecar_suffix).exists()]
+        for path in files:
+            _ensure_ready_artifact(path, self.ready_sidecar_suffix)
         if not files and not self.continuous_mode:
             raise ValueError(f"No .aedt files found in input_queue_dir: {input_root}")
         return input_root, output_root, files, accounts
@@ -180,6 +196,29 @@ class PipelineResult:
     success_windows: int = 0
     failed_windows: int = 0
     quarantined_windows: int = 0
+    queued_windows: int = 0
+    terminal_jobs: int = 0
+    replacement_jobs: int = 0
+    ready_accounts: tuple[str, ...] = ()
+    blocked_accounts: tuple[str, ...] = ()
+    bootstrapping_accounts: tuple[str, ...] = ()
+    readiness_blocked_windows: int = 0
+
+    @property
+    def blocked(self) -> bool:
+        return self.readiness_blocked_windows > 0 or bool(self.blocked_accounts)
+
+    @property
+    def recovery_needed(self) -> bool:
+        if self.blocked or self.total_windows == 0:
+            return False
+        return (
+            self.failed_jobs > 0
+            or self.quarantined_jobs > 0
+            or self.failed_windows > 0
+            or self.quarantined_windows > 0
+            or self.terminal_jobs > self.replacement_jobs
+        )
 
 
 @dataclass(slots=True)
@@ -192,6 +231,11 @@ class _BundleRuntimeOutcome:
     success_windows: int
     failed_windows: int
     quarantined_windows: int
+    requeue_windows: tuple[WindowTaskRef, ...] = ()
+
+    @property
+    def terminal_worker(self) -> bool:
+        return bool(self.requeue_windows) or not self.success
 
 
 @dataclass(slots=True)
@@ -205,6 +249,38 @@ class _RemoteExecutionConfig:
     time_limit: str
     windows_per_job: int
     cores_per_window: int
+
+
+def _blocked_readiness_snapshot(*, account: AccountConfig, reason: str) -> AccountReadinessSnapshot:
+    return AccountReadinessSnapshot(
+        account_id=account.account_id,
+        host_alias=account.host_alias,
+        ready=False,
+        status="DISABLED_FOR_DISPATCH",
+        reason=reason,
+        home_ok=False,
+        runtime_path_ok=False,
+        venv_ok=False,
+        python_ok=False,
+        module_ok=False,
+        binaries_ok=False,
+        ansys_ok=False,
+    )
+
+
+def _update_readiness_snapshot(
+    snapshot: AccountReadinessSnapshot,
+    *,
+    status: str,
+    reason: str,
+    ready: bool | None = None,
+) -> AccountReadinessSnapshot:
+    return replace(
+        snapshot,
+        status=status,
+        reason=reason,
+        ready=snapshot.ready if ready is None else ready,
+    )
 
 
 def run_pipeline(config: PipelineConfig) -> PipelineResult:
@@ -255,6 +331,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
 
     outcomes: list[_BundleRuntimeOutcome] = []
     max_inflight_jobs = 0
+    terminal_jobs = 0
+    replacement_jobs = 0
+    ready_account_ids: list[str] = []
+    blocked_account_ids: list[str] = []
+    bootstrapping_account_ids: list[str] = []
+    readiness_blocked_windows = 0
     next_job_index = state_store.get_next_job_index(run_id=run_id)
 
     def _current_completed_windows() -> dict[str, int]:
@@ -263,15 +345,136 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             for account in accounts
         }
 
-    def _run_window_batch(window_batch: list[WindowTaskRef]) -> None:
-        nonlocal max_inflight_jobs, next_job_index
+    def _record_readiness(snapshot: AccountReadinessSnapshot) -> None:
+        state_store.record_account_readiness_snapshot(
+            account_id=snapshot.account_id,
+            host=snapshot.host_alias,
+            ready=snapshot.ready,
+            status=snapshot.status,
+            reason=snapshot.reason,
+            home_ok=snapshot.home_ok,
+            runtime_path_ok=snapshot.runtime_path_ok,
+            venv_ok=snapshot.venv_ok,
+            python_ok=snapshot.python_ok,
+            module_ok=snapshot.module_ok,
+            binaries_ok=snapshot.binaries_ok,
+            ansys_ok=snapshot.ansys_ok,
+            uv_ok=snapshot.uv_ok,
+            pyaedt_ok=snapshot.pyaedt_ok,
+        )
+        if snapshot.ready:
+            _log_stage(
+                f"account readiness ready account={snapshot.account_id} host={snapshot.host_alias} "
+                f"reason={snapshot.reason}"
+            )
+        else:
+            _log_stage(
+                f"account readiness {snapshot.status.lower()} account={snapshot.account_id} host={snapshot.host_alias} "
+                f"reason={snapshot.reason}"
+            )
+            state_store.append_event(
+                run_id=run_id,
+                job_id="__worker__",
+                level="WARN",
+                stage=snapshot.status,
+                message=f"account={snapshot.account_id} host={snapshot.host_alias} reason={snapshot.reason}",
+            )
+
+    def _resolve_dispatch_accounts() -> list[AccountConfig]:
+        nonlocal ready_account_ids, blocked_account_ids, bootstrapping_account_ids
+        if not config.execute_remote:
+            ready_account_ids = [account.account_id for account in accounts]
+            blocked_account_ids = []
+            bootstrapping_account_ids = []
+            return list(accounts)
+
+        ready_accounts: list[AccountConfig] = []
+        ready_account_ids = []
+        blocked_account_ids = []
+        bootstrapping_account_ids = []
+        for account in accounts:
+            try:
+                snapshot = query_account_readiness(account=account)
+            except Exception as exc:
+                snapshot = _blocked_readiness_snapshot(account=account, reason=str(exc))
+            _record_readiness(snapshot)
+
+            if not snapshot.ready and snapshot.status == "BOOTSTRAP_REQUIRED":
+                bootstrapping_account_ids.append(account.account_id)
+                bootstrapping_snapshot = _update_readiness_snapshot(
+                    snapshot,
+                    status="BOOTSTRAPPING",
+                    reason=snapshot.reason,
+                    ready=False,
+                )
+                _record_readiness(bootstrapping_snapshot)
+                state_store.append_event(
+                    run_id=run_id,
+                    job_id="__worker__",
+                    level="INFO",
+                    stage="ACCOUNT_BOOTSTRAP_START",
+                    message=f"account={account.account_id} host={account.host_alias} reason={snapshot.reason}",
+                )
+                try:
+                    bootstrap_account_runtime(account=account)
+                except Exception as exc:
+                    failed_snapshot = _update_readiness_snapshot(
+                        snapshot,
+                        status="BOOTSTRAP_FAILED",
+                        reason=str(exc),
+                        ready=False,
+                    )
+                    _record_readiness(failed_snapshot)
+                    blocked_account_ids.append(account.account_id)
+                    continue
+                state_store.append_event(
+                    run_id=run_id,
+                    job_id="__worker__",
+                    level="INFO",
+                    stage="ACCOUNT_BOOTSTRAP_OK",
+                    message=f"account={account.account_id} host={account.host_alias}",
+                )
+                try:
+                    snapshot = query_account_preflight(account=account)
+                except Exception as exc:
+                    snapshot = _update_readiness_snapshot(
+                        snapshot,
+                        status="PREFLIGHT_FAILED",
+                        reason=str(exc),
+                        ready=False,
+                    )
+            elif snapshot.ready:
+                try:
+                    snapshot = query_account_preflight(account=account)
+                except Exception as exc:
+                    snapshot = _update_readiness_snapshot(
+                        snapshot,
+                        status="PREFLIGHT_FAILED",
+                        reason=str(exc),
+                        ready=False,
+                    )
+
+            _record_readiness(snapshot)
+            if snapshot.ready:
+                ready_accounts.append(account)
+                ready_account_ids.append(account.account_id)
+            else:
+                blocked_account_ids.append(account.account_id)
+        return ready_accounts
+
+    def _run_window_batch(window_batch: list[WindowTaskRef]) -> bool:
+        nonlocal max_inflight_jobs, next_job_index, terminal_jobs, replacement_jobs, readiness_blocked_windows
         if not window_batch:
-            return
+            return False
+        dispatch_accounts = _resolve_dispatch_accounts()
+        if not dispatch_accounts:
+            readiness_blocked_windows = len(window_batch)
+            return False
         completed_windows = _current_completed_windows()
         if config.execute_remote:
             batch = run_window_workers(
                 window_queue=window_batch,
-                accounts=accounts,
+                accounts=dispatch_accounts,
                 windows_per_job=config.windows_per_job,
                 pending_buffer_per_account=config.pending_buffer_per_account,
                 worker=lambda bundle: _run_bundle_with_retry(
@@ -287,11 +490,13 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 on_capacity_snapshot=_capacity_log,
                 on_capacity_error=_capacity_error,
                 on_bundle_submitted=_bundle_submitted,
+                recovery_windows_lookup=lambda _bundle, outcome: outcome.requeue_windows,
+                terminal_bundle_lookup=lambda _bundle, outcome: outcome.terminal_worker,
             )
         else:
             batch = run_window_workers(
                 window_queue=window_batch,
-                accounts=accounts,
+                accounts=dispatch_accounts,
                 windows_per_job=config.windows_per_job,
                 pending_buffer_per_account=config.pending_buffer_per_account,
                 worker=lambda bundle: _run_dry_bundle(
@@ -304,17 +509,33 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 job_index_start=next_job_index,
                 on_capacity_snapshot=_capacity_log,
                 on_bundle_submitted=_bundle_submitted,
+                recovery_windows_lookup=lambda _bundle, outcome: (),
+                terminal_bundle_lookup=lambda _bundle, outcome: False,
             )
         max_inflight_jobs = max(max_inflight_jobs, batch.max_inflight_jobs)
         next_job_index += batch.submitted_jobs
+        terminal_jobs += batch.terminal_jobs
+        replacement_jobs += batch.replacement_jobs
         outcomes.extend(batch.results)
+        return True
 
     def _dispatch_queued_windows() -> None:
         nonlocal queued_windows
-        while queued_windows:
+        while True:
+            if not queued_windows:
+                queued_windows = _load_schedulable_windows(
+                    state_store=state_store,
+                    run_id=run_id,
+                    input_root=input_root,
+                )
+                if not queued_windows:
+                    break
             batch_windows = queued_windows
             queued_windows = []
-            _run_window_batch(batch_windows)
+            dispatched = _run_window_batch(batch_windows)
+            if not dispatched:
+                queued_windows = batch_windows
+                break
 
     _dispatch_queued_windows()
 
@@ -366,6 +587,13 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             success_windows=0,
             failed_windows=0,
             quarantined_windows=0,
+            queued_windows=0,
+            terminal_jobs=0,
+            replacement_jobs=0,
+            ready_accounts=tuple(ready_account_ids),
+            blocked_accounts=tuple(blocked_account_ids),
+            bootstrapping_accounts=tuple(bootstrapping_account_ids),
+            readiness_blocked_windows=0,
         )
 
     orphan_cleanup_error: _WorkflowError | None = None
@@ -405,9 +633,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         and failed_windows == 0
         and quarantined_windows == 0
         and orphan_cleanup_error is None
+        and readiness_blocked_windows == 0
     )
     first_failure_code = next((item.exit_code for item in outcomes if item.exit_code != EXIT_CODE_SUCCESS), EXIT_CODE_SUCCESS)
     exit_code = EXIT_CODE_SUCCESS if success else first_failure_code
+    if exit_code == EXIT_CODE_SUCCESS and readiness_blocked_windows > 0:
+        exit_code = EXIT_CODE_REMOTE_RUN_FAILURE
     if orphan_cleanup_error is not None:
         exit_code = orphan_cleanup_error.exit_code
 
@@ -416,7 +647,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         f"quarantined_jobs={quarantined_jobs} total_windows={total_windows} "
         f"active_windows=0 success_windows={success_windows} failed_windows={failed_windows} "
         f"quarantined_windows={quarantined_windows} failed_job_ids={failed_job_ids} "
-        f"active_jobs=0 max_inflight_jobs={max_inflight_jobs}"
+        f"active_jobs=0 max_inflight_jobs={max_inflight_jobs} "
+        f"terminal_jobs={terminal_jobs} replacement_jobs={replacement_jobs} "
+        f"ready_accounts={ready_account_ids} blocked_accounts={blocked_account_ids} "
+        f"bootstrapping_accounts={bootstrapping_account_ids} "
+        f"readiness_blocked_windows={readiness_blocked_windows}"
     )
     if orphan_cleanup_error is not None:
         summary = f"{summary} orphan_cleanup_error={orphan_cleanup_error}"
@@ -446,6 +681,13 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         success_windows=success_windows,
         failed_windows=failed_windows,
         quarantined_windows=quarantined_windows,
+        queued_windows=readiness_blocked_windows,
+        terminal_jobs=terminal_jobs,
+        replacement_jobs=replacement_jobs,
+        ready_accounts=tuple(ready_account_ids),
+        blocked_accounts=tuple(blocked_account_ids),
+        bootstrapping_accounts=tuple(bootstrapping_account_ids),
+        readiness_blocked_windows=readiness_blocked_windows,
     )
 
 
@@ -490,14 +732,17 @@ def _ingest_window_queue(
             output_root=output_root,
             relative_path=relative_path,
         )
-        ready_path = _ready_path_for_input(input_file, config.ready_sidecar_suffix)
+        ready_state = _ensure_ready_artifact(input_file, config.ready_sidecar_suffix)
         file_stat = input_file.stat()
         discovered_count += 1
 
         if config.continuous_mode:
             inserted = state_store.register_ingest_candidate(
                 input_path=str(input_file),
-                ready_path=str(ready_path),
+                ready_path=str(ready_state.ready_path),
+                ready_present=ready_state.ready_present,
+                ready_mode=ready_state.ready_mode,
+                ready_error=ready_state.ready_error,
                 file_size=file_stat.st_size,
                 file_mtime_ns=file_stat.st_mtime_ns,
             )
@@ -516,9 +761,22 @@ def _ingest_window_queue(
             run_id=run_id,
             window_id=window_id,
             level="INFO",
+            stage="READY" if ready_state.ready_present else "READY_INTERNAL",
+            message=(
+                f"ready_mode={ready_state.ready_mode}"
+                if ready_state.ready_error is None
+                else f"ready_mode={ready_state.ready_mode} error={ready_state.ready_error}"
+            ),
+        )
+        state_store.append_window_event(
+            run_id=run_id,
+            window_id=window_id,
+            level="INFO",
             stage="QUEUED",
             message="ingested",
         )
+        if config.continuous_mode:
+            state_store.mark_ingest_state(input_path=str(input_file), state="QUEUED")
         window_ref = WindowTaskRef(
             run_id=run_id,
             window_id=window_id,
@@ -680,6 +938,7 @@ def _run_bundle_with_retry(
         terminal_exit_code = EXIT_CODE_SUCCESS
         terminal_message = "ok"
         last_attempt_no = 0
+        worker_requeue_windows: list[WindowTaskRef] = []
 
         for attempt in range(1, config.job_retry_count + 2):
             if not pending_windows:
@@ -775,13 +1034,17 @@ def _run_bundle_with_retry(
             )
 
             def _delete_after_upload() -> None:
-                _delete_window_input_files(
-                    config=config,
-                    state_store=state_store,
-                    run_id=run_id,
-                    windows=runnable_windows,
-                    deleted_window_ids=deleted_window_ids,
-                )
+                if config.delete_input_after_upload:
+                    for window in runnable_windows:
+                        state_store.mark_window_delete_pending(run_id=run_id, window_id=window.window_id)
+                        state_store.append_window_event(
+                            run_id=run_id,
+                            window_id=window.window_id,
+                            level="INFO",
+                            stage="DELETE_PENDING",
+                            message="uploaded; waiting for terminal materialization",
+                        )
+                        state_store.mark_ingest_state(input_path=str(window.input_path), state="UPLOADED")
                 _mark_window_lifecycle_stage(
                     state_store=state_store,
                     run_id=run_id,
@@ -819,11 +1082,22 @@ def _run_bundle_with_retry(
                     case_summary=_CaseExecutionSummary(success_cases=0, failed_cases=0, case_lines=[]),
                     message=f"unexpected exception: {exc}",
                     failed_case_lines=[],
+                    failure_category="launch",
                 )
             materialized_window_ids = _materialize_window_outputs(
                 local_bundle_dir=local_bundle_dir,
                 windows=runnable_windows,
                 staged_input_paths=staged_input_paths,
+            )
+            if not result.success or result.failure_category:
+                _materialize_window_failure_artifacts(
+                    local_bundle_dir=local_bundle_dir,
+                    windows=runnable_windows,
+                    staged_input_paths=staged_input_paths,
+                )
+            formatted_result_message = _format_failure_message(
+                message=result.message,
+                failure_category=result.failure_category,
             )
 
             try:
@@ -841,10 +1115,19 @@ def _run_bundle_with_retry(
                 run_id=run_id,
                 attempt_id=attempt_id,
                 exit_code=result.exit_code,
-                error=None if result.success else result.message,
+                error=None if result.success else formatted_result_message,
             )
             terminal_exit_code = result.exit_code
-            terminal_message = result.message
+            terminal_message = formatted_result_message
+
+            if not result.success and result.failure_category:
+                state_store.append_event(
+                    run_id=run_id,
+                    job_id=bundle.job_id,
+                    level="ERROR",
+                    stage=f"FAILURE_{result.failure_category.upper()}",
+                    message=terminal_message,
+                )
 
             failed_indices = _parse_failed_case_indices(result.failed_case_lines, len(runnable_windows))
             if not result.success and not failed_indices:
@@ -860,8 +1143,12 @@ def _run_bundle_with_retry(
             for index, window in enumerate(runnable_windows):
                 if index in failed_indices:
                     failure_message = terminal_message
-                    state_store.mark_ingest_state(input_path=str(window.input_path), state="FAILED")
+                    should_requeue = (
+                        window.window_id not in materialized_window_ids
+                        and window.attempt_no <= config.worker_requeue_limit
+                    )
                     if attempt <= config.job_retry_count:
+                        state_store.mark_ingest_state(input_path=str(window.input_path), state="FAILED")
                         state_store.update_window_task(
                             run_id=run_id,
                             window_id=window.window_id,
@@ -888,7 +1175,43 @@ def _run_bundle_with_retry(
                                 attempt_no=window.attempt_no + 1,
                             )
                         )
+                    elif should_requeue:
+                        restore_source = staged_input_paths.get(window.window_id)
+                        if restore_source is not None:
+                            _restore_window_input_from_stage(
+                                source_path=restore_source,
+                                target_path=window.input_path,
+                                ready_suffix=config.ready_sidecar_suffix,
+                            )
+                        state_store.mark_ingest_state(input_path=str(window.input_path), state="RETRY_QUEUED")
+                        state_store.update_window_task(
+                            run_id=run_id,
+                            window_id=window.window_id,
+                            state="RETRY_QUEUED",
+                            attempt_no=window.attempt_no + 1,
+                            job_id=bundle.job_id,
+                            account_id=None,
+                            failure_reason=failure_message,
+                        )
+                        state_store.append_window_event(
+                            run_id=run_id,
+                            window_id=window.window_id,
+                            level="WARN",
+                            stage="RETRY_QUEUED",
+                            message=f"worker_requeue attempt_no={window.attempt_no + 1} reason={failure_message}",
+                        )
+                        worker_requeue_windows.append(
+                            WindowTaskRef(
+                                run_id=window.run_id,
+                                window_id=window.window_id,
+                                input_path=window.input_path,
+                                relative_path=window.relative_path,
+                                output_dir=window.output_dir,
+                                attempt_no=window.attempt_no + 1,
+                            )
+                        )
                     else:
+                        state_store.mark_ingest_state(input_path=str(window.input_path), state="FAILED")
                         state_store.quarantine_job(
                             run_id=run_id,
                             job_id=window.window_id,
@@ -913,6 +1236,13 @@ def _run_bundle_with_retry(
                             message=failure_message,
                         )
                         state_store.mark_ingest_state(input_path=str(window.input_path), state="QUARANTINED")
+                        _finalize_window_input_cleanup(
+                            config=config,
+                            state_store=state_store,
+                            run_id=run_id,
+                            window=window,
+                            deleted_window_ids=deleted_window_ids,
+                        )
                         quarantined_windows += 1
                 else:
                     state_store.update_window_task(
@@ -933,6 +1263,13 @@ def _run_bundle_with_retry(
                     )
                     state_store.mark_ingest_state(input_path=str(window.input_path), state="SUCCEEDED")
                     state_store.record_artifact(run_id=run_id, job_id=bundle.job_id, artifact_root=str(window.output_dir))
+                    _finalize_window_input_cleanup(
+                        config=config,
+                        state_store=state_store,
+                        run_id=run_id,
+                        window=window,
+                        deleted_window_ids=deleted_window_ids,
+                    )
                     success_windows += 1
 
             if not retry_windows:
@@ -971,6 +1308,7 @@ def _run_bundle_with_retry(
         success_windows=success_windows,
         failed_windows=failed_windows,
         quarantined_windows=quarantined_windows,
+        requeue_windows=tuple(worker_requeue_windows),
     )
 
 
@@ -978,13 +1316,18 @@ def _build_window_output_dir(*, output_root: Path, relative_path: Path) -> Path:
     return output_root / relative_path.parent / f"{relative_path.name}.out"
 
 
+def _seed_window_output_dir(*, window: WindowTaskRef, seed_input_path: Path | None = None) -> None:
+    window.output_dir.mkdir(parents=True, exist_ok=True)
+    source_input = seed_input_path if seed_input_path is not None else window.input_path
+    target_input = window.output_dir / window.input_path.name
+    if source_input.exists() and not target_input.exists():
+        shutil.copy2(source_input, target_input)
+
+
 def _initialize_window_output_dir(*, window: WindowTaskRef, seed_input_path: Path | None = None) -> None:
     if window.output_dir.exists():
         shutil.rmtree(window.output_dir)
-    window.output_dir.mkdir(parents=True, exist_ok=True)
-    source_input = seed_input_path if seed_input_path is not None else window.input_path
-    if source_input.exists():
-        shutil.copy2(source_input, window.output_dir / window.input_path.name)
+    _seed_window_output_dir(window=window, seed_input_path=seed_input_path)
 
 
 def _materialize_window_outputs(
@@ -1011,9 +1354,84 @@ def _materialize_window_outputs(
             else:
                 shutil.copy2(item, target_path)
             copied_any = True
+        _copy_bundle_summary_artifacts(local_bundle_dir=local_bundle_dir, output_dir=window.output_dir)
         if copied_any:
             materialized_window_ids.add(window.window_id)
     return materialized_window_ids
+
+
+def _materialize_window_failure_artifacts(
+    *,
+    local_bundle_dir: Path,
+    windows: list[WindowTaskRef],
+    staged_input_paths: dict[str, Path] | None = None,
+) -> set[str]:
+    artifact_names = (
+        "bundle.exit.code",
+        "remote_stdout.log",
+        "remote_stderr.log",
+        "remote_submission.log",
+        "failure_category.txt",
+        "failure_reason.txt",
+        "failed_case_lines.txt",
+    )
+    artifact_paths = [local_bundle_dir / name for name in artifact_names if (local_bundle_dir / name).exists()]
+    if not artifact_paths:
+        return set()
+
+    materialized_window_ids: set[str] = set()
+    for window in windows:
+        seed_input_path = None if staged_input_paths is None else staged_input_paths.get(window.window_id)
+        _seed_window_output_dir(window=window, seed_input_path=seed_input_path)
+
+        copied_any = False
+        for artifact_path in artifact_paths:
+            shutil.copy2(artifact_path, window.output_dir / artifact_path.name)
+            copied_any = True
+
+        bundle_exit_path = local_bundle_dir / "bundle.exit.code"
+        output_exit_path = window.output_dir / "exit.code"
+        if not output_exit_path.exists() and bundle_exit_path.exists():
+            shutil.copy2(bundle_exit_path, output_exit_path)
+            copied_any = True
+
+        output_run_log = window.output_dir / "run.log"
+        if not output_run_log.exists():
+            remote_submission_log = local_bundle_dir / "remote_submission.log"
+            remote_stderr_log = local_bundle_dir / "remote_stderr.log"
+            failure_reason_path = local_bundle_dir / "failure_reason.txt"
+            if remote_submission_log.exists():
+                shutil.copy2(remote_submission_log, output_run_log)
+                copied_any = True
+            elif remote_stderr_log.exists():
+                shutil.copy2(remote_stderr_log, output_run_log)
+                copied_any = True
+            elif failure_reason_path.exists():
+                output_run_log.write_text(failure_reason_path.read_text(encoding="utf-8"), encoding="utf-8")
+                copied_any = True
+        _copy_bundle_summary_artifacts(local_bundle_dir=local_bundle_dir, output_dir=window.output_dir)
+
+        if copied_any:
+            materialized_window_ids.add(window.window_id)
+
+    return materialized_window_ids
+
+
+def _copy_bundle_summary_artifacts(*, local_bundle_dir: Path, output_dir: Path) -> None:
+    for name in ("case_summary.txt", "failed.count"):
+        source_path = local_bundle_dir / name
+        if source_path.exists():
+            shutil.copy2(source_path, output_dir / name)
+
+
+def _format_failure_message(*, message: str, failure_category: str | None) -> str:
+    normalized_message = message.strip()
+    if not failure_category:
+        return normalized_message
+    prefix = f"{failure_category.upper()}: "
+    if normalized_message.startswith(prefix):
+        return normalized_message
+    return f"{prefix}{normalized_message}"
 
 
 def _rename_case_output_name(*, case_name: str, input_name: str) -> str:
@@ -1044,6 +1462,42 @@ def _delete_window_input_files(
         deleted_window_ids.add(window.window_id)
 
 
+def _finalize_window_input_cleanup(
+    *,
+    config: PipelineConfig,
+    state_store: StateStore,
+    run_id: str,
+    window: WindowTaskRef,
+    deleted_window_ids: set[str],
+) -> None:
+    if window.window_id in deleted_window_ids:
+        return
+    if config.delete_input_after_upload and _window_output_has_materialized_artifacts(
+        output_dir=window.output_dir,
+        input_name=window.input_path.name,
+    ):
+        _delete_window_input_file(
+            config=config,
+            state_store=state_store,
+            run_id=run_id,
+            window=window,
+        )
+        deleted_window_ids.add(window.window_id)
+        return
+
+    retain_reason = "delete disabled"
+    if config.delete_input_after_upload:
+        retain_reason = "materialized output missing; input retained"
+    state_store.mark_window_delete_retained(run_id=run_id, window_id=window.window_id)
+    state_store.append_window_event(
+        run_id=run_id,
+        window_id=window.window_id,
+        level="INFO" if not config.delete_input_after_upload else "WARN",
+        stage="DELETE_RETAINED",
+        message=retain_reason,
+    )
+
+
 def _delete_window_input_file(
     *,
     config: PipelineConfig,
@@ -1067,7 +1521,7 @@ def _delete_window_input_file(
                 stage="INPUT_DELETED",
                 message=f"retry={retry}",
             )
-            state_store.mark_ingest_state(input_path=str(path), state="UPLOADED")
+            state_store.mark_ingest_state(input_path=str(path), state="DELETED")
             return
         except OSError as exc:
             state_store.mark_window_delete_retrying(run_id=run_id, window_id=window.window_id, retry_count=retry + 1)
@@ -1104,6 +1558,16 @@ def _delete_window_input_file(
             message=str(quarantine_target),
         )
         state_store.mark_ingest_state(input_path=str(path), state="DELETE_QUARANTINED")
+
+
+def _window_output_has_materialized_artifacts(*, output_dir: Path, input_name: str) -> bool:
+    if not output_dir.exists():
+        return False
+    for item in output_dir.iterdir():
+        if item.name == input_name:
+            continue
+        return True
+    return False
 
 
 def _mark_window_lifecycle_stage(
@@ -1207,6 +1671,33 @@ def _run_with_retry(
 
 def _ready_path_for_input(input_path: Path, ready_suffix: str) -> Path:
     return Path(f"{input_path}{ready_suffix}")
+
+
+def _restore_window_input_from_stage(*, source_path: Path, target_path: Path, ready_suffix: str) -> None:
+    if not source_path.exists():
+        return
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_path, target_path)
+    _ensure_ready_artifact(target_path, ready_suffix)
+
+
+def _ensure_ready_artifact(input_path: Path, ready_suffix: str) -> _ReadyArtifactState:
+    ready_path = _ready_path_for_input(input_path, ready_suffix)
+    try:
+        ready_path.parent.mkdir(parents=True, exist_ok=True)
+        ready_path.touch(exist_ok=True)
+        return _ReadyArtifactState(
+            ready_path=ready_path,
+            ready_present=True,
+            ready_mode="SIDECAR",
+        )
+    except OSError as exc:
+        return _ReadyArtifactState(
+            ready_path=ready_path,
+            ready_present=ready_path.exists(),
+            ready_mode="INTERNAL_ONLY",
+            ready_error=str(exc),
+        )
 
 
 def _build_window_id(*, relative_path: Path, mtime_ns: int) -> str:
