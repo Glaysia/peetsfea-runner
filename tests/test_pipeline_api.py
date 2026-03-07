@@ -72,6 +72,41 @@ class TestPipelineApi(unittest.TestCase):
             self.assertEqual(files, [input_file.resolve()])
             self.assertTrue((input_dir / "foo.aedt.ready").is_file())
 
+    def test_validate_follows_symlinked_input_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            input_dir = root / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            source_dir = root / "source"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            source_file = source_dir / "foo.aedt"
+            source_file.write_text("x", encoding="utf-8")
+            linked_dir = input_dir / "linked"
+            linked_dir.symlink_to(source_dir, target_is_directory=True)
+
+            config = PipelineConfig(input_queue_dir=str(input_dir), continuous_mode=False)
+            _input_root, _output_root, files, _accounts = config.validate()
+
+            logical_file = linked_dir / "foo.aedt"
+            self.assertEqual(files, [logical_file])
+            self.assertTrue((linked_dir / "foo.aedt.ready").is_file())
+
+    def test_validate_recursive_symlink_cycle_does_not_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            input_dir = root / "in"
+            nested = input_dir / "nested"
+            nested.mkdir(parents=True, exist_ok=True)
+            input_file = nested / "foo.aedt"
+            input_file.write_text("x", encoding="utf-8")
+            (nested / "back").symlink_to(input_dir, target_is_directory=True)
+
+            config = PipelineConfig(input_queue_dir=str(input_dir), continuous_mode=False)
+            _input_root, _output_root, files, _accounts = config.validate()
+
+            self.assertEqual(files, [input_file])
+            self.assertTrue((nested / "foo.aedt.ready").is_file())
+
     def test_dry_run_creates_mirrored_out_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
@@ -188,11 +223,11 @@ class TestPipelineApi(unittest.TestCase):
             for index in range(1, 3):
                 self.assertTrue((input_dir / f"sample_{index:02d}.aedt.ready").is_file())
 
-    def test_continuous_mode_ingests_all_discovered_files_before_dispatch(self) -> None:
+    def test_continuous_mode_dispatches_before_full_ingest_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            for index in range(1, 4):
+            for index in range(1, 31):
                 input_file = input_dir / f"sample_{index:02d}.aedt"
                 input_file.write_text("placeholder", encoding="utf-8")
 
@@ -205,36 +240,75 @@ class TestPipelineApi(unittest.TestCase):
                 execute_remote=False,
                 continuous_mode=True,
             )
+            discovered_counts_at_dispatch: list[int] = []
             dispatched_sizes: list[int] = []
 
-            def _mock_run_window_workers(*, window_queue, job_index_start, **kwargs):
-                dispatched_sizes.append(len(window_queue))
-                conn = duckdb.connect(str(db_path))
-                try:
-                    conn.execute(
-                        """
-                        UPDATE window_tasks
-                        SET state = 'SUCCEEDED',
-                            updated_at = now()
-                        """
-                    )
-                finally:
-                    conn.close()
-                return SimpleNamespace(
-                    results=[],
-                    max_inflight_jobs=0,
-                    submitted_jobs=0,
-                    terminal_jobs=0,
-                    replacement_jobs=0,
-                )
+            class _FakeController:
+                def __init__(self, **kwargs):
+                    self._pending: list = []
+                    self._submitted = 0
 
-            with patch("peetsfea_runner.pipeline.run_window_workers", side_effect=_mock_run_window_workers):
+                def enqueue_windows(self, windows):
+                    self._pending.extend(windows)
+
+                def snapshot(self):
+                    return SimpleNamespace(
+                        queued_windows=0,
+                        pending_windows=len(self._pending),
+                        inflight_windows=0,
+                        inflight_jobs=0,
+                        submitted_jobs=self._submitted,
+                    )
+
+                def has_work(self):
+                    return bool(self._pending)
+
+                def step(self, *, wait_for_progress=False):
+                    if not self._pending:
+                        return False
+                    conn = duckdb.connect(str(db_path))
+                    try:
+                        discovered_counts_at_dispatch.append(
+                            conn.execute("SELECT COUNT(*) FROM window_tasks").fetchone()[0]
+                        )
+                        dispatched_sizes.append(len(self._pending))
+                        conn.executemany(
+                            """
+                            UPDATE window_tasks
+                            SET state = 'SUCCEEDED',
+                                updated_at = now()
+                            WHERE window_id = ?
+                            """,
+                            [[window.window_id] for window in self._pending],
+                        )
+                    finally:
+                        conn.close()
+                    self._submitted += max(1, (len(self._pending) + 3) // 4)
+                    self._pending = []
+                    return True
+
+                def finalize(self):
+                    return SimpleNamespace(
+                        results=[],
+                        max_inflight_jobs=0,
+                        submitted_jobs=self._submitted,
+                        terminal_jobs=0,
+                        replacement_jobs=0,
+                    )
+
+            with (
+                patch("peetsfea_runner.pipeline._continuous_backlog_limits", return_value=(12, 24)),
+                patch("peetsfea_runner.pipeline.WindowWorkerController", _FakeController),
+            ):
                 result = run_pipeline(config)
 
             self.assertTrue(result.success)
-            self.assertEqual(result.total_windows, 3)
-            self.assertEqual(dispatched_sizes, [3])
-            for index in range(1, 4):
+            self.assertEqual(result.total_windows, 30)
+            self.assertGreaterEqual(len(dispatched_sizes), 1)
+            self.assertEqual(dispatched_sizes[0], 4)
+            self.assertEqual(discovered_counts_at_dispatch[0], 4)
+            self.assertLess(discovered_counts_at_dispatch[0], 30)
+            for index in range(1, 31):
                 self.assertTrue((input_dir / f"sample_{index:02d}.aedt.ready").is_file())
 
     def test_continuous_mode_ingests_without_ready_sidecar_when_internal_ready_fallback_is_used(self) -> None:

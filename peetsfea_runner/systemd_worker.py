@@ -111,7 +111,7 @@ def _build_config() -> PipelineConfig:
         continuous_mode=_env_bool("PEETSFEA_CONTINUOUS_MODE", True),
         ingest_poll_seconds=int(os.getenv("PEETSFEA_INGEST_POLL_SECONDS", "30")),
         ready_sidecar_suffix=os.getenv("PEETSFEA_READY_SIDECAR_SUFFIX", ".ready"),
-        windows_per_job=int(os.getenv("PEETSFEA_WINDOWS_PER_JOB", "8")),
+        windows_per_job=int(os.getenv("PEETSFEA_WINDOWS_PER_JOB", "4")),
         cores_per_window=int(os.getenv("PEETSFEA_CORES_PER_WINDOW", "4")),
         worker_requeue_limit=int(os.getenv("PEETSFEA_WORKER_REQUEUE_LIMIT", "1")),
         run_rotation_hours=int(os.getenv("PEETSFEA_RUN_ROTATION_HOURS", "24")),

@@ -255,7 +255,7 @@ def _latest_account_readiness(db_path: Path) -> dict[str, dict[str, object]]:
 
 
 def _configured_capacity_targets() -> dict[str, int]:
-    windows_per_job = _env_int("PEETSFEA_WINDOWS_PER_JOB", 8)
+    windows_per_job = _env_int("PEETSFEA_WINDOWS_PER_JOB", 4)
     raw_accounts = os.getenv("PEETSFEA_ACCOUNTS", "").strip()
     configured_accounts = 0
     configured_worker_jobs = 0

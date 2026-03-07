@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import time
 from dataclasses import dataclass, field, replace
@@ -7,7 +8,7 @@ from datetime import datetime, timezone
 from hashlib import sha1
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Callable
+from typing import Callable, Iterator
 
 from .constants import (
     EXIT_CODE_DOWNLOAD_FAILURE,
@@ -42,6 +43,7 @@ from .scheduler import (
     AccountCapacitySnapshot,
     AccountReadinessSnapshot,
     BundleSpec,
+    WindowWorkerController,
     WindowTaskRef,
     bootstrap_account_runtime,
     query_account_preflight,
@@ -92,7 +94,7 @@ class PipelineConfig:
     time_limit: str = "05:00:00"
     remote_root: str = "~/aedt_runs"
     execute_remote: bool = False
-    windows_per_job: int = 8
+    windows_per_job: int = 4
     cores_per_window: int = 4
     job_retry_count: int = 1
     worker_requeue_limit: int = 1
@@ -162,16 +164,9 @@ class PipelineConfig:
             if account.max_jobs <= 0:
                 raise ValueError("account.max_jobs must be > 0")
 
-        if self.scan_recursive:
-            files = sorted(
-                [p.resolve() for p in input_root.rglob("*") if p.is_file() and p.suffix.lower() == ".aedt"],
-                key=lambda p: str(p.relative_to(input_root)).lower(),
-            )
-        else:
-            files = sorted(
-                [p.resolve() for p in input_root.glob("*") if p.is_file() and p.suffix.lower() == ".aedt"],
-                key=lambda p: str(p.relative_to(input_root)).lower(),
-            )
+        files: list[Path] = []
+        if not self.continuous_mode:
+            files = _scan_input_aedt_files(input_root=input_root, recursive=self.scan_recursive)
         for path in files:
             _ensure_ready_artifact(path, self.ready_sidecar_suffix)
         if not files and not self.continuous_mode:
@@ -251,6 +246,54 @@ class _RemoteExecutionConfig:
     cores_per_window: int
 
 
+def _scan_input_aedt_files(*, input_root: Path, recursive: bool) -> list[Path]:
+    return list(_iter_input_aedt_files(input_root=input_root, recursive=recursive))
+
+
+def _iter_input_aedt_files(*, input_root: Path, recursive: bool) -> Iterator[Path]:
+    if not recursive:
+        yield from sorted(
+            [
+                path
+                for path in input_root.iterdir()
+                if path.is_file() and path.suffix.lower() == ".aedt"
+            ],
+            key=lambda p: str(p.relative_to(input_root)).lower(),
+        )
+        return
+
+    visited_dirs: set[tuple[int, int]] = set()
+    for root, dirs, filenames in os.walk(input_root, followlinks=True):
+        try:
+            root_stat = os.stat(root)
+        except OSError:
+            dirs[:] = []
+            continue
+        root_key = (root_stat.st_dev, root_stat.st_ino)
+        if root_key in visited_dirs:
+            dirs[:] = []
+            continue
+        visited_dirs.add(root_key)
+        dirs.sort()
+        for filename in sorted(filenames):
+            path = Path(root) / filename
+            if path.suffix.lower() != ".aedt":
+                continue
+            if not path.is_file():
+                continue
+            yield path
+
+
+def _configured_target_slots(*, config: PipelineConfig, accounts: list[AccountConfig]) -> int:
+    return sum(max(1, account.max_jobs) for account in accounts) * config.windows_per_job
+
+
+def _continuous_backlog_limits(*, config: PipelineConfig, accounts: list[AccountConfig]) -> tuple[int, int]:
+    low_watermark = max(config.windows_per_job, _configured_target_slots(config=config, accounts=accounts))
+    high_watermark = max(low_watermark, low_watermark * 2)
+    return low_watermark, high_watermark
+
+
 def _blocked_readiness_snapshot(*, account: AccountConfig, reason: str) -> AccountReadinessSnapshot:
     return AccountReadinessSnapshot(
         account_id=account.account_id,
@@ -296,7 +339,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         run_id = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
         state_store.start_run(run_id)
     remote_run_dir = _join_remote_root(config.remote_root, run_id)
-    _log_stage(f"pipeline start run_id={run_id} total_inputs={len(aedt_files)} execute_remote={config.execute_remote}")
+    total_inputs_label = "streaming" if config.continuous_mode else str(len(aedt_files))
+    _log_stage(f"pipeline start run_id={run_id} total_inputs={total_inputs_label} execute_remote={config.execute_remote}")
 
     queued_windows = _load_schedulable_windows(state_store=state_store, run_id=run_id, input_root=input_root)
     total_windows = len(queued_windows)
@@ -338,6 +382,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     bootstrapping_account_ids: list[str] = []
     readiness_blocked_windows = 0
     next_job_index = state_store.get_next_job_index(run_id=run_id)
+    controller: WindowWorkerController[_BundleRuntimeOutcome] | None = None
 
     def _current_completed_windows() -> dict[str, int]:
         return {
@@ -519,7 +564,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         outcomes.extend(batch.results)
         return True
 
-    def _dispatch_queued_windows() -> None:
+    def _dispatch_queued_windows(*, max_windows: int | None = None) -> None:
         nonlocal queued_windows
         while True:
             if not queued_windows:
@@ -530,14 +575,21 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 )
                 if not queued_windows:
                     break
-            batch_windows = queued_windows
-            queued_windows = []
+            if max_windows is None or max_windows <= 0 or len(queued_windows) <= max_windows:
+                batch_windows = queued_windows
+                queued_windows = []
+            else:
+                batch_windows = queued_windows[:max_windows]
+                queued_windows = queued_windows[max_windows:]
             dispatched = _run_window_batch(batch_windows)
             if not dispatched:
-                queued_windows = batch_windows
+                queued_windows = batch_windows + queued_windows
+                break
+            if max_windows is not None:
                 break
 
-    _dispatch_queued_windows()
+    if not config.continuous_mode:
+        _dispatch_queued_windows()
 
     def _on_window_enqueued(window: WindowTaskRef) -> None:
         nonlocal total_windows
@@ -545,21 +597,153 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         total_windows += 1
         _dispatch_queued_windows()
 
-    ingest_callback = None
-    windows, discovered_count = _ingest_window_queue(
-        config=config,
-        state_store=state_store,
-        run_id=run_id,
-        input_root=input_root,
-        output_root=output_root,
-        aedt_files=aedt_files,
-        on_window_enqueued=ingest_callback,
-    )
-    if windows:
-        queued_windows.extend(windows)
-        total_windows += len(windows)
+    if config.continuous_mode:
+        low_watermark, high_watermark = _continuous_backlog_limits(config=config, accounts=accounts)
+        input_iter = _iter_input_aedt_files(input_root=input_root, recursive=config.scan_recursive)
+        scan_exhausted = False
+        def _start_controller(*, force: bool = False) -> bool:
+            nonlocal controller, queued_windows, readiness_blocked_windows
+            if controller is not None:
+                return True
+            if not queued_windows:
+                return False
+            if not force and len(queued_windows) < config.windows_per_job:
+                return False
+            dispatch_accounts = _resolve_dispatch_accounts()
+            if not dispatch_accounts:
+                readiness_blocked_windows = len(queued_windows)
+                return False
+            controller = WindowWorkerController(
+                accounts=dispatch_accounts,
+                windows_per_job=config.windows_per_job,
+                pending_buffer_per_account=config.pending_buffer_per_account,
+                worker=(
+                    lambda bundle: _run_bundle_with_retry(
+                        config=config,
+                        state_store=state_store,
+                        run_id=run_id,
+                        remote_run_dir=remote_run_dir,
+                        bundle=bundle,
+                    )
+                )
+                if config.execute_remote
+                else (
+                    lambda bundle: _run_dry_bundle(
+                        run_id=run_id,
+                        state_store=state_store,
+                        bundle=bundle,
+                    )
+                ),
+                capacity_lookup=query_account_capacity if config.execute_remote else _local_capacity_lookup,
+                initial_completed_windows=_current_completed_windows(),
+                job_index_start=next_job_index,
+                on_capacity_snapshot=_capacity_log,
+                on_capacity_error=_capacity_error if config.execute_remote else None,
+                on_bundle_submitted=_bundle_submitted,
+                recovery_windows_lookup=(
+                    (lambda _bundle, outcome: outcome.requeue_windows)
+                    if config.execute_remote
+                    else (lambda _bundle, outcome: ())
+                ),
+                terminal_bundle_lookup=(
+                    (lambda _bundle, outcome: outcome.terminal_worker)
+                    if config.execute_remote
+                    else (lambda _bundle, outcome: False)
+                ),
+            )
+            controller.enqueue_windows(queued_windows)
+            queued_windows = []
+            controller.step(wait_for_progress=False)
+            return True
 
-    _dispatch_queued_windows()
+        while True:
+            controller_snapshot = controller.snapshot() if controller is not None else None
+            backlog_windows = len(queued_windows)
+            if controller_snapshot is not None:
+                backlog_windows += (
+                    controller_snapshot.queued_windows
+                    + controller_snapshot.pending_windows
+                    + controller_snapshot.inflight_windows
+                )
+
+            if controller is None and queued_windows:
+                forced_start = scan_exhausted or len(queued_windows) >= config.windows_per_job
+                if forced_start and _start_controller(force=scan_exhausted):
+                    continue
+
+            if not scan_exhausted and backlog_windows < high_watermark:
+                try:
+                    input_file = next(input_iter)
+                except StopIteration:
+                    scan_exhausted = True
+                else:
+                    windows, discovered_delta = _ingest_window_queue(
+                        config=config,
+                        state_store=state_store,
+                        run_id=run_id,
+                        input_root=input_root,
+                        output_root=output_root,
+                        aedt_files=[input_file],
+                    )
+                    discovered_count += discovered_delta
+                    if windows:
+                        total_windows += len(windows)
+                        if controller is not None:
+                            controller.enqueue_windows(windows)
+                            controller.step(wait_for_progress=False)
+                        else:
+                            queued_windows.extend(windows)
+                            if len(queued_windows) >= config.windows_per_job:
+                                _start_controller()
+                    continue
+
+            if controller is not None:
+                controller_snapshot = controller.snapshot()
+                controller_backlog = (
+                    controller_snapshot.queued_windows
+                    + controller_snapshot.pending_windows
+                    + controller_snapshot.inflight_windows
+                )
+                wait_for_progress = scan_exhausted or controller_backlog >= low_watermark
+                progressed = controller.step(wait_for_progress=wait_for_progress)
+                if progressed:
+                    continue
+                if scan_exhausted and not controller.has_work():
+                    break
+
+            if controller is None and scan_exhausted:
+                if queued_windows:
+                    if _start_controller(force=True):
+                        continue
+                    readiness_blocked_windows = len(queued_windows)
+                break
+
+            if controller is None and blocked_account_ids and backlog_windows >= high_watermark:
+                readiness_blocked_windows = backlog_windows
+                break
+    else:
+        windows, discovered_count = _ingest_window_queue(
+            config=config,
+            state_store=state_store,
+            run_id=run_id,
+            input_root=input_root,
+            output_root=output_root,
+            aedt_files=aedt_files,
+            on_window_enqueued=None,
+        )
+        if windows:
+            queued_windows.extend(windows)
+            total_windows += len(windows)
+
+        _dispatch_queued_windows()
+
+    if config.continuous_mode and controller is not None:
+        batch = controller.finalize()
+        max_inflight_jobs = max(max_inflight_jobs, batch.max_inflight_jobs)
+        next_job_index += batch.submitted_jobs
+        terminal_jobs += batch.terminal_jobs
+        replacement_jobs += batch.replacement_jobs
+        outcomes.extend(batch.results)
 
     if total_windows == 0:
         summary = (

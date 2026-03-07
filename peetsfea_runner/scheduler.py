@@ -96,6 +96,15 @@ class BalancedBatchResult(Generic[T]):
     replacement_jobs: int = 0
 
 
+@dataclass(slots=True, frozen=True)
+class WindowWorkerControllerSnapshot:
+    queued_windows: int
+    pending_windows: int
+    inflight_windows: int
+    inflight_jobs: int
+    submitted_jobs: int
+
+
 RUNNING_STATES = frozenset({"R", "CG", "RUNNING", "COMPLETING"})
 PENDING_STATES = frozenset({"PD", "PENDING"})
 
@@ -739,6 +748,298 @@ def run_window_bundles(
     )
 
 
+class WindowWorkerController(Generic[T]):
+    def __init__(
+        self,
+        *,
+        accounts: list[AccountConfigLike],
+        windows_per_job: int,
+        pending_buffer_per_account: int,
+        worker: Callable[[BundleSpec], T],
+        capacity_lookup: Callable[..., AccountCapacitySnapshot] = query_account_capacity,
+        initial_completed_windows: dict[str, int] | None = None,
+        job_index_start: int = 1,
+        max_workers: int | None = None,
+        idle_sleep_seconds: float = 1.0,
+        on_capacity_snapshot: Callable[[AccountCapacitySnapshot], None] | None = None,
+        on_bundle_submitted: Callable[[BundleSpec], None] | None = None,
+        on_capacity_error: Callable[[AccountConfigLike, Exception], None] | None = None,
+        recovery_windows_lookup: Callable[[BundleSpec, T], Sequence[WindowTaskRef]] | None = None,
+        terminal_bundle_lookup: Callable[[BundleSpec, T], bool] | None = None,
+    ) -> None:
+        if windows_per_job <= 0:
+            raise ValueError("windows_per_job must be > 0")
+        if pending_buffer_per_account < 0:
+            raise ValueError("pending_buffer_per_account must be >= 0")
+        if idle_sleep_seconds <= 0:
+            raise ValueError("idle_sleep_seconds must be > 0")
+        if not accounts:
+            raise ValueError("accounts must not be empty")
+        if job_index_start <= 0:
+            raise ValueError("job_index_start must be > 0")
+
+        self._accounts = list(accounts)
+        self._windows_per_job = windows_per_job
+        self._pending_buffer_per_account = pending_buffer_per_account
+        self._worker = worker
+        self._capacity_lookup = capacity_lookup
+        self._completed_windows = dict(initial_completed_windows or {})
+        self._idle_sleep_seconds = idle_sleep_seconds
+        self._on_capacity_snapshot = on_capacity_snapshot
+        self._on_bundle_submitted = on_bundle_submitted
+        self._on_capacity_error = on_capacity_error
+        self._recovery_windows_lookup = recovery_windows_lookup
+        self._terminal_bundle_lookup = terminal_bundle_lookup
+
+        self._source_queue: deque[WindowTaskRef] = deque()
+        self._pending_bundles_by_account: dict[str, deque[list[WindowTaskRef]]] = {}
+        self._pending_seed_bundles: list[list[WindowTaskRef]] = []
+        self._inflight_windows: dict[str, int] = {}
+        self._inflight_workers: dict[str, int] = {}
+        self._target_workers_by_account: dict[str, int] = {}
+        self._seeded_workers_by_account: dict[str, int] = {}
+        self._results: list[T] = []
+        self._max_inflight_jobs = 0
+        self._submitted_jobs = 0
+        self._terminal_jobs = 0
+        self._replacement_jobs = 0
+        self._job_counter = job_index_start - 1
+        self._seed_account_cursor = 0
+        self._backlog_account_cursor = 0
+
+        if max_workers is None:
+            max_workers = max(1, sum(max(1, account.max_jobs) for account in self._accounts))
+        else:
+            max_workers = max(1, max_workers)
+        self._max_workers = max_workers
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._future_to_bundle: dict[Future[T], BundleSpec] = {}
+
+    def enqueue_windows(self, windows: Sequence[WindowTaskRef]) -> None:
+        if not windows:
+            return
+        self._source_queue.extend(windows)
+        self._materialize_pending_bundles()
+
+    def has_work(self) -> bool:
+        return bool(self._source_queue) or any(self._pending_bundles_by_account.values()) or bool(self._future_to_bundle)
+
+    def snapshot(self) -> WindowWorkerControllerSnapshot:
+        pending_windows = sum(
+            len(bundle)
+            for queue in self._pending_bundles_by_account.values()
+            for bundle in queue
+        )
+        inflight_windows = sum(self._inflight_windows.values())
+        return WindowWorkerControllerSnapshot(
+            queued_windows=len(self._source_queue),
+            pending_windows=pending_windows,
+            inflight_windows=inflight_windows,
+            inflight_jobs=len(self._future_to_bundle),
+            submitted_jobs=self._submitted_jobs,
+        )
+
+    def step(self, *, wait_for_progress: bool = False) -> bool:
+        progressed = self._collect_done_futures()
+        self._materialize_pending_bundles()
+
+        snapshots: list[AccountCapacitySnapshot] = []
+        for account in self._accounts:
+            try:
+                snapshot = self._capacity_lookup(
+                    account=account,
+                    pending_buffer_per_account=self._pending_buffer_per_account,
+                )
+            except Exception as exc:
+                if self._on_capacity_error is not None:
+                    self._on_capacity_error(account, exc)
+                continue
+            snapshots.append(snapshot)
+            if self._on_capacity_snapshot is not None:
+                self._on_capacity_snapshot(snapshot)
+
+        if any(queue for queue in self._pending_bundles_by_account.values()) and not snapshots and not self._future_to_bundle:
+            raise RuntimeError("No account capacity snapshots available for worker startup.")
+
+        if self._submit_pending_bundles(snapshots):
+            progressed = True
+
+        if progressed:
+            return True
+
+        if wait_for_progress and self._future_to_bundle:
+            wait(tuple(self._future_to_bundle), return_when=FIRST_COMPLETED, timeout=self._idle_sleep_seconds)
+            return self._collect_done_futures()
+
+        if wait_for_progress:
+            time.sleep(self._idle_sleep_seconds)
+        return False
+
+    def finalize(self) -> BalancedBatchResult[T]:
+        try:
+            while self.has_work():
+                self.step(wait_for_progress=True)
+        finally:
+            self._executor.shutdown(wait=True)
+        return BalancedBatchResult(
+            results=list(self._results),
+            max_inflight_jobs=self._max_inflight_jobs,
+            submitted_jobs=self._submitted_jobs,
+            terminal_jobs=self._terminal_jobs,
+            replacement_jobs=self._replacement_jobs,
+        )
+
+    def _collect_done_futures(self) -> bool:
+        progressed = False
+        done_futures = [future for future in tuple(self._future_to_bundle) if future.done()]
+        for future in done_futures:
+            progressed = True
+            bundle = self._future_to_bundle.pop(future)
+            result = future.result()
+            self._results.append(result)
+            self._inflight_windows[bundle.account_id] = max(
+                0,
+                self._inflight_windows.get(bundle.account_id, 0) - bundle.window_count,
+            )
+            self._inflight_workers[bundle.account_id] = max(
+                0,
+                self._inflight_workers.get(bundle.account_id, 0) - 1,
+            )
+            self._completed_windows[bundle.account_id] = self._completed_windows.get(bundle.account_id, 0) + bundle.window_count
+            if self._terminal_bundle_lookup is not None and self._terminal_bundle_lookup(bundle, result):
+                self._terminal_jobs += 1
+            if self._recovery_windows_lookup is not None:
+                recovery_windows = list(self._recovery_windows_lookup(bundle, result))
+                if recovery_windows:
+                    account = next((item for item in self._accounts if item.account_id == bundle.account_id), None)
+                    if account is not None:
+                        self._replacement_jobs += self._queue_bundles_for_account(account=account, windows=recovery_windows)
+        return progressed
+
+    def _submit_pending_bundles(self, snapshots: Sequence[AccountCapacitySnapshot]) -> bool:
+        submitted_any = False
+        snapshot_by_account = {snapshot.account_id: snapshot for snapshot in snapshots}
+        for account in self._accounts:
+            queue = self._pending_bundles_by_account.get(account.account_id)
+            if not queue:
+                continue
+            snapshot = snapshot_by_account.get(account.account_id)
+            if snapshot is None:
+                continue
+            target_workers = self._target_workers_by_account.get(account.account_id, 0)
+            if target_workers <= 0:
+                continue
+            external_occupied = max(
+                0,
+                max(0, snapshot.running_count) + max(0, snapshot.pending_count) - self._inflight_workers.get(account.account_id, 0),
+            )
+            target_available_workers = max(
+                0,
+                target_workers - external_occupied - self._inflight_workers.get(account.account_id, 0),
+            )
+            allowed_submit_workers = max(
+                0,
+                snapshot.allowed_submit - self._inflight_workers.get(account.account_id, 0),
+            )
+            available_workers = min(target_available_workers, allowed_submit_workers)
+            while queue and available_workers > 0 and len(self._future_to_bundle) < self._max_workers:
+                bundle_windows = queue.popleft()
+                if bundle_windows in self._pending_seed_bundles:
+                    self._pending_seed_bundles.remove(bundle_windows)
+                self._job_counter += 1
+                bundle = BundleSpec(
+                    job_id=f"job_{self._job_counter:04d}",
+                    job_index=self._job_counter,
+                    account_id=account.account_id,
+                    host_alias=account.host_alias,
+                    window_inputs=tuple(bundle_windows),
+                )
+                future = self._executor.submit(self._worker, bundle)
+                self._future_to_bundle[future] = bundle
+                self._inflight_windows[bundle.account_id] = self._inflight_windows.get(bundle.account_id, 0) + bundle.window_count
+                self._inflight_workers[bundle.account_id] = self._inflight_workers.get(bundle.account_id, 0) + 1
+                self._submitted_jobs += 1
+                self._max_inflight_jobs = max(self._max_inflight_jobs, len(self._future_to_bundle))
+                available_workers -= 1
+                submitted_any = True
+                if self._on_bundle_submitted is not None:
+                    self._on_bundle_submitted(bundle)
+        return submitted_any
+
+    def _next_seed_account(self) -> AccountConfigLike | None:
+        if not self._accounts:
+            return None
+        account_count = len(self._accounts)
+        for offset in range(account_count):
+            index = (self._seed_account_cursor + offset) % account_count
+            account = self._accounts[index]
+            seeded = self._seeded_workers_by_account.get(account.account_id, 0)
+            if seeded >= account.max_jobs:
+                continue
+            self._seed_account_cursor = (index + 1) % account_count
+            return account
+        return None
+
+    def _queue_bundle(self, *, account: AccountConfigLike, assigned: Sequence[WindowTaskRef]) -> list[WindowTaskRef] | None:
+        if not assigned:
+            return None
+        bundle_windows = list(assigned)
+        self._pending_bundles_by_account.setdefault(account.account_id, deque()).append(bundle_windows)
+        return bundle_windows
+
+    def _materialize_pending_bundles(self) -> None:
+        while self._source_queue:
+            account = self._next_seed_account()
+            if account is None:
+                break
+            if not self._source_queue:
+                break
+            assigned = [self._source_queue.popleft()]
+            self._seeded_workers_by_account[account.account_id] = self._seeded_workers_by_account.get(account.account_id, 0) + 1
+            self._target_workers_by_account[account.account_id] = self._target_workers_by_account.get(account.account_id, 0) + 1
+            bundle_windows = self._queue_bundle(account=account, assigned=assigned)
+            if bundle_windows is not None:
+                self._pending_seed_bundles.append(bundle_windows)
+
+        while self._source_queue and self._pending_seed_bundles:
+            progressed = False
+            for bundle_windows in list(self._pending_seed_bundles):
+                if not self._source_queue:
+                    break
+                if len(bundle_windows) >= self._windows_per_job:
+                    continue
+                bundle_windows.append(self._source_queue.popleft())
+                progressed = True
+            self._pending_seed_bundles = [
+                bundle_windows for bundle_windows in self._pending_seed_bundles if len(bundle_windows) < self._windows_per_job
+            ]
+            if not progressed:
+                break
+
+        while self._source_queue:
+            account = self._accounts[self._backlog_account_cursor % len(self._accounts)]
+            self._backlog_account_cursor += 1
+            assigned: list[WindowTaskRef] = []
+            while self._source_queue and len(assigned) < self._windows_per_job:
+                assigned.append(self._source_queue.popleft())
+            if not assigned:
+                break
+            self._queue_bundle(account=account, assigned=assigned)
+
+    def _queue_bundles_for_account(self, *, account: AccountConfigLike, windows: Sequence[WindowTaskRef]) -> int:
+        queued_jobs = 0
+        recovery_queue = deque(windows)
+        while recovery_queue:
+            assigned: list[WindowTaskRef] = []
+            while recovery_queue and len(assigned) < self._windows_per_job:
+                assigned.append(recovery_queue.popleft())
+            if not assigned:
+                break
+            self._queue_bundle(account=account, assigned=assigned)
+            queued_jobs += 1
+        return queued_jobs
+
+
 def run_window_workers(
     *,
     window_queue: list[WindowTaskRef],
@@ -757,221 +1058,26 @@ def run_window_workers(
     recovery_windows_lookup: Callable[[BundleSpec, T], Sequence[WindowTaskRef]] | None = None,
     terminal_bundle_lookup: Callable[[BundleSpec, T], bool] | None = None,
 ) -> BalancedBatchResult[T]:
-    if windows_per_job <= 0:
-        raise ValueError("windows_per_job must be > 0")
-    if pending_buffer_per_account < 0:
-        raise ValueError("pending_buffer_per_account must be >= 0")
-    if idle_sleep_seconds <= 0:
-        raise ValueError("idle_sleep_seconds must be > 0")
-    if not accounts:
-        raise ValueError("accounts must not be empty")
-    if job_index_start <= 0:
-        raise ValueError("job_index_start must be > 0")
     if not window_queue:
         return BalancedBatchResult(results=[], max_inflight_jobs=0, submitted_jobs=0)
-
-    completed_windows = dict(initial_completed_windows or {})
-    total_target_workers = min(len(window_queue), sum(max(1, account.max_jobs) for account in accounts))
-    account_order: list[AccountConfigLike] = []
-    while len(account_order) < total_target_workers:
-        progressed = False
-        for account in accounts:
-            assigned_for_account = sum(1 for item in account_order if item.account_id == account.account_id)
-            if assigned_for_account >= account.max_jobs:
-                continue
-            account_order.append(account)
-            progressed = True
-            if len(account_order) >= total_target_workers:
-                break
-        if not progressed:
-            break
-
-    if not account_order:
-        raise RuntimeError("Unable to allocate worker targets.")
-
-    if max_workers is None:
-        max_workers = max(1, len(account_order))
-    else:
-        max_workers = max(1, max_workers)
-
-    queue = deque(window_queue)
-    worker_inputs: list[list[WindowTaskRef]] = [[] for _ in range(len(account_order))]
-    for worker_index in range(len(account_order)):
-        if not queue:
-            break
-        worker_inputs[worker_index].append(queue.popleft())
-    while queue:
-        progressed = False
-        for assigned in worker_inputs:
-            if not queue:
-                break
-            if len(assigned) >= windows_per_job:
-                continue
-            assigned.append(queue.popleft())
-            progressed = True
-        if not progressed:
-            break
-
-    bundles: list[BundleSpec] = []
-    target_workers_by_account: dict[str, int] = {}
-    job_counter = job_index_start - 1
-    for worker_index, account in enumerate(account_order):
-        assigned = worker_inputs[worker_index]
-        if not assigned:
-            continue
-        target_workers_by_account[account.account_id] = target_workers_by_account.get(account.account_id, 0) + 1
-        job_counter += 1
-        bundles.append(
-            BundleSpec(
-                job_id=f"job_{job_counter:04d}",
-                job_index=job_counter,
-                account_id=account.account_id,
-                host_alias=account.host_alias,
-                window_inputs=tuple(assigned),
-            )
-        )
-
-    backlog_owner_index = 0
-    while queue:
-        account = account_order[backlog_owner_index % len(account_order)]
-        assigned: list[WindowTaskRef] = []
-        while queue and len(assigned) < windows_per_job:
-            assigned.append(queue.popleft())
-        if not assigned:
-            break
-        job_counter += 1
-        bundles.append(
-            BundleSpec(
-                job_id=f"job_{job_counter:04d}",
-                job_index=job_counter,
-                account_id=account.account_id,
-                host_alias=account.host_alias,
-                window_inputs=tuple(assigned),
-            )
-        )
-        backlog_owner_index += 1
-
-    pending_bundles_by_account: dict[str, deque[BundleSpec]] = {}
-    for bundle in bundles:
-        pending_bundles_by_account.setdefault(bundle.account_id, deque()).append(bundle)
-
-    inflight_windows: dict[str, int] = {}
-    inflight_workers: dict[str, int] = {}
-    results: list[T] = []
-    max_inflight_jobs = 0
-    submitted_jobs = 0
-    terminal_jobs = 0
-    replacement_jobs = 0
-
-    def _queue_bundles_for_account(*, account: AccountConfigLike, windows: Sequence[WindowTaskRef]) -> int:
-        nonlocal job_counter
-        queued_jobs = 0
-        recovery_queue = deque(windows)
-        while recovery_queue:
-            assigned: list[WindowTaskRef] = []
-            while recovery_queue and len(assigned) < windows_per_job:
-                assigned.append(recovery_queue.popleft())
-            if not assigned:
-                break
-            job_counter += 1
-            pending_bundles_by_account.setdefault(account.account_id, deque()).append(
-                BundleSpec(
-                    job_id=f"job_{job_counter:04d}",
-                    job_index=job_counter,
-                    account_id=account.account_id,
-                    host_alias=account.host_alias,
-                    window_inputs=tuple(assigned),
-                )
-            )
-            queued_jobs += 1
-        return queued_jobs
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_bundle: dict[Future[T], BundleSpec] = {}
-
-        while future_to_bundle or any(queue for queue in pending_bundles_by_account.values()):
-            done_futures = [future for future in tuple(future_to_bundle) if future.done()]
-            for future in done_futures:
-                bundle = future_to_bundle.pop(future)
-                result = future.result()
-                results.append(result)
-                inflight_windows[bundle.account_id] = max(0, inflight_windows.get(bundle.account_id, 0) - bundle.window_count)
-                inflight_workers[bundle.account_id] = max(0, inflight_workers.get(bundle.account_id, 0) - 1)
-                completed_windows[bundle.account_id] = completed_windows.get(bundle.account_id, 0) + bundle.window_count
-                if terminal_bundle_lookup is not None and terminal_bundle_lookup(bundle, result):
-                    terminal_jobs += 1
-                if recovery_windows_lookup is not None:
-                    recovery_windows = list(recovery_windows_lookup(bundle, result))
-                    if recovery_windows:
-                        account = next((item for item in accounts if item.account_id == bundle.account_id), None)
-                        if account is not None:
-                            replacement_jobs += _queue_bundles_for_account(account=account, windows=recovery_windows)
-
-            snapshots: list[AccountCapacitySnapshot] = []
-            for account in accounts:
-                try:
-                    snapshot = capacity_lookup(account=account, pending_buffer_per_account=pending_buffer_per_account)
-                except Exception as exc:
-                    if on_capacity_error is not None:
-                        on_capacity_error(account, exc)
-                    continue
-                snapshots.append(snapshot)
-                if on_capacity_snapshot is not None:
-                    on_capacity_snapshot(snapshot)
-
-            if not snapshots:
-                raise RuntimeError("No account capacity snapshots available for worker startup.")
-
-            snapshot_by_account = {snapshot.account_id: snapshot for snapshot in snapshots}
-            submitted_any = False
-            for account in accounts:
-                queue = pending_bundles_by_account.get(account.account_id)
-                if not queue:
-                    continue
-                snapshot = snapshot_by_account.get(account.account_id)
-                if snapshot is None:
-                    continue
-                target_workers = target_workers_by_account.get(account.account_id, 0)
-                if target_workers <= 0:
-                    continue
-                external_occupied = max(
-                    0,
-                    max(0, snapshot.running_count) + max(0, snapshot.pending_count) - inflight_workers.get(account.account_id, 0),
-                )
-                available_workers = max(
-                    0,
-                    target_workers - external_occupied - inflight_workers.get(account.account_id, 0),
-                )
-                while queue and available_workers > 0 and len(future_to_bundle) < max_workers:
-                    bundle = queue.popleft()
-                    future = executor.submit(worker, bundle)
-                    future_to_bundle[future] = bundle
-                    inflight_windows[bundle.account_id] = inflight_windows.get(bundle.account_id, 0) + bundle.window_count
-                    inflight_workers[bundle.account_id] = inflight_workers.get(bundle.account_id, 0) + 1
-                    available_workers -= 1
-                    submitted_any = True
-                    submitted_jobs += 1
-                    max_inflight_jobs = max(max_inflight_jobs, len(future_to_bundle))
-                    if on_bundle_submitted is not None:
-                        on_bundle_submitted(bundle)
-
-            if submitted_any:
-                time.sleep(idle_sleep_seconds)
-                continue
-
-            if future_to_bundle:
-                wait(tuple(future_to_bundle), return_when=FIRST_COMPLETED, timeout=idle_sleep_seconds)
-                continue
-
-            time.sleep(idle_sleep_seconds)
-
-    return BalancedBatchResult(
-        results=results,
-        max_inflight_jobs=max_inflight_jobs,
-        submitted_jobs=submitted_jobs,
-        terminal_jobs=terminal_jobs,
-        replacement_jobs=replacement_jobs,
+    controller = WindowWorkerController(
+        accounts=accounts,
+        windows_per_job=windows_per_job,
+        pending_buffer_per_account=pending_buffer_per_account,
+        worker=worker,
+        capacity_lookup=capacity_lookup,
+        initial_completed_windows=initial_completed_windows,
+        job_index_start=job_index_start,
+        max_workers=max_workers,
+        idle_sleep_seconds=idle_sleep_seconds,
+        on_capacity_snapshot=on_capacity_snapshot,
+        on_bundle_submitted=on_bundle_submitted,
+        on_capacity_error=on_capacity_error,
+        recovery_windows_lookup=recovery_windows_lookup,
+        terminal_bundle_lookup=terminal_bundle_lookup,
     )
+    controller.enqueue_windows(window_queue)
+    return controller.finalize()
 
 
 def calculate_effective_slots(*, max_jobs_per_account: int) -> int:
