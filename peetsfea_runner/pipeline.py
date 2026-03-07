@@ -73,6 +73,7 @@ class _ReadyArtifactState:
     ready_present: bool
     ready_mode: str
     ready_error: str | None = None
+    locked: bool = False
 
 
 @dataclass(slots=True)
@@ -917,6 +918,9 @@ def _ingest_window_queue(
             relative_path=relative_path,
         )
         ready_state = _ensure_ready_artifact(input_file, config.ready_sidecar_suffix)
+        if getattr(ready_state, "locked", False):
+            discovered_count += 1
+            continue
         file_stat = input_file.stat()
         discovered_count += 1
 
@@ -1857,6 +1861,10 @@ def _ready_path_for_input(input_path: Path, ready_suffix: str) -> Path:
     return Path(f"{input_path}{ready_suffix}")
 
 
+def _lock_path_for_input(input_path: Path) -> Path:
+    return Path(f"{input_path}.lock")
+
+
 def _restore_window_input_from_stage(*, source_path: Path, target_path: Path, ready_suffix: str) -> None:
     if not source_path.exists():
         return
@@ -1867,6 +1875,15 @@ def _restore_window_input_from_stage(*, source_path: Path, target_path: Path, re
 
 def _ensure_ready_artifact(input_path: Path, ready_suffix: str) -> _ReadyArtifactState:
     ready_path = _ready_path_for_input(input_path, ready_suffix)
+    lock_path = _lock_path_for_input(input_path)
+    if lock_path.exists():
+        return _ReadyArtifactState(
+            ready_path=ready_path,
+            ready_present=ready_path.exists(),
+            ready_mode="LOCKED",
+            ready_error=f"lock present: {lock_path.name}",
+            locked=True,
+        )
     try:
         ready_path.parent.mkdir(parents=True, exist_ok=True)
         ready_path.touch(exist_ok=True)
@@ -1874,6 +1891,7 @@ def _ensure_ready_artifact(input_path: Path, ready_suffix: str) -> _ReadyArtifac
             ready_path=ready_path,
             ready_present=True,
             ready_mode="SIDECAR",
+            locked=False,
         )
     except OSError as exc:
         return _ReadyArtifactState(
@@ -1881,6 +1899,7 @@ def _ensure_ready_artifact(input_path: Path, ready_suffix: str) -> _ReadyArtifac
             ready_present=ready_path.exists(),
             ready_mode="INTERNAL_ONLY",
             ready_error=str(exc),
+            locked=False,
         )
 
 

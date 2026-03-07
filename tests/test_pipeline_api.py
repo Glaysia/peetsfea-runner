@@ -72,6 +72,20 @@ class TestPipelineApi(unittest.TestCase):
             self.assertEqual(files, [input_file.resolve()])
             self.assertTrue((input_dir / "foo.aedt.ready").is_file())
 
+    def test_validate_does_not_create_ready_sidecar_when_lock_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "foo.aedt"
+            input_file.write_text("x", encoding="utf-8")
+            Path(f"{input_file}.lock").write_text("", encoding="utf-8")
+
+            config = PipelineConfig(input_queue_dir=str(input_dir), continuous_mode=False)
+            _input_root, _output_root, files, _accounts = config.validate()
+
+            self.assertEqual(files, [input_file.resolve()])
+            self.assertFalse((input_dir / "foo.aedt.ready").exists())
+
     def test_validate_follows_symlinked_input_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -371,6 +385,40 @@ class TestPipelineApi(unittest.TestCase):
                 (False, "INTERNAL_ONLY", "read-only filesystem", "SUCCEEDED"),
             )
             self.assertIn("READY_INTERNAL", stages)
+
+    def test_continuous_mode_skips_locked_input_without_creating_ready_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "sample_01.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            Path(f"{input_file}.lock").write_text("", encoding="utf-8")
+
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=False,
+                continuous_mode=True,
+            )
+
+            result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.total_windows, 0)
+            self.assertFalse((input_dir / "sample_01.aedt.ready").exists())
+            self.assertFalse((output_root / "sample_01.aedt.out").exists())
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                window_count = conn.execute("SELECT COUNT(*) FROM window_tasks").fetchone()[0]
+                ingest_count = conn.execute("SELECT COUNT(*) FROM ingest_index").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(window_count, 0)
+            self.assertEqual(ingest_count, 0)
 
     def test_materialized_terminal_output_deletes_input_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
