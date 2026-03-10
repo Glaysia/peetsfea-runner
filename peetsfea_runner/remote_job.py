@@ -663,7 +663,7 @@ def _build_remote_job_script_content() -> str:
         "            port=grpc_port,",
         "            close_on_exit=True,",
         "        )",
-        "        hfss.solve_in_batch(file_name='./project.aedt', cores=[cores], tasks=[tasks])",
+        "        hfss.solve_in_batch(file_name='./project.aedt', cores=cores, tasks=tasks)",
         "        # Batch solve output is already persisted in project artifacts.",
         "        # save_project() can intermittently fail on shared Ansoft temp path",
         "        # even when simulation completed normally; treat it as non-fatal.",

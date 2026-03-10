@@ -9,6 +9,8 @@
 3. 신규 코드/리팩터링 시 CLI 옵션/서브커맨드/엔트리포인트 추가를 금지한다.
 4. 문서와 테스트도 함수 호출 경로만 예시로 사용한다.
 5. 실행, 테스트, 디버깅은 항상 저장소 루트의 `.venv` Python(`.venv/bin/python`)을 사용한다.
+6. `pytest`가 필요하지만 `.venv`에 없으면 `uv pip install --python .venv/bin/python pytest`로 설치한다.
+7. `pytest` 실행은 항상 `.venv/bin/python -m pytest ...` 형태를 사용한다.
 
 ## Debug Policy
 

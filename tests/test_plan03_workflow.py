@@ -38,6 +38,9 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("ensure_runner_venv() {", content)
         self.assertIn("\"$VENV_DIR/bin/python\" run_sim.py", content)
         self.assertIn("os.environ['TMPDIR'] = str(tmpdir)", content)
+        self.assertIn("hfss.solve_in_batch(file_name='./project.aedt', cores=cores, tasks=tasks)", content)
+        self.assertNotIn("cores=[cores]", content)
+        self.assertNotIn("tasks=[tasks]", content)
 
     def test_remote_dispatch_script_uses_noninteractive_srun_without_screen(self) -> None:
         class _Cfg:

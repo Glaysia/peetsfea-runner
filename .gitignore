@@ -12,7 +12,7 @@
 *.duckdb.wal
 *.bak
 
-input_queue/*
+input_queue*/*
 output/*
 
 examples/*
