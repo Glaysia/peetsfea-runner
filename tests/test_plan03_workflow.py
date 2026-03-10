@@ -21,6 +21,10 @@ from peetsfea_runner.pipeline import (
     _run_with_retry,
 )
 from peetsfea_runner.remote_job import _categorize_failure, _resolve_remote_path
+from peetsfea_runner.remote_job import (
+    _build_windows_remote_dispatch_script_content,
+    _build_windows_remote_job_script_content,
+)
 
 
 class TestPlan03Workflow(unittest.TestCase):
@@ -41,6 +45,8 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("hfss.solve_in_batch(file_name='./project.aedt', cores=cores, tasks=tasks)", content)
         self.assertNotIn("cores=[cores]", content)
         self.assertNotIn("tasks=[tasks]", content)
+        self.assertIn('if [ -e "$MINICONDA_DIR" ]; then', content)
+        self.assertIn('rm -rf "$MINICONDA_DIR"', content)
 
     def test_remote_dispatch_script_uses_noninteractive_srun_without_screen(self) -> None:
         class _Cfg:
@@ -69,6 +75,34 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("archive_path=$(mktemp /tmp/peetsfea-results.", content)
         self.assertIn('tar -czf "$archive_path" case_* case_summary.txt failed.count', content)
         self.assertNotIn("tar --exclude='.venv' --exclude='results.tgz' --exclude='.env_initialized' -czf results.tgz .", content)
+
+    def test_windows_remote_scripts_use_powershell_without_slurm(self) -> None:
+        class _Cfg:
+            platform = "windows"
+            scheduler = "none"
+            partition = "cpu2"
+            nodes = 1
+            ntasks = 1
+            cpus_per_job = 16
+            mem = "960G"
+            time_limit = "05:00:00"
+            slots_per_job = 4
+            cores_per_slot = 4
+
+        job_content = _build_windows_remote_job_script_content()
+        dispatch_content = _build_windows_remote_dispatch_script_content(
+            config=_Cfg(),
+            remote_job_dir=r"C:\peets\job_0001",
+            case_count=2,
+        )
+        self.assertIn("Scripts\\python.exe", job_content)
+        self.assertIn("hfss.solve_in_batch(file_name='./project.aedt', cores=cores, tasks=tasks)", job_content)
+        self.assertNotIn("module load", job_content)
+        self.assertNotIn("srun", dispatch_content)
+        self.assertNotIn("squeue", dispatch_content)
+        self.assertNotIn("bash -lc", dispatch_content)
+        self.assertIn("remote_job.ps1", dispatch_content)
+        self.assertIn("__PEETS_RESULTS_TGZ_BEGIN__", dispatch_content)
 
     def test_retry_calls_action_again(self) -> None:
         calls = {"count": 0}

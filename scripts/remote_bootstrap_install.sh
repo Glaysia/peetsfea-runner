@@ -34,6 +34,10 @@ ensure_miniconda() {
     return 0
   fi
 
+  if [[ -e "$MINICONDA_DIR" ]]; then
+    rm -rf "${MINICONDA_DIR}"
+  fi
+
   echo "[INFO] Installing Miniconda3 to ${MINICONDA_DIR}"
   local installer_path
   installer_path="$(mktemp /tmp/miniconda_installer.XXXXXX.sh)"
@@ -49,6 +53,11 @@ ensure_conda_python312() {
   local conda_bin="$MINICONDA_DIR/bin/conda"
   if [[ ! -x "${conda_bin}" ]]; then
     fail "Miniconda3 conda 실행 파일을 찾을 수 없습니다."
+  fi
+
+  if "${conda_bin}" tos --help >/dev/null 2>&1; then
+    "${conda_bin}" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
+    "${conda_bin}" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
   fi
 
   if [[ -x "${CONDA_PYTHON_PATH}" ]]; then

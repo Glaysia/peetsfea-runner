@@ -35,6 +35,8 @@ class AccountConfigLike(Protocol):
     account_id: str
     host_alias: str
     max_jobs: int
+    platform: str
+    scheduler: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -54,6 +56,8 @@ class BundleSpec:
     account_id: str
     host_alias: str
     slot_inputs: tuple[SlotTaskRef, ...]
+    platform: str = "linux"
+    scheduler: str = "slurm"
 
     @property
     def slot_count(self) -> int:
@@ -113,6 +117,27 @@ _PREFLIGHT_MARKER = "__PEETSFEA_PREFLIGHT__:"
 _BOOTSTRAP_MARKER = "__PEETSFEA_BOOTSTRAP__:ok"
 
 
+def _account_platform(account: AccountConfigLike) -> str:
+    return getattr(account, "platform", "linux").strip().lower()
+
+
+def _account_scheduler(account: AccountConfigLike) -> str:
+    default = "slurm" if _account_platform(account) == "linux" else "none"
+    return getattr(account, "scheduler", default).strip().lower()
+
+
+def _windows_ssh_command(account: AccountConfigLike, command: str) -> list[str]:
+    return [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        account.host_alias,
+        command,
+    ]
+
+
 def parse_squeue_state_counts(lines: Sequence[str]) -> tuple[int, int, dict[str, int]]:
     state_counts: dict[str, int] = {}
     for raw in lines:
@@ -133,6 +158,19 @@ def query_account_capacity(
     ssh_connect_timeout_seconds: int = 5,
     command_timeout_seconds: int = 8,
 ) -> AccountCapacitySnapshot:
+    if (_account_platform(account), _account_scheduler(account)) == ("windows", "none"):
+        return AccountCapacitySnapshot(
+            account_id=account.account_id,
+            host_alias=account.host_alias,
+            running_count=0,
+            pending_count=0,
+            allowed_submit=max(0, account.max_jobs),
+        )
+    if (_account_platform(account), _account_scheduler(account)) != ("linux", "slurm"):
+        raise RuntimeError(
+            f"unsupported account provider account={account.account_id} "
+            f"platform={_account_platform(account)} scheduler={_account_scheduler(account)}"
+        )
     if pending_buffer_per_account < 0:
         raise ValueError("pending_buffer_per_account must be >= 0")
     if ssh_connect_timeout_seconds <= 0:
@@ -248,6 +286,149 @@ def _parse_readiness_marker(*, account: AccountConfigLike, text: str) -> Account
     )
 
 
+def _build_windows_readiness_script() -> str:
+    return r"""
+$ErrorActionPreference = 'Stop'
+$HomeOk = 1
+$ModuleOk = 1
+$MinicondaDir = Join-Path $HOME 'miniconda3'
+$VenvDir = Join-Path $HOME '.peetsfea-runner-venv'
+$CondaEnvName = 'peetsfea-runner-py312'
+$CondaPython = Join-Path $MinicondaDir ('envs\' + $CondaEnvName + '\python.exe')
+$RuntimeOk = [int](Test-Path $MinicondaDir)
+$VenvOk = [int](Test-Path (Join-Path $VenvDir 'Scripts\python.exe'))
+$PythonOk = [int](Test-Path $CondaPython)
+$BinariesOk = [int]($RuntimeOk -and $VenvOk -and $PythonOk)
+$AnsysOk = 0
+if (Get-Command ansysedt.exe -ErrorAction SilentlyContinue) { $AnsysOk = 1 }
+elseif (Test-Path 'C:\Program Files\ANSYS Inc') { $AnsysOk = 1 }
+Write-Output ('__PEETSFEA_READY__:home={0} runtime={1} venv={2} python={3} module={4} binaries={5} ansys={6}' -f $HomeOk,$RuntimeOk,$VenvOk,$PythonOk,$ModuleOk,$BinariesOk,$AnsysOk)
+"""
+
+
+def _build_windows_preflight_script() -> str:
+    return r"""
+$ErrorActionPreference = 'Stop'
+$HomeOk = 1
+$ModuleOk = 1
+$MinicondaDir = Join-Path $HOME 'miniconda3'
+$VenvDir = Join-Path $HOME '.peetsfea-runner-venv'
+$CondaEnvName = 'peetsfea-runner-py312'
+$CondaPython = Join-Path $MinicondaDir ('envs\' + $CondaEnvName + '\python.exe')
+$RuntimeOk = [int](Test-Path $MinicondaDir)
+$VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
+$VenvOk = [int](Test-Path $VenvPython)
+$PythonOk = [int](Test-Path $CondaPython)
+$BinariesOk = [int]($RuntimeOk -and $VenvOk -and $PythonOk)
+$AnsysOk = 0
+if (Get-Command ansysedt.exe -ErrorAction SilentlyContinue) { $AnsysOk = 1 }
+elseif (Test-Path 'C:\Program Files\ANSYS Inc') { $AnsysOk = 1 }
+$UvOk = 0
+if ($VenvOk) {
+  & $VenvPython -m uv --version *> $null
+  if ($LASTEXITCODE -eq 0) { $UvOk = 1 }
+}
+$PyaedtOk = 0
+if ($VenvOk) {
+  & $VenvPython -c "import ansys.aedt.core" *> $null
+  if ($LASTEXITCODE -eq 0) { $PyaedtOk = 1 }
+}
+Write-Output ('__PEETSFEA_PREFLIGHT__:home={0} runtime={1} venv={2} python={3} module={4} binaries={5} ansys={6} uv={7} pyaedt={8}' -f $HomeOk,$RuntimeOk,$VenvOk,$PythonOk,$ModuleOk,$BinariesOk,$AnsysOk,$UvOk,$PyaedtOk)
+"""
+
+
+def _run_windows_ssh_script(
+    *,
+    account: AccountConfigLike,
+    script: str,
+    run_command: Callable[[list[str]], tuple[int, str, str]] | None,
+    ssh_connect_timeout_seconds: int,
+    command_timeout_seconds: int,
+    stage: str,
+) -> tuple[int, str, str]:
+    command = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={ssh_connect_timeout_seconds}",
+        account.host_alias,
+        f"powershell -NoProfile -NonInteractive -Command {shlex.quote(script)}",
+    ]
+    if run_command is not None:
+        return run_command(command)
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=command_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{stage} timed out account={account.account_id} host={account.host_alias} "
+            f"timeout={command_timeout_seconds}s"
+        ) from exc
+    return completed.returncode, completed.stdout or "", completed.stderr or ""
+
+
+def _query_windows_account_readiness(
+    *,
+    account: AccountConfigLike,
+    run_command: Callable[[list[str]], tuple[int, str, str]] | None,
+    ssh_connect_timeout_seconds: int,
+    command_timeout_seconds: int,
+) -> AccountReadinessSnapshot:
+    return_code, stdout, stderr = _run_windows_ssh_script(
+        account=account,
+        script=_build_windows_readiness_script(),
+        run_command=run_command,
+        ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+        command_timeout_seconds=command_timeout_seconds,
+        stage="windows readiness check",
+    )
+    combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
+    if combined_output:
+        snapshot = _parse_readiness_marker(account=account, text=combined_output)
+        if return_code != 0 and snapshot.ready:
+            raise RuntimeError(
+                f"readiness check failed account={account.account_id}: "
+                f"{(stderr or stdout).strip() or f'return code={return_code}'}"
+            )
+        return snapshot
+    details = (stderr or stdout).strip() or f"return code={return_code}"
+    raise RuntimeError(f"readiness check failed account={account.account_id}: {details}")
+
+
+def _query_windows_account_preflight(
+    *,
+    account: AccountConfigLike,
+    run_command: Callable[[list[str]], tuple[int, str, str]] | None,
+    ssh_connect_timeout_seconds: int,
+    command_timeout_seconds: int,
+) -> AccountReadinessSnapshot:
+    return_code, stdout, stderr = _run_windows_ssh_script(
+        account=account,
+        script=_build_windows_preflight_script(),
+        run_command=run_command,
+        ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+        command_timeout_seconds=command_timeout_seconds,
+        stage="windows preflight check",
+    )
+    combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
+    if combined_output:
+        snapshot = _parse_preflight_marker(account=account, text=combined_output)
+        if return_code != 0 and snapshot.ready:
+            raise RuntimeError(
+                f"preflight check failed account={account.account_id}: "
+                f"{(stderr or stdout).strip() or f'return code={return_code}'}"
+            )
+        return snapshot
+    details = (stderr or stdout).strip() or f"return code={return_code}"
+    raise RuntimeError(f"preflight check failed account={account.account_id}: {details}")
+
+
 def query_account_readiness(
     *,
     account: AccountConfigLike,
@@ -255,6 +436,18 @@ def query_account_readiness(
     ssh_connect_timeout_seconds: int = 5,
     command_timeout_seconds: int = 12,
 ) -> AccountReadinessSnapshot:
+    if (_account_platform(account), _account_scheduler(account)) == ("windows", "none"):
+        return _query_windows_account_readiness(
+            account=account,
+            run_command=run_command,
+            ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+            command_timeout_seconds=command_timeout_seconds,
+        )
+    if (_account_platform(account), _account_scheduler(account)) != ("linux", "slurm"):
+        raise RuntimeError(
+            f"unsupported account provider account={account.account_id} "
+            f"platform={_account_platform(account)} scheduler={_account_scheduler(account)}"
+        )
     if ssh_connect_timeout_seconds <= 0:
         raise ValueError("ssh_connect_timeout_seconds must be > 0")
     if command_timeout_seconds <= 0:
@@ -400,6 +593,18 @@ def query_account_preflight(
     ssh_connect_timeout_seconds: int = 5,
     command_timeout_seconds: int = 20,
 ) -> AccountReadinessSnapshot:
+    if (_account_platform(account), _account_scheduler(account)) == ("windows", "none"):
+        return _query_windows_account_preflight(
+            account=account,
+            run_command=run_command,
+            ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+            command_timeout_seconds=command_timeout_seconds,
+        )
+    if (_account_platform(account), _account_scheduler(account)) != ("linux", "slurm"):
+        raise RuntimeError(
+            f"unsupported account provider account={account.account_id} "
+            f"platform={_account_platform(account)} scheduler={_account_scheduler(account)}"
+        )
     if ssh_connect_timeout_seconds <= 0:
         raise ValueError("ssh_connect_timeout_seconds must be > 0")
     if command_timeout_seconds <= 0:
@@ -499,6 +704,18 @@ def bootstrap_account_runtime(
     ssh_connect_timeout_seconds: int = 5,
     command_timeout_seconds: int = 900,
 ) -> str:
+    if (_account_platform(account), _account_scheduler(account)) == ("windows", "none"):
+        return _bootstrap_windows_account_runtime(
+            account=account,
+            run_command=run_command,
+            ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+            command_timeout_seconds=command_timeout_seconds,
+        )
+    if (_account_platform(account), _account_scheduler(account)) != ("linux", "slurm"):
+        raise RuntimeError(
+            f"unsupported account provider account={account.account_id} "
+            f"platform={_account_platform(account)} scheduler={_account_scheduler(account)}"
+        )
     if ssh_connect_timeout_seconds <= 0:
         raise ValueError("ssh_connect_timeout_seconds must be > 0")
     if command_timeout_seconds <= 0:
@@ -532,12 +749,19 @@ ensure_miniconda() {
   if [ -x "$MINICONDA_DIR/bin/conda" ]; then
     return 0
   fi
+  if [ -e "$MINICONDA_DIR" ]; then
+    rm -rf "$MINICONDA_DIR"
+  fi
   installer_path=$(mktemp /tmp/miniconda_installer.XXXXXX.sh)
   download_miniconda_installer "$installer_path"
   bash "$installer_path" -b -p "$MINICONDA_DIR"
   rm -f "$installer_path"
 }
 ensure_conda_python312() {
+  if "$MINICONDA_DIR/bin/conda" tos --help >/dev/null 2>&1; then
+    "$MINICONDA_DIR/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
+    "$MINICONDA_DIR/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
+  fi
   if [ -x "$CONDA_PYTHON_PATH" ]; then
     major_minor="$($CONDA_PYTHON_PATH -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
     if [ "$major_minor" = "3.12" ]; then
@@ -604,6 +828,73 @@ printf '__PEETSFEA_BOOTSTRAP__:ok\\n'
     else:
         return_code, stdout, stderr = run_command(command)
 
+    output = "\n".join(part for part in (stdout, stderr) if part).strip()
+    if return_code != 0 or _BOOTSTRAP_MARKER not in output:
+        details = output or f"return code={return_code}"
+        raise RuntimeError(f"bootstrap failed account={account.account_id}: {details}")
+    return output
+
+
+def _bootstrap_windows_account_runtime(
+    *,
+    account: AccountConfigLike,
+    run_command: Callable[[list[str]], tuple[int, str, str]] | None,
+    ssh_connect_timeout_seconds: int,
+    command_timeout_seconds: int,
+) -> str:
+    remote_script = r"""
+$ErrorActionPreference = 'Stop'
+$VenvDir = Join-Path $HOME '.peetsfea-runner-venv'
+$MinicondaDir = Join-Path $HOME 'miniconda3'
+$CondaEnvName = 'peetsfea-runner-py312'
+$CondaPythonPath = Join-Path $MinicondaDir ('envs\' + $CondaEnvName + '\python.exe')
+$CondaExe = Join-Path $MinicondaDir 'Scripts\conda.exe'
+$InstallerPath = Join-Path $env:TEMP 'Miniconda3-latest-Windows-x86_64.exe'
+function Ensure-Miniconda {
+  if (Test-Path $CondaExe) { return }
+  if (Test-Path $MinicondaDir) { Remove-Item -Recurse -Force $MinicondaDir }
+  Invoke-WebRequest -UseBasicParsing -Uri 'https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe' -OutFile $InstallerPath
+  Start-Process -FilePath $InstallerPath -ArgumentList '/InstallationType=JustMe','/RegisterPython=0','/S',('/D=' + $MinicondaDir) -Wait
+  Remove-Item -Force $InstallerPath
+}
+function Ensure-CondaPython312 {
+  & $CondaExe tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main *> $null
+  & $CondaExe tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r *> $null
+  if (Test-Path $CondaPythonPath) {
+    $ver = & $CondaPythonPath -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+    if ($ver -eq '3.12') { return }
+  }
+  & $CondaExe create -y -n $CondaEnvName python=3.12
+}
+function Ensure-RunnerVenv {
+  $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
+  $recreate = $true
+  if (Test-Path $VenvPython) {
+    $ver = & $VenvPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+    if ($ver -eq '3.12') { $recreate = $false }
+  }
+  if ($recreate) {
+    if (Test-Path $VenvDir) { Remove-Item -Recurse -Force $VenvDir }
+    & $CondaPythonPath -m venv $VenvDir
+  }
+}
+Ensure-Miniconda
+Ensure-CondaPython312
+Ensure-RunnerVenv
+$VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
+& $VenvPython -m pip install --upgrade pip
+& $VenvPython -m pip install uv
+& $VenvPython -m uv pip install pyaedt==0.25.1
+Write-Output '__PEETSFEA_BOOTSTRAP__:ok'
+"""
+    return_code, stdout, stderr = _run_windows_ssh_script(
+        account=account,
+        script=remote_script,
+        run_command=run_command,
+        ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+        command_timeout_seconds=command_timeout_seconds,
+        stage="windows bootstrap",
+    )
     output = "\n".join(part for part in (stdout, stderr) if part).strip()
     if return_code != 0 or _BOOTSTRAP_MARKER not in output:
         details = output or f"return code={return_code}"
@@ -728,6 +1019,8 @@ def run_slot_bundles(
                 account_id=selected.account_id,
                 host_alias=selected.host_alias,
                 slot_inputs=tuple(bundle_inputs),
+                platform=_account_platform(selected),
+                scheduler=_account_scheduler(selected),
             )
             future = executor.submit(worker, bundle)
             inflight_futures[future] = (selected.account_id, len(bundle_inputs))
@@ -953,6 +1246,8 @@ class SlotWorkerController(Generic[T]):
                     account_id=account.account_id,
                     host_alias=account.host_alias,
                     slot_inputs=tuple(bundle_slots),
+                    platform=_account_platform(account),
+                    scheduler=_account_scheduler(account),
                 )
                 future = self._executor.submit(self._worker, bundle)
                 self._future_to_bundle[future] = bundle

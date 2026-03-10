@@ -50,9 +50,10 @@ def _parse_accounts_from_env() -> tuple[AccountConfig, ...]:
     Parse PEETSFEA_ACCOUNTS as comma-separated entries.
     Entry formats:
       - account_id@host_alias:max_jobs
+      - account_id@host_alias:max_jobs:platform:scheduler
       - account_id@host_alias
     Example:
-      account_01@gate1-harry:10,account_02@gate1-dhj02:10,account_03@gate1-jji0930:10
+      account_01@gate1-harry:10,account_02@gate1-dhj02:10,account_03@gate1-jji0930:10,account_04@gate1-dw16:2:windows:none
     """
     raw = os.getenv("PEETSFEA_ACCOUNTS", "").strip()
     if not raw:
@@ -71,17 +72,33 @@ def _parse_accounts_from_env() -> tuple[AccountConfig, ...]:
             raise ValueError(f"Invalid PEETSFEA_ACCOUNTS entry (empty account_id): {entry}")
 
         max_jobs = 10
+        platform = "linux"
+        scheduler = "slurm"
         host_alias = host_and_jobs.strip()
-        if ":" in host_and_jobs:
-            host_alias, max_jobs_raw = host_and_jobs.rsplit(":", 1)
-            host_alias = host_alias.strip()
-            max_jobs = int(max_jobs_raw.strip())
+        parts = [part.strip() for part in host_and_jobs.split(":")]
+        if len(parts) >= 2:
+            host_alias = parts[0]
+            max_jobs = int(parts[1])
+        if len(parts) >= 3 and parts[2]:
+            platform = parts[2].lower()
+        if len(parts) >= 4 and parts[3]:
+            scheduler = parts[3].lower()
+        if len(parts) > 4:
+            raise ValueError(f"Invalid PEETSFEA_ACCOUNTS entry (too many fields): {entry}")
         if not host_alias:
             raise ValueError(f"Invalid PEETSFEA_ACCOUNTS entry (empty host_alias): {entry}")
         if max_jobs <= 0:
             raise ValueError(f"Invalid PEETSFEA_ACCOUNTS entry (max_jobs must be > 0): {entry}")
 
-        accounts.append(AccountConfig(account_id=account_id, host_alias=host_alias, max_jobs=max_jobs))
+        accounts.append(
+            AccountConfig(
+                account_id=account_id,
+                host_alias=host_alias,
+                max_jobs=max_jobs,
+                platform=platform,
+                scheduler=scheduler,
+            )
+        )
 
     if not accounts:
         raise ValueError("PEETSFEA_ACCOUNTS is set but no valid account entries were parsed.")

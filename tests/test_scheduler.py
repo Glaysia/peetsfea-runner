@@ -12,6 +12,8 @@ from unittest.mock import patch
 from peetsfea_runner.scheduler import (
     AccountCapacitySnapshot,
     AccountReadinessSnapshot,
+    _build_windows_preflight_script,
+    _build_windows_readiness_script,
     bootstrap_account_runtime,
     JobSpec,
     SlotTaskRef,
@@ -32,6 +34,8 @@ class _Account:
     account_id: str
     host_alias: str
     max_jobs: int
+    platform: str = "linux"
+    scheduler: str = "slurm"
 
 
 @dataclass(slots=True)
@@ -183,6 +187,69 @@ class TestScheduler(unittest.TestCase):
             run_command=lambda _cmd: (0, "__PEETSFEA_BOOTSTRAP__:ok\n", ""),
         )
         self.assertIn("__PEETSFEA_BOOTSTRAP__:ok", output)
+
+    def test_linux_bootstrap_recreates_stale_miniconda_dir(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        seen: list[list[str]] = []
+
+        def _runner(cmd: list[str]) -> tuple[int, str, str]:
+            seen.append(cmd)
+            return 0, "__PEETSFEA_BOOTSTRAP__:ok\n", ""
+
+        bootstrap_account_runtime(account=account, run_command=_runner)
+        self.assertTrue(seen)
+        self.assertIn('if [ -e "$MINICONDA_DIR" ]; then', seen[0][-1])
+        self.assertIn('rm -rf "$MINICONDA_DIR"', seen[0][-1])
+
+    def test_query_windows_account_capacity_uses_local_max_jobs(self) -> None:
+        account = _Account(account_id="w1", host_alias="win-1", max_jobs=2, platform="windows", scheduler="none")
+        snapshot = query_account_capacity(account=account, pending_buffer_per_account=3)
+        self.assertEqual(snapshot.running_count, 0)
+        self.assertEqual(snapshot.pending_count, 0)
+        self.assertEqual(snapshot.allowed_submit, 2)
+
+    def test_query_windows_account_readiness_uses_powershell_marker(self) -> None:
+        account = _Account(account_id="w1", host_alias="win-1", max_jobs=2, platform="windows", scheduler="none")
+        seen: list[list[str]] = []
+
+        def _runner(cmd: list[str]) -> tuple[int, str, str]:
+            seen.append(cmd)
+            return (
+                0,
+                "__PEETSFEA_READY__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1\n",
+                "",
+            )
+
+        snapshot = query_account_readiness(
+            account=account,
+            run_command=_runner,
+        )
+        self.assertTrue(snapshot.ready)
+        self.assertEqual(snapshot.status, "READY")
+        self.assertTrue(seen)
+        self.assertIn("powershell -NoProfile -NonInteractive -Command", seen[0][-1])
+
+    def test_windows_bootstrap_dispatches_via_powershell(self) -> None:
+        account = _Account(account_id="w1", host_alias="win-1", max_jobs=2, platform="windows", scheduler="none")
+        seen: list[list[str]] = []
+
+        def _runner(cmd: list[str]) -> tuple[int, str, str]:
+            seen.append(cmd)
+            return 0, "__PEETSFEA_BOOTSTRAP__:ok\n", ""
+
+        output = bootstrap_account_runtime(account=account, run_command=_runner)
+        self.assertIn("__PEETSFEA_BOOTSTRAP__:ok", output)
+        self.assertTrue(seen)
+        self.assertIn("powershell -NoProfile -NonInteractive -Command", seen[0][-1])
+
+    def test_windows_scripts_do_not_reference_slurm_or_modules(self) -> None:
+        readiness = _build_windows_readiness_script()
+        preflight = _build_windows_preflight_script()
+        for content in (readiness, preflight):
+            self.assertNotIn("squeue", content)
+            self.assertNotIn("srun", content)
+            self.assertNotIn("module load", content)
+            self.assertNotIn("bash -lc", content)
 
     def test_pick_balanced_account_uses_score_then_running_then_account_id(self) -> None:
         capacities = [

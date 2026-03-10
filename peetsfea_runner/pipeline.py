@@ -69,6 +69,8 @@ class AccountConfig:
     host_alias: str
     max_jobs: int = 10
     enabled: bool = True
+    platform: str = "linux"
+    scheduler: str = "slurm"
 
 
 @dataclass(slots=True, frozen=True)
@@ -168,6 +170,10 @@ class PipelineConfig:
                 raise ValueError("host_alias must not be empty")
             if account.max_jobs <= 0:
                 raise ValueError("account.max_jobs must be > 0")
+            platform = account.platform.strip().lower()
+            scheduler = account.scheduler.strip().lower()
+            if (platform, scheduler) not in {("linux", "slurm"), ("windows", "none")}:
+                raise ValueError("account platform/scheduler must be linux/slurm or windows/none")
 
         files: list[Path] = []
         if not self.continuous_mode:
@@ -250,6 +256,8 @@ class _RemoteExecutionConfig:
     time_limit: str
     slots_per_job: int
     cores_per_slot: int
+    platform: str = "linux"
+    scheduler: str = "slurm"
 
 
 def _scan_input_aedt_files(*, input_root: Path, recursive: bool) -> list[Path]:
@@ -802,6 +810,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 time_limit=config.time_limit,
                 slots_per_job=config.slots_per_job,
                 cores_per_slot=config.cores_per_slot,
+                platform=account.platform,
+                scheduler=account.scheduler,
             )
             try:
                 cleanup_orphan_sessions_for_run(config=cleanup_cfg, run_id=run_id)
@@ -1111,6 +1121,8 @@ def _run_bundle_with_retry(
         time_limit=config.time_limit,
         slots_per_job=config.slots_per_job,
         cores_per_slot=config.cores_per_slot,
+        platform=bundle.platform,
+        scheduler=bundle.scheduler,
     )
     with TemporaryDirectory(prefix=f"peetsfea_bundle_{bundle.job_id}_") as tmpdir:
         local_bundle_dir = Path(tmpdir) / "bundle"

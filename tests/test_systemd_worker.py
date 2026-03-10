@@ -43,6 +43,24 @@ class TestSystemdWorker(unittest.TestCase):
             self.assertEqual(config.mem, "512G")
             self.assertEqual(config.time_limit, "02:30:00")
 
+    def test_build_config_parses_windows_account_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                environ,
+                {
+                    "PEETSFEA_INPUT_QUEUE_DIR": str(Path(tmpdir) / "in"),
+                    "PEETSFEA_OUTPUT_ROOT_DIR": str(Path(tmpdir) / "out"),
+                    "PEETSFEA_DB_PATH": str(Path(tmpdir) / "state.duckdb"),
+                    "PEETSFEA_ACCOUNTS": "account_01@gate1-harry:10,account_04@gate1-dw16:2:windows:none",
+                },
+                clear=False,
+            ):
+                config = _build_config()
+
+        self.assertEqual(len(config.accounts_registry), 2)
+        self.assertEqual(config.accounts_registry[1].platform, "windows")
+        self.assertEqual(config.accounts_registry[1].scheduler, "none")
+
     def test_run_worker_iteration_marks_idle_when_pipeline_is_idle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"

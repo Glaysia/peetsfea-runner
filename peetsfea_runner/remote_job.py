@@ -30,6 +30,8 @@ class RemoteJobConfig(Protocol):
     time_limit: str
     slots_per_job: int
     cores_per_slot: int
+    platform: str
+    scheduler: str
 
 
 @dataclass(slots=True)
@@ -92,6 +94,15 @@ def _log_stage(message: str) -> None:
     print(f"[peetsfea][{timestamp}] {message}", flush=True)
 
 
+def _remote_platform(config: RemoteJobConfig) -> str:
+    return getattr(config, "platform", "linux").strip().lower()
+
+
+def _remote_scheduler(config: RemoteJobConfig) -> str:
+    default = "slurm" if _remote_platform(config) == "linux" else "none"
+    return getattr(config, "scheduler", default).strip().lower()
+
+
 def run_remote_job_attempt(
     *,
     config: RemoteJobConfig,
@@ -126,7 +137,11 @@ def run_remote_job_attempt(
                 staged_project = tmpdir_path / f"project_{index:02d}.aedt"
                 shutil.copy2(slot.input_path, staged_project)
                 staged_projects.append(staged_project)
-            remote_script = _write_remote_job_script(tmpdir_path)
+            remote_script = (
+                _write_windows_remote_job_script(tmpdir_path)
+                if _remote_platform(config) == "windows"
+                else _write_remote_job_script(tmpdir_path)
+            )
             remote_dispatch_script = _write_remote_dispatch_script(
                 tmpdir_path,
                 config=config,
@@ -147,9 +162,9 @@ def run_remote_job_attempt(
             remote_job_dir=resolved_remote_job_dir,
             case_count=case_count,
         )
-        local_archive = local_job_dir / "results.tgz"
+        local_archive = local_job_dir / ("results.zip" if _remote_platform(config) == "windows" else "results.tgz")
         local_archive.write_bytes(workflow_result.archive_bytes)
-        _extract_local_results_archive(local_job_dir=local_job_dir)
+        _extract_local_results_archive(local_job_dir=local_job_dir, archive_name=local_archive.name)
         _cleanup_remote_workspace(config, remote_job_dir=resolved_remote_job_dir)
     except WorkflowError as exc:
         failure_category = _categorize_failure(
@@ -243,6 +258,19 @@ def cleanup_orphan_sessions_for_run(*, config: RemoteJobConfig, run_id: str) -> 
 
 
 def _resolve_remote_path(*, config: RemoteJobConfig, path: str) -> str:
+    if _remote_platform(config) == "windows":
+        home = _get_remote_home(config=config)
+        if path == "~":
+            return home
+        if path.startswith("~/"):
+            return f"{home}\\{path[2:].replace('/', '\\')}"
+        if path == "/tmp/peetsfea-runner" or path.startswith("/tmp/peetsfea-runner/"):
+            scoped_root = f"{home}\\AppData\\Local\\Temp\\peetsfea-runner"
+            if path == "/tmp/peetsfea-runner":
+                return scoped_root
+            suffix = path[len("/tmp/peetsfea-runner/") :].replace("/", "\\")
+            return f"{scoped_root}\\{suffix}"
+        return path.replace("/", "\\")
     if path == "~" or path.startswith("~/"):
         home = _get_remote_home(config=config)
         if path == "~":
@@ -258,8 +286,13 @@ def _resolve_remote_path(*, config: RemoteJobConfig, path: str) -> str:
 
 
 def _get_remote_home(*, config: RemoteJobConfig) -> str:
+    command = ["ssh", config.host]
+    if _remote_platform(config) == "windows":
+        command.append('powershell -NoProfile -NonInteractive -Command "$HOME"')
+    else:
+        command.append('printf %s "$HOME"')
     completed = subprocess.run(
-        ["ssh", config.host, "printf %s \"$HOME\""],
+        command,
         check=False,
         capture_output=True,
         text=True,
@@ -272,6 +305,10 @@ def _get_remote_home(*, config: RemoteJobConfig) -> str:
             raise WorkflowError(f"ssh failed: {details}", exit_code=EXIT_CODE_SSH_FAILURE)
         raise WorkflowError("ssh failed while resolving remote home directory.", exit_code=EXIT_CODE_SSH_FAILURE)
     home = (completed.stdout or "").strip()
+    if _remote_platform(config) == "windows":
+        if ":" not in home:
+            raise WorkflowError("Unable to resolve remote home directory.", exit_code=EXIT_CODE_SSH_FAILURE)
+        return home
     if not home.startswith("/"):
         raise WorkflowError("Unable to resolve remote home directory.", exit_code=EXIT_CODE_SSH_FAILURE)
     return home
@@ -286,8 +323,19 @@ def _get_remote_user(*, config: RemoteJobConfig) -> str:
 
 
 def _prepare_remote_workspace(config: RemoteJobConfig, *, remote_job_dir: str) -> None:
-    remote_path = _remote_path_for_shell(remote_job_dir)
+    remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
     _log_stage(f"prepare remote workspace path={remote_job_dir}")
+    if _remote_platform(config) == "windows":
+        command = (
+            "powershell -NoProfile -NonInteractive -Command "
+            + shlex.quote(f"New-Item -ItemType Directory -Force -Path '{remote_job_dir}' | Out-Null")
+        )
+        _run_subprocess(
+            ["ssh", config.host, command],
+            stage="ssh",
+            exit_code=EXIT_CODE_SSH_FAILURE,
+        )
+        return
     _run_subprocess(
         ["ssh", config.host, f"mkdir -p {shlex.quote(remote_path)}"],
         stage="ssh",
@@ -331,8 +379,14 @@ def _download_results(config: RemoteJobConfig, *, remote_job_dir: str, local_job
     )
 
 
-def _extract_local_results_archive(*, local_job_dir: Path) -> None:
-    local_archive = local_job_dir / "results.tgz"
+def _extract_local_results_archive(*, local_job_dir: Path, archive_name: str = "results.tgz") -> None:
+    local_archive = local_job_dir / archive_name
+    if local_archive.suffix == ".zip":
+        try:
+            shutil.unpack_archive(str(local_archive), str(local_job_dir), format="zip")
+        except Exception as exc:
+            raise WorkflowError("download extract failed: unable to extract zip archive", exit_code=EXIT_CODE_DOWNLOAD_FAILURE) from exc
+        return
     _run_subprocess(
         ["tar", "-xzf", str(local_archive), "-C", str(local_job_dir)],
         stage="download extract",
@@ -341,8 +395,19 @@ def _extract_local_results_archive(*, local_job_dir: Path) -> None:
 
 
 def _cleanup_remote_workspace(config: RemoteJobConfig, *, remote_job_dir: str) -> None:
-    remote_path = _remote_path_for_shell(remote_job_dir)
+    remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
     _log_stage(f"cleanup remote workspace path={remote_job_dir}")
+    if _remote_platform(config) == "windows":
+        command = (
+            "powershell -NoProfile -NonInteractive -Command "
+            + shlex.quote(f"if (Test-Path '{remote_job_dir}') {{ Remove-Item -Recurse -Force '{remote_job_dir}' }}")
+        )
+        _run_subprocess(
+            ["ssh", config.host, command],
+            stage="remote cleanup",
+            exit_code=EXIT_CODE_REMOTE_CLEANUP_FAILURE,
+        )
+        return
     _run_subprocess(
         ["ssh", config.host, f"rm -rf {shlex.quote(remote_path)}"],
         stage="remote cleanup",
@@ -381,8 +446,14 @@ def _submit_remote_workflow_noninteractive(
     *,
     remote_job_dir: str,
 ) -> _RemoteWorkflowSubmission:
-    remote_path = _remote_path_for_shell(remote_job_dir)
-    command = f"cd {shlex.quote(remote_path)} && bash ./remote_dispatch.sh"
+    remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
+    if _remote_platform(config) == "windows":
+        command = (
+            "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "
+            + shlex.quote(f"Set-Location '{remote_job_dir}'; .\\remote_dispatch.ps1")
+        )
+    else:
+        command = f"cd {shlex.quote(remote_path)} && bash ./remote_dispatch.sh"
     timeout_seconds = _time_limit_to_seconds(config.time_limit) + 900
     _log_stage(f"launch non-interactive remote workflow host={config.host} path={remote_job_dir}")
     completed = _run_completed_process_capture(
@@ -481,7 +552,9 @@ def _normalize_slot_inputs(
     ]
 
 
-def _remote_path_for_shell(path: str) -> str:
+def _remote_path_for_shell(*, config: RemoteJobConfig, path: str) -> str:
+    if _remote_platform(config) == "windows":
+        return path
     if path == "~":
         return "$HOME"
     if path.startswith("~/"):
@@ -526,12 +599,19 @@ def _build_remote_job_script_content() -> str:
         "  if [ -x \"$MINICONDA_DIR/bin/conda\" ]; then",
         "    return 0",
         "  fi",
+        "  if [ -e \"$MINICONDA_DIR\" ]; then",
+        "    rm -rf \"$MINICONDA_DIR\"",
+        "  fi",
         "  installer_path=$(mktemp /tmp/miniconda_installer.XXXXXX.sh)",
         "  download_miniconda_installer \"$installer_path\"",
         "  bash \"$installer_path\" -b -p \"$MINICONDA_DIR\"",
         "  rm -f \"$installer_path\"",
         "}",
         "ensure_conda_python312() {",
+        "  if \"$MINICONDA_DIR/bin/conda\" tos --help >/dev/null 2>&1; then",
+        "    \"$MINICONDA_DIR/bin/conda\" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true",
+        "    \"$MINICONDA_DIR/bin/conda\" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true",
+        "  fi",
         "  if [ -x \"$CONDA_PYTHON_PATH\" ]; then",
         "    major_minor=\"$($CONDA_PYTHON_PATH -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")')\"",
         "    if [ \"$major_minor\" = \"3.12\" ]; then",
@@ -685,13 +765,74 @@ def _build_remote_job_script_content() -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_windows_remote_job_script_content() -> str:
+    lines = [
+        "$ErrorActionPreference = 'Stop'",
+        "$VenvDir = Join-Path $HOME '.peetsfea-runner-venv'",
+        "$RunSim = @'",
+        "from __future__ import annotations",
+        "",
+        "import os",
+        "from pathlib import Path",
+        "from ansys.aedt.core import Hfss",
+        "",
+        "AEDT_FILENAME = 'project.aedt'",
+        "",
+        "def remove_lock_files(workdir: Path) -> None:",
+        "    for lock_file in workdir.glob('*.lock'):",
+        "        lock_file.unlink(missing_ok=True)",
+        "",
+        "def main() -> None:",
+        "    workdir = Path.cwd()",
+        "    project_file = workdir / AEDT_FILENAME",
+        "    if not project_file.exists():",
+        "        raise FileNotFoundError(project_file)",
+        "    tmpdir = workdir / 'tmp'",
+        "    tmpdir.mkdir(parents=True, exist_ok=True)",
+        "    os.environ['TMPDIR'] = str(tmpdir)",
+        "    cores = int(os.environ.get('PEETS_SLOT_CORES', '4'))",
+        "    tasks = int(os.environ.get('PEETS_SLOT_TASKS', '1'))",
+        "    remove_lock_files(workdir)",
+        "    hfss = Hfss(non_graphical=True, new_desktop=True, close_on_exit=True)",
+        "    try:",
+        "        hfss.solve_in_batch(file_name='./project.aedt', cores=cores, tasks=tasks)",
+        "        hfss.save_project()",
+        "    finally:",
+        "        hfss.release_desktop(close_projects=True, close_desktop=True)",
+        "",
+        "if __name__ == '__main__':",
+        "    main()",
+        "'@",
+        "Set-Content -Path run_sim.py -Value $RunSim",
+        "& (Join-Path $VenvDir 'Scripts\\python.exe') run_sim.py",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _write_remote_job_script(tmpdir: Path) -> Path:
     script = tmpdir / "remote_job.sh"
     script.write_text(_build_remote_job_script_content(), encoding="utf-8")
     return script
 
 
+def _write_windows_remote_job_script(tmpdir: Path) -> Path:
+    script = tmpdir / "remote_job.ps1"
+    script.write_text(_build_windows_remote_job_script_content(), encoding="utf-8")
+    return script
+
+
 def _write_remote_dispatch_script(tmpdir: Path, *, config: RemoteJobConfig, remote_job_dir: str, case_count: int) -> Path:
+    if _remote_platform(config) == "windows":
+        script = tmpdir / "remote_dispatch.ps1"
+        script.write_text(
+            _build_windows_remote_dispatch_script_content(
+                config=config,
+                remote_job_dir=remote_job_dir,
+                case_count=case_count,
+            ),
+            encoding="utf-8",
+        )
+        return script
     script = tmpdir / "remote_dispatch.sh"
     script.write_text(
         _build_remote_dispatch_script_content(
@@ -705,7 +846,7 @@ def _write_remote_dispatch_script(tmpdir: Path, *, config: RemoteJobConfig, remo
 
 
 def _build_remote_dispatch_script_content(*, config: RemoteJobConfig, remote_job_dir: str, case_count: int) -> str:
-    remote_path = _remote_path_for_shell(remote_job_dir)
+    remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
     lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
@@ -718,6 +859,53 @@ def _build_remote_dispatch_script_content(*, config: RemoteJobConfig, remote_job
             case_count=case_count,
         ),
     ]
+    return "\n".join(lines) + "\n"
+
+
+def _build_windows_remote_dispatch_script_content(*, config: RemoteJobConfig, remote_job_dir: str, case_count: int) -> str:
+    lines = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$RemoteJobDir = {remote_job_dir!r}",
+        "Set-Location $RemoteJobDir",
+        "New-Item -ItemType Directory -Force -Path '.\\results' | Out-Null",
+    ]
+    for case_index in range(1, case_count + 1):
+        case_name = f"case_{case_index:02d}"
+        source_name = f"project_{case_index:02d}.aedt"
+        lines.extend(
+            [
+                f"New-Item -ItemType Directory -Force -Path '.\\{case_name}' | Out-Null",
+                f"Copy-Item -Force '.\\{source_name}' '.\\{case_name}\\project.aedt'",
+                f"Set-Location '.\\{case_name}'",
+                f"$env:PEETS_SLOT_CORES = '{config.cores_per_slot}'",
+                "$env:PEETS_SLOT_TASKS = '1'",
+                "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ..\\remote_job.ps1 *> run.log",
+                "if ($LASTEXITCODE -eq $null) { $LASTEXITCODE = 0 }",
+                "Set-Content -Path exit.code -Value $LASTEXITCODE",
+                "Set-Location ..",
+            ]
+        )
+    lines.extend(
+        [
+            "$failed = 0",
+            "Remove-Item -Force case_summary.txt, failed.count -ErrorAction SilentlyContinue",
+            f"1..{case_count} | ForEach-Object {{",
+            "  $caseDir = ('case_{0:d2}' -f $_)",
+            "  if (Test-Path (Join-Path $caseDir 'exit.code')) { $code = (Get-Content (Join-Path $caseDir 'exit.code')).Trim() } else { $code = '97' }",
+            "  Add-Content -Path case_summary.txt -Value ($caseDir + ':' + $code)",
+            "  if ([int]$code -ne 0) { $failed += 1 }",
+            "}",
+            "Set-Content -Path failed.count -Value $failed",
+            "Compress-Archive -Path case_*, case_summary.txt, failed.count -DestinationPath results.zip -Force",
+            "Write-Output ('__PEETS_FAILED_COUNT__:{0}' -f $failed)",
+            "Write-Output '__PEETS_CASE_SUMMARY_BEGIN__'",
+            "Get-Content case_summary.txt",
+            "Write-Output '__PEETS_CASE_SUMMARY_END__'",
+            "Write-Output '__PEETS_RESULTS_TGZ_BEGIN__'",
+            "[Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $RemoteJobDir 'results.zip')))",
+            "Write-Output '__PEETS_RESULTS_TGZ_END__'",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
