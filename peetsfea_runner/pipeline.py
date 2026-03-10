@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import os
 import shutil
 import time
@@ -616,8 +617,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
 
     if config.continuous_mode:
         low_watermark, high_watermark = _continuous_backlog_limits(config=config, accounts=accounts)
-        input_iter = _iter_input_aedt_files(input_root=input_root, recursive=config.scan_recursive)
-        scan_exhausted = False
+        pending_scan_files: deque[Path] = deque()
+        rescan_scan_files: deque[Path] = deque()
+        next_scan_monotonic = 0.0
+
         def _start_controller(*, force: bool = False) -> bool:
             nonlocal controller, queued_slots, readiness_blocked_slots
             if controller is not None:
@@ -674,6 +677,16 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             return True
 
         while True:
+            controller_has_work = controller is not None and controller.has_work()
+            if (
+                not controller_has_work
+                and not queued_slots
+                and not pending_scan_files
+                and not rescan_scan_files
+                and total_slots > 0
+            ):
+                break
+
             controller_snapshot = controller.snapshot() if controller is not None else None
             backlog_slots = len(queued_slots)
             if controller_snapshot is not None:
@@ -684,35 +697,53 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 )
 
             if controller is None and queued_slots:
-                forced_start = scan_exhausted or len(queued_slots) >= config.slots_per_job
-                if forced_start and _start_controller(force=scan_exhausted):
+                scan_backlog_empty = not pending_scan_files and not rescan_scan_files
+                forced_start = scan_backlog_empty or len(queued_slots) >= config.slots_per_job
+                if forced_start and _start_controller(force=scan_backlog_empty):
                     continue
 
-            if not scan_exhausted and backlog_slots < high_watermark:
-                try:
-                    input_file = next(input_iter)
-                except StopIteration:
-                    scan_exhausted = True
+            now = time.monotonic()
+            if now >= next_scan_monotonic:
+                scan_results = _scan_input_aedt_files(input_root=input_root, recursive=config.scan_recursive)
+                queued_scan_paths = set(pending_scan_files)
+                queued_scan_paths.update(rescan_scan_files)
+                filtered_scan_results = [
+                    path
+                    for path in scan_results
+                    if path not in queued_scan_paths and not Path(f"{path}{config.ready_sidecar_suffix}").exists()
+                ]
+                has_active_ingest_backlog = bool(
+                    pending_scan_files or rescan_scan_files or queued_slots or controller is not None
+                )
+                if has_active_ingest_backlog:
+                    rescan_scan_files.extend(filtered_scan_results)
                 else:
-                    slots, discovered_delta = _ingest_slot_queue(
-                        config=config,
-                        state_store=state_store,
-                        run_id=run_id,
-                        input_root=input_root,
-                        output_root=output_root,
-                        aedt_files=[input_file],
-                    )
-                    discovered_count += discovered_delta
-                    if slots:
-                        total_slots += len(slots)
-                        if controller is not None:
-                            controller.enqueue_slots(slots)
-                            controller.step(wait_for_progress=False)
-                        else:
-                            queued_slots.extend(slots)
-                            if len(queued_slots) >= config.slots_per_job:
-                                _start_controller()
-                    continue
+                    pending_scan_files.extend(filtered_scan_results)
+                next_scan_monotonic = now + config.ingest_poll_seconds
+
+            allow_rescan_ingest = bool(rescan_scan_files)
+            scan_queue = rescan_scan_files if allow_rescan_ingest else pending_scan_files
+            if scan_queue and (backlog_slots < high_watermark or allow_rescan_ingest):
+                input_file = scan_queue.popleft()
+                slots, _discovered_delta = _ingest_slot_queue(
+                    config=config,
+                    state_store=state_store,
+                    run_id=run_id,
+                    input_root=input_root,
+                    output_root=output_root,
+                    aedt_files=[input_file],
+                )
+                discovered_count += len(slots)
+                if slots:
+                    total_slots += len(slots)
+                    if controller is not None:
+                        controller.enqueue_slots(slots)
+                        controller.step(wait_for_progress=False)
+                    else:
+                        queued_slots.extend(slots)
+                        if len(queued_slots) >= config.slots_per_job:
+                            _start_controller()
+                continue
 
             if controller is not None:
                 controller_snapshot = controller.snapshot()
@@ -721,19 +752,20 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     + controller_snapshot.pending_slots
                     + controller_snapshot.inflight_slots
                 )
-                wait_for_progress = scan_exhausted or controller_backlog >= low_watermark
+                wait_for_progress = not pending_scan_files and not rescan_scan_files
                 progressed = controller.step(wait_for_progress=wait_for_progress)
                 if progressed:
                     continue
-                if scan_exhausted and not controller.has_work():
+                if not controller.has_work() and not queued_slots and not pending_scan_files and not rescan_scan_files:
                     break
 
-            if controller is None and scan_exhausted:
+            if controller is None and not pending_scan_files and not rescan_scan_files:
                 if queued_slots:
                     if _start_controller(force=True):
                         continue
                     readiness_blocked_slots = len(queued_slots)
-                break
+                else:
+                    break
 
             if controller is None and blocked_account_ids and backlog_slots >= high_watermark:
                 readiness_blocked_slots = backlog_slots

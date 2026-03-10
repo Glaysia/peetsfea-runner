@@ -327,6 +327,111 @@ class TestPipelineApi(unittest.TestCase):
             for index in range(1, 31):
                 self.assertTrue((input_dir / f"sample_{index:02d}.aedt.ready").is_file())
 
+    def test_continuous_mode_rescans_and_ingests_late_arriving_file_during_active_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            first_file = input_dir / "sample_01.aedt"
+            late_file = input_dir / "sample_02.aedt"
+            first_file.write_text("placeholder", encoding="utf-8")
+            late_file.write_text("placeholder", encoding="utf-8")
+
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=False,
+                continuous_mode=True,
+                ingest_poll_seconds=1,
+                slots_per_job=1,
+            )
+            submitted_sizes: list[int] = []
+            scan_calls = 0
+
+            def _mock_scan(*, input_root, recursive):
+                nonlocal scan_calls
+                scan_calls += 1
+                if scan_calls == 1:
+                    return [first_file]
+                return [first_file, late_file]
+
+            class _FakeController:
+                def __init__(self, **kwargs):
+                    self._pending: list = []
+                    self._step_calls = 0
+                    self._submitted = 0
+
+                def enqueue_slots(self, slots):
+                    self._pending.extend(slots)
+
+                def snapshot(self):
+                    return SimpleNamespace(
+                        queued_slots=0,
+                        pending_slots=len(self._pending),
+                        inflight_slots=0,
+                        inflight_jobs=0,
+                        submitted_jobs=self._submitted,
+                    )
+
+                def has_work(self):
+                    return bool(self._pending)
+
+                def step(self, *, wait_for_progress=False):
+                    self._step_calls += 1
+                    if not self._pending:
+                        return False
+                    if len(self._pending) < 2:
+                        return False
+                    submitted_sizes.append(len(self._pending))
+                    conn = duckdb.connect(str(db_path))
+                    try:
+                        conn.executemany(
+                            """
+                            UPDATE slot_tasks
+                            SET state = 'SUCCEEDED',
+                                updated_at = now()
+                            WHERE slot_id = ?
+                            """,
+                            [[slot.slot_id] for slot in self._pending],
+                        )
+                    finally:
+                        conn.close()
+                    self._submitted += 1
+                    self._pending = []
+                    return True
+
+                def finalize(self):
+                    return SimpleNamespace(
+                        results=[],
+                        max_inflight_jobs=0,
+                        submitted_jobs=self._submitted,
+                        terminal_jobs=0,
+                        replacement_jobs=0,
+                    )
+
+            monotonic_tick = {"value": -1.0}
+
+            def _mock_monotonic():
+                monotonic_tick["value"] += 1.0
+                return min(monotonic_tick["value"], 3.0)
+
+            with (
+                patch("peetsfea_runner.pipeline._continuous_backlog_limits", return_value=(1, 1)),
+                patch("peetsfea_runner.pipeline._scan_input_aedt_files", side_effect=_mock_scan),
+                patch("peetsfea_runner.pipeline.SlotWorkerController", _FakeController),
+                patch("peetsfea_runner.pipeline.time.monotonic", side_effect=_mock_monotonic),
+            ):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.total_slots, 2)
+            self.assertGreaterEqual(scan_calls, 2)
+            self.assertEqual(submitted_sizes, [2])
+            self.assertTrue((input_dir / "sample_01.aedt.ready").is_file())
+            self.assertTrue((input_dir / "sample_02.aedt.ready").is_file())
+
     def test_continuous_mode_ingests_without_ready_sidecar_when_internal_ready_fallback_is_used(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"

@@ -1222,19 +1222,30 @@ class SlotWorkerController(Generic[T]):
             target_workers = self._target_workers_by_account.get(account.account_id, 0)
             if target_workers <= 0:
                 continue
+            inflight_workers = self._inflight_workers.get(account.account_id, 0)
             external_occupied = max(
                 0,
-                max(0, snapshot.running_count) + max(0, snapshot.pending_count) - self._inflight_workers.get(account.account_id, 0),
+                max(0, snapshot.running_count) + max(0, snapshot.pending_count) - inflight_workers,
             )
             target_available_workers = max(
                 0,
-                target_workers - external_occupied - self._inflight_workers.get(account.account_id, 0),
+                target_workers - external_occupied,
             )
             allowed_submit_workers = max(
                 0,
-                snapshot.allowed_submit - self._inflight_workers.get(account.account_id, 0),
+                snapshot.allowed_submit,
             )
             available_workers = min(target_available_workers, allowed_submit_workers)
+            if available_workers <= 0:
+                print(
+                    "[peetsfea] "
+                    f"dispatch gate account={account.account_id} "
+                    f"target_available={target_available_workers} "
+                    f"allowed_submit={allowed_submit_workers} "
+                    f"inflight_local={inflight_workers} "
+                    f"external_occupied={external_occupied}",
+                    flush=True,
+                )
             while queue and available_workers > 0 and len(self._future_to_bundle) < self._max_workers:
                 bundle_slots = queue.popleft()
                 if bundle_slots in self._pending_seed_bundles:
