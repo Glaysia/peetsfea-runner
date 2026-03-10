@@ -10,7 +10,7 @@ Environment=PEETSFEA_INPUT_QUEUE_DIR=%h/peetsfea-runner/input_queue
 Environment=PEETSFEA_OUTPUT_ROOT_DIR=%h/peetsfea-runner/output
 Environment=PEETSFEA_DELETE_FAILED_DIR=%h/peetsfea-runner/output/_delete_failed
 Environment=PEETSFEA_DB_PATH=%h/peetsfea-runner/peetsfea_runner.duckdb
-Environment=PEETSFEA_ACCOUNTS=account_01@gate1-harry:10,account_02@gate1-dhj02:10,account_03@gate1-jji0930:10
+Environment=PEETSFEA_ACCOUNTS=account_01@gate1-harry:10,account_02@gate1-dhj02:10,account_03@gate1-jji0930:10,account_04@gate1-dw16:10
 Environment=PEETSFEA_EXECUTE_REMOTE=true
 Environment=PEETSFEA_PARTITION=cpu2
 Environment=PEETSFEA_CPUS_PER_JOB=16
