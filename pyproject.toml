@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peetsfea-runner"
-version = "0.1.0"
+version = "2026.03.10.1"
 description = "Function-only AEDT Slurm pipeline skeleton"
 requires-python = "==3.12.*"
 dependencies = [

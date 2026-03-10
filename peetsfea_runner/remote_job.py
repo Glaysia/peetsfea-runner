@@ -28,8 +28,8 @@ class RemoteJobConfig(Protocol):
     cpus_per_job: int
     mem: str
     time_limit: str
-    windows_per_job: int
-    cores_per_window: int
+    slots_per_job: int
+    cores_per_slot: int
 
 
 @dataclass(slots=True)
@@ -63,8 +63,8 @@ class WorkflowError(RuntimeError):
 
 
 @dataclass(slots=True, frozen=True)
-class WindowInput:
-    window_id: str
+class SlotInput:
+    slot_id: str
     input_path: Path
 
 
@@ -96,16 +96,16 @@ def run_remote_job_attempt(
     *,
     config: RemoteJobConfig,
     aedt_path: Path | None = None,
-    window_inputs: Sequence[WindowInput] | None = None,
+    slot_inputs: Sequence[SlotInput] | None = None,
     remote_job_dir: str,
     local_job_dir: Path,
     session_name: str,
     on_upload_success: Callable[[], None] | None = None,
 ) -> RemoteJobAttemptResult:
-    inputs = _normalize_window_inputs(
+    inputs = _normalize_slot_inputs(
         config=config,
         aedt_path=aedt_path,
-        window_inputs=window_inputs,
+        slot_inputs=slot_inputs,
     )
     case_count = len(inputs)
 
@@ -114,7 +114,7 @@ def run_remote_job_attempt(
     resolved_remote_job_dir = _resolve_remote_path(config=config, path=remote_job_dir)
     _log_stage(
         "job attempt start "
-        f"session={session_name} window_count={case_count} remote_dir={remote_job_dir} "
+        f"session={session_name} slot_count={case_count} remote_dir={remote_job_dir} "
         f"resolved_remote_dir={resolved_remote_job_dir}"
     )
     try:
@@ -122,9 +122,9 @@ def run_remote_job_attempt(
         with TemporaryDirectory(prefix="peetsfea_runner_") as tmpdir:
             tmpdir_path = Path(tmpdir)
             staged_projects: list[Path] = []
-            for index, window in enumerate(inputs, start=1):
+            for index, slot in enumerate(inputs, start=1):
                 staged_project = tmpdir_path / f"project_{index:02d}.aedt"
-                shutil.copy2(window.input_path, staged_project)
+                shutil.copy2(slot.input_path, staged_project)
                 staged_projects.append(staged_project)
             remote_script = _write_remote_job_script(tmpdir_path)
             remote_dispatch_script = _write_remote_dispatch_script(
@@ -457,27 +457,27 @@ def _run_completed_process(
     return completed
 
 
-def _normalize_window_inputs(
+def _normalize_slot_inputs(
     *,
     config: RemoteJobConfig,
     aedt_path: Path | None,
-    window_inputs: Sequence[WindowInput] | None,
-) -> list[WindowInput]:
-    if aedt_path is None and window_inputs is None:
-        raise ValueError("Either aedt_path or window_inputs must be provided.")
-    if aedt_path is not None and window_inputs is not None:
-        raise ValueError("aedt_path and window_inputs are mutually exclusive.")
+    slot_inputs: Sequence[SlotInput] | None,
+) -> list[SlotInput]:
+    if aedt_path is None and slot_inputs is None:
+        raise ValueError("Either aedt_path or slot_inputs must be provided.")
+    if aedt_path is not None and slot_inputs is not None:
+        raise ValueError("aedt_path and slot_inputs are mutually exclusive.")
 
-    if window_inputs is not None:
-        normalized = list(window_inputs)
+    if slot_inputs is not None:
+        normalized = list(slot_inputs)
         if not normalized:
-            raise ValueError("window_inputs must not be empty.")
+            raise ValueError("slot_inputs must not be empty.")
         return normalized
 
     assert aedt_path is not None
     return [
-        WindowInput(window_id=f"case_{index:02d}", input_path=aedt_path)
-        for index in range(1, config.windows_per_job + 1)
+        SlotInput(slot_id=f"case_{index:02d}", input_path=aedt_path)
+        for index in range(1, config.slots_per_job + 1)
     ]
 
 
@@ -649,7 +649,8 @@ def _build_remote_job_script_content() -> str:
         "    tmpdir = workdir / 'tmp'",
         "    tmpdir.mkdir(parents=True, exist_ok=True)",
         "    os.environ['TMPDIR'] = str(tmpdir)",
-        "    cores = int(os.environ.get('PEETS_CORES', '32'))",
+        "    cores = int(os.environ.get('PEETS_SLOT_CORES', '4'))",
+        "    tasks = int(os.environ.get('PEETS_SLOT_TASKS', '1'))",
         "    remove_lock_files(workdir)",
         "    grpc_port = get_available_port()",
         "    ansys_process = launch_ansys_grpc_server(grpc_port)",
@@ -662,7 +663,7 @@ def _build_remote_job_script_content() -> str:
         "            port=grpc_port,",
         "            close_on_exit=True,",
         "        )",
-        "        hfss.solve_in_batch(file_name='./project.aedt', cores=cores, tasks=cores)",
+        "        hfss.solve_in_batch(file_name='./project.aedt', cores=[cores], tasks=[tasks])",
         "        # Batch solve output is already persisted in project artifacts.",
         "        # save_project() can intermittently fail on shared Ansoft temp path",
         "        # even when simulation completed normally; treat it as non-fatal.",
@@ -721,7 +722,7 @@ def _build_remote_dispatch_script_content(*, config: RemoteJobConfig, remote_job
 
 
 def _build_noninteractive_srun_command(*, config: RemoteJobConfig, remote_job_dir: str, case_count: int) -> str:
-    max_parallel = max(1, int(getattr(config, "windows_per_job", case_count)))
+    max_parallel = max(1, int(getattr(config, "slots_per_job", case_count)))
     payload_lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
@@ -752,7 +753,7 @@ def _build_noninteractive_srun_command(*, config: RemoteJobConfig, remote_job_di
             "    cd \"$case_dir\"",
             "    mkdir -p tmp",
             "    export TMPDIR=\"$PWD/tmp\"",
-            f"    if PEETS_CORES={config.cores_per_window} bash ../remote_job.sh > run.log 2>&1; then",
+            f"    if PEETS_SLOT_CORES={config.cores_per_slot} PEETS_SLOT_TASKS=1 bash ../remote_job.sh > run.log 2>&1; then",
             "      rc=0",
             "    else",
             "      rc=$?",
@@ -789,42 +790,42 @@ def _build_noninteractive_srun_command(*, config: RemoteJobConfig, remote_job_di
     )
 
 
-def _count_screen_windows(output: str) -> int:
+def _count_screen_slots(output: str) -> int:
     tokens = output.strip()
     if not tokens:
         return 0
-    window_tokens = re.findall(r"(?:(?<=^)|(?<=\s))\d+\$?(?=\s)", tokens)
-    return len(window_tokens)
+    slot_tokens = re.findall(r"(?:(?<=^)|(?<=\s))\d+\$?(?=\s)", tokens)
+    return len(slot_tokens)
 
 
-def _build_case_window_command(*, case_index: int, cores_per_window: int) -> str:
+def _build_case_slot_command(*, case_index: int, cores_per_slot: int) -> str:
     case_name = f"case_{case_index:02d}"
     return (
         f"cd {shlex.quote(case_name)} && "
-        f"PEETS_CORES={cores_per_window} bash ../remote_job.sh > run.log 2>&1; "
+        f"PEETS_SLOT_CORES={cores_per_slot} PEETS_SLOT_TASKS=1 bash ../remote_job.sh > run.log 2>&1; "
         "echo $? > exit.code"
     )
 
 
-def _build_wait_all_command(parallel_windows: int) -> str:
+def _build_wait_all_command(parallel_slots: int) -> str:
     return (
         "while true; do "
         "done_count=0; "
-        f"for i in $(seq 1 {parallel_windows}); do "
+        f"for i in $(seq 1 {parallel_slots}); do "
         "case_dir=$(printf 'case_%02d' \"$i\"); "
         "[ -f \"$case_dir/exit.code\" ] && done_count=$((done_count+1)); "
         "done; "
-        f"[ \"$done_count\" -eq {parallel_windows} ] && break; "
+        f"[ \"$done_count\" -eq {parallel_slots} ] && break; "
         "sleep 5; "
         "done"
     )
 
 
-def _build_case_aggregation_command(parallel_windows: int) -> str:
+def _build_case_aggregation_command(parallel_slots: int) -> str:
     return (
         "rm -f case_summary.txt failed.count; "
         "failed=0; "
-        f"for i in $(seq 1 {parallel_windows}); do "
+        f"for i in $(seq 1 {parallel_slots}); do "
         "case_dir=$(printf 'case_%02d' \"$i\"); "
         "if [ -f \"$case_dir/exit.code\" ]; then "
         "code=$(cat \"$case_dir/exit.code\"); "

@@ -38,9 +38,9 @@ class AccountConfigLike(Protocol):
 
 
 @dataclass(slots=True, frozen=True)
-class WindowTaskRef:
+class SlotTaskRef:
     run_id: str
-    window_id: str
+    slot_id: str
     input_path: Path
     relative_path: Path
     output_dir: Path
@@ -53,11 +53,11 @@ class BundleSpec:
     job_index: int
     account_id: str
     host_alias: str
-    window_inputs: tuple[WindowTaskRef, ...]
+    slot_inputs: tuple[SlotTaskRef, ...]
 
     @property
-    def window_count(self) -> int:
-        return len(self.window_inputs)
+    def slot_count(self) -> int:
+        return len(self.slot_inputs)
 
 
 @dataclass(slots=True, frozen=True)
@@ -97,10 +97,10 @@ class BalancedBatchResult(Generic[T]):
 
 
 @dataclass(slots=True, frozen=True)
-class WindowWorkerControllerSnapshot:
-    queued_windows: int
-    pending_windows: int
-    inflight_windows: int
+class SlotWorkerControllerSnapshot:
+    queued_slots: int
+    pending_slots: int
+    inflight_slots: int
     inflight_jobs: int
     submitted_jobs: int
 
@@ -614,15 +614,15 @@ printf '__PEETSFEA_BOOTSTRAP__:ok\\n'
 def pick_balanced_account(
     *,
     capacities: Sequence[AccountCapacitySnapshot],
-    completed_windows_by_account: dict[str, int],
-    inflight_windows_by_account: dict[str, int],
+    completed_slots_by_account: dict[str, int],
+    inflight_slots_by_account: dict[str, int],
 ) -> AccountCapacitySnapshot | None:
     eligible = [item for item in capacities if item.allowed_submit > 0]
     if not eligible:
         return None
 
     def _sort_key(item: AccountCapacitySnapshot) -> tuple[int, int, str]:
-        score = completed_windows_by_account.get(item.account_id, 0) + inflight_windows_by_account.get(
+        score = completed_slots_by_account.get(item.account_id, 0) + inflight_slots_by_account.get(
             item.account_id, 0
         )
         return score, item.running_count, item.account_id
@@ -630,15 +630,15 @@ def pick_balanced_account(
     return min(eligible, key=_sort_key)
 
 
-def run_window_bundles(
+def run_slot_bundles(
     *,
-    window_queue: list[WindowTaskRef],
+    slot_queue: list[SlotTaskRef],
     accounts: list[AccountConfigLike],
-    windows_per_job: int,
+    slots_per_job: int,
     pending_buffer_per_account: int,
     worker: Callable[[BundleSpec], T],
     capacity_lookup: Callable[..., AccountCapacitySnapshot] = query_account_capacity,
-    initial_completed_windows: dict[str, int] | None = None,
+    initial_completed_slots: dict[str, int] | None = None,
     job_index_start: int = 1,
     max_workers: int | None = None,
     idle_sleep_seconds: float = 1.0,
@@ -646,8 +646,8 @@ def run_window_bundles(
     on_bundle_submitted: Callable[[BundleSpec], None] | None = None,
     on_capacity_error: Callable[[AccountConfigLike, Exception], None] | None = None,
 ) -> BalancedBatchResult[T]:
-    if windows_per_job <= 0:
-        raise ValueError("windows_per_job must be > 0")
+    if slots_per_job <= 0:
+        raise ValueError("slots_per_job must be > 0")
     if pending_buffer_per_account < 0:
         raise ValueError("pending_buffer_per_account must be >= 0")
     if idle_sleep_seconds <= 0:
@@ -657,9 +657,9 @@ def run_window_bundles(
     if job_index_start <= 0:
         raise ValueError("job_index_start must be > 0")
 
-    queue = deque(window_queue)
-    completed_windows: dict[str, int] = dict(initial_completed_windows or {})
-    inflight_windows: dict[str, int] = {}
+    queue = deque(slot_queue)
+    completed_slots: dict[str, int] = dict(initial_completed_slots or {})
+    inflight_slots: dict[str, int] = {}
     results: list[T] = []
     max_inflight_jobs = 0
     submitted_jobs = 0
@@ -676,12 +676,12 @@ def run_window_bundles(
         while queue or inflight_futures:
             done_futures = [future for future in tuple(inflight_futures) if future.done()]
             for future in done_futures:
-                account_id, window_count = inflight_futures.pop(future)
+                account_id, slot_count = inflight_futures.pop(future)
                 try:
                     results.append(future.result())
                 finally:
-                    inflight_windows[account_id] = max(0, inflight_windows.get(account_id, 0) - window_count)
-                    completed_windows[account_id] = completed_windows.get(account_id, 0) + window_count
+                    inflight_slots[account_id] = max(0, inflight_slots.get(account_id, 0) - slot_count)
+                    completed_slots[account_id] = completed_slots.get(account_id, 0) + slot_count
 
             if not queue:
                 if inflight_futures:
@@ -706,8 +706,8 @@ def run_window_bundles(
 
             selected = pick_balanced_account(
                 capacities=snapshots,
-                completed_windows_by_account=completed_windows,
-                inflight_windows_by_account=inflight_windows,
+                completed_slots_by_account=completed_slots,
+                inflight_slots_by_account=inflight_slots,
             )
             if selected is None:
                 if inflight_futures:
@@ -715,8 +715,8 @@ def run_window_bundles(
                     continue
                 raise RuntimeError("No eligible account available for bundle submission.")
 
-            bundle_inputs: list[WindowTaskRef] = []
-            while queue and len(bundle_inputs) < windows_per_job:
+            bundle_inputs: list[SlotTaskRef] = []
+            while queue and len(bundle_inputs) < slots_per_job:
                 bundle_inputs.append(queue.popleft())
             if not bundle_inputs:
                 continue
@@ -727,11 +727,11 @@ def run_window_bundles(
                 job_index=job_counter,
                 account_id=selected.account_id,
                 host_alias=selected.host_alias,
-                window_inputs=tuple(bundle_inputs),
+                slot_inputs=tuple(bundle_inputs),
             )
             future = executor.submit(worker, bundle)
             inflight_futures[future] = (selected.account_id, len(bundle_inputs))
-            inflight_windows[selected.account_id] = inflight_windows.get(selected.account_id, 0) + len(bundle_inputs)
+            inflight_slots[selected.account_id] = inflight_slots.get(selected.account_id, 0) + len(bundle_inputs)
             submitted_jobs += 1
             max_inflight_jobs = max(max_inflight_jobs, len(inflight_futures))
             if on_bundle_submitted is not None:
@@ -748,27 +748,27 @@ def run_window_bundles(
     )
 
 
-class WindowWorkerController(Generic[T]):
+class SlotWorkerController(Generic[T]):
     def __init__(
         self,
         *,
         accounts: list[AccountConfigLike],
-        windows_per_job: int,
+        slots_per_job: int,
         pending_buffer_per_account: int,
         worker: Callable[[BundleSpec], T],
         capacity_lookup: Callable[..., AccountCapacitySnapshot] = query_account_capacity,
-        initial_completed_windows: dict[str, int] | None = None,
+        initial_completed_slots: dict[str, int] | None = None,
         job_index_start: int = 1,
         max_workers: int | None = None,
         idle_sleep_seconds: float = 1.0,
         on_capacity_snapshot: Callable[[AccountCapacitySnapshot], None] | None = None,
         on_bundle_submitted: Callable[[BundleSpec], None] | None = None,
         on_capacity_error: Callable[[AccountConfigLike, Exception], None] | None = None,
-        recovery_windows_lookup: Callable[[BundleSpec, T], Sequence[WindowTaskRef]] | None = None,
+        recovery_slots_lookup: Callable[[BundleSpec, T], Sequence[SlotTaskRef]] | None = None,
         terminal_bundle_lookup: Callable[[BundleSpec, T], bool] | None = None,
     ) -> None:
-        if windows_per_job <= 0:
-            raise ValueError("windows_per_job must be > 0")
+        if slots_per_job <= 0:
+            raise ValueError("slots_per_job must be > 0")
         if pending_buffer_per_account < 0:
             raise ValueError("pending_buffer_per_account must be >= 0")
         if idle_sleep_seconds <= 0:
@@ -779,22 +779,22 @@ class WindowWorkerController(Generic[T]):
             raise ValueError("job_index_start must be > 0")
 
         self._accounts = list(accounts)
-        self._windows_per_job = windows_per_job
+        self._slots_per_job = slots_per_job
         self._pending_buffer_per_account = pending_buffer_per_account
         self._worker = worker
         self._capacity_lookup = capacity_lookup
-        self._completed_windows = dict(initial_completed_windows or {})
+        self._completed_slots = dict(initial_completed_slots or {})
         self._idle_sleep_seconds = idle_sleep_seconds
         self._on_capacity_snapshot = on_capacity_snapshot
         self._on_bundle_submitted = on_bundle_submitted
         self._on_capacity_error = on_capacity_error
-        self._recovery_windows_lookup = recovery_windows_lookup
+        self._recovery_slots_lookup = recovery_slots_lookup
         self._terminal_bundle_lookup = terminal_bundle_lookup
 
-        self._source_queue: deque[WindowTaskRef] = deque()
-        self._pending_bundles_by_account: dict[str, deque[list[WindowTaskRef]]] = {}
-        self._pending_seed_bundles: list[list[WindowTaskRef]] = []
-        self._inflight_windows: dict[str, int] = {}
+        self._source_queue: deque[SlotTaskRef] = deque()
+        self._pending_bundles_by_account: dict[str, deque[list[SlotTaskRef]]] = {}
+        self._pending_seed_bundles: list[list[SlotTaskRef]] = []
+        self._inflight_slots: dict[str, int] = {}
         self._inflight_workers: dict[str, int] = {}
         self._target_workers_by_account: dict[str, int] = {}
         self._seeded_workers_by_account: dict[str, int] = {}
@@ -815,26 +815,26 @@ class WindowWorkerController(Generic[T]):
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._future_to_bundle: dict[Future[T], BundleSpec] = {}
 
-    def enqueue_windows(self, windows: Sequence[WindowTaskRef]) -> None:
-        if not windows:
+    def enqueue_slots(self, slots: Sequence[SlotTaskRef]) -> None:
+        if not slots:
             return
-        self._source_queue.extend(windows)
+        self._source_queue.extend(slots)
         self._materialize_pending_bundles()
 
     def has_work(self) -> bool:
         return bool(self._source_queue) or any(self._pending_bundles_by_account.values()) or bool(self._future_to_bundle)
 
-    def snapshot(self) -> WindowWorkerControllerSnapshot:
-        pending_windows = sum(
+    def snapshot(self) -> SlotWorkerControllerSnapshot:
+        pending_slots = sum(
             len(bundle)
             for queue in self._pending_bundles_by_account.values()
             for bundle in queue
         )
-        inflight_windows = sum(self._inflight_windows.values())
-        return WindowWorkerControllerSnapshot(
-            queued_windows=len(self._source_queue),
-            pending_windows=pending_windows,
-            inflight_windows=inflight_windows,
+        inflight_slots = sum(self._inflight_slots.values())
+        return SlotWorkerControllerSnapshot(
+            queued_slots=len(self._source_queue),
+            pending_slots=pending_slots,
+            inflight_slots=inflight_slots,
             inflight_jobs=len(self._future_to_bundle),
             submitted_jobs=self._submitted_jobs,
         )
@@ -897,23 +897,23 @@ class WindowWorkerController(Generic[T]):
             bundle = self._future_to_bundle.pop(future)
             result = future.result()
             self._results.append(result)
-            self._inflight_windows[bundle.account_id] = max(
+            self._inflight_slots[bundle.account_id] = max(
                 0,
-                self._inflight_windows.get(bundle.account_id, 0) - bundle.window_count,
+                self._inflight_slots.get(bundle.account_id, 0) - bundle.slot_count,
             )
             self._inflight_workers[bundle.account_id] = max(
                 0,
                 self._inflight_workers.get(bundle.account_id, 0) - 1,
             )
-            self._completed_windows[bundle.account_id] = self._completed_windows.get(bundle.account_id, 0) + bundle.window_count
+            self._completed_slots[bundle.account_id] = self._completed_slots.get(bundle.account_id, 0) + bundle.slot_count
             if self._terminal_bundle_lookup is not None and self._terminal_bundle_lookup(bundle, result):
                 self._terminal_jobs += 1
-            if self._recovery_windows_lookup is not None:
-                recovery_windows = list(self._recovery_windows_lookup(bundle, result))
-                if recovery_windows:
+            if self._recovery_slots_lookup is not None:
+                recovery_slots = list(self._recovery_slots_lookup(bundle, result))
+                if recovery_slots:
                     account = next((item for item in self._accounts if item.account_id == bundle.account_id), None)
                     if account is not None:
-                        self._replacement_jobs += self._queue_bundles_for_account(account=account, windows=recovery_windows)
+                        self._replacement_jobs += self._queue_bundles_for_account(account=account, slots=recovery_slots)
         return progressed
 
     def _submit_pending_bundles(self, snapshots: Sequence[AccountCapacitySnapshot]) -> bool:
@@ -943,20 +943,20 @@ class WindowWorkerController(Generic[T]):
             )
             available_workers = min(target_available_workers, allowed_submit_workers)
             while queue and available_workers > 0 and len(self._future_to_bundle) < self._max_workers:
-                bundle_windows = queue.popleft()
-                if bundle_windows in self._pending_seed_bundles:
-                    self._pending_seed_bundles.remove(bundle_windows)
+                bundle_slots = queue.popleft()
+                if bundle_slots in self._pending_seed_bundles:
+                    self._pending_seed_bundles.remove(bundle_slots)
                 self._job_counter += 1
                 bundle = BundleSpec(
                     job_id=f"job_{self._job_counter:04d}",
                     job_index=self._job_counter,
                     account_id=account.account_id,
                     host_alias=account.host_alias,
-                    window_inputs=tuple(bundle_windows),
+                    slot_inputs=tuple(bundle_slots),
                 )
                 future = self._executor.submit(self._worker, bundle)
                 self._future_to_bundle[future] = bundle
-                self._inflight_windows[bundle.account_id] = self._inflight_windows.get(bundle.account_id, 0) + bundle.window_count
+                self._inflight_slots[bundle.account_id] = self._inflight_slots.get(bundle.account_id, 0) + bundle.slot_count
                 self._inflight_workers[bundle.account_id] = self._inflight_workers.get(bundle.account_id, 0) + 1
                 self._submitted_jobs += 1
                 self._max_inflight_jobs = max(self._max_inflight_jobs, len(self._future_to_bundle))
@@ -980,12 +980,12 @@ class WindowWorkerController(Generic[T]):
             return account
         return None
 
-    def _queue_bundle(self, *, account: AccountConfigLike, assigned: Sequence[WindowTaskRef]) -> list[WindowTaskRef] | None:
+    def _queue_bundle(self, *, account: AccountConfigLike, assigned: Sequence[SlotTaskRef]) -> list[SlotTaskRef] | None:
         if not assigned:
             return None
-        bundle_windows = list(assigned)
-        self._pending_bundles_by_account.setdefault(account.account_id, deque()).append(bundle_windows)
-        return bundle_windows
+        bundle_slots = list(assigned)
+        self._pending_bundles_by_account.setdefault(account.account_id, deque()).append(bundle_slots)
+        return bundle_slots
 
     def _materialize_pending_bundles(self) -> None:
         while self._source_queue:
@@ -997,21 +997,21 @@ class WindowWorkerController(Generic[T]):
             assigned = [self._source_queue.popleft()]
             self._seeded_workers_by_account[account.account_id] = self._seeded_workers_by_account.get(account.account_id, 0) + 1
             self._target_workers_by_account[account.account_id] = self._target_workers_by_account.get(account.account_id, 0) + 1
-            bundle_windows = self._queue_bundle(account=account, assigned=assigned)
-            if bundle_windows is not None:
-                self._pending_seed_bundles.append(bundle_windows)
+            bundle_slots = self._queue_bundle(account=account, assigned=assigned)
+            if bundle_slots is not None:
+                self._pending_seed_bundles.append(bundle_slots)
 
         while self._source_queue and self._pending_seed_bundles:
             progressed = False
-            for bundle_windows in list(self._pending_seed_bundles):
+            for bundle_slots in list(self._pending_seed_bundles):
                 if not self._source_queue:
                     break
-                if len(bundle_windows) >= self._windows_per_job:
+                if len(bundle_slots) >= self._slots_per_job:
                     continue
-                bundle_windows.append(self._source_queue.popleft())
+                bundle_slots.append(self._source_queue.popleft())
                 progressed = True
             self._pending_seed_bundles = [
-                bundle_windows for bundle_windows in self._pending_seed_bundles if len(bundle_windows) < self._windows_per_job
+                bundle_slots for bundle_slots in self._pending_seed_bundles if len(bundle_slots) < self._slots_per_job
             ]
             if not progressed:
                 break
@@ -1019,19 +1019,19 @@ class WindowWorkerController(Generic[T]):
         while self._source_queue:
             account = self._accounts[self._backlog_account_cursor % len(self._accounts)]
             self._backlog_account_cursor += 1
-            assigned: list[WindowTaskRef] = []
-            while self._source_queue and len(assigned) < self._windows_per_job:
+            assigned: list[SlotTaskRef] = []
+            while self._source_queue and len(assigned) < self._slots_per_job:
                 assigned.append(self._source_queue.popleft())
             if not assigned:
                 break
             self._queue_bundle(account=account, assigned=assigned)
 
-    def _queue_bundles_for_account(self, *, account: AccountConfigLike, windows: Sequence[WindowTaskRef]) -> int:
+    def _queue_bundles_for_account(self, *, account: AccountConfigLike, slots: Sequence[SlotTaskRef]) -> int:
         queued_jobs = 0
-        recovery_queue = deque(windows)
+        recovery_queue = deque(slots)
         while recovery_queue:
-            assigned: list[WindowTaskRef] = []
-            while recovery_queue and len(assigned) < self._windows_per_job:
+            assigned: list[SlotTaskRef] = []
+            while recovery_queue and len(assigned) < self._slots_per_job:
                 assigned.append(recovery_queue.popleft())
             if not assigned:
                 break
@@ -1040,43 +1040,43 @@ class WindowWorkerController(Generic[T]):
         return queued_jobs
 
 
-def run_window_workers(
+def run_slot_workers(
     *,
-    window_queue: list[WindowTaskRef],
+    slot_queue: list[SlotTaskRef],
     accounts: list[AccountConfigLike],
-    windows_per_job: int,
+    slots_per_job: int,
     pending_buffer_per_account: int,
     worker: Callable[[BundleSpec], T],
     capacity_lookup: Callable[..., AccountCapacitySnapshot] = query_account_capacity,
-    initial_completed_windows: dict[str, int] | None = None,
+    initial_completed_slots: dict[str, int] | None = None,
     job_index_start: int = 1,
     max_workers: int | None = None,
     idle_sleep_seconds: float = 1.0,
     on_capacity_snapshot: Callable[[AccountCapacitySnapshot], None] | None = None,
     on_bundle_submitted: Callable[[BundleSpec], None] | None = None,
     on_capacity_error: Callable[[AccountConfigLike, Exception], None] | None = None,
-    recovery_windows_lookup: Callable[[BundleSpec, T], Sequence[WindowTaskRef]] | None = None,
+    recovery_slots_lookup: Callable[[BundleSpec, T], Sequence[SlotTaskRef]] | None = None,
     terminal_bundle_lookup: Callable[[BundleSpec, T], bool] | None = None,
 ) -> BalancedBatchResult[T]:
-    if not window_queue:
+    if not slot_queue:
         return BalancedBatchResult(results=[], max_inflight_jobs=0, submitted_jobs=0)
-    controller = WindowWorkerController(
+    controller = SlotWorkerController(
         accounts=accounts,
-        windows_per_job=windows_per_job,
+        slots_per_job=slots_per_job,
         pending_buffer_per_account=pending_buffer_per_account,
         worker=worker,
         capacity_lookup=capacity_lookup,
-        initial_completed_windows=initial_completed_windows,
+        initial_completed_slots=initial_completed_slots,
         job_index_start=job_index_start,
         max_workers=max_workers,
         idle_sleep_seconds=idle_sleep_seconds,
         on_capacity_snapshot=on_capacity_snapshot,
         on_bundle_submitted=on_bundle_submitted,
         on_capacity_error=on_capacity_error,
-        recovery_windows_lookup=recovery_windows_lookup,
+        recovery_slots_lookup=recovery_slots_lookup,
         terminal_bundle_lookup=terminal_bundle_lookup,
     )
-    controller.enqueue_windows(window_queue)
+    controller.enqueue_slots(slot_queue)
     return controller.finalize()
 
 

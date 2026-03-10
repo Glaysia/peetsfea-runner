@@ -14,7 +14,7 @@ from peetsfea_runner.scheduler import (
     AccountReadinessSnapshot,
     bootstrap_account_runtime,
     JobSpec,
-    WindowTaskRef,
+    SlotTaskRef,
     calculate_effective_slots,
     parse_squeue_state_counts,
     pick_balanced_account,
@@ -22,8 +22,8 @@ from peetsfea_runner.scheduler import (
     query_account_readiness,
     query_account_capacity,
     run_jobs_with_slots,
-    run_window_bundles,
-    run_window_workers,
+    run_slot_bundles,
+    run_slot_workers,
 )
 
 
@@ -37,11 +37,11 @@ class _Account:
 @dataclass(slots=True)
 class _WorkerOutcome:
     name: str
-    requeue_windows: tuple[WindowTaskRef, ...] = ()
+    requeue_slots: tuple[SlotTaskRef, ...] = ()
 
     @property
     def terminal_worker(self) -> bool:
-        return bool(self.requeue_windows)
+        return bool(self.requeue_slots)
 
 
 class TestScheduler(unittest.TestCase):
@@ -192,19 +192,19 @@ class TestScheduler(unittest.TestCase):
         ]
         selected = pick_balanced_account(
             capacities=capacities,
-            completed_windows_by_account={"a1": 2, "a2": 2, "a3": 0},
-            inflight_windows_by_account={"a1": 0, "a2": 0, "a3": 0},
+            completed_slots_by_account={"a1": 2, "a2": 2, "a3": 0},
+            inflight_slots_by_account={"a1": 0, "a2": 0, "a3": 0},
         )
         assert selected is not None
         self.assertEqual(selected.account_id, "a2")
 
-    def test_run_window_bundles_chunks_by_windows_per_job(self) -> None:
+    def test_run_slot_bundles_chunks_by_slots_per_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            windows = [
-                WindowTaskRef(
+            slots = [
+                SlotTaskRef(
                     run_id="run_01",
-                    window_id=f"w_{idx:04d}",
+                    slot_id=f"w_{idx:04d}",
                     input_path=root / f"in_{idx}.aedt",
                     relative_path=Path(f"in_{idx}.aedt"),
                     output_dir=root / f"out_{idx}.aedt_all",
@@ -213,12 +213,12 @@ class TestScheduler(unittest.TestCase):
             ]
             account = _Account(account_id="a1", host_alias="h1", max_jobs=10)
 
-            batch = run_window_bundles(
-                window_queue=windows,
+            batch = run_slot_bundles(
+                slot_queue=slots,
                 accounts=[account],
-                windows_per_job=8,
+                slots_per_job=8,
                 pending_buffer_per_account=3,
-                worker=lambda bundle: bundle.window_count,
+                worker=lambda bundle: bundle.slot_count,
                 capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 0, 0, 99),
                 max_workers=2,
             )
@@ -226,13 +226,13 @@ class TestScheduler(unittest.TestCase):
             self.assertEqual(sorted(batch.results), [1, 8, 8])
             self.assertEqual(batch.submitted_jobs, 3)
 
-    def test_run_window_bundles_skips_blocked_account(self) -> None:
+    def test_run_slot_bundles_skips_blocked_account(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            windows = [
-                WindowTaskRef(
+            slots = [
+                SlotTaskRef(
                     run_id="run_01",
-                    window_id=f"w_{idx:04d}",
+                    slot_id=f"w_{idx:04d}",
                     input_path=root / f"in_{idx}.aedt",
                     relative_path=Path(f"in_{idx}.aedt"),
                     output_dir=root / f"out_{idx}.aedt_all",
@@ -249,10 +249,10 @@ class TestScheduler(unittest.TestCase):
                     return AccountCapacitySnapshot("a1", "h1", 10, 3, 0)
                 return AccountCapacitySnapshot("a2", "h2", 0, 0, 10 + pending_buffer_per_account)
 
-            batch = run_window_bundles(
-                window_queue=windows,
+            batch = run_slot_bundles(
+                slot_queue=slots,
                 accounts=accounts,
-                windows_per_job=2,
+                slots_per_job=2,
                 pending_buffer_per_account=3,
                 worker=lambda bundle: bundle.account_id,
                 capacity_lookup=_capacity_lookup,
@@ -261,13 +261,13 @@ class TestScheduler(unittest.TestCase):
 
             self.assertEqual(batch.results, ["a2", "a2"])
 
-    def test_run_window_workers_caps_submitted_jobs_at_account_max(self) -> None:
+    def test_run_slot_workers_caps_submitted_jobs_at_account_max(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            windows = [
-                WindowTaskRef(
+            slots = [
+                SlotTaskRef(
                     run_id="run_01",
-                    window_id=f"w_{idx:04d}",
+                    slot_id=f"w_{idx:04d}",
                     input_path=root / f"in_{idx}.aedt",
                     relative_path=Path(f"in_{idx}.aedt"),
                     output_dir=root / f"out_{idx}.aedt_all",
@@ -276,12 +276,12 @@ class TestScheduler(unittest.TestCase):
             ]
             account = _Account(account_id="a1", host_alias="h1", max_jobs=10)
 
-            batch = run_window_workers(
-                window_queue=windows,
+            batch = run_slot_workers(
+                slot_queue=slots,
                 accounts=[account],
-                windows_per_job=8,
+                slots_per_job=8,
                 pending_buffer_per_account=3,
-                worker=lambda bundle: bundle.window_count,
+                worker=lambda bundle: bundle.slot_count,
                 capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 0, 0, 10),
             )
 
@@ -289,13 +289,13 @@ class TestScheduler(unittest.TestCase):
             self.assertEqual(sorted(batch.results), [5, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8])
             self.assertLessEqual(batch.max_inflight_jobs, 10)
 
-    def test_run_window_workers_respects_existing_running_and_pending_jobs(self) -> None:
+    def test_run_slot_workers_respects_existing_running_and_pending_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            windows = [
-                WindowTaskRef(
+            slots = [
+                SlotTaskRef(
                     run_id="run_01",
-                    window_id=f"w_{idx:04d}",
+                    slot_id=f"w_{idx:04d}",
                     input_path=root / f"in_{idx}.aedt",
                     relative_path=Path(f"in_{idx}.aedt"),
                     output_dir=root / f"out_{idx}.aedt_all",
@@ -304,12 +304,12 @@ class TestScheduler(unittest.TestCase):
             ]
             account = _Account(account_id="a1", host_alias="h1", max_jobs=10)
 
-            batch = run_window_workers(
-                window_queue=windows,
+            batch = run_slot_workers(
+                slot_queue=slots,
                 accounts=[account],
-                windows_per_job=8,
+                slots_per_job=8,
                 pending_buffer_per_account=3,
-                worker=lambda bundle: bundle.window_count,
+                worker=lambda bundle: bundle.slot_count,
                 capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 7, 1, 2),
             )
 
@@ -317,13 +317,13 @@ class TestScheduler(unittest.TestCase):
             self.assertEqual(sum(batch.results), 12)
             self.assertLessEqual(batch.max_inflight_jobs, 2)
 
-    def test_run_window_workers_submits_replacement_bundle_from_backlog(self) -> None:
+    def test_run_slot_workers_submits_replacement_bundle_from_backlog(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            windows = [
-                WindowTaskRef(
+            slots = [
+                SlotTaskRef(
                     run_id="run_01",
-                    window_id=f"w_{idx:04d}",
+                    slot_id=f"w_{idx:04d}",
                     input_path=root / f"in_{idx}.aedt",
                     relative_path=Path(f"in_{idx}.aedt"),
                     output_dir=root / f"out_{idx}.aedt_all",
@@ -332,12 +332,12 @@ class TestScheduler(unittest.TestCase):
             ]
             account = _Account(account_id="a1", host_alias="h1", max_jobs=2)
 
-            batch = run_window_workers(
-                window_queue=windows,
+            batch = run_slot_workers(
+                slot_queue=slots,
                 accounts=[account],
-                windows_per_job=8,
+                slots_per_job=8,
                 pending_buffer_per_account=3,
-                worker=lambda bundle: bundle.window_count,
+                worker=lambda bundle: bundle.slot_count,
                 capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 0, 0, 2),
                 max_workers=2,
             )
@@ -346,13 +346,13 @@ class TestScheduler(unittest.TestCase):
             self.assertEqual(sorted(batch.results), [1, 8, 8])
             self.assertLessEqual(batch.max_inflight_jobs, 2)
 
-    def test_run_window_workers_waits_until_worker_slot_is_available(self) -> None:
+    def test_run_slot_workers_waits_until_worker_slot_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            windows = [
-                WindowTaskRef(
+            slots = [
+                SlotTaskRef(
                     run_id="run_01",
-                    window_id="w_0001",
+                    slot_id="w_0001",
                     input_path=root / "in_1.aedt",
                     relative_path=Path("in_1.aedt"),
                     output_dir=root / "out_1.aedt_all",
@@ -368,12 +368,12 @@ class TestScheduler(unittest.TestCase):
                 return AccountCapacitySnapshot("a1", "h1", 0, 0, 1)
 
             with patch("peetsfea_runner.scheduler.time.sleep") as mocked_sleep:
-                batch = run_window_workers(
-                    window_queue=windows,
+                batch = run_slot_workers(
+                    slot_queue=slots,
                     accounts=[account],
-                    windows_per_job=8,
+                    slots_per_job=8,
                     pending_buffer_per_account=3,
-                    worker=lambda bundle: bundle.window_count,
+                    worker=lambda bundle: bundle.slot_count,
                     capacity_lookup=_capacity_lookup,
                     idle_sleep_seconds=1.0,
                 )
@@ -382,22 +382,22 @@ class TestScheduler(unittest.TestCase):
             self.assertEqual(batch.submitted_jobs, 1)
             self.assertEqual(batch.results, [1])
 
-    def test_run_window_workers_recovers_terminal_worker_with_replacement_before_run_end(self) -> None:
+    def test_run_slot_workers_recovers_terminal_worker_with_replacement_before_run_end(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            initial_windows = [
-                WindowTaskRef(
+            initial_slots = [
+                SlotTaskRef(
                     run_id="run_01",
-                    window_id=f"w_{idx:04d}",
+                    slot_id=f"w_{idx:04d}",
                     input_path=root / f"in_{idx}.aedt",
                     relative_path=Path(f"in_{idx}.aedt"),
                     output_dir=root / f"out_{idx}.aedt_all",
                 )
                 for idx in range(1, 3)
             ]
-            recovery_window = WindowTaskRef(
+            recovery_slot = SlotTaskRef(
                 run_id="run_01",
-                window_id="w_9999",
+                slot_id="w_9999",
                 input_path=root / "recovery.aedt",
                 relative_path=Path("recovery.aedt"),
                 output_dir=root / "recovery.aedt_all",
@@ -414,22 +414,22 @@ class TestScheduler(unittest.TestCase):
 
             def _worker(bundle):
                 if bundle.job_id == "job_0001":
-                    return _WorkerOutcome(name=bundle.job_id, requeue_windows=(recovery_window,))
+                    return _WorkerOutcome(name=bundle.job_id, requeue_slots=(recovery_slot,))
                 if bundle.job_id == "job_0002":
                     self.assertTrue(recovery_submitted.wait(timeout=2))
                     return _WorkerOutcome(name=bundle.job_id)
                 return _WorkerOutcome(name=bundle.job_id)
 
-            batch = run_window_workers(
-                window_queue=initial_windows,
+            batch = run_slot_workers(
+                slot_queue=initial_slots,
                 accounts=[account],
-                windows_per_job=1,
+                slots_per_job=1,
                 pending_buffer_per_account=3,
                 worker=_worker,
                 capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 0, 0, 2),
                 max_workers=2,
                 on_bundle_submitted=_on_bundle_submitted,
-                recovery_windows_lookup=lambda _bundle, outcome: outcome.requeue_windows,
+                recovery_slots_lookup=lambda _bundle, outcome: outcome.requeue_slots,
                 terminal_bundle_lookup=lambda _bundle, outcome: outcome.terminal_worker,
             )
 

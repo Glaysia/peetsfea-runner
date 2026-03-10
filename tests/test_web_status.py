@@ -11,6 +11,7 @@ from urllib.request import urlopen
 
 from peetsfea_runner.state_store import StateStore
 from peetsfea_runner import web_status
+from peetsfea_runner import __version__
 from peetsfea_runner.web_status import start_status_server
 
 
@@ -76,29 +77,29 @@ class TestWebStatus(unittest.TestCase):
                 message="done",
             )
             store.mark_input_deleted(run_id="run_01", job_id="job_0001", retry_count=0)
-            store.create_window_task(
+            store.create_slot_task(
                 run_id="run_01",
-                window_id="w_001",
+                slot_id="w_001",
                 input_path="/in/a.aedt",
                 output_path="/out/a.aedt_all",
                 account_id="account_01",
             )
-            store.update_window_task(
+            store.update_slot_task(
                 run_id="run_01",
-                window_id="w_001",
+                slot_id="w_001",
                 state="SUCCEEDED",
                 attempt_no=1,
                 job_id="job_0001",
                 account_id="account_01",
             )
-            store.append_window_event(
+            store.append_slot_event(
                 run_id="run_01",
-                window_id="w_001",
+                slot_id="w_001",
                 level="INFO",
                 stage="SUCCEEDED",
-                message="window done",
+                message="slot done",
             )
-            store.mark_window_input_deleted(run_id="run_01", window_id="w_001", retry_count=0)
+            store.mark_slot_input_deleted(run_id="run_01", slot_id="w_001", retry_count=0)
             store.record_account_capacity_snapshot(
                 account_id="account_01",
                 host="gate1-harry",
@@ -151,14 +152,16 @@ class TestWebStatus(unittest.TestCase):
                 with urlopen(f"http://{host}:{port}/") as resp:
                     html = resp.read().decode("utf-8")
                 self.assertIn("Peets FEA Status Dashboard", html)
-                self.assertIn("Window(.aedt)", html)
+                self.assertIn("Slot(.aedt)", html)
+                self.assertIn(__version__, html)
 
                 with urlopen(f"http://{host}:{port}/api") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(payload["version"], __version__)
                 self.assertIn("/api/worker/health", payload["endpoints"])
                 self.assertIn("/api/jobs/{id}/timeline", payload["endpoints"])
-                self.assertIn("/api/windows", payload["endpoints"])
-                self.assertIn("/api/windows/{id}/timeline", payload["endpoints"])
+                self.assertIn("/api/slots", payload["endpoints"])
+                self.assertIn("/api/slots/{id}/timeline", payload["endpoints"])
                 self.assertIn("/api/accounts/capacity", payload["endpoints"])
 
                 with urlopen(f"http://{host}:{port}/api/jobs") as resp:
@@ -177,14 +180,15 @@ class TestWebStatus(unittest.TestCase):
 
                 with urlopen(f"http://{host}:{port}/api/metrics/throughput") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(payload["version"], __version__)
                 self.assertEqual(payload["metrics"]["total_jobs"], 1)
                 self.assertEqual(payload["metrics"]["succeeded_jobs"], 1)
                 self.assertEqual(payload["metrics"]["active_jobs"], 0)
                 self.assertEqual(payload["metrics"]["queue_jobs"], 0)
-                self.assertEqual(payload["metrics"]["total_windows"], 1)
-                self.assertEqual(payload["metrics"]["succeeded_windows"], 1)
-                self.assertEqual(payload["metrics"]["quarantined_windows"], 0)
-                self.assertEqual(payload["metrics"]["delete_quarantined_windows"], 0)
+                self.assertEqual(payload["metrics"]["total_slots"], 1)
+                self.assertEqual(payload["metrics"]["succeeded_slots"], 1)
+                self.assertEqual(payload["metrics"]["quarantined_slots"], 0)
+                self.assertEqual(payload["metrics"]["delete_quarantined_slots"], 0)
                 self.assertEqual(payload["metrics"]["throughput_kpi"]["configured_target_slots"], 40)
                 self.assertEqual(payload["metrics"]["throughput_kpi"]["expansion_target_slots"], 200)
                 self.assertEqual(payload["metrics"]["throughput_kpi"]["effective_target_slots"], 0)
@@ -192,7 +196,7 @@ class TestWebStatus(unittest.TestCase):
                 self.assertEqual(payload["metrics"]["throughput_kpi"]["throughput_mode"], "IDLE")
                 self.assertEqual(payload["metrics"]["throughput_kpi"]["active_workers"], 0)
                 self.assertEqual(payload["metrics"]["throughput_kpi"]["pending_workers"], 0)
-                self.assertEqual(len(payload["metrics"]["account_window_scores"]), 1)
+                self.assertEqual(len(payload["metrics"]["account_slot_scores"]), 1)
 
                 with urlopen(f"http://{host}:{port}/api/runs/latest") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -205,22 +209,22 @@ class TestWebStatus(unittest.TestCase):
                     payload = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(payload["run"]["run_id"], "run_01")
                 self.assertTrue(any(x["status"] == "SUCCEEDED" for x in payload["run"]["status_counts"]))
-                self.assertTrue(any(x["state"] == "SUCCEEDED" for x in payload["run"]["window_state_counts"]))
+                self.assertTrue(any(x["state"] == "SUCCEEDED" for x in payload["run"]["slot_state_counts"]))
 
                 with urlopen(f"http://{host}:{port}/api/runs/run_01/jobs") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(len(payload["jobs"]), 1)
 
-                with urlopen(f"http://{host}:{port}/api/windows") as resp:
+                with urlopen(f"http://{host}:{port}/api/slots") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(payload["run_id"], "run_01")
-                self.assertEqual(len(payload["windows"]), 1)
-                self.assertEqual(payload["windows"][0]["window_id"], "w_001")
+                self.assertEqual(len(payload["slots"]), 1)
+                self.assertEqual(payload["slots"][0]["slot_id"], "w_001")
 
-                with urlopen(f"http://{host}:{port}/api/windows/w_001/timeline") as resp:
+                with urlopen(f"http://{host}:{port}/api/slots/w_001/timeline") as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
-                self.assertEqual(payload["window_task"]["window_id"], "w_001")
-                self.assertEqual(payload["attempt_summary"]["window_attempt_no"], 1)
+                self.assertEqual(payload["slot_task"]["slot_id"], "w_001")
+                self.assertEqual(payload["attempt_summary"]["slot_attempt_no"], 1)
                 self.assertEqual(payload["file_lifecycle"]["delete_final_state"], "DELETED")
 
                 with urlopen(f"http://{host}:{port}/api/accounts/capacity") as resp:
@@ -233,7 +237,7 @@ class TestWebStatus(unittest.TestCase):
                 self.assertEqual(payload["accounts"][0]["configured_worker_jobs"], 10)
                 self.assertEqual(payload["accounts"][0]["active_slots"], 0)
                 self.assertEqual(payload["accounts"][0]["completed_slots"], 1)
-                self.assertEqual(payload["accounts"][0]["quarantined_windows"], 0)
+                self.assertEqual(payload["accounts"][0]["quarantined_slots"], 0)
                 self.assertEqual(payload["accounts"][0]["live_status"], "UNDER_CAPACITY")
                 self.assertEqual(payload["accounts"][1]["account_id"], "account_02")
                 self.assertEqual(payload["accounts"][1]["readiness_status"], "DISABLED_FOR_DISPATCH")
@@ -357,16 +361,16 @@ class TestWebStatus(unittest.TestCase):
             store.start_run("run_01")
             for index in range(1, 12):
                 state = "RUNNING" if index == 1 else "QUEUED"
-                store.create_window_task(
+                store.create_slot_task(
                     run_id="run_01",
-                    window_id=f"w_{index:03d}",
+                    slot_id=f"w_{index:03d}",
                     input_path=f"/in/{index:03d}.aedt",
                     output_path=f"/out/{index:03d}.aedt.out",
                     account_id="account_01",
                 )
-                store.update_window_task(
+                store.update_slot_task(
                     run_id="run_01",
-                    window_id=f"w_{index:03d}",
+                    slot_id=f"w_{index:03d}",
                     state=state,
                     attempt_no=1 if state == "RUNNING" else 0,
                     job_id="job_0001" if state == "RUNNING" else None,
@@ -381,7 +385,7 @@ class TestWebStatus(unittest.TestCase):
                     os.environ,
                     {
                         "PEETSFEA_ACCOUNTS": "account_01@gate1-harry:1",
-                        "PEETSFEA_WINDOWS_PER_JOB": "8",
+                        "PEETSFEA_SLOTS_PER_JOB": "8",
                     },
                     clear=False,
                 ):
@@ -397,7 +401,7 @@ class TestWebStatus(unittest.TestCase):
                 self.assertEqual(throughput_kpi["pending_workers"], 0)
                 self.assertEqual(throughput_kpi["worker_shortfall"], 1)
                 self.assertEqual(throughput_kpi["scheduled_worker_shortfall"], 1)
-                self.assertEqual(throughput_kpi["recovery_backlog_windows"], 10)
+                self.assertEqual(throughput_kpi["recovery_backlog_slots"], 10)
                 self.assertEqual(throughput_kpi["throughput_mode"], "CAPACITY_SHORTFALL")
                 self.assertTrue(throughput_kpi["capacity_limited"])
                 self.assertFalse(throughput_kpi["input_limited"])
@@ -412,46 +416,46 @@ class TestWebStatus(unittest.TestCase):
             store = StateStore(db_path)
             store.initialize()
             store.start_run("run_01")
-            store.create_window_task(
+            store.create_slot_task(
                 run_id="run_01",
-                window_id="w_run",
+                slot_id="w_run",
                 input_path="/in/run.aedt",
                 output_path="/out/run.aedt.out",
                 account_id="account_01",
             )
-            store.update_window_task(
+            store.update_slot_task(
                 run_id="run_01",
-                window_id="w_run",
+                slot_id="w_run",
                 state="RUNNING",
                 attempt_no=1,
                 job_id="job_0001",
                 account_id="account_01",
             )
-            store.create_window_task(
+            store.create_slot_task(
                 run_id="run_01",
-                window_id="w_done",
+                slot_id="w_done",
                 input_path="/in/done.aedt",
                 output_path="/out/done.aedt.out",
                 account_id="account_01",
             )
-            store.update_window_task(
+            store.update_slot_task(
                 run_id="run_01",
-                window_id="w_done",
+                slot_id="w_done",
                 state="SUCCEEDED",
                 attempt_no=1,
                 job_id="job_0001",
                 account_id="account_01",
             )
-            store.create_window_task(
+            store.create_slot_task(
                 run_id="run_01",
-                window_id="w_quar",
+                slot_id="w_quar",
                 input_path="/in/quar.aedt",
                 output_path="/out/quar.aedt.out",
                 account_id="account_01",
             )
-            store.update_window_task(
+            store.update_slot_task(
                 run_id="run_01",
-                window_id="w_quar",
+                slot_id="w_quar",
                 state="QUARANTINED",
                 attempt_no=1,
                 job_id="job_0002",
@@ -487,7 +491,7 @@ class TestWebStatus(unittest.TestCase):
                     os.environ,
                     {
                         "PEETSFEA_ACCOUNTS": "account_01@gate1-harry:2",
-                        "PEETSFEA_WINDOWS_PER_JOB": "8",
+                        "PEETSFEA_SLOTS_PER_JOB": "8",
                     },
                     clear=False,
                 ):
@@ -500,7 +504,7 @@ class TestWebStatus(unittest.TestCase):
                 self.assertEqual(account["pending_count"], 1)
                 self.assertEqual(account["active_slots"], 1)
                 self.assertEqual(account["completed_slots"], 2)
-                self.assertEqual(account["quarantined_windows"], 1)
+                self.assertEqual(account["quarantined_slots"], 1)
                 self.assertEqual(account["active_worker_shortfall"], 1)
                 self.assertEqual(account["scheduled_worker_shortfall"], 0)
                 self.assertEqual(account["active_slot_shortfall"], 15)
@@ -531,58 +535,58 @@ class TestWebStatus(unittest.TestCase):
                 message="account=account_01 readiness blocked by preflight",
             )
             for index in range(1, 11):
-                window_id = f"w_q_{index:03d}"
-                store.create_window_task(
+                slot_id = f"w_q_{index:03d}"
+                store.create_slot_task(
                     run_id="run_01",
-                    window_id=window_id,
-                    input_path=f"/in/{window_id}.aedt",
-                    output_path=f"/out/{window_id}.aedt.out",
+                    slot_id=slot_id,
+                    input_path=f"/in/{slot_id}.aedt",
+                    output_path=f"/out/{slot_id}.aedt.out",
                     account_id="account_01",
                 )
                 if index <= 2:
-                    store.update_window_task(
+                    store.update_slot_task(
                         run_id="run_01",
-                        window_id=window_id,
+                        slot_id=slot_id,
                         state="QUARANTINED",
                         attempt_no=1,
                         job_id=f"job_quar_{index:02d}",
                         account_id="account_01",
                     )
-                    store.append_window_event(
+                    store.append_slot_event(
                         run_id="run_01",
-                        window_id=window_id,
+                        slot_id=slot_id,
                         level="ERROR",
                         stage="QUARANTINED",
-                        message="solve failed and window quarantined",
+                        message="solve failed and slot quarantined",
                     )
                 else:
-                    store.update_window_task(
+                    store.update_slot_task(
                         run_id="run_01",
-                        window_id=window_id,
+                        slot_id=slot_id,
                         state="QUEUED",
                         attempt_no=0,
                         job_id=None,
                         account_id="account_01",
                     )
             store.start_run("run_02")
-            store.create_window_task(
+            store.create_slot_task(
                 run_id="run_02",
-                window_id="w_other",
+                slot_id="w_other",
                 input_path="/in/other.aedt",
                 output_path="/out/other.aedt.out",
                 account_id="account_02",
             )
-            store.update_window_task(
+            store.update_slot_task(
                 run_id="run_02",
-                window_id="w_other",
+                slot_id="w_other",
                 state="QUARANTINED",
                 attempt_no=1,
                 job_id="job_other",
                 account_id="account_02",
             )
-            store.append_window_event(
+            store.append_slot_event(
                 run_id="run_02",
-                window_id="w_other",
+                slot_id="w_other",
                 level="ERROR",
                 stage="QUARANTINED",
                 message="other run quarantine",
@@ -596,7 +600,7 @@ class TestWebStatus(unittest.TestCase):
                     os.environ,
                     {
                         "PEETSFEA_ACCOUNTS": "account_01@gate1-harry:1",
-                        "PEETSFEA_WINDOWS_PER_JOB": "8",
+                        "PEETSFEA_SLOTS_PER_JOB": "8",
                     },
                     clear=False,
                 ):

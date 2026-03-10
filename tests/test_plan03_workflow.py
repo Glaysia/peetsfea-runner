@@ -8,11 +8,11 @@ from peetsfea_runner.pipeline import (
     EXIT_CODE_REMOTE_RUN_FAILURE,
     _WorkflowError,
     _build_case_aggregation_command,
-    _build_case_window_command,
+    _build_case_slot_command,
     _build_remote_dispatch_script_content,
     _build_remote_job_script_content,
     _build_wait_all_command,
-    _count_screen_windows,
+    _count_screen_slots,
     _extract_meaningful_remote_failure_details,
     _has_remote_workflow_markers,
     _parse_marked_case_summary_lines,
@@ -44,24 +44,24 @@ class TestPlan03Workflow(unittest.TestCase):
             partition = "cpu2"
             nodes = 1
             ntasks = 1
-            cpus_per_job = 32
-            mem = "320G"
+            cpus_per_job = 16
+            mem = "960G"
             time_limit = "05:00:00"
-            windows_per_job = 8
-            cores_per_window = 4
+            slots_per_job = 4
+            cores_per_slot = 4
 
         content = _build_remote_dispatch_script_content(
             config=_Cfg(),
             remote_job_dir="/tmp/peetsfea/run_01/job_0001",
             case_count=2,
         )
-        self.assertIn("srun -D /tmp -p cpu2 -N 1 -n 1 -c 32 --mem=320G --time=05:00:00", content)
+        self.assertIn("srun -D /tmp -p cpu2 -N 1 -n 1 -c 16 --mem=960G --time=05:00:00", content)
         self.assertNotIn("screen -dmS", content)
         self.assertNotIn("srun --pty", content)
         self.assertIn("__PEETS_FAILED_COUNT__", content)
-        self.assertIn("max_parallel=8", content)
+        self.assertIn("max_parallel=4", content)
         self.assertIn("wait -n || true", content)
-        self.assertIn("if PEETS_CORES=4 bash ../remote_job.sh > run.log 2>&1; then", content)
+        self.assertIn("if PEETS_SLOT_CORES=4 PEETS_SLOT_TASKS=1 bash ../remote_job.sh > run.log 2>&1; then", content)
         self.assertIn("echo \"$rc\" > exit.code", content)
         self.assertIn("archive_path=$(mktemp /tmp/peetsfea-results.", content)
         self.assertIn('tar -czf "$archive_path" case_* case_summary.txt failed.count', content)
@@ -107,21 +107,22 @@ class TestPlan03Workflow(unittest.TestCase):
             _run_with_retry("srun", retry_count=1, action=flaky_once, retryable_exit_codes={11})
             mocked_sleep.assert_called_once_with(10)
 
-    def test_window_count_parser(self) -> None:
-        self.assertEqual(_count_screen_windows("0$ case_01 1 case_02 2 case_03"), 3)
-        self.assertEqual(_count_screen_windows(""), 0)
+    def test_slot_count_parser(self) -> None:
+        self.assertEqual(_count_screen_slots("0$ case_01 1 case_02 2 case_03"), 3)
+        self.assertEqual(_count_screen_slots(""), 0)
 
-    def test_wait_all_and_aggregation_commands_contain_parallel_window_count(self) -> None:
+    def test_wait_all_and_aggregation_commands_contain_parallel_slot_count(self) -> None:
         self.assertIn("seq 1 8", _build_wait_all_command(8))
         command = _build_case_aggregation_command(8)
         self.assertIn("seq 1 8", command)
         self.assertIn('if [ -f "$case_dir/exit.code" ]; then', command)
         self.assertIn('code=97; echo "$code" > "$case_dir/exit.code";', command)
 
-    def test_case_window_command_contains_case_name_and_core_count(self) -> None:
-        command = _build_case_window_command(case_index=3, cores_per_window=4)
+    def test_case_slot_command_contains_case_name_and_core_count(self) -> None:
+        command = _build_case_slot_command(case_index=3, cores_per_slot=4)
         self.assertIn("case_03", command)
-        self.assertIn("PEETS_CORES=4", command)
+        self.assertIn("PEETS_SLOT_CORES=4", command)
+        self.assertIn("PEETS_SLOT_TASKS=1", command)
 
     def test_parse_case_summary_lines_only_keeps_failed_cases(self) -> None:
         parsed = _parse_case_summary_lines("case_01:0\ncase_02:2\ncase_03:137\nnoise\n")

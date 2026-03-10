@@ -22,14 +22,14 @@ from .constants import (
 from .remote_job import (
     CaseExecutionSummary as _CaseExecutionSummary,
     RemoteJobAttemptResult,
-    WindowInput,
+    SlotInput,
     WorkflowError as _WorkflowError,
     _build_case_aggregation_command,
-    _build_case_window_command,
+    _build_case_slot_command,
     _build_remote_dispatch_script_content,
     _build_remote_job_script_content,
     _build_wait_all_command,
-    _count_screen_windows,
+    _count_screen_slots,
     _extract_meaningful_remote_failure_details,
     _has_remote_workflow_markers,
     _parse_marked_case_summary_lines,
@@ -43,15 +43,19 @@ from .scheduler import (
     AccountCapacitySnapshot,
     AccountReadinessSnapshot,
     BundleSpec,
-    WindowWorkerController,
-    WindowTaskRef,
+    SlotWorkerController,
+    SlotTaskRef,
     bootstrap_account_runtime,
     query_account_preflight,
     query_account_readiness,
     query_account_capacity,
-    run_window_workers,
+    run_slot_workers,
 )
 from .state_store import StateStore
+from .version import get_version
+
+
+APP_VERSION = get_version()
 
 
 def _log_stage(message: str) -> None:
@@ -90,13 +94,13 @@ class PipelineConfig:
     partition: str = "cpu2"
     nodes: int = 1
     ntasks: int = 1
-    cpus_per_job: int = 32
-    mem: str = "320G"
+    cpus_per_job: int = 16
+    mem: str = "960G"
     time_limit: str = "05:00:00"
     remote_root: str = "~/aedt_runs"
     execute_remote: bool = False
-    windows_per_job: int = 4
-    cores_per_window: int = 4
+    slots_per_job: int = 4
+    cores_per_slot: int = 4
     job_retry_count: int = 1
     worker_requeue_limit: int = 1
     scan_recursive: bool = True
@@ -113,7 +117,7 @@ class PipelineConfig:
     run_rotation_hours: int = 24
     pending_buffer_per_account: int = 3
     capacity_scope: str = "all_user_jobs"
-    balance_metric: str = "window_throughput"
+    balance_metric: str = "slot_throughput"
 
     def validate(self) -> tuple[Path, Path, list[Path], list[AccountConfig]]:
         input_root = Path(self.input_queue_dir).expanduser().resolve()
@@ -130,8 +134,8 @@ class PipelineConfig:
         _ensure_positive("nodes", self.nodes)
         _ensure_positive("ntasks", self.ntasks)
         _ensure_positive("cpus_per_job", self.cpus_per_job)
-        _ensure_positive("windows_per_job", self.windows_per_job)
-        _ensure_positive("cores_per_window", self.cores_per_window)
+        _ensure_positive("slots_per_job", self.slots_per_job)
+        _ensure_positive("cores_per_slot", self.cores_per_slot)
         _ensure_positive("ingest_poll_seconds", self.ingest_poll_seconds)
         _ensure_positive("run_rotation_hours", self.run_rotation_hours)
         if self.job_retry_count < 0:
@@ -142,16 +146,16 @@ class PipelineConfig:
             raise ValueError("pending_buffer_per_account must be >= 0")
         if self.capacity_scope != "all_user_jobs":
             raise ValueError("capacity_scope must be 'all_user_jobs'")
-        if self.balance_metric != "window_throughput":
-            raise ValueError("balance_metric must be 'window_throughput'")
+        if self.balance_metric != "slot_throughput":
+            raise ValueError("balance_metric must be 'slot_throughput'")
         if not self.ready_sidecar_suffix.strip():
             raise ValueError("ready_sidecar_suffix must not be empty")
         for name in ("partition", "mem", "time_limit", "remote_root", "metadata_db_path"):
             if not getattr(self, name).strip():
                 raise ValueError(f"{name} must not be empty")
-        if self.cpus_per_job < (self.windows_per_job * self.cores_per_window):
+        if self.cpus_per_job < (self.slots_per_job * self.cores_per_slot):
             raise ValueError(
-                f"cpus_per_job must be >= windows_per_job * cores_per_window ({self.windows_per_job * self.cores_per_window})"
+                f"cpus_per_job must be >= slots_per_job * cores_per_slot ({self.slots_per_job * self.cores_per_slot})"
             )
 
         accounts = [account for account in self.accounts_registry if account.enabled]
@@ -187,32 +191,33 @@ class PipelineResult:
     success_jobs: int
     failed_jobs: int
     quarantined_jobs: int
-    total_windows: int = 0
-    active_windows: int = 0
-    success_windows: int = 0
-    failed_windows: int = 0
-    quarantined_windows: int = 0
-    queued_windows: int = 0
+    total_slots: int = 0
+    active_slots: int = 0
+    success_slots: int = 0
+    failed_slots: int = 0
+    quarantined_slots: int = 0
+    queued_slots: int = 0
     terminal_jobs: int = 0
     replacement_jobs: int = 0
     ready_accounts: tuple[str, ...] = ()
     blocked_accounts: tuple[str, ...] = ()
     bootstrapping_accounts: tuple[str, ...] = ()
-    readiness_blocked_windows: int = 0
+    readiness_blocked_slots: int = 0
+    version: str = APP_VERSION
 
     @property
     def blocked(self) -> bool:
-        return self.readiness_blocked_windows > 0 or bool(self.blocked_accounts)
+        return self.readiness_blocked_slots > 0 or bool(self.blocked_accounts)
 
     @property
     def recovery_needed(self) -> bool:
-        if self.blocked or self.total_windows == 0:
+        if self.blocked or self.total_slots == 0:
             return False
         return (
             self.failed_jobs > 0
             or self.quarantined_jobs > 0
-            or self.failed_windows > 0
-            or self.quarantined_windows > 0
+            or self.failed_slots > 0
+            or self.quarantined_slots > 0
             or self.terminal_jobs > self.replacement_jobs
         )
 
@@ -224,14 +229,14 @@ class _BundleRuntimeOutcome:
     quarantined: bool
     exit_code: int
     message: str
-    success_windows: int
-    failed_windows: int
-    quarantined_windows: int
-    requeue_windows: tuple[WindowTaskRef, ...] = ()
+    success_slots: int
+    failed_slots: int
+    quarantined_slots: int
+    requeue_slots: tuple[SlotTaskRef, ...] = ()
 
     @property
     def terminal_worker(self) -> bool:
-        return bool(self.requeue_windows) or not self.success
+        return bool(self.requeue_slots) or not self.success
 
 
 @dataclass(slots=True)
@@ -243,8 +248,8 @@ class _RemoteExecutionConfig:
     cpus_per_job: int
     mem: str
     time_limit: str
-    windows_per_job: int
-    cores_per_window: int
+    slots_per_job: int
+    cores_per_slot: int
 
 
 def _scan_input_aedt_files(*, input_root: Path, recursive: bool) -> list[Path]:
@@ -286,11 +291,11 @@ def _iter_input_aedt_files(*, input_root: Path, recursive: bool) -> Iterator[Pat
 
 
 def _configured_target_slots(*, config: PipelineConfig, accounts: list[AccountConfig]) -> int:
-    return sum(max(1, account.max_jobs) for account in accounts) * config.windows_per_job
+    return sum(max(1, account.max_jobs) for account in accounts) * config.slots_per_job
 
 
 def _continuous_backlog_limits(*, config: PipelineConfig, accounts: list[AccountConfig]) -> tuple[int, int]:
-    low_watermark = max(config.windows_per_job, _configured_target_slots(config=config, accounts=accounts))
+    low_watermark = max(config.slots_per_job, _configured_target_slots(config=config, accounts=accounts))
     high_watermark = max(low_watermark, low_watermark * 2)
     return low_watermark, high_watermark
 
@@ -341,13 +346,16 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         state_store.start_run(run_id)
     remote_run_dir = _join_remote_root(config.remote_root, run_id)
     total_inputs_label = "streaming" if config.continuous_mode else str(len(aedt_files))
-    _log_stage(f"pipeline start run_id={run_id} total_inputs={total_inputs_label} execute_remote={config.execute_remote}")
+    _log_stage(
+        f"pipeline start version={APP_VERSION} run_id={run_id} "
+        f"total_inputs={total_inputs_label} execute_remote={config.execute_remote}"
+    )
 
-    queued_windows = _load_schedulable_windows(state_store=state_store, run_id=run_id, input_root=input_root)
-    total_windows = len(queued_windows)
+    queued_slots = _load_schedulable_slots(state_store=state_store, run_id=run_id, input_root=input_root)
+    total_slots = len(queued_slots)
     discovered_count = 0
-    if queued_windows:
-        _log_stage(f"restored queued windows run_id={run_id} count={len(queued_windows)}")
+    if queued_slots:
+        _log_stage(f"restored queued slots run_id={run_id} count={len(queued_slots)}")
 
     def _capacity_log(snapshot: AccountCapacitySnapshot) -> None:
         state_store.record_account_capacity_snapshot(
@@ -366,12 +374,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         _log_stage(f"capacity query failed account={account.account_id} host={account.host_alias} reason={exc}")
 
     def _bundle_submitted(bundle: BundleSpec) -> None:
-        completed, inflight = state_store.get_window_throughput_score(run_id=run_id, account_id=bundle.account_id)
+        completed, inflight = state_store.get_slot_throughput_score(run_id=run_id, account_id=bundle.account_id)
         _log_stage(
-            f"scheduler pick account={bundle.account_id} score={completed + inflight} windows={bundle.window_count}"
+            f"scheduler pick account={bundle.account_id} score={completed + inflight} slots={bundle.slot_count}"
         )
         _log_stage(
-            f"bundle submitted job_id={bundle.job_id} account={bundle.account_id} window_count={bundle.window_count}"
+            f"bundle submitted job_id={bundle.job_id} account={bundle.account_id} slot_count={bundle.slot_count}"
         )
 
     outcomes: list[_BundleRuntimeOutcome] = []
@@ -381,13 +389,13 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     ready_account_ids: list[str] = []
     blocked_account_ids: list[str] = []
     bootstrapping_account_ids: list[str] = []
-    readiness_blocked_windows = 0
+    readiness_blocked_slots = 0
     next_job_index = state_store.get_next_job_index(run_id=run_id)
-    controller: WindowWorkerController[_BundleRuntimeOutcome] | None = None
+    controller: SlotWorkerController[_BundleRuntimeOutcome] | None = None
 
-    def _current_completed_windows() -> dict[str, int]:
+    def _current_completed_slots() -> dict[str, int]:
         return {
-            account.account_id: state_store.get_window_throughput_score(run_id=run_id, account_id=account.account_id)[0]
+            account.account_id: state_store.get_slot_throughput_score(run_id=run_id, account_id=account.account_id)[0]
             for account in accounts
         }
 
@@ -508,20 +516,20 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 blocked_account_ids.append(account.account_id)
         return ready_accounts
 
-    def _run_window_batch(window_batch: list[WindowTaskRef]) -> bool:
-        nonlocal max_inflight_jobs, next_job_index, terminal_jobs, replacement_jobs, readiness_blocked_windows
-        if not window_batch:
+    def _run_slot_batch(slot_batch: list[SlotTaskRef]) -> bool:
+        nonlocal max_inflight_jobs, next_job_index, terminal_jobs, replacement_jobs, readiness_blocked_slots
+        if not slot_batch:
             return False
         dispatch_accounts = _resolve_dispatch_accounts()
         if not dispatch_accounts:
-            readiness_blocked_windows = len(window_batch)
+            readiness_blocked_slots = len(slot_batch)
             return False
-        completed_windows = _current_completed_windows()
+        completed_slots = _current_completed_slots()
         if config.execute_remote:
-            batch = run_window_workers(
-                window_queue=window_batch,
+            batch = run_slot_workers(
+                slot_queue=slot_batch,
                 accounts=dispatch_accounts,
-                windows_per_job=config.windows_per_job,
+                slots_per_job=config.slots_per_job,
                 pending_buffer_per_account=config.pending_buffer_per_account,
                 worker=lambda bundle: _run_bundle_with_retry(
                     config=config,
@@ -531,19 +539,19 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     bundle=bundle,
                 ),
                 capacity_lookup=query_account_capacity,
-                initial_completed_windows=completed_windows,
+                initial_completed_slots=completed_slots,
                 job_index_start=next_job_index,
                 on_capacity_snapshot=_capacity_log,
                 on_capacity_error=_capacity_error,
                 on_bundle_submitted=_bundle_submitted,
-                recovery_windows_lookup=lambda _bundle, outcome: outcome.requeue_windows,
+                recovery_slots_lookup=lambda _bundle, outcome: outcome.requeue_slots,
                 terminal_bundle_lookup=lambda _bundle, outcome: outcome.terminal_worker,
             )
         else:
-            batch = run_window_workers(
-                window_queue=window_batch,
+            batch = run_slot_workers(
+                slot_queue=slot_batch,
                 accounts=dispatch_accounts,
-                windows_per_job=config.windows_per_job,
+                slots_per_job=config.slots_per_job,
                 pending_buffer_per_account=config.pending_buffer_per_account,
                 worker=lambda bundle: _run_dry_bundle(
                     run_id=run_id,
@@ -551,11 +559,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     bundle=bundle,
                 ),
                 capacity_lookup=_local_capacity_lookup,
-                initial_completed_windows=completed_windows,
+                initial_completed_slots=completed_slots,
                 job_index_start=next_job_index,
                 on_capacity_snapshot=_capacity_log,
                 on_bundle_submitted=_bundle_submitted,
-                recovery_windows_lookup=lambda _bundle, outcome: (),
+                recovery_slots_lookup=lambda _bundle, outcome: (),
                 terminal_bundle_lookup=lambda _bundle, outcome: False,
             )
         max_inflight_jobs = max(max_inflight_jobs, batch.max_inflight_jobs)
@@ -565,58 +573,58 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         outcomes.extend(batch.results)
         return True
 
-    def _dispatch_queued_windows(*, max_windows: int | None = None) -> None:
-        nonlocal queued_windows
+    def _dispatch_queued_slots(*, max_slots: int | None = None) -> None:
+        nonlocal queued_slots
         while True:
-            if not queued_windows:
-                queued_windows = _load_schedulable_windows(
+            if not queued_slots:
+                queued_slots = _load_schedulable_slots(
                     state_store=state_store,
                     run_id=run_id,
                     input_root=input_root,
                 )
-                if not queued_windows:
+                if not queued_slots:
                     break
-            if max_windows is None or max_windows <= 0 or len(queued_windows) <= max_windows:
-                batch_windows = queued_windows
-                queued_windows = []
+            if max_slots is None or max_slots <= 0 or len(queued_slots) <= max_slots:
+                batch_slots = queued_slots
+                queued_slots = []
             else:
-                batch_windows = queued_windows[:max_windows]
-                queued_windows = queued_windows[max_windows:]
-            dispatched = _run_window_batch(batch_windows)
+                batch_slots = queued_slots[:max_slots]
+                queued_slots = queued_slots[max_slots:]
+            dispatched = _run_slot_batch(batch_slots)
             if not dispatched:
-                queued_windows = batch_windows + queued_windows
+                queued_slots = batch_slots + queued_slots
                 break
-            if max_windows is not None:
+            if max_slots is not None:
                 break
 
     if not config.continuous_mode:
-        _dispatch_queued_windows()
+        _dispatch_queued_slots()
 
-    def _on_window_enqueued(window: WindowTaskRef) -> None:
-        nonlocal total_windows
-        queued_windows.append(window)
-        total_windows += 1
-        _dispatch_queued_windows()
+    def _on_slot_enqueued(slot: SlotTaskRef) -> None:
+        nonlocal total_slots
+        queued_slots.append(slot)
+        total_slots += 1
+        _dispatch_queued_slots()
 
     if config.continuous_mode:
         low_watermark, high_watermark = _continuous_backlog_limits(config=config, accounts=accounts)
         input_iter = _iter_input_aedt_files(input_root=input_root, recursive=config.scan_recursive)
         scan_exhausted = False
         def _start_controller(*, force: bool = False) -> bool:
-            nonlocal controller, queued_windows, readiness_blocked_windows
+            nonlocal controller, queued_slots, readiness_blocked_slots
             if controller is not None:
                 return True
-            if not queued_windows:
+            if not queued_slots:
                 return False
-            if not force and len(queued_windows) < config.windows_per_job:
+            if not force and len(queued_slots) < config.slots_per_job:
                 return False
             dispatch_accounts = _resolve_dispatch_accounts()
             if not dispatch_accounts:
-                readiness_blocked_windows = len(queued_windows)
+                readiness_blocked_slots = len(queued_slots)
                 return False
-            controller = WindowWorkerController(
+            controller = SlotWorkerController(
                 accounts=dispatch_accounts,
-                windows_per_job=config.windows_per_job,
+                slots_per_job=config.slots_per_job,
                 pending_buffer_per_account=config.pending_buffer_per_account,
                 worker=(
                     lambda bundle: _run_bundle_with_retry(
@@ -636,13 +644,13 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     )
                 ),
                 capacity_lookup=query_account_capacity if config.execute_remote else _local_capacity_lookup,
-                initial_completed_windows=_current_completed_windows(),
+                initial_completed_slots=_current_completed_slots(),
                 job_index_start=next_job_index,
                 on_capacity_snapshot=_capacity_log,
                 on_capacity_error=_capacity_error if config.execute_remote else None,
                 on_bundle_submitted=_bundle_submitted,
-                recovery_windows_lookup=(
-                    (lambda _bundle, outcome: outcome.requeue_windows)
+                recovery_slots_lookup=(
+                    (lambda _bundle, outcome: outcome.requeue_slots)
                     if config.execute_remote
                     else (lambda _bundle, outcome: ())
                 ),
@@ -652,33 +660,33 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     else (lambda _bundle, outcome: False)
                 ),
             )
-            controller.enqueue_windows(queued_windows)
-            queued_windows = []
+            controller.enqueue_slots(queued_slots)
+            queued_slots = []
             controller.step(wait_for_progress=False)
             return True
 
         while True:
             controller_snapshot = controller.snapshot() if controller is not None else None
-            backlog_windows = len(queued_windows)
+            backlog_slots = len(queued_slots)
             if controller_snapshot is not None:
-                backlog_windows += (
-                    controller_snapshot.queued_windows
-                    + controller_snapshot.pending_windows
-                    + controller_snapshot.inflight_windows
+                backlog_slots += (
+                    controller_snapshot.queued_slots
+                    + controller_snapshot.pending_slots
+                    + controller_snapshot.inflight_slots
                 )
 
-            if controller is None and queued_windows:
-                forced_start = scan_exhausted or len(queued_windows) >= config.windows_per_job
+            if controller is None and queued_slots:
+                forced_start = scan_exhausted or len(queued_slots) >= config.slots_per_job
                 if forced_start and _start_controller(force=scan_exhausted):
                     continue
 
-            if not scan_exhausted and backlog_windows < high_watermark:
+            if not scan_exhausted and backlog_slots < high_watermark:
                 try:
                     input_file = next(input_iter)
                 except StopIteration:
                     scan_exhausted = True
                 else:
-                    windows, discovered_delta = _ingest_window_queue(
+                    slots, discovered_delta = _ingest_slot_queue(
                         config=config,
                         state_store=state_store,
                         run_id=run_id,
@@ -687,23 +695,23 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                         aedt_files=[input_file],
                     )
                     discovered_count += discovered_delta
-                    if windows:
-                        total_windows += len(windows)
+                    if slots:
+                        total_slots += len(slots)
                         if controller is not None:
-                            controller.enqueue_windows(windows)
+                            controller.enqueue_slots(slots)
                             controller.step(wait_for_progress=False)
                         else:
-                            queued_windows.extend(windows)
-                            if len(queued_windows) >= config.windows_per_job:
+                            queued_slots.extend(slots)
+                            if len(queued_slots) >= config.slots_per_job:
                                 _start_controller()
                     continue
 
             if controller is not None:
                 controller_snapshot = controller.snapshot()
                 controller_backlog = (
-                    controller_snapshot.queued_windows
-                    + controller_snapshot.pending_windows
-                    + controller_snapshot.inflight_windows
+                    controller_snapshot.queued_slots
+                    + controller_snapshot.pending_slots
+                    + controller_snapshot.inflight_slots
                 )
                 wait_for_progress = scan_exhausted or controller_backlog >= low_watermark
                 progressed = controller.step(wait_for_progress=wait_for_progress)
@@ -713,30 +721,30 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     break
 
             if controller is None and scan_exhausted:
-                if queued_windows:
+                if queued_slots:
                     if _start_controller(force=True):
                         continue
-                    readiness_blocked_windows = len(queued_windows)
+                    readiness_blocked_slots = len(queued_slots)
                 break
 
-            if controller is None and blocked_account_ids and backlog_windows >= high_watermark:
-                readiness_blocked_windows = backlog_windows
+            if controller is None and blocked_account_ids and backlog_slots >= high_watermark:
+                readiness_blocked_slots = backlog_slots
                 break
     else:
-        windows, discovered_count = _ingest_window_queue(
+        slots, discovered_count = _ingest_slot_queue(
             config=config,
             state_store=state_store,
             run_id=run_id,
             input_root=input_root,
             output_root=output_root,
             aedt_files=aedt_files,
-            on_window_enqueued=None,
+            on_slot_enqueued=None,
         )
-        if windows:
-            queued_windows.extend(windows)
-            total_windows += len(windows)
+        if slots:
+            queued_slots.extend(slots)
+            total_slots += len(slots)
 
-        _dispatch_queued_windows()
+        _dispatch_queued_slots()
 
     if config.continuous_mode and controller is not None:
         batch = controller.finalize()
@@ -746,9 +754,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         replacement_jobs += batch.replacement_jobs
         outcomes.extend(batch.results)
 
-    if total_windows == 0:
+    if total_slots == 0:
         summary = (
-            f"total_windows=0 active_windows=0 success_windows=0 failed_windows=0 quarantined_windows=0 "
+            f"version={APP_VERSION} total_slots=0 active_slots=0 success_slots=0 failed_slots=0 quarantined_slots=0 "
             f"active_jobs=0 ingest_discovered={discovered_count} ingest_enqueued=0"
         )
         if config.continuous_mode:
@@ -767,18 +775,18 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             success_jobs=0,
             failed_jobs=0,
             quarantined_jobs=0,
-            total_windows=0,
-            active_windows=0,
-            success_windows=0,
-            failed_windows=0,
-            quarantined_windows=0,
-            queued_windows=0,
+            total_slots=0,
+            active_slots=0,
+            success_slots=0,
+            failed_slots=0,
+            quarantined_slots=0,
+            queued_slots=0,
             terminal_jobs=0,
             replacement_jobs=0,
             ready_accounts=tuple(ready_account_ids),
             blocked_accounts=tuple(blocked_account_ids),
             bootstrapping_accounts=tuple(bootstrapping_account_ids),
-            readiness_blocked_windows=0,
+            readiness_blocked_slots=0,
         )
 
     orphan_cleanup_error: _WorkflowError | None = None
@@ -792,8 +800,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 cpus_per_job=config.cpus_per_job,
                 mem=config.mem,
                 time_limit=config.time_limit,
-                windows_per_job=config.windows_per_job,
-                cores_per_window=config.cores_per_window,
+                slots_per_job=config.slots_per_job,
+                cores_per_slot=config.cores_per_slot,
             )
             try:
                 cleanup_orphan_sessions_for_run(config=cleanup_cfg, run_id=run_id)
@@ -808,35 +816,35 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     success_jobs = total_jobs - failed_jobs
     failed_job_ids = [item.job_id for item in outcomes if not item.success]
 
-    success_windows = sum(item.success_windows for item in outcomes)
-    failed_windows = sum(item.failed_windows for item in outcomes)
-    quarantined_windows = sum(item.quarantined_windows for item in outcomes)
+    success_slots = sum(item.success_slots for item in outcomes)
+    failed_slots = sum(item.failed_slots for item in outcomes)
+    quarantined_slots = sum(item.quarantined_slots for item in outcomes)
 
     success = (
         failed_jobs == 0
         and quarantined_jobs == 0
-        and failed_windows == 0
-        and quarantined_windows == 0
+        and failed_slots == 0
+        and quarantined_slots == 0
         and orphan_cleanup_error is None
-        and readiness_blocked_windows == 0
+        and readiness_blocked_slots == 0
     )
     first_failure_code = next((item.exit_code for item in outcomes if item.exit_code != EXIT_CODE_SUCCESS), EXIT_CODE_SUCCESS)
     exit_code = EXIT_CODE_SUCCESS if success else first_failure_code
-    if exit_code == EXIT_CODE_SUCCESS and readiness_blocked_windows > 0:
+    if exit_code == EXIT_CODE_SUCCESS and readiness_blocked_slots > 0:
         exit_code = EXIT_CODE_REMOTE_RUN_FAILURE
     if orphan_cleanup_error is not None:
         exit_code = orphan_cleanup_error.exit_code
 
     summary = (
-        f"total_jobs={total_jobs} success_jobs={success_jobs} failed_jobs={failed_jobs} "
-        f"quarantined_jobs={quarantined_jobs} total_windows={total_windows} "
-        f"active_windows=0 success_windows={success_windows} failed_windows={failed_windows} "
-        f"quarantined_windows={quarantined_windows} failed_job_ids={failed_job_ids} "
+        f"version={APP_VERSION} total_jobs={total_jobs} success_jobs={success_jobs} failed_jobs={failed_jobs} "
+        f"quarantined_jobs={quarantined_jobs} total_slots={total_slots} "
+        f"active_slots=0 success_slots={success_slots} failed_slots={failed_slots} "
+        f"quarantined_slots={quarantined_slots} failed_job_ids={failed_job_ids} "
         f"active_jobs=0 max_inflight_jobs={max_inflight_jobs} "
         f"terminal_jobs={terminal_jobs} replacement_jobs={replacement_jobs} "
         f"ready_accounts={ready_account_ids} blocked_accounts={blocked_account_ids} "
         f"bootstrapping_accounts={bootstrapping_account_ids} "
-        f"readiness_blocked_windows={readiness_blocked_windows}"
+        f"readiness_blocked_slots={readiness_blocked_slots}"
     )
     if orphan_cleanup_error is not None:
         summary = f"{summary} orphan_cleanup_error={orphan_cleanup_error}"
@@ -846,8 +854,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     else:
         state_store.finish_run(run_id, state="SUCCEEDED" if success else "FAILED", summary=summary)
     _log_stage(
-        f"pipeline end run_id={run_id} success={success} total_jobs={total_jobs} "
-        f"failed_jobs={failed_jobs} quarantined_jobs={quarantined_jobs}"
+        f"pipeline end version={APP_VERSION} run_id={run_id} success={success} "
+        f"total_jobs={total_jobs} failed_jobs={failed_jobs} quarantined_jobs={quarantined_jobs}"
     )
 
     return PipelineResult(
@@ -861,44 +869,44 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         success_jobs=success_jobs,
         failed_jobs=failed_jobs,
         quarantined_jobs=quarantined_jobs,
-        total_windows=total_windows,
-        active_windows=0,
-        success_windows=success_windows,
-        failed_windows=failed_windows,
-        quarantined_windows=quarantined_windows,
-        queued_windows=readiness_blocked_windows,
+        total_slots=total_slots,
+        active_slots=0,
+        success_slots=success_slots,
+        failed_slots=failed_slots,
+        quarantined_slots=quarantined_slots,
+        queued_slots=readiness_blocked_slots,
         terminal_jobs=terminal_jobs,
         replacement_jobs=replacement_jobs,
         ready_accounts=tuple(ready_account_ids),
         blocked_accounts=tuple(blocked_account_ids),
         bootstrapping_accounts=tuple(bootstrapping_account_ids),
-        readiness_blocked_windows=readiness_blocked_windows,
+        readiness_blocked_slots=readiness_blocked_slots,
     )
 
 
-def _load_schedulable_windows(*, state_store: StateStore, run_id: str, input_root: Path) -> list[WindowTaskRef]:
-    windows: list[WindowTaskRef] = []
-    for window_id, input_path, output_path, attempt_no in state_store.list_schedulable_window_tasks(run_id=run_id):
+def _load_schedulable_slots(*, state_store: StateStore, run_id: str, input_root: Path) -> list[SlotTaskRef]:
+    slots: list[SlotTaskRef] = []
+    for slot_id, input_path, output_path, attempt_no in state_store.list_schedulable_slot_tasks(run_id=run_id):
         input_ref = Path(input_path)
         output_ref = Path(output_path)
         try:
             relative_path = input_ref.relative_to(input_root)
         except Exception:
             relative_path = Path(input_ref.name)
-        windows.append(
-            WindowTaskRef(
+        slots.append(
+            SlotTaskRef(
                 run_id=run_id,
-                window_id=window_id,
+                slot_id=slot_id,
                 input_path=input_ref,
                 relative_path=Path(relative_path),
                 output_dir=output_ref,
                 attempt_no=max(1, attempt_no),
             )
         )
-    return windows
+    return slots
 
 
-def _ingest_window_queue(
+def _ingest_slot_queue(
     *,
     config: PipelineConfig,
     state_store: StateStore,
@@ -906,14 +914,14 @@ def _ingest_window_queue(
     input_root: Path,
     output_root: Path,
     aedt_files: list[Path],
-    on_window_enqueued: Callable[[WindowTaskRef], None] | None = None,
-) -> tuple[list[WindowTaskRef], int]:
-    windows: list[WindowTaskRef] = []
+    on_slot_enqueued: Callable[[SlotTaskRef], None] | None = None,
+) -> tuple[list[SlotTaskRef], int]:
+    slots: list[SlotTaskRef] = []
     discovered_count = 0
 
     for input_file in aedt_files:
         relative_path = input_file.relative_to(input_root)
-        output_dir = _build_window_output_dir(
+        output_dir = _build_slot_output_dir(
             output_root=output_root,
             relative_path=relative_path,
         )
@@ -937,17 +945,17 @@ def _ingest_window_queue(
             if not inserted:
                 continue
 
-        window_id = _build_window_id(relative_path=relative_path, mtime_ns=file_stat.st_mtime_ns)
-        state_store.create_window_task(
+        slot_id = _build_slot_id(relative_path=relative_path, mtime_ns=file_stat.st_mtime_ns)
+        state_store.create_slot_task(
             run_id=run_id,
-            window_id=window_id,
+            slot_id=slot_id,
             input_path=str(input_file),
             output_path=str(output_dir),
             account_id=None,
         )
-        state_store.append_window_event(
+        state_store.append_slot_event(
             run_id=run_id,
-            window_id=window_id,
+            slot_id=slot_id,
             level="INFO",
             stage="READY" if ready_state.ready_present else "READY_INTERNAL",
             message=(
@@ -956,29 +964,29 @@ def _ingest_window_queue(
                 else f"ready_mode={ready_state.ready_mode} error={ready_state.ready_error}"
             ),
         )
-        state_store.append_window_event(
+        state_store.append_slot_event(
             run_id=run_id,
-            window_id=window_id,
+            slot_id=slot_id,
             level="INFO",
             stage="QUEUED",
             message="ingested",
         )
         if config.continuous_mode:
             state_store.mark_ingest_state(input_path=str(input_file), state="QUEUED")
-        window_ref = WindowTaskRef(
+        slot_ref = SlotTaskRef(
             run_id=run_id,
-            window_id=window_id,
+            slot_id=slot_id,
             input_path=input_file,
             relative_path=relative_path,
             output_dir=output_dir,
             attempt_no=1,
         )
-        if on_window_enqueued is None:
-            windows.append(window_ref)
+        if on_slot_enqueued is None:
+            slots.append(slot_ref)
         else:
-            on_window_enqueued(window_ref)
+            on_slot_enqueued(slot_ref)
 
-    return windows, discovered_count
+    return slots, discovered_count
 
 
 def _run_dry_bundle(
@@ -987,24 +995,24 @@ def _run_dry_bundle(
     state_store: StateStore,
     bundle: BundleSpec,
 ) -> _BundleRuntimeOutcome:
-    if not bundle.window_inputs:
+    if not bundle.slot_inputs:
         return _BundleRuntimeOutcome(
             job_id=bundle.job_id,
             success=True,
             quarantined=False,
             exit_code=EXIT_CODE_SUCCESS,
-            message="no windows",
-            success_windows=0,
-            failed_windows=0,
-            quarantined_windows=0,
+            message="no slots",
+            success_slots=0,
+            failed_slots=0,
+            quarantined_slots=0,
         )
 
-    first_window = bundle.window_inputs[0]
+    first_slot = bundle.slot_inputs[0]
     state_store.create_job(
         run_id=run_id,
         job_id=bundle.job_id,
-        input_path=str(first_window.input_path),
-        output_path=str(first_window.output_dir),
+        input_path=str(first_slot.input_path),
+        output_path=str(first_slot.output_dir),
         account_id=bundle.account_id,
     )
     state_store.update_job_status(run_id=run_id, job_id=bundle.job_id, status="RUNNING", attempt_no=0)
@@ -1013,29 +1021,29 @@ def _run_dry_bundle(
         job_id=bundle.job_id,
         level="INFO",
         stage="RUNNING",
-        message=f"dry-run window_count={bundle.window_count}",
+        message=f"dry-run slot_count={bundle.slot_count}",
     )
 
-    for window in bundle.window_inputs:
-        _initialize_window_output_dir(window=window)
-        state_store.update_window_task(
+    for slot in bundle.slot_inputs:
+        _initialize_slot_output_dir(slot=slot)
+        state_store.update_slot_task(
             run_id=run_id,
-            window_id=window.window_id,
+            slot_id=slot.slot_id,
             state="SUCCEEDED",
             attempt_no=0,
             job_id=bundle.job_id,
             account_id=bundle.account_id,
             failure_reason=None,
         )
-        state_store.append_window_event(
+        state_store.append_slot_event(
             run_id=run_id,
-            window_id=window.window_id,
+            slot_id=slot.slot_id,
             level="INFO",
             stage="SUCCEEDED",
             message="execute_remote=False dry run",
         )
-        state_store.mark_ingest_state(input_path=str(window.input_path), state="SUCCEEDED")
-        state_store.record_artifact(run_id=run_id, job_id=bundle.job_id, artifact_root=str(window.output_dir))
+        state_store.mark_ingest_state(input_path=str(slot.input_path), state="SUCCEEDED")
+        state_store.record_artifact(run_id=run_id, job_id=bundle.job_id, artifact_root=str(slot.output_dir))
 
     state_store.update_job_status(run_id=run_id, job_id=bundle.job_id, status="SUCCEEDED", attempt_no=0)
     state_store.append_event(
@@ -1051,9 +1059,9 @@ def _run_dry_bundle(
         quarantined=False,
         exit_code=EXIT_CODE_SUCCESS,
         message="execute_remote=False dry run",
-        success_windows=bundle.window_count,
-        failed_windows=0,
-        quarantined_windows=0,
+        success_slots=bundle.slot_count,
+        failed_slots=0,
+        quarantined_slots=0,
     )
 
 
@@ -1065,24 +1073,24 @@ def _run_bundle_with_retry(
     remote_run_dir: str,
     bundle: BundleSpec,
 ) -> _BundleRuntimeOutcome:
-    if not bundle.window_inputs:
+    if not bundle.slot_inputs:
         return _BundleRuntimeOutcome(
             job_id=bundle.job_id,
             success=True,
             quarantined=False,
             exit_code=EXIT_CODE_SUCCESS,
-            message="no windows",
-            success_windows=0,
-            failed_windows=0,
-            quarantined_windows=0,
+            message="no slots",
+            success_slots=0,
+            failed_slots=0,
+            quarantined_slots=0,
         )
 
-    first_window = bundle.window_inputs[0]
+    first_slot = bundle.slot_inputs[0]
     state_store.create_job(
         run_id=run_id,
         job_id=bundle.job_id,
-        input_path=str(first_window.input_path),
-        output_path=str(first_window.output_dir),
+        input_path=str(first_slot.input_path),
+        output_path=str(first_slot.output_dir),
         account_id=bundle.account_id,
     )
     state_store.append_event(
@@ -1090,7 +1098,7 @@ def _run_bundle_with_retry(
         job_id=bundle.job_id,
         level="INFO",
         stage="PENDING",
-        message=f"bundle queued account={bundle.account_id} windows={bundle.window_count}",
+        message=f"bundle queued account={bundle.account_id} slots={bundle.slot_count}",
     )
 
     remote_cfg = _RemoteExecutionConfig(
@@ -1101,79 +1109,79 @@ def _run_bundle_with_retry(
         cpus_per_job=config.cpus_per_job,
         mem=config.mem,
         time_limit=config.time_limit,
-        windows_per_job=config.windows_per_job,
-        cores_per_window=config.cores_per_window,
+        slots_per_job=config.slots_per_job,
+        cores_per_slot=config.cores_per_slot,
     )
     with TemporaryDirectory(prefix=f"peetsfea_bundle_{bundle.job_id}_") as tmpdir:
         local_bundle_dir = Path(tmpdir) / "bundle"
         local_bundle_dir.mkdir(parents=True, exist_ok=True)
         retry_inputs_dir = local_bundle_dir / "_retry_inputs"
         retry_inputs_dir.mkdir(parents=True, exist_ok=True)
-        pending_windows = list(bundle.window_inputs)
+        pending_slots = list(bundle.slot_inputs)
         staged_input_paths: dict[str, Path] = {}
-        for window in pending_windows:
-            staged_path = retry_inputs_dir / f"{window.window_id}.aedt"
+        for slot in pending_slots:
+            staged_path = retry_inputs_dir / f"{slot.slot_id}.aedt"
             try:
-                if window.input_path.exists():
-                    shutil.copy2(window.input_path, staged_path)
-                    staged_input_paths[window.window_id] = staged_path
+                if slot.input_path.exists():
+                    shutil.copy2(slot.input_path, staged_path)
+                    staged_input_paths[slot.slot_id] = staged_path
             except OSError:
                 continue
-        deleted_window_ids: set[str] = set()
-        success_windows = 0
-        failed_windows = 0
-        quarantined_windows = 0
+        deleted_slot_ids: set[str] = set()
+        success_slots = 0
+        failed_slots = 0
+        quarantined_slots = 0
         terminal_exit_code = EXIT_CODE_SUCCESS
         terminal_message = "ok"
         last_attempt_no = 0
-        worker_requeue_windows: list[WindowTaskRef] = []
+        worker_requeue_slots: list[SlotTaskRef] = []
 
         for attempt in range(1, config.job_retry_count + 2):
-            if not pending_windows:
+            if not pending_slots:
                 break
             last_attempt_no = attempt
 
-            runnable_windows: list[WindowTaskRef] = []
-            for window in pending_windows:
-                source_path = staged_input_paths.get(window.window_id, window.input_path)
+            runnable_slots: list[SlotTaskRef] = []
+            for slot in pending_slots:
+                source_path = staged_input_paths.get(slot.slot_id, slot.input_path)
                 if source_path.exists():
-                    runnable_windows.append(window)
+                    runnable_slots.append(slot)
                     continue
                 state_store.quarantine_job(
                     run_id=run_id,
-                    job_id=window.window_id,
+                    job_id=slot.slot_id,
                     attempt=attempt,
-                    reason=f"input missing: {window.input_path}",
+                    reason=f"input missing: {slot.input_path}",
                     exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
                 )
-                state_store.update_window_task(
+                state_store.update_slot_task(
                     run_id=run_id,
-                    window_id=window.window_id,
+                    slot_id=slot.slot_id,
                     state="QUARANTINED",
                     attempt_no=attempt,
                     job_id=bundle.job_id,
                     account_id=bundle.account_id,
-                    failure_reason=f"input missing: {window.input_path}",
+                    failure_reason=f"input missing: {slot.input_path}",
                 )
-                state_store.append_window_event(
+                state_store.append_slot_event(
                     run_id=run_id,
-                    window_id=window.window_id,
+                    slot_id=slot.slot_id,
                     level="ERROR",
                     stage="QUARANTINED",
-                    message=f"input missing: {window.input_path}",
+                    message=f"input missing: {slot.input_path}",
                 )
-                state_store.mark_ingest_state(input_path=str(window.input_path), state="QUARANTINED")
-                quarantined_windows += 1
+                state_store.mark_ingest_state(input_path=str(slot.input_path), state="QUARANTINED")
+                quarantined_slots += 1
 
-            if not runnable_windows:
-                pending_windows = []
+            if not runnable_slots:
+                pending_slots = []
                 terminal_exit_code = EXIT_CODE_REMOTE_RUN_FAILURE
-                terminal_message = "all windows quarantined due to missing input files"
+                terminal_message = "all slots quarantined due to missing input files"
                 break
 
             session_name = _build_session_name(run_id, bundle.job_index, attempt)
             _log_stage(
-                f"job start job_id={bundle.job_id} attempt={attempt} session={session_name} windows={len(runnable_windows)}"
+                f"job start job_id={bundle.job_id} attempt={attempt} session={session_name} slots={len(runnable_slots)}"
             )
             state_store.update_job_status(run_id=run_id, job_id=bundle.job_id, status="SUBMITTED", attempt_no=attempt)
             state_store.append_event(
@@ -1181,31 +1189,31 @@ def _run_bundle_with_retry(
                 job_id=bundle.job_id,
                 level="INFO",
                 stage="SUBMITTED",
-                message=f"attempt={attempt} windows={len(runnable_windows)}",
+                message=f"attempt={attempt} slots={len(runnable_slots)}",
             )
 
-            for window in runnable_windows:
-                state_store.update_window_task(
+            for slot in runnable_slots:
+                state_store.update_slot_task(
                     run_id=run_id,
-                    window_id=window.window_id,
+                    slot_id=slot.slot_id,
                     state="ASSIGNED",
                     attempt_no=attempt,
                     job_id=bundle.job_id,
                     account_id=bundle.account_id,
                     failure_reason=None,
                 )
-                state_store.append_window_event(
+                state_store.append_slot_event(
                     run_id=run_id,
-                    window_id=window.window_id,
+                    slot_id=slot.slot_id,
                     level="INFO",
                     stage="ASSIGNED",
                     message=f"job={bundle.job_id} attempt={attempt}",
                 )
 
-            _mark_window_lifecycle_stage(
+            _mark_slot_lifecycle_stage(
                 state_store=state_store,
                 run_id=run_id,
-                windows=runnable_windows,
+                slots=runnable_slots,
                 attempt_no=attempt,
                 job_id=bundle.job_id,
                 account_id=bundle.account_id,
@@ -1223,20 +1231,20 @@ def _run_bundle_with_retry(
 
             def _delete_after_upload() -> None:
                 if config.delete_input_after_upload:
-                    for window in runnable_windows:
-                        state_store.mark_window_delete_pending(run_id=run_id, window_id=window.window_id)
-                        state_store.append_window_event(
+                    for slot in runnable_slots:
+                        state_store.mark_slot_delete_pending(run_id=run_id, slot_id=slot.slot_id)
+                        state_store.append_slot_event(
                             run_id=run_id,
-                            window_id=window.window_id,
+                            slot_id=slot.slot_id,
                             level="INFO",
                             stage="DELETE_PENDING",
                             message="uploaded; waiting for terminal materialization",
                         )
-                        state_store.mark_ingest_state(input_path=str(window.input_path), state="UPLOADED")
-                _mark_window_lifecycle_stage(
+                        state_store.mark_ingest_state(input_path=str(slot.input_path), state="UPLOADED")
+                _mark_slot_lifecycle_stage(
                     state_store=state_store,
                     run_id=run_id,
-                    windows=runnable_windows,
+                    slots=runnable_slots,
                     attempt_no=attempt,
                     job_id=bundle.job_id,
                     account_id=bundle.account_id,
@@ -1247,12 +1255,12 @@ def _run_bundle_with_retry(
             try:
                 result = run_remote_job_attempt(
                     config=remote_cfg,
-                    window_inputs=[
-                        WindowInput(
-                            window_id=window.window_id,
-                            input_path=staged_input_paths.get(window.window_id, window.input_path),
+                    slot_inputs=[
+                        SlotInput(
+                            slot_id=slot.slot_id,
+                            input_path=staged_input_paths.get(slot.slot_id, slot.input_path),
                         )
-                        for window in runnable_windows
+                        for slot in runnable_slots
                     ],
                     remote_job_dir=_join_remote_root(
                         _join_remote_root(_join_remote_root(remote_run_dir, bundle.account_id), bundle.job_id),
@@ -1272,15 +1280,15 @@ def _run_bundle_with_retry(
                     failed_case_lines=[],
                     failure_category="launch",
                 )
-            materialized_window_ids = _materialize_window_outputs(
+            materialized_slot_ids = _materialize_slot_outputs(
                 local_bundle_dir=local_bundle_dir,
-                windows=runnable_windows,
+                slots=runnable_slots,
                 staged_input_paths=staged_input_paths,
             )
             if not result.success or result.failure_category:
-                _materialize_window_failure_artifacts(
+                _materialize_slot_failure_artifacts(
                     local_bundle_dir=local_bundle_dir,
-                    windows=runnable_windows,
+                    slots=runnable_slots,
                     staged_input_paths=staged_input_paths,
                 )
             formatted_result_message = _format_failure_message(
@@ -1317,157 +1325,157 @@ def _run_bundle_with_retry(
                     message=terminal_message,
                 )
 
-            failed_indices = _parse_failed_case_indices(result.failed_case_lines, len(runnable_windows))
+            failed_indices = _parse_failed_case_indices(result.failed_case_lines, len(runnable_slots))
             if not result.success and not failed_indices:
-                failed_indices = set(range(len(runnable_windows)))
-            for index, window in enumerate(runnable_windows):
-                if window.window_id not in materialized_window_ids:
+                failed_indices = set(range(len(runnable_slots)))
+            for index, slot in enumerate(runnable_slots):
+                if slot.slot_id not in materialized_slot_ids:
                     failed_indices.add(index)
                     if result.success:
                         terminal_exit_code = EXIT_CODE_DOWNLOAD_FAILURE
                         terminal_message = "output materialization missing"
 
-            retry_windows: list[WindowTaskRef] = []
-            for index, window in enumerate(runnable_windows):
+            retry_slots: list[SlotTaskRef] = []
+            for index, slot in enumerate(runnable_slots):
                 if index in failed_indices:
                     failure_message = terminal_message
                     should_requeue = (
-                        window.window_id not in materialized_window_ids
-                        and window.attempt_no <= config.worker_requeue_limit
+                        slot.slot_id not in materialized_slot_ids
+                        and slot.attempt_no <= config.worker_requeue_limit
                     )
                     if attempt <= config.job_retry_count:
-                        state_store.mark_ingest_state(input_path=str(window.input_path), state="FAILED")
-                        state_store.update_window_task(
+                        state_store.mark_ingest_state(input_path=str(slot.input_path), state="FAILED")
+                        state_store.update_slot_task(
                             run_id=run_id,
-                            window_id=window.window_id,
+                            slot_id=slot.slot_id,
                             state="RETRY_QUEUED",
                             attempt_no=attempt,
                             job_id=bundle.job_id,
                             account_id=bundle.account_id,
                             failure_reason=failure_message,
                         )
-                        state_store.append_window_event(
+                        state_store.append_slot_event(
                             run_id=run_id,
-                            window_id=window.window_id,
+                            slot_id=slot.slot_id,
                             level="WARN",
                             stage="RETRY_QUEUED",
                             message=f"attempt={attempt} reason={failure_message}",
                         )
-                        retry_windows.append(
-                            WindowTaskRef(
-                                run_id=window.run_id,
-                                window_id=window.window_id,
-                                input_path=window.input_path,
-                                relative_path=window.relative_path,
-                                output_dir=window.output_dir,
-                                attempt_no=window.attempt_no + 1,
+                        retry_slots.append(
+                            SlotTaskRef(
+                                run_id=slot.run_id,
+                                slot_id=slot.slot_id,
+                                input_path=slot.input_path,
+                                relative_path=slot.relative_path,
+                                output_dir=slot.output_dir,
+                                attempt_no=slot.attempt_no + 1,
                             )
                         )
                     elif should_requeue:
-                        restore_source = staged_input_paths.get(window.window_id)
+                        restore_source = staged_input_paths.get(slot.slot_id)
                         if restore_source is not None:
-                            _restore_window_input_from_stage(
+                            _restore_slot_input_from_stage(
                                 source_path=restore_source,
-                                target_path=window.input_path,
+                                target_path=slot.input_path,
                                 ready_suffix=config.ready_sidecar_suffix,
                             )
-                        state_store.mark_ingest_state(input_path=str(window.input_path), state="RETRY_QUEUED")
-                        state_store.update_window_task(
+                        state_store.mark_ingest_state(input_path=str(slot.input_path), state="RETRY_QUEUED")
+                        state_store.update_slot_task(
                             run_id=run_id,
-                            window_id=window.window_id,
+                            slot_id=slot.slot_id,
                             state="RETRY_QUEUED",
-                            attempt_no=window.attempt_no + 1,
+                            attempt_no=slot.attempt_no + 1,
                             job_id=bundle.job_id,
                             account_id=None,
                             failure_reason=failure_message,
                         )
-                        state_store.append_window_event(
+                        state_store.append_slot_event(
                             run_id=run_id,
-                            window_id=window.window_id,
+                            slot_id=slot.slot_id,
                             level="WARN",
                             stage="RETRY_QUEUED",
-                            message=f"worker_requeue attempt_no={window.attempt_no + 1} reason={failure_message}",
+                            message=f"worker_requeue attempt_no={slot.attempt_no + 1} reason={failure_message}",
                         )
-                        worker_requeue_windows.append(
-                            WindowTaskRef(
-                                run_id=window.run_id,
-                                window_id=window.window_id,
-                                input_path=window.input_path,
-                                relative_path=window.relative_path,
-                                output_dir=window.output_dir,
-                                attempt_no=window.attempt_no + 1,
+                        worker_requeue_slots.append(
+                            SlotTaskRef(
+                                run_id=slot.run_id,
+                                slot_id=slot.slot_id,
+                                input_path=slot.input_path,
+                                relative_path=slot.relative_path,
+                                output_dir=slot.output_dir,
+                                attempt_no=slot.attempt_no + 1,
                             )
                         )
                     else:
-                        state_store.mark_ingest_state(input_path=str(window.input_path), state="FAILED")
+                        state_store.mark_ingest_state(input_path=str(slot.input_path), state="FAILED")
                         state_store.quarantine_job(
                             run_id=run_id,
-                            job_id=window.window_id,
+                            job_id=slot.slot_id,
                             attempt=attempt,
                             reason=failure_message,
                             exit_code=terminal_exit_code,
                         )
-                        state_store.update_window_task(
+                        state_store.update_slot_task(
                             run_id=run_id,
-                            window_id=window.window_id,
+                            slot_id=slot.slot_id,
                             state="QUARANTINED",
                             attempt_no=attempt,
                             job_id=bundle.job_id,
                             account_id=bundle.account_id,
                             failure_reason=failure_message,
                         )
-                        state_store.append_window_event(
+                        state_store.append_slot_event(
                             run_id=run_id,
-                            window_id=window.window_id,
+                            slot_id=slot.slot_id,
                             level="ERROR",
                             stage="QUARANTINED",
                             message=failure_message,
                         )
-                        state_store.mark_ingest_state(input_path=str(window.input_path), state="QUARANTINED")
-                        _finalize_window_input_cleanup(
+                        state_store.mark_ingest_state(input_path=str(slot.input_path), state="QUARANTINED")
+                        _finalize_slot_input_cleanup(
                             config=config,
                             state_store=state_store,
                             run_id=run_id,
-                            window=window,
-                            deleted_window_ids=deleted_window_ids,
+                            slot=slot,
+                            deleted_slot_ids=deleted_slot_ids,
                         )
-                        quarantined_windows += 1
+                        quarantined_slots += 1
                 else:
-                    state_store.update_window_task(
+                    state_store.update_slot_task(
                         run_id=run_id,
-                        window_id=window.window_id,
+                        slot_id=slot.slot_id,
                         state="SUCCEEDED",
                         attempt_no=attempt,
                         job_id=bundle.job_id,
                         account_id=bundle.account_id,
                         failure_reason=None,
                     )
-                    state_store.append_window_event(
+                    state_store.append_slot_event(
                         run_id=run_id,
-                        window_id=window.window_id,
+                        slot_id=slot.slot_id,
                         level="INFO",
                         stage="SUCCEEDED",
                         message=f"job={bundle.job_id} attempt={attempt}",
                     )
-                    state_store.mark_ingest_state(input_path=str(window.input_path), state="SUCCEEDED")
-                    state_store.record_artifact(run_id=run_id, job_id=bundle.job_id, artifact_root=str(window.output_dir))
-                    _finalize_window_input_cleanup(
+                    state_store.mark_ingest_state(input_path=str(slot.input_path), state="SUCCEEDED")
+                    state_store.record_artifact(run_id=run_id, job_id=bundle.job_id, artifact_root=str(slot.output_dir))
+                    _finalize_slot_input_cleanup(
                         config=config,
                         state_store=state_store,
                         run_id=run_id,
-                        window=window,
-                        deleted_window_ids=deleted_window_ids,
+                        slot=slot,
+                        deleted_slot_ids=deleted_slot_ids,
                     )
-                    success_windows += 1
+                    success_slots += 1
 
-            if not retry_windows:
-                failed_windows = 0
+            if not retry_slots:
+                failed_slots = 0
                 break
-            pending_windows = retry_windows
+            pending_slots = retry_slots
             _log_stage(f"job retry scheduled job_id={bundle.job_id} next_attempt={attempt + 1}")
 
-    quarantined = quarantined_windows > 0
-    success = (failed_windows == 0) and (quarantined_windows == 0)
+    quarantined = quarantined_slots > 0
+    success = (failed_slots == 0) and (quarantined_slots == 0)
     final_status = "SUCCEEDED" if success else ("QUARANTINED" if quarantined else "FAILED")
     state_store.update_job_status(
         run_id=run_id,
@@ -1484,8 +1492,8 @@ def _run_bundle_with_retry(
         message=terminal_message,
     )
     _log_stage(
-        f"bundle result job_id={bundle.job_id} success_windows={success_windows} "
-        f"failed_windows={failed_windows} quarantined_windows={quarantined_windows}"
+        f"bundle result job_id={bundle.job_id} success_slots={success_slots} "
+        f"failed_slots={failed_slots} quarantined_slots={quarantined_slots}"
     )
     return _BundleRuntimeOutcome(
         job_id=bundle.job_id,
@@ -1493,65 +1501,65 @@ def _run_bundle_with_retry(
         quarantined=quarantined,
         exit_code=EXIT_CODE_SUCCESS if success else terminal_exit_code,
         message=terminal_message,
-        success_windows=success_windows,
-        failed_windows=failed_windows,
-        quarantined_windows=quarantined_windows,
-        requeue_windows=tuple(worker_requeue_windows),
+        success_slots=success_slots,
+        failed_slots=failed_slots,
+        quarantined_slots=quarantined_slots,
+        requeue_slots=tuple(worker_requeue_slots),
     )
 
 
-def _build_window_output_dir(*, output_root: Path, relative_path: Path) -> Path:
+def _build_slot_output_dir(*, output_root: Path, relative_path: Path) -> Path:
     return output_root / relative_path.parent / f"{relative_path.name}.out"
 
 
-def _seed_window_output_dir(*, window: WindowTaskRef, seed_input_path: Path | None = None) -> None:
-    window.output_dir.mkdir(parents=True, exist_ok=True)
-    source_input = seed_input_path if seed_input_path is not None else window.input_path
-    target_input = window.output_dir / window.input_path.name
+def _seed_slot_output_dir(*, slot: SlotTaskRef, seed_input_path: Path | None = None) -> None:
+    slot.output_dir.mkdir(parents=True, exist_ok=True)
+    source_input = seed_input_path if seed_input_path is not None else slot.input_path
+    target_input = slot.output_dir / slot.input_path.name
     if source_input.exists() and not target_input.exists():
         shutil.copy2(source_input, target_input)
 
 
-def _initialize_window_output_dir(*, window: WindowTaskRef, seed_input_path: Path | None = None) -> None:
-    if window.output_dir.exists():
-        shutil.rmtree(window.output_dir)
-    _seed_window_output_dir(window=window, seed_input_path=seed_input_path)
+def _initialize_slot_output_dir(*, slot: SlotTaskRef, seed_input_path: Path | None = None) -> None:
+    if slot.output_dir.exists():
+        shutil.rmtree(slot.output_dir)
+    _seed_slot_output_dir(slot=slot, seed_input_path=seed_input_path)
 
 
-def _materialize_window_outputs(
+def _materialize_slot_outputs(
     *,
     local_bundle_dir: Path,
-    windows: list[WindowTaskRef],
+    slots: list[SlotTaskRef],
     staged_input_paths: dict[str, Path] | None = None,
 ) -> set[str]:
-    materialized_window_ids: set[str] = set()
-    for index, window in enumerate(windows, start=1):
+    materialized_slot_ids: set[str] = set()
+    for index, slot in enumerate(slots, start=1):
         case_dir = local_bundle_dir / f"case_{index:02d}"
         if not case_dir.exists():
             continue
-        seed_input_path = None if staged_input_paths is None else staged_input_paths.get(window.window_id)
-        _initialize_window_output_dir(window=window, seed_input_path=seed_input_path)
+        seed_input_path = None if staged_input_paths is None else staged_input_paths.get(slot.slot_id)
+        _initialize_slot_output_dir(slot=slot, seed_input_path=seed_input_path)
         copied_any = False
         for item in case_dir.iterdir():
             if item.name == "tmp":
                 continue
-            target_name = _rename_case_output_name(case_name=item.name, input_name=window.input_path.name)
-            target_path = window.output_dir / target_name
+            target_name = _rename_case_output_name(case_name=item.name, input_name=slot.input_path.name)
+            target_path = slot.output_dir / target_name
             if item.is_dir():
                 shutil.copytree(item, target_path, dirs_exist_ok=True)
             else:
                 shutil.copy2(item, target_path)
             copied_any = True
-        _copy_bundle_summary_artifacts(local_bundle_dir=local_bundle_dir, output_dir=window.output_dir)
+        _copy_bundle_summary_artifacts(local_bundle_dir=local_bundle_dir, output_dir=slot.output_dir)
         if copied_any:
-            materialized_window_ids.add(window.window_id)
-    return materialized_window_ids
+            materialized_slot_ids.add(slot.slot_id)
+    return materialized_slot_ids
 
 
-def _materialize_window_failure_artifacts(
+def _materialize_slot_failure_artifacts(
     *,
     local_bundle_dir: Path,
-    windows: list[WindowTaskRef],
+    slots: list[SlotTaskRef],
     staged_input_paths: dict[str, Path] | None = None,
 ) -> set[str]:
     artifact_names = (
@@ -1567,23 +1575,23 @@ def _materialize_window_failure_artifacts(
     if not artifact_paths:
         return set()
 
-    materialized_window_ids: set[str] = set()
-    for window in windows:
-        seed_input_path = None if staged_input_paths is None else staged_input_paths.get(window.window_id)
-        _seed_window_output_dir(window=window, seed_input_path=seed_input_path)
+    materialized_slot_ids: set[str] = set()
+    for slot in slots:
+        seed_input_path = None if staged_input_paths is None else staged_input_paths.get(slot.slot_id)
+        _seed_slot_output_dir(slot=slot, seed_input_path=seed_input_path)
 
         copied_any = False
         for artifact_path in artifact_paths:
-            shutil.copy2(artifact_path, window.output_dir / artifact_path.name)
+            shutil.copy2(artifact_path, slot.output_dir / artifact_path.name)
             copied_any = True
 
         bundle_exit_path = local_bundle_dir / "bundle.exit.code"
-        output_exit_path = window.output_dir / "exit.code"
+        output_exit_path = slot.output_dir / "exit.code"
         if not output_exit_path.exists() and bundle_exit_path.exists():
             shutil.copy2(bundle_exit_path, output_exit_path)
             copied_any = True
 
-        output_run_log = window.output_dir / "run.log"
+        output_run_log = slot.output_dir / "run.log"
         if not output_run_log.exists():
             remote_submission_log = local_bundle_dir / "remote_submission.log"
             remote_stderr_log = local_bundle_dir / "remote_stderr.log"
@@ -1597,12 +1605,12 @@ def _materialize_window_failure_artifacts(
             elif failure_reason_path.exists():
                 output_run_log.write_text(failure_reason_path.read_text(encoding="utf-8"), encoding="utf-8")
                 copied_any = True
-        _copy_bundle_summary_artifacts(local_bundle_dir=local_bundle_dir, output_dir=window.output_dir)
+        _copy_bundle_summary_artifacts(local_bundle_dir=local_bundle_dir, output_dir=slot.output_dir)
 
         if copied_any:
-            materialized_window_ids.add(window.window_id)
+            materialized_slot_ids.add(slot.slot_id)
 
-    return materialized_window_ids
+    return materialized_slot_ids
 
 
 def _copy_bundle_summary_artifacts(*, local_bundle_dir: Path, output_dir: Path) -> None:
@@ -1628,72 +1636,72 @@ def _rename_case_output_name(*, case_name: str, input_name: str) -> str:
     return case_name
 
 
-def _delete_window_input_files(
+def _delete_slot_input_files(
     *,
     config: PipelineConfig,
     state_store: StateStore,
     run_id: str,
-    windows: list[WindowTaskRef],
-    deleted_window_ids: set[str],
+    slots: list[SlotTaskRef],
+    deleted_slot_ids: set[str],
 ) -> None:
     if not config.delete_input_after_upload:
         return
-    for window in windows:
-        if window.window_id in deleted_window_ids:
+    for slot in slots:
+        if slot.slot_id in deleted_slot_ids:
             continue
-        _delete_window_input_file(
+        _delete_slot_input_file(
             config=config,
             state_store=state_store,
             run_id=run_id,
-            window=window,
+            slot=slot,
         )
-        deleted_window_ids.add(window.window_id)
+        deleted_slot_ids.add(slot.slot_id)
 
 
-def _finalize_window_input_cleanup(
+def _finalize_slot_input_cleanup(
     *,
     config: PipelineConfig,
     state_store: StateStore,
     run_id: str,
-    window: WindowTaskRef,
-    deleted_window_ids: set[str],
+    slot: SlotTaskRef,
+    deleted_slot_ids: set[str],
 ) -> None:
-    if window.window_id in deleted_window_ids:
+    if slot.slot_id in deleted_slot_ids:
         return
-    if config.delete_input_after_upload and _window_output_has_materialized_artifacts(
-        output_dir=window.output_dir,
-        input_name=window.input_path.name,
+    if config.delete_input_after_upload and _slot_output_has_materialized_artifacts(
+        output_dir=slot.output_dir,
+        input_name=slot.input_path.name,
     ):
-        _delete_window_input_file(
+        _delete_slot_input_file(
             config=config,
             state_store=state_store,
             run_id=run_id,
-            window=window,
+            slot=slot,
         )
-        deleted_window_ids.add(window.window_id)
+        deleted_slot_ids.add(slot.slot_id)
         return
 
     retain_reason = "delete disabled"
     if config.delete_input_after_upload:
         retain_reason = "materialized output missing; input retained"
-    state_store.mark_window_delete_retained(run_id=run_id, window_id=window.window_id)
-    state_store.append_window_event(
+    state_store.mark_slot_delete_retained(run_id=run_id, slot_id=slot.slot_id)
+    state_store.append_slot_event(
         run_id=run_id,
-        window_id=window.window_id,
+        slot_id=slot.slot_id,
         level="INFO" if not config.delete_input_after_upload else "WARN",
         stage="DELETE_RETAINED",
         message=retain_reason,
     )
 
 
-def _delete_window_input_file(
+def _delete_slot_input_file(
     *,
     config: PipelineConfig,
     state_store: StateStore,
     run_id: str,
-    window: WindowTaskRef,
+    slot: SlotTaskRef,
 ) -> None:
-    path = window.input_path
+    path = slot.input_path
     ready_path = _ready_path_for_input(path, config.ready_sidecar_suffix)
     for retry in range(3):
         try:
@@ -1701,10 +1709,10 @@ def _delete_window_input_file(
                 path.unlink()
             if ready_path.exists():
                 ready_path.unlink()
-            state_store.mark_window_input_deleted(run_id=run_id, window_id=window.window_id, retry_count=retry)
-            state_store.append_window_event(
+            state_store.mark_slot_input_deleted(run_id=run_id, slot_id=slot.slot_id, retry_count=retry)
+            state_store.append_slot_event(
                 run_id=run_id,
-                window_id=window.window_id,
+                slot_id=slot.slot_id,
                 level="INFO",
                 stage="INPUT_DELETED",
                 message=f"retry={retry}",
@@ -1712,10 +1720,10 @@ def _delete_window_input_file(
             state_store.mark_ingest_state(input_path=str(path), state="DELETED")
             return
         except OSError as exc:
-            state_store.mark_window_delete_retrying(run_id=run_id, window_id=window.window_id, retry_count=retry + 1)
-            state_store.append_window_event(
+            state_store.mark_slot_delete_retrying(run_id=run_id, slot_id=slot.slot_id, retry_count=retry + 1)
+            state_store.append_slot_event(
                 run_id=run_id,
-                window_id=window.window_id,
+                slot_id=slot.slot_id,
                 level="WARN",
                 stage="DELETE_RETRYING",
                 message=str(exc),
@@ -1723,7 +1731,7 @@ def _delete_window_input_file(
             time.sleep(0.2)
 
     quarantine_root = Path(config.delete_failed_quarantine_dir).expanduser().resolve()
-    quarantine_target = quarantine_root / window.relative_path
+    quarantine_target = quarantine_root / slot.relative_path
     quarantine_ready_target = _ready_path_for_input(quarantine_target, config.ready_sidecar_suffix)
     quarantine_target.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -1732,15 +1740,15 @@ def _delete_window_input_file(
         if ready_path.exists():
             shutil.move(str(ready_path), str(quarantine_ready_target))
     finally:
-        state_store.mark_window_delete_quarantined(
+        state_store.mark_slot_delete_quarantined(
             run_id=run_id,
-            window_id=window.window_id,
+            slot_id=slot.slot_id,
             retry_count=3,
             quarantine_path=str(quarantine_target),
         )
-        state_store.append_window_event(
+        state_store.append_slot_event(
             run_id=run_id,
-            window_id=window.window_id,
+            slot_id=slot.slot_id,
             level="ERROR",
             stage="DELETE_QUARANTINED",
             message=str(quarantine_target),
@@ -1748,7 +1756,7 @@ def _delete_window_input_file(
         state_store.mark_ingest_state(input_path=str(path), state="DELETE_QUARANTINED")
 
 
-def _window_output_has_materialized_artifacts(*, output_dir: Path, input_name: str) -> bool:
+def _slot_output_has_materialized_artifacts(*, output_dir: Path, input_name: str) -> bool:
     if not output_dir.exists():
         return False
     for item in output_dir.iterdir():
@@ -1758,30 +1766,30 @@ def _window_output_has_materialized_artifacts(*, output_dir: Path, input_name: s
     return False
 
 
-def _mark_window_lifecycle_stage(
+def _mark_slot_lifecycle_stage(
     *,
     state_store: StateStore,
     run_id: str,
-    windows: list[WindowTaskRef],
+    slots: list[SlotTaskRef],
     attempt_no: int,
     job_id: str,
     account_id: str,
     state: str,
     message: str,
 ) -> None:
-    for window in windows:
-        state_store.update_window_task(
+    for slot in slots:
+        state_store.update_slot_task(
             run_id=run_id,
-            window_id=window.window_id,
+            slot_id=slot.slot_id,
             state=state,
             attempt_no=attempt_no,
             job_id=job_id,
             account_id=account_id,
             failure_reason=None,
         )
-        state_store.append_window_event(
+        state_store.append_slot_event(
             run_id=run_id,
-            window_id=window.window_id,
+            slot_id=slot.slot_id,
             level="INFO",
             stage=state,
             message=message,
@@ -1865,7 +1873,7 @@ def _lock_path_for_input(input_path: Path) -> Path:
     return Path(f"{input_path}.lock")
 
 
-def _restore_window_input_from_stage(*, source_path: Path, target_path: Path, ready_suffix: str) -> None:
+def _restore_slot_input_from_stage(*, source_path: Path, target_path: Path, ready_suffix: str) -> None:
     if not source_path.exists():
         return
     target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1903,6 +1911,6 @@ def _ensure_ready_artifact(input_path: Path, ready_suffix: str) -> _ReadyArtifac
         )
 
 
-def _build_window_id(*, relative_path: Path, mtime_ns: int) -> str:
+def _build_slot_id(*, relative_path: Path, mtime_ns: int) -> str:
     digest = sha1(f"{relative_path.as_posix()}:{mtime_ns}".encode("utf-8")).hexdigest()[:16]
     return f"w_{digest}"

@@ -9,7 +9,11 @@ from pathlib import Path
 
 from .pipeline import AccountConfig, PipelineConfig, PipelineResult, run_pipeline
 from .state_store import StateStore
+from .version import get_version
 from .web_status import start_status_server
+
+
+APP_VERSION = get_version()
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -107,17 +111,20 @@ def _build_config() -> PipelineConfig:
         accounts_registry=accounts_registry,
         execute_remote=_env_bool("PEETSFEA_EXECUTE_REMOTE", True),
         partition=os.getenv("PEETSFEA_PARTITION", "cpu2"),
+        cpus_per_job=int(os.getenv("PEETSFEA_CPUS_PER_JOB", "16")),
+        mem=os.getenv("PEETSFEA_MEM", "960G"),
+        time_limit=os.getenv("PEETSFEA_TIME_LIMIT", "05:00:00"),
         remote_root=os.getenv("PEETSFEA_REMOTE_ROOT", "~/aedt_runs"),
         continuous_mode=_env_bool("PEETSFEA_CONTINUOUS_MODE", True),
         ingest_poll_seconds=int(os.getenv("PEETSFEA_INGEST_POLL_SECONDS", "30")),
         ready_sidecar_suffix=os.getenv("PEETSFEA_READY_SIDECAR_SUFFIX", ".ready"),
-        windows_per_job=int(os.getenv("PEETSFEA_WINDOWS_PER_JOB", "4")),
-        cores_per_window=int(os.getenv("PEETSFEA_CORES_PER_WINDOW", "4")),
+        slots_per_job=int(os.getenv("PEETSFEA_SLOTS_PER_JOB", "4")),
+        cores_per_slot=int(os.getenv("PEETSFEA_CORES_PER_SLOT", "4")),
         worker_requeue_limit=int(os.getenv("PEETSFEA_WORKER_REQUEUE_LIMIT", "1")),
         run_rotation_hours=int(os.getenv("PEETSFEA_RUN_ROTATION_HOURS", "24")),
         pending_buffer_per_account=int(os.getenv("PEETSFEA_PENDING_BUFFER_PER_ACCOUNT", "3")),
         capacity_scope=os.getenv("PEETSFEA_CAPACITY_SCOPE", "all_user_jobs"),
-        balance_metric=os.getenv("PEETSFEA_BALANCE_METRIC", "window_throughput"),
+        balance_metric=os.getenv("PEETSFEA_BALANCE_METRIC", "slot_throughput"),
     )
 
 
@@ -134,7 +141,7 @@ def _start_embedded_web_if_enabled() -> None:
     server = start_status_server(db_path=db_path, host=host, port=port)
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="peetsfea-web")
     thread.start()
-    print(f"[peetsfea][web] embedded status server listening on http://{host}:{port}", flush=True)
+    print(f"[peetsfea][web] version={APP_VERSION} embedded status server listening on http://{host}:{port}", flush=True)
 
 
 def _heartbeat_once(
@@ -199,7 +206,7 @@ def _run_worker_iteration(
         job_id="__worker__",
         level="INFO",
         stage="WORKER_LOOP_ACTIVE",
-        message="run_pipeline start",
+        message=f"run_pipeline start version={APP_VERSION}",
     )
     result = run_pipeline(config)
     _apply_post_iteration_status(
@@ -226,7 +233,7 @@ def _apply_post_iteration_status(
         level = "WARN"
         message = (
             f"blocked_accounts={list(result.blocked_accounts)} "
-            f"readiness_blocked_windows={result.readiness_blocked_windows}"
+            f"readiness_blocked_slots={result.readiness_blocked_slots}"
         )
     elif result.recovery_needed:
         status = "RECOVERING"
@@ -235,9 +242,9 @@ def _apply_post_iteration_status(
         message = (
             f"terminal_jobs={result.terminal_jobs} replacement_jobs={result.replacement_jobs} "
             f"failed_jobs={result.failed_jobs} quarantined_jobs={result.quarantined_jobs} "
-            f"failed_windows={result.failed_windows} quarantined_windows={result.quarantined_windows}"
+            f"failed_slots={result.failed_slots} quarantined_slots={result.quarantined_slots}"
         )
-    elif result.total_windows == 0:
+    elif result.total_slots == 0:
         status = "IDLE"
         stage = "WORKER_LOOP_IDLE"
         level = "INFO"
@@ -355,6 +362,7 @@ def run_user_worker_loop() -> None:
         level="INFO",
         stage="WORKER_LOOP_START",
         message=(
+            f"version={APP_VERSION} "
             f"poll_seconds={poll_seconds} heartbeat_seconds={heartbeat_seconds} "
             f"recovery_poll_seconds={recovery_poll_seconds} blocked_poll_seconds={blocked_poll_seconds} "
             f"autorecovery_min_interval_seconds={autorecovery_min_interval_seconds}"

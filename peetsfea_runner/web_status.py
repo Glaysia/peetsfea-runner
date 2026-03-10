@@ -11,6 +11,10 @@ from urllib.parse import parse_qs, urlparse
 import duckdb
 
 from peetsfea_runner.state_store import _GLOBAL_DUCKDB_LOCK
+from peetsfea_runner.version import get_version
+
+
+APP_VERSION = get_version()
 
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
@@ -74,13 +78,13 @@ def _first_int_param(params: dict[str, list[str]], key: str, default: int, minim
     return value
 
 
-def _window_state_counts(db_path: Path, *, run_id: str | None = None) -> dict[str, int]:
+def _slot_state_counts(db_path: Path, *, run_id: str | None = None) -> dict[str, int]:
     if run_id is None:
         rows = _query(
             db_path,
             """
             SELECT state, COUNT(*)
-            FROM window_tasks
+            FROM slot_tasks
             GROUP BY state
             """,
         )
@@ -89,7 +93,7 @@ def _window_state_counts(db_path: Path, *, run_id: str | None = None) -> dict[st
             db_path,
             """
             SELECT state, COUNT(*)
-            FROM window_tasks
+            FROM slot_tasks
             WHERE run_id = ?
             GROUP BY state
             """,
@@ -98,7 +102,7 @@ def _window_state_counts(db_path: Path, *, run_id: str | None = None) -> dict[st
     return {str(row[0]): int(row[1]) for row in rows}
 
 
-def _account_window_scores(db_path: Path, *, run_id: str | None) -> list[dict[str, object]]:
+def _account_slot_scores(db_path: Path, *, run_id: str | None) -> list[dict[str, object]]:
     if run_id is None:
         return []
     rows = _query(
@@ -106,9 +110,9 @@ def _account_window_scores(db_path: Path, *, run_id: str | None) -> list[dict[st
         """
         SELECT
             account_id,
-            SUM(CASE WHEN state IN ('SUCCEEDED', 'FAILED', 'QUARANTINED') THEN 1 ELSE 0 END) AS completed_windows,
-            SUM(CASE WHEN state IN ('ASSIGNED', 'UPLOADING', 'RUNNING', 'COLLECTING') THEN 1 ELSE 0 END) AS inflight_windows
-        FROM window_tasks
+            SUM(CASE WHEN state IN ('SUCCEEDED', 'FAILED', 'QUARANTINED') THEN 1 ELSE 0 END) AS completed_slots,
+            SUM(CASE WHEN state IN ('ASSIGNED', 'UPLOADING', 'RUNNING', 'COLLECTING') THEN 1 ELSE 0 END) AS inflight_slots
+        FROM slot_tasks
         WHERE run_id = ? AND account_id IS NOT NULL
         GROUP BY account_id
         ORDER BY account_id
@@ -122,15 +126,15 @@ def _account_window_scores(db_path: Path, *, run_id: str | None) -> list[dict[st
         scores.append(
             {
                 "account_id": row[0],
-                "completed_windows": completed,
-                "inflight_windows": inflight,
+                "completed_slots": completed,
+                "inflight_slots": inflight,
                 "score": completed + inflight,
             }
         )
     return scores
 
 
-def _account_window_live_stats(db_path: Path, *, run_id: str | None) -> dict[str, dict[str, int]]:
+def _account_slot_live_stats(db_path: Path, *, run_id: str | None) -> dict[str, dict[str, int]]:
     if run_id is None:
         return {}
     rows = _query(
@@ -143,7 +147,7 @@ def _account_window_live_stats(db_path: Path, *, run_id: str | None) -> dict[str
             SUM(CASE WHEN state = 'SUCCEEDED' THEN 1 ELSE 0 END) AS succeeded_slots,
             SUM(CASE WHEN state = 'FAILED' THEN 1 ELSE 0 END) AS failed_slots,
             SUM(CASE WHEN state = 'QUARANTINED' THEN 1 ELSE 0 END) AS quarantined_slots
-        FROM window_tasks
+        FROM slot_tasks
         WHERE run_id = ? AND account_id IS NOT NULL
         GROUP BY account_id
         ORDER BY account_id
@@ -157,7 +161,7 @@ def _account_window_live_stats(db_path: Path, *, run_id: str | None) -> dict[str
             "completed_slots": int(row[2] or 0),
             "succeeded_slots": int(row[3] or 0),
             "failed_slots": int(row[4] or 0),
-            "quarantined_windows": int(row[5] or 0),
+            "quarantined_slots": int(row[5] or 0),
         }
     return stats
 
@@ -255,7 +259,7 @@ def _latest_account_readiness(db_path: Path) -> dict[str, dict[str, object]]:
 
 
 def _configured_capacity_targets() -> dict[str, int]:
-    windows_per_job = _env_int("PEETSFEA_WINDOWS_PER_JOB", 4)
+    slots_per_job = _env_int("PEETSFEA_SLOTS_PER_JOB", 4)
     raw_accounts = os.getenv("PEETSFEA_ACCOUNTS", "").strip()
     configured_accounts = 0
     configured_worker_jobs = 0
@@ -281,27 +285,27 @@ def _configured_capacity_targets() -> dict[str, int]:
     return {
         "configured_accounts": configured_accounts,
         "configured_worker_jobs": configured_worker_jobs,
-        "windows_per_job": windows_per_job,
-        "configured_target_slots": configured_worker_jobs * windows_per_job,
+        "slots_per_job": slots_per_job,
+        "configured_target_slots": configured_worker_jobs * slots_per_job,
         "scaling_accounts": scaling_accounts,
         "scaling_worker_jobs": scaling_accounts * scaling_jobs_per_account,
-        "expansion_target_slots": scaling_accounts * scaling_jobs_per_account * windows_per_job,
+        "expansion_target_slots": scaling_accounts * scaling_jobs_per_account * slots_per_job,
     }
 
 
 def _throughput_kpi_payload(
     *,
-    queued_windows: int,
-    active_windows: int,
+    queued_slots: int,
+    active_slots: int,
     active_workers: int,
     pending_workers: int,
 ) -> dict[str, object]:
     targets = _configured_capacity_targets()
-    demand_slots = queued_windows + active_windows
+    demand_slots = queued_slots + active_slots
     configured_target_slots = int(targets["configured_target_slots"])
     configured_worker_jobs = int(targets["configured_worker_jobs"])
     effective_target_slots = min(configured_target_slots, demand_slots) if demand_slots > 0 else 0
-    active_slot_shortfall = max(effective_target_slots - active_windows, 0)
+    active_slot_shortfall = max(effective_target_slots - active_slots, 0)
     worker_shortfall = max(configured_worker_jobs - active_workers, 0)
     scheduled_worker_shortfall = max(configured_worker_jobs - (active_workers + pending_workers), 0)
     input_limited = demand_slots < configured_target_slots
@@ -325,12 +329,12 @@ def _throughput_kpi_payload(
         "pending_workers": pending_workers,
         "worker_shortfall": worker_shortfall,
         "scheduled_worker_shortfall": scheduled_worker_shortfall,
-        "recovery_backlog_windows": queued_windows,
+        "recovery_backlog_slots": queued_slots,
         "input_limited": input_limited,
         "capacity_limited": (not input_limited) and active_slot_shortfall > 0,
         "throughput_mode": throughput_mode,
-        "configured_slot_utilization": (float(active_windows) / configured_target_slots) if configured_target_slots else 0.0,
-        "effective_slot_utilization": (float(active_windows) / effective_target_slots) if effective_target_slots else 0.0,
+        "configured_slot_utilization": (float(active_slots) / configured_target_slots) if configured_target_slots else 0.0,
+        "effective_slot_utilization": (float(active_slots) / effective_target_slots) if effective_target_slots else 0.0,
     }
 
 
@@ -503,7 +507,7 @@ def _worker_health_payload(db_path: Path, *, stale_threshold: int) -> dict[str, 
         FROM (
             SELECT ts FROM events
             UNION ALL
-            SELECT ts FROM window_events
+            SELECT ts FROM slot_events
         ) AS all_events
         ORDER BY ts DESC
         LIMIT 1
@@ -569,6 +573,8 @@ def make_status_handler(*, db_path: Path):
 
     class StatusHandler(BaseHTTPRequestHandler):
         def _send_json(self, payload: object, status: int = 200) -> None:
+            if isinstance(payload, dict) and "version" not in payload:
+                payload = {"version": APP_VERSION, **payload}
             body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -589,7 +595,7 @@ def make_status_handler(*, db_path: Path):
             params = parse_qs(parsed.query)
 
             if parsed.path == "/":
-                self._send_html(_dashboard_html())
+                self._send_html(_dashboard_html(version=APP_VERSION))
                 return
 
             if parsed.path == "/health":
@@ -601,8 +607,8 @@ def make_status_handler(*, db_path: Path):
                     {
                         "endpoints": [
                             "/api/worker/health",
-                            "/api/windows",
-                            "/api/windows/{id}/timeline",
+                            "/api/slots",
+                            "/api/slots/{id}/timeline",
                             "/api/accounts/capacity",
                             "/api/jobs",
                             "/api/jobs/{id}",
@@ -622,18 +628,18 @@ def make_status_handler(*, db_path: Path):
                 self._send_json(_worker_health_payload(db_path, stale_threshold=stale_threshold))
                 return
 
-            if parsed.path == "/api/windows":
+            if parsed.path == "/api/slots":
                 requested_run_id = _first_str_param(params, "run_id")
                 run_id = requested_run_id or _latest_run_id(db_path)
                 state_filter = _first_str_param(params, "status")
                 limit = _first_int_param(params, "limit", default=500, minimum=1)
                 if run_id is None:
-                    self._send_json({"run_id": None, "windows": []})
+                    self._send_json({"run_id": None, "slots": []})
                     return
 
                 sql = """
-                    SELECT run_id, window_id, job_id, account_id, input_path, output_path, state, attempt_no, updated_at
-                    FROM window_tasks
+                    SELECT run_id, slot_id, job_id, account_id, input_path, output_path, state, attempt_no, updated_at
+                    FROM slot_tasks
                     WHERE run_id = ?
                 """
                 sql_params: list[object] = [run_id]
@@ -646,9 +652,9 @@ def make_status_handler(*, db_path: Path):
                 self._send_json(
                     {
                         "run_id": run_id,
-                        "windows": [
+                        "slots": [
                             {
-                                "window_id": row[1],
+                                "slot_id": row[1],
                                 "run_id": row[0],
                                 "job_id": row[2],
                                 "account_id": row[3],
@@ -664,22 +670,22 @@ def make_status_handler(*, db_path: Path):
                 )
                 return
 
-            if parsed.path.startswith("/api/windows/") and parsed.path.endswith("/timeline"):
+            if parsed.path.startswith("/api/slots/") and parsed.path.endswith("/timeline"):
                 parts = parsed.path.strip("/").split("/")
                 if len(parts) != 4:
                     self._send_json({"error": "not_found"}, status=404)
                     return
-                window_id = parts[2]
+                slot_id = parts[2]
                 rows = _query(
                     db_path,
                     """
-                    SELECT run_id, window_id, job_id, account_id, input_path, output_path, state, attempt_no, failure_reason, created_at, updated_at
-                    FROM window_tasks
-                    WHERE window_id = ?
+                    SELECT run_id, slot_id, job_id, account_id, input_path, output_path, state, attempt_no, failure_reason, created_at, updated_at
+                    FROM slot_tasks
+                    WHERE slot_id = ?
                     ORDER BY updated_at DESC
                     LIMIT 1
                     """,
-                    [window_id],
+                    [slot_id],
                 )
                 if not rows:
                     self._send_json({"error": "not_found"}, status=404)
@@ -689,8 +695,8 @@ def make_status_handler(*, db_path: Path):
                     db_path,
                     """
                     SELECT level, stage, message, ts
-                    FROM window_events
-                    WHERE run_id = ? AND window_id = ?
+                    FROM slot_events
+                    WHERE run_id = ? AND slot_id = ?
                     ORDER BY ts DESC
                     LIMIT 300
                     """,
@@ -701,7 +707,7 @@ def make_status_handler(*, db_path: Path):
                     """
                     SELECT input_deleted_at, delete_retry_count, delete_final_state, quarantine_path, updated_at
                     FROM file_lifecycle
-                    WHERE run_id = ? AND window_id = ?
+                    WHERE run_id = ? AND slot_id = ?
                     LIMIT 1
                     """,
                     [row[0], row[1]],
@@ -723,9 +729,9 @@ def make_status_handler(*, db_path: Path):
                 latest_attempt_ended_at = attempt_summary_rows[0][3] if attempt_summary_rows else None
                 self._send_json(
                     {
-                        "window_task": {
+                        "slot_task": {
                             "run_id": row[0],
-                            "window_id": row[1],
+                            "slot_id": row[1],
                             "job_id": row[2],
                             "account_id": row[3],
                             "input_path": row[4],
@@ -749,7 +755,7 @@ def make_status_handler(*, db_path: Path):
                             else None
                         ),
                         "attempt_summary": {
-                            "window_attempt_no": int(row[7] or 0),
+                            "slot_attempt_no": int(row[7] or 0),
                             "job_attempt_count": attempt_count,
                             "latest_job_attempt": latest_job_attempt,
                             "latest_job_node": latest_node,
@@ -761,10 +767,10 @@ def make_status_handler(*, db_path: Path):
 
             if parsed.path == "/api/accounts/capacity":
                 run_id = _first_str_param(params, "run_id") or _latest_run_id(db_path)
-                score_map = {item["account_id"]: item for item in _account_window_scores(db_path, run_id=run_id)}
-                live_window_map = _account_window_live_stats(db_path, run_id=run_id)
+                score_map = {item["account_id"]: item for item in _account_slot_scores(db_path, run_id=run_id)}
+                live_slot_map = _account_slot_live_stats(db_path, run_id=run_id)
                 target_worker_map = _configured_account_worker_targets()
-                windows_per_job = int(_configured_capacity_targets()["windows_per_job"])
+                slots_per_job = int(_configured_capacity_targets()["slots_per_job"])
                 capacity_rows = _query(
                     db_path,
                     """
@@ -816,13 +822,13 @@ def make_status_handler(*, db_path: Path):
                                 "configured_target_slots": int(
                                     target_worker_map.get(account_id, _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10))
                                 )
-                                * windows_per_job,
-                                "active_slots": int(live_window_map.get(account_id, {}).get("active_slots", 0)),
-                                "completed_slots": int(live_window_map.get(account_id, {}).get("completed_slots", 0)),
-                                "succeeded_slots": int(live_window_map.get(account_id, {}).get("succeeded_slots", 0)),
-                                "failed_slots": int(live_window_map.get(account_id, {}).get("failed_slots", 0)),
-                                "quarantined_windows": int(
-                                    live_window_map.get(account_id, {}).get("quarantined_windows", 0)
+                                * slots_per_job,
+                                "active_slots": int(live_slot_map.get(account_id, {}).get("active_slots", 0)),
+                                "completed_slots": int(live_slot_map.get(account_id, {}).get("completed_slots", 0)),
+                                "succeeded_slots": int(live_slot_map.get(account_id, {}).get("succeeded_slots", 0)),
+                                "failed_slots": int(live_slot_map.get(account_id, {}).get("failed_slots", 0)),
+                                "quarantined_slots": int(
+                                    live_slot_map.get(account_id, {}).get("quarantined_slots", 0)
                                 ),
                                 "active_worker_shortfall": max(
                                     int(target_worker_map.get(account_id, _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10)))
@@ -839,8 +845,8 @@ def make_status_handler(*, db_path: Path):
                                 ),
                                 "active_slot_shortfall": max(
                                     int(target_worker_map.get(account_id, _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10)))
-                                    * windows_per_job
-                                    - int(live_window_map.get(account_id, {}).get("active_slots", 0)),
+                                    * slots_per_job
+                                    - int(live_slot_map.get(account_id, {}).get("active_slots", 0)),
                                     0,
                                 ),
                                 "live_status": _account_live_status(
@@ -1073,37 +1079,37 @@ def make_status_handler(*, db_path: Path):
                     queue_jobs = int(queue_jobs_raw or 0)
                 failed_ratio = float(failed_jobs / total_jobs) if total_jobs > 0 else 0.0
 
-                total_windows = 0
-                queued_windows = 0
-                active_windows = 0
-                succeeded_windows = 0
-                failed_windows = 0
-                quarantined_windows = 0
-                delete_quarantined_windows = 0
+                total_slots = 0
+                queued_slots = 0
+                active_slots = 0
+                succeeded_slots = 0
+                failed_slots = 0
+                quarantined_slots = 0
+                delete_quarantined_slots = 0
                 if run_id is not None:
-                    window_rows = _query(
+                    slot_rows = _query(
                         db_path,
                         """
                         SELECT
-                            COUNT(*) AS total_windows,
-                            SUM(CASE WHEN state IN ('QUEUED', 'RETRY_QUEUED') THEN 1 ELSE 0 END) AS queued_windows,
-                            SUM(CASE WHEN state IN ('ASSIGNED', 'UPLOADING', 'RUNNING', 'COLLECTING') THEN 1 ELSE 0 END) AS active_windows,
-                            SUM(CASE WHEN state = 'SUCCEEDED' THEN 1 ELSE 0 END) AS succeeded_windows,
-                            SUM(CASE WHEN state = 'FAILED' THEN 1 ELSE 0 END) AS failed_windows,
-                            SUM(CASE WHEN state = 'QUARANTINED' THEN 1 ELSE 0 END) AS quarantined_windows
-                        FROM window_tasks
+                            COUNT(*) AS total_slots,
+                            SUM(CASE WHEN state IN ('QUEUED', 'RETRY_QUEUED') THEN 1 ELSE 0 END) AS queued_slots,
+                            SUM(CASE WHEN state IN ('ASSIGNED', 'UPLOADING', 'RUNNING', 'COLLECTING') THEN 1 ELSE 0 END) AS active_slots,
+                            SUM(CASE WHEN state = 'SUCCEEDED' THEN 1 ELSE 0 END) AS succeeded_slots,
+                            SUM(CASE WHEN state = 'FAILED' THEN 1 ELSE 0 END) AS failed_slots,
+                            SUM(CASE WHEN state = 'QUARANTINED' THEN 1 ELSE 0 END) AS quarantined_slots
+                        FROM slot_tasks
                         WHERE run_id = ?
                         """,
                         [run_id],
                     )
                     (
-                        total_windows,
-                        queued_windows,
-                        active_windows,
-                        succeeded_windows,
-                        failed_windows,
-                        quarantined_windows,
-                    ) = (int(item or 0) for item in window_rows[0])
+                        total_slots,
+                        queued_slots,
+                        active_slots,
+                        succeeded_slots,
+                        failed_slots,
+                        quarantined_slots,
+                    ) = (int(item or 0) for item in slot_rows[0])
                     delete_rows = _query(
                         db_path,
                         """
@@ -1113,10 +1119,10 @@ def make_status_handler(*, db_path: Path):
                         """,
                         [run_id],
                     )
-                    delete_quarantined_windows = int(delete_rows[0][0] or 0)
+                    delete_quarantined_slots = int(delete_rows[0][0] or 0)
                 throughput_kpi = _throughput_kpi_payload(
-                    queued_windows=queued_windows,
-                    active_windows=active_windows,
+                    queued_slots=queued_slots,
+                    active_slots=active_slots,
                     active_workers=active_jobs,
                     pending_workers=queue_jobs,
                 )
@@ -1131,15 +1137,15 @@ def make_status_handler(*, db_path: Path):
                             "active_jobs": active_jobs,
                             "queue_jobs": queue_jobs,
                             "failed_ratio": failed_ratio,
-                            "total_windows": total_windows,
-                            "queued_windows": queued_windows,
-                            "active_windows": active_windows,
-                            "succeeded_windows": succeeded_windows,
-                            "failed_windows": failed_windows,
-                            "quarantined_windows": quarantined_windows,
-                            "delete_quarantined_windows": delete_quarantined_windows,
+                            "total_slots": total_slots,
+                            "queued_slots": queued_slots,
+                            "active_slots": active_slots,
+                            "succeeded_slots": succeeded_slots,
+                            "failed_slots": failed_slots,
+                            "quarantined_slots": quarantined_slots,
+                            "delete_quarantined_slots": delete_quarantined_slots,
                             "throughput_kpi": throughput_kpi,
-                            "account_window_scores": _account_window_scores(db_path, run_id=run_id),
+                            "account_slot_scores": _account_slot_scores(db_path, run_id=run_id),
                         }
                     }
                 )
@@ -1206,11 +1212,11 @@ def make_status_handler(*, db_path: Path):
                     """,
                     [run_id],
                 )
-                window_state_rows = _query(
+                slot_state_rows = _query(
                     db_path,
                     """
                     SELECT state, COUNT(*)
-                    FROM window_tasks
+                    FROM slot_tasks
                     WHERE run_id = ?
                     GROUP BY state
                     ORDER BY state
@@ -1226,8 +1232,8 @@ def make_status_handler(*, db_path: Path):
                         FROM events
                         WHERE run_id = ?
                         UNION ALL
-                        SELECT level, stage, message, ts, 'WINDOW' AS source
-                        FROM window_events
+                        SELECT level, stage, message, ts, 'SLOT' AS source
+                        FROM slot_events
                         WHERE run_id = ?
                     ) merged
                     ORDER BY ts DESC
@@ -1246,8 +1252,8 @@ def make_status_handler(*, db_path: Path):
                             "status_counts": [
                                 {"status": status, "count": int(count)} for status, count in state_rows
                             ],
-                            "window_state_counts": [
-                                {"state": state, "count": int(count)} for state, count in window_state_rows
+                            "slot_state_counts": [
+                                {"state": state, "count": int(count)} for state, count in slot_state_rows
                             ],
                             "recent_events": [
                                 {"level": e[0], "stage": e[1], "message": e[2], "ts": e[3], "source": e[4]}
@@ -1305,11 +1311,11 @@ def make_status_handler(*, db_path: Path):
                         LEFT JOIN jobs AS j
                         ON e.run_id = j.run_id AND e.job_id = j.job_id
                         UNION ALL
-                        SELECT w.run_id, w.window_id AS entity_id, w.level, w.stage, w.message, w.ts, 'WINDOW' AS source, wt.account_id
-                        FROM window_events
+                        SELECT w.run_id, w.slot_id AS entity_id, w.level, w.stage, w.message, w.ts, 'SLOT' AS source, wt.account_id
+                        FROM slot_events
                         AS w
-                        LEFT JOIN window_tasks AS wt
-                        ON w.run_id = wt.run_id AND w.window_id = wt.window_id
+                        LEFT JOIN slot_tasks AS wt
+                        ON w.run_id = wt.run_id AND w.slot_id = wt.slot_id
                     ) AS merged
                 """
                 query_params: list[object] = []
@@ -1325,13 +1331,13 @@ def make_status_handler(*, db_path: Path):
                 )
                 throughput_kpi: dict[str, object] | None = None
                 if scope_run_id is not None:
-                    window_rows = _query(
+                    slot_rows = _query(
                         db_path,
                         """
                         SELECT
                             SUM(CASE WHEN state IN ('QUEUED', 'RETRY_QUEUED') THEN 1 ELSE 0 END),
                             SUM(CASE WHEN state IN ('ASSIGNED', 'UPLOADING', 'RUNNING', 'COLLECTING') THEN 1 ELSE 0 END)
-                        FROM window_tasks
+                        FROM slot_tasks
                         WHERE run_id = ?
                         """,
                         [scope_run_id],
@@ -1347,13 +1353,13 @@ def make_status_handler(*, db_path: Path):
                         """,
                         [scope_run_id],
                     )
-                    queued_windows = int(window_rows[0][0] or 0)
-                    active_windows = int(window_rows[0][1] or 0)
+                    queued_slots = int(slot_rows[0][0] or 0)
+                    active_slots = int(slot_rows[0][1] or 0)
                     active_workers = int(job_rows[0][0] or 0)
                     pending_workers = int(job_rows[0][1] or 0)
                     throughput_kpi = _throughput_kpi_payload(
-                        queued_windows=queued_windows,
-                        active_windows=active_windows,
+                        queued_slots=queued_slots,
+                        active_slots=active_slots,
                         active_workers=active_workers,
                         pending_workers=pending_workers,
                     )
@@ -1376,7 +1382,7 @@ def make_status_handler(*, db_path: Path):
                             "run_id": row[0],
                             "entity_id": row[1],
                             "job_id": row[1] if row[6] == "JOB" else None,
-                            "window_id": row[1] if row[6] == "WINDOW" else None,
+                            "slot_id": row[1] if row[6] == "SLOT" else None,
                             "source": row[6],
                             "account_id": account_id,
                             "level": row[2],
@@ -1431,7 +1437,7 @@ def start_status_server(*, db_path: str, host: str = "127.0.0.1", port: int = 87
     return server
 
 
-def _dashboard_html() -> str:
+def _dashboard_html(*, version: str) -> str:
     return """<!doctype html>
 <html lang="en">
 <head>
@@ -1468,7 +1474,7 @@ def _dashboard_html() -> str:
 <body>
   <div class="wrap">
     <h1>Peets FEA Status Dashboard</h1>
-    <div class="muted">Window(.aedt) 기준 대시보드. 5초마다 갱신. API: <code>/api</code></div>
+    <div class="muted">Version <code id="app-version">__APP_VERSION__</code> | Slot(.aedt) 기준 대시보드. 5초마다 갱신. API: <code>/api</code></div>
 
     <div class="card" style="margin-top:12px;">
       <div class="k">Worker Health</div>
@@ -1491,11 +1497,11 @@ def _dashboard_html() -> str:
       <div class="card"><div class="k">Needed Slots</div><div class="v" id="slot-needed">-</div></div>
       <div class="card"><div class="k">Slot Shortfall</div><div class="v" id="slot-shortfall">-</div></div>
       <div class="card"><div class="k">Throughput Mode</div><div class="v" id="slot-mode" style="font-size:15px;">-</div></div>
-      <div class="card"><div class="k">Queued Windows</div><div class="v" id="w-queued">-</div></div>
-      <div class="card"><div class="k">Active Windows</div><div class="v" id="w-active">-</div></div>
-      <div class="card"><div class="k">Succeeded Windows</div><div class="v" id="w-succ">-</div></div>
-      <div class="card"><div class="k">Failed Windows</div><div class="v" id="w-fail">-</div></div>
-      <div class="card"><div class="k">Quarantined Windows</div><div class="v" id="w-quar">-</div></div>
+      <div class="card"><div class="k">Queued Slots</div><div class="v" id="w-queued">-</div></div>
+      <div class="card"><div class="k">Active Slots</div><div class="v" id="w-active">-</div></div>
+      <div class="card"><div class="k">Succeeded Slots</div><div class="v" id="w-succ">-</div></div>
+      <div class="card"><div class="k">Failed Slots</div><div class="v" id="w-fail">-</div></div>
+      <div class="card"><div class="k">Quarantined Slots</div><div class="v" id="w-quar">-</div></div>
       <div class="card"><div class="k">Delete Quarantined</div><div class="v" id="w-delq">-</div></div>
       <div class="card"><div class="k">Active Jobs</div><div class="v" id="j-active">-</div></div>
       <div class="card"><div class="k">Queued Jobs</div><div class="v" id="j-queue">-</div></div>
@@ -1505,8 +1511,8 @@ def _dashboard_html() -> str:
     <div class="two">
       <div class="row">
         <table>
-          <thead><tr><th>window_id</th><th>job_id</th><th>account</th><th>state</th><th>attempt</th><th>input</th><th>updated_at</th></tr></thead>
-          <tbody id="windows-body"></tbody>
+          <thead><tr><th>slot_id</th><th>job_id</th><th>account</th><th>state</th><th>attempt</th><th>input</th><th>updated_at</th></tr></thead>
+          <tbody id="slots-body"></tbody>
         </table>
       </div>
       <div class="row">
@@ -1544,7 +1550,7 @@ def _dashboard_html() -> str:
         const health = await fetchJson('/api/worker/health');
         const metrics = await fetchJson('/api/metrics/throughput');
         const latest = await fetchJson('/api/runs/latest');
-        const windows = await fetchJson('/api/windows?limit=300');
+        const slots = await fetchJson('/api/slots?limit=300');
         const capacity = await fetchJson('/api/accounts/capacity');
         const events = await fetchJson('/api/events/recent?limit=80');
 
@@ -1565,22 +1571,22 @@ def _dashboard_html() -> str:
         document.getElementById('slot-needed').textContent = metrics.metrics.throughput_kpi.effective_target_slots;
         document.getElementById('slot-shortfall').textContent = metrics.metrics.throughput_kpi.active_slot_shortfall;
         document.getElementById('slot-mode').textContent = metrics.metrics.throughput_kpi.throughput_mode;
-        document.getElementById('w-queued').textContent = metrics.metrics.queued_windows;
-        document.getElementById('w-active').textContent = metrics.metrics.active_windows;
-        document.getElementById('w-succ').textContent = metrics.metrics.succeeded_windows;
-        document.getElementById('w-fail').textContent = metrics.metrics.failed_windows;
-        document.getElementById('w-quar').textContent = metrics.metrics.quarantined_windows;
-        document.getElementById('w-delq').textContent = metrics.metrics.delete_quarantined_windows;
+        document.getElementById('w-queued').textContent = metrics.metrics.queued_slots;
+        document.getElementById('w-active').textContent = metrics.metrics.active_slots;
+        document.getElementById('w-succ').textContent = metrics.metrics.succeeded_slots;
+        document.getElementById('w-fail').textContent = metrics.metrics.failed_slots;
+        document.getElementById('w-quar').textContent = metrics.metrics.quarantined_slots;
+        document.getElementById('w-delq').textContent = metrics.metrics.delete_quarantined_slots;
         document.getElementById('j-active').textContent = metrics.metrics.active_jobs;
         document.getElementById('j-queue').textContent = metrics.metrics.queue_jobs;
         document.getElementById('run-id').textContent = latest.run ? latest.run.run_id : '-';
 
-        const windowsBody = document.getElementById('windows-body');
-        windowsBody.innerHTML = '';
-        for (const w of (windows.windows || [])) {
+        const slotsBody = document.getElementById('slots-body');
+        slotsBody.innerHTML = '';
+        for (const w of (slots.slots || [])) {
           const tr = document.createElement('tr');
           tr.innerHTML = `
-            <td><a href="/api/windows/${encodeURIComponent(w.window_id)}/timeline" target="_blank">${esc(w.window_id)}</a></td>
+            <td><a href="/api/slots/${encodeURIComponent(w.slot_id)}/timeline" target="_blank">${esc(w.slot_id)}</a></td>
             <td>${esc(w.job_id)}</td>
             <td>${esc(w.account_id)}</td>
             <td class="state-${esc(w.state)}">${esc(w.state)}</td>
@@ -1588,7 +1594,7 @@ def _dashboard_html() -> str:
             <td>${esc(w.input_path)}</td>
             <td>${esc(w.updated_at)}</td>
           `;
-          windowsBody.appendChild(tr);
+          slotsBody.appendChild(tr);
         }
 
         const accountsBody = document.getElementById('accounts-body');
@@ -1606,7 +1612,7 @@ def _dashboard_html() -> str:
             <td>${esc(a.allowed_submit)}</td>
             <td>${esc(a.active_slots)}</td>
             <td>${esc(a.completed_slots)}</td>
-            <td>${esc(a.quarantined_windows)}</td>
+            <td>${esc(a.quarantined_slots)}</td>
             <td>${esc(a.active_slot_shortfall)}</td>
             <td>${esc(a.readiness_reason || '-')}</td>
             <td>${esc(a.ts)}</td>
@@ -1653,4 +1659,4 @@ def _dashboard_html() -> str:
   </script>
 </body>
 </html>
-"""
+""".replace("__APP_VERSION__", version)

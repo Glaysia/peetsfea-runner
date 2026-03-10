@@ -34,8 +34,8 @@ class TestStateStore(unittest.TestCase):
             self.assertIn("events", names)
             self.assertIn("file_lifecycle", names)
             self.assertIn("worker_heartbeat", names)
-            self.assertIn("window_tasks", names)
-            self.assertIn("window_events", names)
+            self.assertIn("slot_tasks", names)
+            self.assertIn("slot_events", names)
             self.assertIn("ingest_index", names)
             self.assertIn("account_capacity_snapshots", names)
 
@@ -226,21 +226,21 @@ class TestStateStore(unittest.TestCase):
             run2 = store.ensure_continuous_run(rotation_hours=24)
             self.assertEqual(run1, run2)
 
-    def test_window_delete_lifecycle_can_mark_pending_and_retained(self) -> None:
+    def test_slot_delete_lifecycle_can_mark_pending_and_retained(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "state.duckdb"
             store = StateStore(db_path)
             store.initialize()
             store.start_run("run_01")
-            store.create_window_task(
+            store.create_slot_task(
                 run_id="run_01",
-                window_id="w_001",
+                slot_id="w_001",
                 input_path="/in/a.aedt",
                 output_path="/out/a.aedt.out",
                 account_id=None,
             )
-            store.mark_window_delete_pending(run_id="run_01", window_id="w_001")
-            store.mark_window_delete_retained(run_id="run_01", window_id="w_001")
+            store.mark_slot_delete_pending(run_id="run_01", slot_id="w_001")
+            store.mark_slot_delete_retained(run_id="run_01", slot_id="w_001")
 
             conn = duckdb.connect(str(db_path))
             try:
@@ -248,7 +248,7 @@ class TestStateStore(unittest.TestCase):
                     """
                     SELECT delete_final_state
                     FROM file_lifecycle
-                    WHERE run_id = 'run_01' AND window_id = 'w_001'
+                    WHERE run_id = 'run_01' AND slot_id = 'w_001'
                     """
                 ).fetchone()
             finally:
@@ -256,28 +256,28 @@ class TestStateStore(unittest.TestCase):
 
             self.assertEqual(row[0], "RETAINED")
 
-    def test_window_task_score_and_capacity_snapshot(self) -> None:
+    def test_slot_task_score_and_capacity_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "state.duckdb"
             store = StateStore(db_path)
             store.initialize()
             store.start_run("run_01")
-            store.create_window_task(
+            store.create_slot_task(
                 run_id="run_01",
-                window_id="w_001",
+                slot_id="w_001",
                 input_path="/in/a.aedt",
                 output_path="/out/a.aedt_all",
                 account_id="account_01",
             )
-            store.update_window_task(
+            store.update_slot_task(
                 run_id="run_01",
-                window_id="w_001",
+                slot_id="w_001",
                 state="SUCCEEDED",
                 attempt_no=1,
                 job_id="job_0001",
                 account_id="account_01",
             )
-            completed, inflight = store.get_window_throughput_score(run_id="run_01", account_id="account_01")
+            completed, inflight = store.get_slot_throughput_score(run_id="run_01", account_id="account_01")
             self.assertEqual(completed, 1)
             self.assertEqual(inflight, 0)
 

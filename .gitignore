@@ -19,3 +19,5 @@ examples/*
 
 original/*
 build/*
+
+tmp/*

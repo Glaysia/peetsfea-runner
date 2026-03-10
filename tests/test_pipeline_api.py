@@ -9,11 +9,12 @@ from unittest.mock import patch
 import duckdb
 
 from peetsfea_runner import AccountConfig, PipelineConfig, run_pipeline
+from peetsfea_runner import __version__
 from peetsfea_runner.pipeline import (
     EXIT_CODE_SUCCESS,
     PipelineResult,
     _BundleRuntimeOutcome,
-    _materialize_window_outputs,
+    _materialize_slot_outputs,
 )
 from peetsfea_runner.remote_job import CaseExecutionSummary, RemoteJobAttemptResult
 from peetsfea_runner.scheduler import AccountCapacitySnapshot, AccountReadinessSnapshot
@@ -36,7 +37,7 @@ class TestPipelineApi(unittest.TestCase):
             self.assertTrue(config.continuous_mode)
             self.assertEqual(config.ready_sidecar_suffix, ".ready")
             self.assertEqual(config.run_rotation_hours, 24)
-            self.assertTrue((input_dir / "sample.aedt.ready").is_file())
+            self.assertFalse((input_dir / "sample.aedt.ready").exists())
 
     def test_validate_rejects_missing_directory(self) -> None:
         missing = Path(tempfile.gettempdir()) / "missing_input_queue"
@@ -144,11 +145,12 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIsInstance(result, PipelineResult)
             self.assertTrue(result.success)
             self.assertEqual(result.exit_code, EXIT_CODE_SUCCESS)
+            self.assertEqual(result.version, __version__)
             self.assertEqual(result.total_jobs, 1)
             self.assertIn("failed_job_ids=[]", result.summary)
             self.assertTrue((nested / "foo.aedt.ready").is_file())
 
-    def test_continuous_mode_schedules_existing_queued_windows(self) -> None:
+    def test_continuous_mode_schedules_existing_queued_slots(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
@@ -157,9 +159,9 @@ class TestPipelineApi(unittest.TestCase):
             store = StateStore(db_path)
             store.initialize()
             store.start_run("run_01")
-            store.create_window_task(
+            store.create_slot_task(
                 run_id="run_01",
-                window_id="w_backlog_0001",
+                slot_id="w_backlog_0001",
                 input_path=str(input_dir / "backlog.aedt"),
                 output_path=str(output_root / "backlog.aedt.out"),
                 account_id=None,
@@ -176,12 +178,12 @@ class TestPipelineApi(unittest.TestCase):
             result = run_pipeline(config)
 
             self.assertTrue(result.success)
-            self.assertEqual(result.total_windows, 1)
+            self.assertEqual(result.total_slots, 1)
             self.assertEqual(result.total_jobs, 1)
             conn = duckdb.connect(str(db_path))
             try:
                 state = conn.execute(
-                    "SELECT state FROM window_tasks WHERE run_id = ? AND window_id = ?",
+                    "SELECT state FROM slot_tasks WHERE run_id = ? AND slot_id = ?",
                     ["run_01", "w_backlog_0001"],
                 ).fetchone()[0]
             finally:
@@ -207,13 +209,13 @@ class TestPipelineApi(unittest.TestCase):
             )
             dispatched_sizes: list[int] = []
 
-            def _mock_run_window_workers(*, window_queue, job_index_start, **kwargs):
-                dispatched_sizes.append(len(window_queue))
+            def _mock_run_slot_workers(*, slot_queue, job_index_start, **kwargs):
+                dispatched_sizes.append(len(slot_queue))
                 conn = duckdb.connect(str(db_path))
                 try:
                     conn.execute(
                         """
-                        UPDATE window_tasks
+                        UPDATE slot_tasks
                         SET state = 'SUCCEEDED',
                             updated_at = now()
                         """
@@ -228,11 +230,11 @@ class TestPipelineApi(unittest.TestCase):
                     replacement_jobs=0,
                 )
 
-            with patch("peetsfea_runner.pipeline.run_window_workers", side_effect=_mock_run_window_workers):
+            with patch("peetsfea_runner.pipeline.run_slot_workers", side_effect=_mock_run_slot_workers):
                 result = run_pipeline(config)
 
             self.assertTrue(result.success)
-            self.assertEqual(result.total_windows, 2)
+            self.assertEqual(result.total_slots, 2)
             self.assertEqual(dispatched_sizes, [2])
             for index in range(1, 3):
                 self.assertTrue((input_dir / f"sample_{index:02d}.aedt.ready").is_file())
@@ -262,14 +264,14 @@ class TestPipelineApi(unittest.TestCase):
                     self._pending: list = []
                     self._submitted = 0
 
-                def enqueue_windows(self, windows):
-                    self._pending.extend(windows)
+                def enqueue_slots(self, slots):
+                    self._pending.extend(slots)
 
                 def snapshot(self):
                     return SimpleNamespace(
-                        queued_windows=0,
-                        pending_windows=len(self._pending),
-                        inflight_windows=0,
+                        queued_slots=0,
+                        pending_slots=len(self._pending),
+                        inflight_slots=0,
                         inflight_jobs=0,
                         submitted_jobs=self._submitted,
                     )
@@ -283,17 +285,17 @@ class TestPipelineApi(unittest.TestCase):
                     conn = duckdb.connect(str(db_path))
                     try:
                         discovered_counts_at_dispatch.append(
-                            conn.execute("SELECT COUNT(*) FROM window_tasks").fetchone()[0]
+                            conn.execute("SELECT COUNT(*) FROM slot_tasks").fetchone()[0]
                         )
                         dispatched_sizes.append(len(self._pending))
                         conn.executemany(
                             """
-                            UPDATE window_tasks
+                            UPDATE slot_tasks
                             SET state = 'SUCCEEDED',
                                 updated_at = now()
-                            WHERE window_id = ?
+                            WHERE slot_id = ?
                             """,
-                            [[window.window_id] for window in self._pending],
+                            [[slot.slot_id] for slot in self._pending],
                         )
                     finally:
                         conn.close()
@@ -312,12 +314,12 @@ class TestPipelineApi(unittest.TestCase):
 
             with (
                 patch("peetsfea_runner.pipeline._continuous_backlog_limits", return_value=(12, 24)),
-                patch("peetsfea_runner.pipeline.WindowWorkerController", _FakeController),
+                patch("peetsfea_runner.pipeline.SlotWorkerController", _FakeController),
             ):
                 result = run_pipeline(config)
 
             self.assertTrue(result.success)
-            self.assertEqual(result.total_windows, 30)
+            self.assertEqual(result.total_slots, 30)
             self.assertGreaterEqual(len(dispatched_sizes), 1)
             self.assertEqual(dispatched_sizes[0], 4)
             self.assertEqual(discovered_counts_at_dispatch[0], 4)
@@ -372,7 +374,7 @@ class TestPipelineApi(unittest.TestCase):
                     for row in conn.execute(
                         """
                         SELECT stage
-                        FROM window_events
+                        FROM slot_events
                         ORDER BY ts
                         """
                     ).fetchall()
@@ -407,17 +409,17 @@ class TestPipelineApi(unittest.TestCase):
             result = run_pipeline(config)
 
             self.assertTrue(result.success)
-            self.assertEqual(result.total_windows, 0)
+            self.assertEqual(result.total_slots, 0)
             self.assertFalse((input_dir / "sample_01.aedt.ready").exists())
             self.assertFalse((output_root / "sample_01.aedt.out").exists())
 
             conn = duckdb.connect(str(db_path))
             try:
-                window_count = conn.execute("SELECT COUNT(*) FROM window_tasks").fetchone()[0]
+                slot_count = conn.execute("SELECT COUNT(*) FROM slot_tasks").fetchone()[0]
                 ingest_count = conn.execute("SELECT COUNT(*) FROM ingest_index").fetchone()[0]
             finally:
                 conn.close()
-            self.assertEqual(window_count, 0)
+            self.assertEqual(slot_count, 0)
             self.assertEqual(ingest_count, 0)
 
     def test_materialized_terminal_output_deletes_input_file(self) -> None:
@@ -630,7 +632,7 @@ class TestPipelineApi(unittest.TestCase):
                 conn.close()
             self.assertEqual(state, "RETAINED")
 
-    def test_remote_attempt_records_window_lifecycle_events(self) -> None:
+    def test_remote_attempt_records_slot_lifecycle_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
@@ -650,6 +652,16 @@ class TestPipelineApi(unittest.TestCase):
             def _mock_attempt(*, on_upload_success=None, **kwargs):
                 if on_upload_success is not None:
                     on_upload_success()
+                local_job_dir = kwargs["local_job_dir"]
+                case_dir = Path(local_job_dir) / "case_01"
+                (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
+                (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
+                (case_dir / "project.aedt.q.complete").write_text("done", encoding="utf-8")
+                (case_dir / "project.aedtresults" / "trace.txt").write_text("trace", encoding="utf-8")
+                (case_dir / "run.log").write_text("log", encoding="utf-8")
+                (case_dir / "exit.code").write_text("0", encoding="utf-8")
+                (Path(local_job_dir) / "case_summary.txt").write_text("case_01:0\n", encoding="utf-8")
+                (Path(local_job_dir) / "failed.count").write_text("0\n", encoding="utf-8")
                 return RemoteJobAttemptResult(
                     success=True,
                     exit_code=0,
@@ -684,8 +696,8 @@ class TestPipelineApi(unittest.TestCase):
                     for row in conn.execute(
                         """
                         SELECT stage
-                        FROM window_events
-                        WHERE window_id IN (SELECT window_id FROM window_tasks LIMIT 1)
+                        FROM slot_events
+                        WHERE slot_id IN (SELECT slot_id FROM slot_tasks LIMIT 1)
                         """
                     ).fetchall()
                 ]
@@ -697,7 +709,7 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIn("RUNNING", stages)
             self.assertIn("SUCCEEDED", stages)
 
-    def test_materialize_window_outputs_mirrors_case_outputs_into_out_dir(self) -> None:
+    def test_materialize_slot_outputs_mirrors_case_outputs_into_out_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             input_file = root / "nested" / "sample.aedt"
@@ -715,11 +727,11 @@ class TestPipelineApi(unittest.TestCase):
             (local_bundle_dir / "case_summary.txt").write_text("case_01:0\n", encoding="utf-8")
             (local_bundle_dir / "failed.count").write_text("0\n", encoding="utf-8")
 
-            _materialize_window_outputs(
+            _materialize_slot_outputs(
                 local_bundle_dir=local_bundle_dir,
-                windows=[
+                slots=[
                     SimpleNamespace(
-                        window_id="w_001",
+                        slot_id="w_001",
                         input_path=input_file,
                         output_dir=output_dir,
                     )
@@ -931,7 +943,7 @@ class TestPipelineApi(unittest.TestCase):
             conn = duckdb.connect(str(db_path))
             try:
                 state, failure_reason = conn.execute(
-                    "SELECT state, failure_reason FROM window_tasks LIMIT 1"
+                    "SELECT state, failure_reason FROM slot_tasks LIMIT 1"
                 ).fetchone()
             finally:
                 conn.close()
@@ -1011,8 +1023,8 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIn("replacement_jobs=1", result.summary)
             conn = duckdb.connect(str(db_path))
             try:
-                state = conn.execute("SELECT state FROM window_tasks LIMIT 1").fetchone()[0]
-                stages = [row[0] for row in conn.execute("SELECT stage FROM window_events ORDER BY ts").fetchall()]
+                state = conn.execute("SELECT state FROM slot_tasks LIMIT 1").fetchone()[0]
+                stages = [row[0] for row in conn.execute("SELECT stage FROM slot_events ORDER BY ts").fetchall()]
             finally:
                 conn.close()
             self.assertEqual(state, "SUCCEEDED")
@@ -1072,9 +1084,9 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIn("replacement_jobs=1", result.summary)
             conn = duckdb.connect(str(db_path))
             try:
-                state = conn.execute("SELECT state FROM window_tasks LIMIT 1").fetchone()[0]
+                state = conn.execute("SELECT state FROM slot_tasks LIMIT 1").fetchone()[0]
                 retry_count = conn.execute(
-                    "SELECT COUNT(*) FROM window_events WHERE stage = 'RETRY_QUEUED'"
+                    "SELECT COUNT(*) FROM slot_events WHERE stage = 'RETRY_QUEUED'"
                 ).fetchone()[0]
             finally:
                 conn.close()
@@ -1210,7 +1222,7 @@ class TestPipelineApi(unittest.TestCase):
                         ansys_ok=True,
                     ),
                 ),
-                patch("peetsfea_runner.pipeline.run_window_workers") as run_workers_mock,
+                patch("peetsfea_runner.pipeline.run_slot_workers") as run_workers_mock,
             ):
                 result = run_pipeline(config)
 
@@ -1218,12 +1230,12 @@ class TestPipelineApi(unittest.TestCase):
             self.assertEqual(result.total_jobs, 0)
             self.assertEqual(result.exit_code, 13)
             self.assertIn("blocked_accounts=['account_01']", result.summary)
-            self.assertIn("readiness_blocked_windows=1", result.summary)
+            self.assertIn("readiness_blocked_slots=1", result.summary)
             run_workers_mock.assert_not_called()
 
             conn = duckdb.connect(str(db_path))
             try:
-                window_state = conn.execute("SELECT state FROM window_tasks LIMIT 1").fetchone()[0]
+                slot_state = conn.execute("SELECT state FROM slot_tasks LIMIT 1").fetchone()[0]
                 readiness_row = conn.execute(
                     """
                     SELECT ready, status, reason
@@ -1234,7 +1246,7 @@ class TestPipelineApi(unittest.TestCase):
                 ).fetchone()
             finally:
                 conn.close()
-            self.assertEqual(window_state, "QUEUED")
+            self.assertEqual(slot_state, "QUEUED")
             self.assertEqual((bool(readiness_row[0]), readiness_row[1], readiness_row[2]), (False, "DISABLED_FOR_DISPATCH", "venv,python"))
 
     def test_remote_pipeline_bootstraps_account_before_dispatch(self) -> None:
@@ -1291,12 +1303,12 @@ class TestPipelineApi(unittest.TestCase):
                     ),
                 ),
             ):
-                def _mock_run_window_workers(*args, **kwargs):
+                def _mock_run_slot_workers(*args, **kwargs):
                     conn = duckdb.connect(str(db_path))
                     try:
                         conn.execute(
                             """
-                            UPDATE window_tasks
+                            UPDATE slot_tasks
                             SET state = 'SUCCEEDED',
                                 job_id = 'job_0001',
                                 account_id = 'account_01',
@@ -1314,9 +1326,9 @@ class TestPipelineApi(unittest.TestCase):
                                 quarantined=False,
                                 exit_code=0,
                                 message="ok",
-                                success_windows=1,
-                                failed_windows=0,
-                                quarantined_windows=0,
+                                success_slots=1,
+                                failed_slots=0,
+                                quarantined_slots=0,
                             )
                         ],
                         max_inflight_jobs=1,
@@ -1325,7 +1337,7 @@ class TestPipelineApi(unittest.TestCase):
                         replacement_jobs=0,
                     )
 
-                with patch("peetsfea_runner.pipeline.run_window_workers", side_effect=_mock_run_window_workers) as run_workers_mock:
+                with patch("peetsfea_runner.pipeline.run_slot_workers", side_effect=_mock_run_slot_workers) as run_workers_mock:
                     result = run_pipeline(config)
 
             self.assertTrue(result.success)
@@ -1399,13 +1411,13 @@ class TestPipelineApi(unittest.TestCase):
                         pyaedt_ok=False,
                     ),
                 ),
-                patch("peetsfea_runner.pipeline.run_window_workers") as run_workers_mock,
+                patch("peetsfea_runner.pipeline.run_slot_workers") as run_workers_mock,
             ):
                 result = run_pipeline(config)
 
             self.assertFalse(result.success)
             self.assertIn("blocked_accounts=['account_01']", result.summary)
-            self.assertIn("readiness_blocked_windows=1", result.summary)
+            self.assertIn("readiness_blocked_slots=1", result.summary)
             run_workers_mock.assert_not_called()
 
             conn = duckdb.connect(str(db_path))
@@ -1442,11 +1454,11 @@ class TestPipelineApi(unittest.TestCase):
                 accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),),
             )
 
-            def _mock_attempt(*, window_inputs=None, local_job_dir=None, on_upload_success=None, **kwargs):
+            def _mock_attempt(*, slot_inputs=None, local_job_dir=None, on_upload_success=None, **kwargs):
                 if on_upload_success is not None:
                     on_upload_success()
                 assert local_job_dir is not None
-                case_count = len(window_inputs or [])
+                case_count = len(slot_inputs or [])
                 for index in range(1, case_count + 1):
                     case_dir = Path(local_job_dir) / f"case_{index:02d}"
                     (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
@@ -1480,8 +1492,8 @@ class TestPipelineApi(unittest.TestCase):
                 result = run_pipeline(config)
 
             self.assertTrue(result.success)
-            self.assertEqual(result.total_jobs, 11)
-            self.assertEqual(result.total_windows, 85)
+            self.assertEqual(result.total_jobs, 22)
+            self.assertEqual(result.total_slots, 85)
 
 
 if __name__ == "__main__":

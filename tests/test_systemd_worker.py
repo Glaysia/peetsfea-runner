@@ -19,7 +19,7 @@ from peetsfea_runner.systemd_worker import (
 
 
 class TestSystemdWorker(unittest.TestCase):
-    def test_build_config_reads_window_parallelism_from_env(self) -> None:
+    def test_build_config_reads_slot_parallelism_from_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(
                 environ,
@@ -27,15 +27,21 @@ class TestSystemdWorker(unittest.TestCase):
                     "PEETSFEA_INPUT_QUEUE_DIR": str(Path(tmpdir) / "in"),
                     "PEETSFEA_OUTPUT_ROOT_DIR": str(Path(tmpdir) / "out"),
                     "PEETSFEA_DB_PATH": str(Path(tmpdir) / "state.duckdb"),
-                    "PEETSFEA_WINDOWS_PER_JOB": "6",
-                    "PEETSFEA_CORES_PER_WINDOW": "5",
+                    "PEETSFEA_CPUS_PER_JOB": "24",
+                    "PEETSFEA_MEM": "512G",
+                    "PEETSFEA_TIME_LIMIT": "02:30:00",
+                    "PEETSFEA_SLOTS_PER_JOB": "6",
+                    "PEETSFEA_CORES_PER_SLOT": "5",
                 },
                 clear=False,
             ):
                 config = _build_config()
 
-            self.assertEqual(config.windows_per_job, 6)
-            self.assertEqual(config.cores_per_window, 5)
+            self.assertEqual(config.slots_per_job, 6)
+            self.assertEqual(config.cores_per_slot, 5)
+            self.assertEqual(config.cpus_per_job, 24)
+            self.assertEqual(config.mem, "512G")
+            self.assertEqual(config.time_limit, "02:30:00")
 
     def test_run_worker_iteration_marks_idle_when_pipeline_is_idle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -59,16 +65,16 @@ class TestSystemdWorker(unittest.TestCase):
                     run_id="run_01",
                     remote_run_dir="/tmp/remote",
                     local_artifacts_dir="/tmp/out",
-                    summary="total_windows=0 active_windows=0",
+                    summary="total_slots=0 active_slots=0",
                     total_jobs=0,
                     success_jobs=0,
                     failed_jobs=0,
                     quarantined_jobs=0,
-                    total_windows=0,
-                    active_windows=0,
-                    success_windows=0,
-                    failed_windows=0,
-                    quarantined_windows=0,
+                    total_slots=0,
+                    active_slots=0,
+                    success_slots=0,
+                    failed_slots=0,
+                    quarantined_slots=0,
                 ),
             ):
                 result = _run_worker_iteration(config=config, store=store, runtime_state=runtime_state)
@@ -110,16 +116,16 @@ class TestSystemdWorker(unittest.TestCase):
                     run_id="run_02",
                     remote_run_dir="/tmp/remote",
                     local_artifacts_dir="/tmp/out",
-                    summary="total_windows=3 active_windows=0",
+                    summary="total_slots=3 active_slots=0",
                     total_jobs=1,
                     success_jobs=1,
                     failed_jobs=0,
                     quarantined_jobs=0,
-                    total_windows=3,
-                    active_windows=0,
-                    success_windows=3,
-                    failed_windows=0,
-                    quarantined_windows=0,
+                    total_slots=3,
+                    active_slots=0,
+                    success_slots=3,
+                    failed_slots=0,
+                    quarantined_slots=0,
                 ),
             ):
                 result = _run_worker_iteration(config=config, store=store, runtime_state=runtime_state)
@@ -164,13 +170,13 @@ class TestSystemdWorker(unittest.TestCase):
                     success_jobs=0,
                     failed_jobs=0,
                     quarantined_jobs=0,
-                    total_windows=4,
-                    active_windows=0,
-                    success_windows=0,
-                    failed_windows=0,
-                    quarantined_windows=0,
+                    total_slots=4,
+                    active_slots=0,
+                    success_slots=0,
+                    failed_slots=0,
+                    quarantined_slots=0,
                     blocked_accounts=("account_01",),
-                    readiness_blocked_windows=4,
+                    readiness_blocked_slots=4,
                 ),
             ):
                 result = _run_worker_iteration(config=config, store=store, runtime_state=runtime_state)
@@ -213,11 +219,11 @@ class TestSystemdWorker(unittest.TestCase):
                     success_jobs=0,
                     failed_jobs=1,
                     quarantined_jobs=1,
-                    total_windows=8,
-                    active_windows=0,
-                    success_windows=0,
-                    failed_windows=4,
-                    quarantined_windows=4,
+                    total_slots=8,
+                    active_slots=0,
+                    success_slots=0,
+                    failed_slots=4,
+                    quarantined_slots=4,
                     terminal_jobs=2,
                     replacement_jobs=1,
                 ),
@@ -260,11 +266,11 @@ class TestSystemdWorker(unittest.TestCase):
                 success_jobs=0,
                 failed_jobs=1,
                 quarantined_jobs=0,
-                total_windows=4,
-                active_windows=0,
-                success_windows=0,
-                failed_windows=4,
-                quarantined_windows=0,
+                total_slots=4,
+                active_slots=0,
+                success_slots=0,
+                failed_slots=4,
+                quarantined_slots=0,
                 terminal_jobs=1,
                 replacement_jobs=0,
             )

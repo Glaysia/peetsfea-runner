@@ -102,7 +102,7 @@ class StateStore:
                     CREATE TABLE IF NOT EXISTS file_lifecycle (
                         run_id TEXT NOT NULL,
                         job_id TEXT NOT NULL,
-                        window_id TEXT,
+                        slot_id TEXT,
                         input_path TEXT NOT NULL,
                         input_deleted_at TEXT,
                         delete_retry_count INTEGER NOT NULL DEFAULT 0,
@@ -127,9 +127,9 @@ class StateStore:
                 )
                 conn.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS window_tasks (
+                    CREATE TABLE IF NOT EXISTS slot_tasks (
                         run_id TEXT NOT NULL,
-                        window_id TEXT NOT NULL,
+                        slot_id TEXT NOT NULL,
                         job_id TEXT,
                         account_id TEXT,
                         input_path TEXT NOT NULL,
@@ -139,15 +139,15 @@ class StateStore:
                         failure_reason TEXT,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
-                        PRIMARY KEY (run_id, window_id)
+                        PRIMARY KEY (run_id, slot_id)
                     )
                     """
                 )
                 conn.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS window_events (
+                    CREATE TABLE IF NOT EXISTS slot_events (
                         run_id TEXT NOT NULL,
-                        window_id TEXT NOT NULL,
+                        slot_id TEXT NOT NULL,
                         level TEXT NOT NULL,
                         stage TEXT NOT NULL,
                         message TEXT NOT NULL,
@@ -228,7 +228,7 @@ class StateStore:
                     )
                     """
                 )
-                conn.execute("ALTER TABLE file_lifecycle ADD COLUMN IF NOT EXISTS window_id TEXT")
+                conn.execute("ALTER TABLE file_lifecycle ADD COLUMN IF NOT EXISTS slot_id TEXT")
                 conn.execute("ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS uv_ok BOOLEAN DEFAULT FALSE")
                 conn.execute(
                     "ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS pyaedt_ok BOOLEAN DEFAULT FALSE"
@@ -326,7 +326,7 @@ class StateStore:
                 )
                 conn.execute(
                     """
-                    INSERT INTO file_lifecycle (run_id, job_id, window_id, input_path, updated_at)
+                    INSERT INTO file_lifecycle (run_id, job_id, slot_id, input_path, updated_at)
                     VALUES (?, ?, ?, ?, ?)
                     """,
                     [run_id, job_id, None, input_path, now],
@@ -334,11 +334,11 @@ class StateStore:
             finally:
                 conn.close()
 
-    def create_window_task(
+    def create_slot_task(
         self,
         *,
         run_id: str,
-        window_id: str,
+        slot_id: str,
         input_path: str,
         output_path: str,
         account_id: str | None,
@@ -350,28 +350,28 @@ class StateStore:
             try:
                 conn.execute(
                     """
-                    INSERT INTO window_tasks (
-                        run_id, window_id, account_id, input_path, output_path, state, created_at, updated_at
+                    INSERT INTO slot_tasks (
+                        run_id, slot_id, account_id, input_path, output_path, state, created_at, updated_at
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    [run_id, window_id, account_id, input_path, output_path, state, now, now],
+                    [run_id, slot_id, account_id, input_path, output_path, state, now, now],
                 )
                 conn.execute(
                     """
-                    INSERT INTO file_lifecycle (run_id, job_id, window_id, input_path, updated_at)
+                    INSERT INTO file_lifecycle (run_id, job_id, slot_id, input_path, updated_at)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    [run_id, window_id, window_id, input_path, now],
+                    [run_id, slot_id, slot_id, input_path, now],
                 )
             finally:
                 conn.close()
 
-    def update_window_task(
+    def update_slot_task(
         self,
         *,
         run_id: str,
-        window_id: str,
+        slot_id: str,
         state: str,
         attempt_no: int | None = None,
         job_id: str | None = None,
@@ -393,22 +393,22 @@ class StateStore:
                 if account_id is not None:
                     fields.append("account_id = ?")
                     values.append(account_id)
-                values.extend([run_id, window_id])
+                values.extend([run_id, slot_id])
                 conn.execute(
-                    f"UPDATE window_tasks SET {', '.join(fields)} WHERE run_id = ? AND window_id = ?",
+                    f"UPDATE slot_tasks SET {', '.join(fields)} WHERE run_id = ? AND slot_id = ?",
                     values,
                 )
             finally:
                 conn.close()
 
-    def get_window_throughput_score(self, *, run_id: str, account_id: str) -> tuple[int, int]:
+    def get_slot_throughput_score(self, *, run_id: str, account_id: str) -> tuple[int, int]:
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
             try:
                 completed_row = conn.execute(
                     """
                     SELECT COUNT(*)
-                    FROM window_tasks
+                    FROM slot_tasks
                     WHERE run_id = ? AND account_id = ? AND state IN ('SUCCEEDED', 'FAILED', 'QUARANTINED')
                     """,
                     [run_id, account_id],
@@ -416,7 +416,7 @@ class StateStore:
                 inflight_row = conn.execute(
                     """
                     SELECT COUNT(*)
-                    FROM window_tasks
+                    FROM slot_tasks
                     WHERE run_id = ? AND account_id = ? AND state IN ('ASSIGNED', 'UPLOADING', 'RUNNING', 'COLLECTING')
                     """,
                     [run_id, account_id],
@@ -427,17 +427,17 @@ class StateStore:
         inflight = int(inflight_row[0]) if inflight_row is not None else 0
         return completed, inflight
 
-    def list_schedulable_window_tasks(self, *, run_id: str) -> list[tuple[str, str, str, int]]:
+    def list_schedulable_slot_tasks(self, *, run_id: str) -> list[tuple[str, str, str, int]]:
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
             try:
                 rows = conn.execute(
                     """
-                    SELECT window_id, input_path, output_path, attempt_no
-                    FROM window_tasks
+                    SELECT slot_id, input_path, output_path, attempt_no
+                    FROM slot_tasks
                     WHERE run_id = ?
                       AND state IN ('QUEUED', 'RETRY_QUEUED')
-                    ORDER BY created_at, window_id
+                    ORDER BY created_at, slot_id
                     """,
                     [run_id],
                 ).fetchall()
@@ -471,29 +471,29 @@ class StateStore:
             finally:
                 conn.close()
 
-    def append_window_event(self, *, run_id: str, window_id: str, level: str, stage: str, message: str) -> None:
+    def append_slot_event(self, *, run_id: str, slot_id: str, level: str, stage: str, message: str) -> None:
         now = _utc_now_iso()
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
             try:
                 conn.execute(
                     """
-                    INSERT INTO window_events (run_id, window_id, level, stage, message, ts)
+                    INSERT INTO slot_events (run_id, slot_id, level, stage, message, ts)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    [run_id, window_id, level, stage, message, now],
+                    [run_id, slot_id, level, stage, message, now],
                 )
             finally:
                 conn.close()
 
-    def count_windows_by_state(self, *, run_id: str) -> dict[str, int]:
+    def count_slots_by_state(self, *, run_id: str) -> dict[str, int]:
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
             try:
                 rows = conn.execute(
                     """
                     SELECT state, COUNT(*)
-                    FROM window_tasks
+                    FROM slot_tasks
                     WHERE run_id = ?
                     GROUP BY state
                     """,
@@ -724,7 +724,7 @@ class StateStore:
             finally:
                 conn.close()
 
-    def mark_window_input_deleted(self, *, run_id: str, window_id: str, retry_count: int) -> None:
+    def mark_slot_input_deleted(self, *, run_id: str, slot_id: str, retry_count: int) -> None:
         now = _utc_now_iso()
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
@@ -733,14 +733,14 @@ class StateStore:
                     """
                     UPDATE file_lifecycle
                     SET input_deleted_at = ?, delete_retry_count = ?, delete_final_state = ?, updated_at = ?
-                    WHERE run_id = ? AND window_id = ?
+                    WHERE run_id = ? AND slot_id = ?
                     """,
-                    [now, retry_count, "DELETED", now, run_id, window_id],
+                    [now, retry_count, "DELETED", now, run_id, slot_id],
                 )
             finally:
                 conn.close()
 
-    def mark_window_delete_pending(self, *, run_id: str, window_id: str) -> None:
+    def mark_slot_delete_pending(self, *, run_id: str, slot_id: str) -> None:
         now = _utc_now_iso()
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
@@ -749,14 +749,14 @@ class StateStore:
                     """
                     UPDATE file_lifecycle
                     SET delete_final_state = ?, updated_at = ?
-                    WHERE run_id = ? AND window_id = ?
+                    WHERE run_id = ? AND slot_id = ?
                     """,
-                    ["DELETE_PENDING", now, run_id, window_id],
+                    ["DELETE_PENDING", now, run_id, slot_id],
                 )
             finally:
                 conn.close()
 
-    def mark_window_delete_retained(self, *, run_id: str, window_id: str) -> None:
+    def mark_slot_delete_retained(self, *, run_id: str, slot_id: str) -> None:
         now = _utc_now_iso()
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
@@ -765,9 +765,9 @@ class StateStore:
                     """
                     UPDATE file_lifecycle
                     SET delete_final_state = ?, updated_at = ?
-                    WHERE run_id = ? AND window_id = ?
+                    WHERE run_id = ? AND slot_id = ?
                     """,
-                    ["RETAINED", now, run_id, window_id],
+                    ["RETAINED", now, run_id, slot_id],
                 )
             finally:
                 conn.close()
@@ -788,7 +788,7 @@ class StateStore:
             finally:
                 conn.close()
 
-    def mark_window_delete_retrying(self, *, run_id: str, window_id: str, retry_count: int) -> None:
+    def mark_slot_delete_retrying(self, *, run_id: str, slot_id: str, retry_count: int) -> None:
         now = _utc_now_iso()
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
@@ -797,9 +797,9 @@ class StateStore:
                     """
                     UPDATE file_lifecycle
                     SET delete_retry_count = ?, delete_final_state = ?, updated_at = ?
-                    WHERE run_id = ? AND window_id = ?
+                    WHERE run_id = ? AND slot_id = ?
                     """,
-                    [retry_count, "DELETE_RETRYING", now, run_id, window_id],
+                    [retry_count, "DELETE_RETRYING", now, run_id, slot_id],
                 )
             finally:
                 conn.close()
@@ -827,11 +827,11 @@ class StateStore:
             finally:
                 conn.close()
 
-    def mark_window_delete_quarantined(
+    def mark_slot_delete_quarantined(
         self,
         *,
         run_id: str,
-        window_id: str,
+        slot_id: str,
         retry_count: int,
         quarantine_path: str,
     ) -> None:
@@ -843,9 +843,9 @@ class StateStore:
                     """
                     UPDATE file_lifecycle
                     SET delete_retry_count = ?, delete_final_state = ?, quarantine_path = ?, updated_at = ?
-                    WHERE run_id = ? AND window_id = ?
+                    WHERE run_id = ? AND slot_id = ?
                     """,
-                    [retry_count, "DELETE_QUARANTINED", quarantine_path, now, run_id, window_id],
+                    [retry_count, "DELETE_QUARANTINED", quarantine_path, now, run_id, slot_id],
                 )
             finally:
                 conn.close()
