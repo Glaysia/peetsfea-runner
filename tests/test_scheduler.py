@@ -699,7 +699,7 @@ class TestScheduler(unittest.TestCase):
 
             self.assertEqual(len(submitted_job_ids), 10)
 
-    def test_slot_worker_controller_does_not_oversubmit_when_remote_snapshot_stays_stale(self) -> None:
+    def test_slot_worker_controller_uses_remaining_remote_visible_capacity_across_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             slots = [
@@ -733,13 +733,57 @@ class TestScheduler(unittest.TestCase):
             controller.step(wait_for_progress=False)
             self.assertEqual(controller.snapshot().inflight_jobs, 3)
             progressed = controller.step(wait_for_progress=False)
-            self.assertFalse(progressed)
-            self.assertEqual(controller.snapshot().inflight_jobs, 3)
+            self.assertTrue(progressed)
+            self.assertEqual(controller.snapshot().inflight_jobs, 6)
             release_event.set()
             while controller.has_work():
                 controller.step(wait_for_progress=False)
 
             self.assertEqual(len(submitted_job_ids), 8)
+
+    def test_slot_worker_controller_allows_remote_visible_capacity_without_double_counting_local_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            slots = [
+                SlotTaskRef(
+                    run_id="run_01",
+                    slot_id=f"w_{idx:04d}",
+                    input_path=root / f"in_{idx}.aedt",
+                    relative_path=Path(f"in_{idx}.aedt"),
+                    output_dir=root / f"out_{idx}.aedt_all",
+                )
+                for idx in range(1, 11)
+            ]
+            account = _Account(account_id="a1", host_alias="h1", max_jobs=10)
+            submitted_job_ids: list[str] = []
+            release_event = threading.Event()
+
+            def _worker(bundle):
+                submitted_job_ids.append(bundle.job_id)
+                self.assertTrue(release_event.wait(timeout=2))
+                return bundle.job_id
+
+            controller = SlotWorkerController(
+                accounts=[account],
+                slots_per_job=1,
+                pending_buffer_per_account=3,
+                worker=_worker,
+                capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 5, 0, 5),
+                max_workers=10,
+            )
+            controller.enqueue_slots(slots)
+            controller.step(wait_for_progress=False)
+            self.assertEqual(controller.snapshot().inflight_jobs, 5)
+
+            progressed = controller.step(wait_for_progress=False)
+            self.assertTrue(progressed)
+            self.assertEqual(controller.snapshot().inflight_jobs, 10)
+
+            release_event.set()
+            while controller.has_work():
+                controller.step(wait_for_progress=False)
+
+            self.assertEqual(len(submitted_job_ids), 10)
 
     def test_run_slot_bundles_counts_local_submissions_against_capacity(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

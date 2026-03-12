@@ -1347,10 +1347,11 @@ class SlotWorkerController(Generic[T]):
 
     def _submit_pending_bundles(self, snapshots: Sequence[AccountCapacitySnapshot]) -> bool:
         submitted_any = False
+        step_submitted_workers: dict[str, int] = {}
         while self._pending_bundles and len(self._future_to_bundle) < self._max_workers:
             eligible: list[AccountCapacitySnapshot] = []
             for snapshot in snapshots:
-                submitted_unobserved = self._inflight_workers.get(snapshot.account_id, 0)
+                submitted_unobserved = step_submitted_workers.get(snapshot.account_id, 0)
                 effective_allowed = max(0, snapshot.allowed_submit - submitted_unobserved)
                 eligible.append(
                     AccountCapacitySnapshot(
@@ -1394,6 +1395,7 @@ class SlotWorkerController(Generic[T]):
             self._future_to_bundle[future] = bundle
             self._inflight_slots[bundle.account_id] = self._inflight_slots.get(bundle.account_id, 0) + bundle.slot_count
             self._inflight_workers[bundle.account_id] = self._inflight_workers.get(bundle.account_id, 0) + 1
+            step_submitted_workers[bundle.account_id] = step_submitted_workers.get(bundle.account_id, 0) + 1
             self._submitted_jobs += 1
             self._max_inflight_jobs = max(self._max_inflight_jobs, len(self._future_to_bundle))
             submitted_any = True

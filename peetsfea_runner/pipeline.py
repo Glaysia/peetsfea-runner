@@ -696,6 +696,16 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
 
     def _capacity_lookup_with_cooldown(*, account: AccountConfig, pending_buffer_per_account: int) -> AccountCapacitySnapshot:
         snapshot = query_account_capacity(account=account, pending_buffer_per_account=pending_buffer_per_account)
+        local_active_jobs = state_store.count_active_jobs_by_account(run_id=run_id).get(account.account_id, 0)
+        remote_visible_workers = max(0, snapshot.running_count) + max(0, snapshot.pending_count)
+        submitted_not_visible_workers = max(0, local_active_jobs - remote_visible_workers)
+        snapshot = AccountCapacitySnapshot(
+            account_id=snapshot.account_id,
+            host_alias=snapshot.host_alias,
+            running_count=snapshot.running_count,
+            pending_count=snapshot.pending_count,
+            allowed_submit=max(0, snapshot.allowed_submit - submitted_not_visible_workers),
+        )
         cooldown = account_cooldowns.get(account.account_id)
         now_monotonic = time.monotonic()
         if cooldown is None:
