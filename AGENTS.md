@@ -2,6 +2,12 @@
 
 이 저장소는 AEDT Slurm 자동화를 **함수 호출 기반 단일 경로**로 유지한다.
 
+## Plan Authority
+
+1. 현재 실행 기준 문서는 `/home/peetsmain/peetsfea-runner/PLANS/roadmap-tonight-master-plan.md`와 그 문서가 참조하는 active roadmap 문서들이다.
+2. `/home/peetsmain/peetsfea-runner/PLANS/archives` 아래 문서는 참고용 기록이며, 직접 실행 기준으로 사용하지 않는다.
+3. active `PLANS`와 이 문서가 충돌하면, active `PLANS`를 우선한다.
+
 ## Mandatory Rules
 
 1. 본 저장소 파이프라인은 CLI를 사용하지 않는다.
@@ -31,12 +37,26 @@
 
 ## DB Reset Rule
 
-1. 매 단계 전환에서 서비스를 끄는 경우, `/home/peetsmain/peetsfea-runner/peetsfea_runner.duckdb`를 삭제한다.
-2. 서비스 동작에 영향을 주는 주요 코드 변경사항이 있는 경우, 다음 실행 전에 `/home/peetsmain/peetsfea-runner/peetsfea_runner.duckdb`를 삭제한다.
-3. DB 삭제는 service가 완전히 내려간 뒤에만 수행한다.
+1. live DB 기본 정책은 `유지`다. restart-safe 운영 변경, canary gate 강화, throughput knob 조정, telemetry 추가, bad-node 정책 추가만으로는 `/home/peetsmain/peetsfea-runner/peetsfea_runner.duckdb`를 삭제하지 않는다.
+2. DB 삭제는 `schema 변경`, `state 의미 변경`, `ingest 의미 변경`일 때만 허용한다.
+3. DB 삭제가 필요하면 service가 완전히 내려간 뒤에만 수행한다.
+4. sample canary나 validation lane은 live DB를 재사용하지 않고 별도 DB 경로를 사용한다.
 
 ## Input Source Rule
 
 1. `/home/peetsmain/peetsfea-runner/original` 아래 파일은 실제로 최종 돌려야 하는 무거운 `.aedt` 원본으로 취급한다.
-2. `PLANS/roadmap1`부터 `PLANS/roadmap5`의 모든 로드맵이 완수되기 전까지는 `/home/peetsmain/peetsfea-runner/examples/sample.aedt`를 여러 개 복사해서 테스트, 재현, 서비스 검증에 사용한다.
-3. `original` 아래의 무거운 `.aedt` 파일은 모든 로드맵 완료 후 최종 검증 단계에서만 사용한다.
+2. active `PLANS`가 명시적으로 real input 사용을 허용하기 전까지는 `/home/peetsmain/peetsfea-runner/examples/sample.aedt`를 여러 개 복사해서 테스트, 재현, sample canary, validation lane 검증에 사용한다.
+3. `original` 아래의 무거운 `.aedt` 파일은 active `PLANS`가 final validation 또는 real cutover를 허용한 단계에서만 사용한다.
+
+## Canary Rule
+
+1. canary는 service 재기동만으로 발생한다고 가정하지 않는다.
+2. canary는 항상 `run_pipeline(config)` 함수 호출 경로에서 `continuous_mode=False`인 별도 validation lane으로 수행한다.
+3. canary 산출물은 live continuous service output과 섞지 않는다.
+4. canary 판정은 `output_variables.csv` 존재 여부만이 아니라 active `PLANS`의 CSV schema gate 기준을 따라야 한다.
+
+## Codex Resume Helper Rule
+
+1. Codex resume automation 입력은 `/home/peetsmain/peetsfea-runner/build/codex_resume_requests.json`에 둔다.
+2. 10분 간격 자동 resume runner는 `/home/peetsmain/peetsfea-runner/build/codex_resume_every_10m.py`를 사용한다.
+3. resume automation용 요청도 active `PLANS`와 이 문서의 제약을 따라야 한다.
