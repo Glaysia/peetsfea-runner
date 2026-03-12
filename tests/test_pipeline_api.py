@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from peetsfea_runner.pipeline import (
     PipelineResult,
     _BundleRuntimeOutcome,
     _is_stale_worker_heartbeat,
+    _record_launch_transient_failure,
     _reconcile_slurm_truth,
     _materialize_slot_outputs,
 )
@@ -80,6 +82,47 @@ class TestPipelineApi(unittest.TestCase):
             self.assertEqual(config.run_rotation_hours, 24)
             self.assertFalse((input_dir / "sample.aedt.ready").exists())
 
+    def test_record_launch_transient_failure_triggers_cooldown_after_threshold(self) -> None:
+        history: dict[str, deque[float]] = {}
+        cooldowns: dict[str, tuple[float, str]] = {}
+
+        triggered, cooldown_until = _record_launch_transient_failure(
+            account_id="account_04",
+            history_by_account=history,
+            cooldowns_by_account=cooldowns,
+            now_monotonic=10.0,
+            threshold=3,
+            window_seconds=300,
+            cooldown_seconds=300,
+            reason="Connection closed by 172.16.10.36 port 22",
+        )
+        self.assertFalse(triggered)
+        self.assertIsNone(cooldown_until)
+
+        _record_launch_transient_failure(
+            account_id="account_04",
+            history_by_account=history,
+            cooldowns_by_account=cooldowns,
+            now_monotonic=20.0,
+            threshold=3,
+            window_seconds=300,
+            cooldown_seconds=300,
+            reason="Connection closed by 172.16.10.36 port 22",
+        )
+        triggered, cooldown_until = _record_launch_transient_failure(
+            account_id="account_04",
+            history_by_account=history,
+            cooldowns_by_account=cooldowns,
+            now_monotonic=30.0,
+            threshold=3,
+            window_seconds=300,
+            cooldown_seconds=300,
+            reason="Connection closed by 172.16.10.36 port 22",
+        )
+        self.assertTrue(triggered)
+        self.assertEqual(cooldown_until, 330.0)
+        self.assertEqual(cooldowns["account_04"][0], 330.0)
+
     def test_validate_rejects_unknown_remote_execution_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
@@ -97,9 +140,9 @@ class TestPipelineApi(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            input_file = input_dir / "sample.aedt"
+            input_file = input_dir / "fixture_01.aedt"
             input_file.write_text("placeholder", encoding="utf-8")
-            (input_dir / "sample.aedt.ready").write_text("", encoding="utf-8")
+            (input_dir / "fixture_01.aedt.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
             config = PipelineConfig(
@@ -227,9 +270,9 @@ class TestPipelineApi(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            input_file = input_dir / "sample.aedt"
+            input_file = input_dir / "fixture_01.aedt"
             input_file.write_text("placeholder", encoding="utf-8")
-            (input_dir / "sample.aedt.ready").write_text("", encoding="utf-8")
+            (input_dir / "fixture_01.aedt.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
             config = PipelineConfig(
@@ -567,7 +610,7 @@ class TestPipelineApi(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            input_file = input_dir / "sample.aedt"
+            input_file = input_dir / "fixture_01.aedt"
             input_file.write_text("placeholder", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
@@ -715,15 +758,15 @@ class TestPipelineApi(unittest.TestCase):
 
             self.assertEqual(worker_rows, [("552818", "LOST", "n108"), ("552819", "COMPLETED", "n109")])
             self.assertIn("WORKER_DEATH_DETECTED", event_stages)
-            self.assertTrue((output_root / "sample.aedt.out" / "sample.aedt").is_file())
+            self.assertTrue((output_root / "fixture_01.aedt.out" / "fixture_01.aedt").is_file())
 
     def test_storage_failure_requeues_slot_to_other_account_without_same_account_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            input_file = input_dir / "sample.aedt"
+            input_file = input_dir / "fixture_01.aedt"
             input_file.write_text("placeholder", encoding="utf-8")
-            (input_dir / "sample.aedt.ready").write_text("", encoding="utf-8")
+            (input_dir / "fixture_01.aedt.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
             config = PipelineConfig(
@@ -825,13 +868,125 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIn("LEASE_EXPIRED", attempts)
             self.assertNotIn("QUARANTINED", attempts)
 
+    def test_launch_transient_retries_same_account_once_then_requeues_to_other_account(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "fixture_01.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            (input_dir / "fixture_01.aedt.ready").write_text("", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                continuous_mode=False,
+                execute_remote=True,
+                remote_execution_backend="slurm_batch",
+                job_retry_count=0,
+                worker_requeue_limit=1,
+                accounts_registry=(
+                    AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),
+                    AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=1),
+                ),
+            )
+
+            seen_hosts: list[str] = []
+            transient_attempts = {"count": 0}
+
+            def _mock_attempt(*, config=None, local_job_dir=None, on_upload_success=None, **kwargs):
+                assert config is not None
+                seen_hosts.append(config.host)
+                if on_upload_success is not None:
+                    on_upload_success()
+                if config.host == "gate1-harry" and transient_attempts["count"] < 2:
+                    transient_attempts["count"] += 1
+                    return RemoteJobAttemptResult(
+                        success=False,
+                        exit_code=13,
+                        session_name=f"s{transient_attempts['count']}",
+                        case_summary=CaseExecutionSummary(success_cases=0, failed_cases=1, case_lines=["case_01:13"]),
+                        message="sbatch submit failed: Connection closed by 172.16.10.36 port 22",
+                        failed_case_lines=[],
+                        failure_category="launch_transient",
+                    )
+                assert local_job_dir is not None
+                case_dir = Path(local_job_dir) / "case_01"
+                (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
+                (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
+                (case_dir / "run.log").write_text("log", encoding="utf-8")
+                (case_dir / "exit.code").write_text("0", encoding="utf-8")
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=0,
+                    session_name="s3",
+                    case_summary=CaseExecutionSummary(success_cases=1, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                )
+
+            readiness_ready = AccountReadinessSnapshot(
+                account_id="account_01",
+                host_alias="gate1-harry",
+                ready=True,
+                status="READY",
+                reason="ok",
+                home_ok=True,
+                runtime_path_ok=True,
+                venv_ok=True,
+                python_ok=True,
+                module_ok=True,
+                binaries_ok=True,
+                ansys_ok=True,
+                uv_ok=True,
+                pyaedt_ok=True,
+            )
+
+            def _capacity(*, account=None, **kwargs):
+                assert account is not None
+                return AccountCapacitySnapshot(
+                    account_id=account.account_id,
+                    host_alias=account.host_alias,
+                    running_count=0,
+                    pending_count=0,
+                    allowed_submit=1,
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.scheduler.time.sleep"),
+                patch("peetsfea_runner.pipeline.query_account_readiness", return_value=readiness_ready),
+                patch("peetsfea_runner.pipeline.query_account_preflight", return_value=readiness_ready),
+                patch("peetsfea_runner.pipeline.query_account_capacity", side_effect=_capacity),
+            ):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            self.assertEqual(seen_hosts, ["gate1-harry", "gate1-harry", "gate1-dhj02"])
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                state = conn.execute("SELECT state FROM slot_tasks").fetchone()[0]
+                attempts = [row[0] for row in conn.execute("SELECT stage FROM slot_events ORDER BY ts").fetchall()]
+                events = [row[0] for row in conn.execute("SELECT stage FROM events ORDER BY ts").fetchall()]
+            finally:
+                conn.close()
+
+            self.assertEqual(state, "SUCCEEDED")
+            self.assertIn("RETRY_QUEUED", attempts)
+            self.assertIn("LEASE_EXPIRED", attempts)
+            self.assertIn("RETRY_BACKOFF", events)
+
     def test_slurm_batch_backend_records_failed_worker_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            input_file = input_dir / "sample.aedt"
+            input_file = input_dir / "fixture_01.aedt"
             input_file.write_text("placeholder", encoding="utf-8")
-            (input_dir / "sample.aedt.ready").write_text("", encoding="utf-8")
+            (input_dir / "fixture_01.aedt.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
             config = PipelineConfig(
@@ -959,18 +1114,44 @@ class TestPipelineApi(unittest.TestCase):
                 metadata_db_path=str(db_path),
                 continuous_mode=False,
                 execute_remote=True,
+                remote_execution_backend="slurm_batch",
                 accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
             )
 
-            def _mock_attempt(*, local_job_dir=None, on_upload_success=None, **kwargs):
+            def _mock_attempt(
+                *,
+                local_job_dir=None,
+                on_upload_success=None,
+                on_worker_submitted=None,
+                on_worker_state_change=None,
+                run_id=None,
+                worker_id=None,
+                **kwargs,
+            ):
                 if on_upload_success is not None:
                     on_upload_success()
+                if on_worker_submitted is not None:
+                    on_worker_submitted("552740", None)
+                if on_worker_state_change is not None:
+                    on_worker_state_change("RUNNING", "n115")
                 assert local_job_dir is not None
                 case_dir = Path(local_job_dir) / "case_01"
                 (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
                 (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
                 (case_dir / "run.log").write_text("log", encoding="utf-8")
                 (case_dir / "exit.code").write_text("0", encoding="utf-8")
+                (case_dir / "output_variables.csv").write_text(
+                    "source_aedt_path,source_case_dir,source_aedt_name\n/path,/case,sample.aedt\n",
+                    encoding="utf-8",
+                )
+                StateStore(db_path).update_slurm_worker_control_plane(
+                    run_id=str(run_id),
+                    worker_id=str(worker_id),
+                    tunnel_state="CONNECTED",
+                    tunnel_session_id="t_01",
+                    heartbeat_ts="2026-03-12T04:00:00+00:00",
+                    observed_node="n115",
+                )
                 return RemoteJobAttemptResult(
                     success=True,
                     exit_code=0,
@@ -978,6 +1159,9 @@ class TestPipelineApi(unittest.TestCase):
                     case_summary=CaseExecutionSummary(success_cases=1, failed_cases=0, case_lines=[]),
                     message="ok",
                     failed_case_lines=[],
+                    slurm_job_id="552740",
+                    observed_node="n115",
+                    worker_terminal_state="COMPLETED",
                 )
 
             with (
@@ -1049,6 +1233,122 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIn("FULL_ROLLOUT_READY", stages)
             self.assertIn("SERVICE_BOUNDARY", stages)
             self.assertTrue(any("input_source_policy=sample_only" in message for message in messages))
+
+    def test_sample_canary_allows_full_rollout_when_output_materializes_without_live_return_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "sample.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            (input_dir / "sample.aedt.ready").write_text("", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                continuous_mode=False,
+                execute_remote=True,
+                remote_execution_backend="slurm_batch",
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+            )
+
+            def _mock_attempt(*, local_job_dir=None, on_upload_success=None, on_worker_submitted=None, on_worker_state_change=None, **kwargs):
+                if on_upload_success is not None:
+                    on_upload_success()
+                if on_worker_submitted is not None:
+                    on_worker_submitted("552741", None)
+                if on_worker_state_change is not None:
+                    on_worker_state_change("RUNNING", "n115")
+                assert local_job_dir is not None
+                case_dir = Path(local_job_dir) / "case_01"
+                (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
+                (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
+                (case_dir / "run.log").write_text("log", encoding="utf-8")
+                (case_dir / "exit.code").write_text("0", encoding="utf-8")
+                (case_dir / "output_variables.csv").write_text(
+                    "source_aedt_path,source_case_dir,source_aedt_name\n/path,/case,sample.aedt\n",
+                    encoding="utf-8",
+                )
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=0,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=1, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                    slurm_job_id="552741",
+                    observed_node="n115",
+                    worker_terminal_state="COMPLETED",
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_readiness",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        venv_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                        uv_ok=True,
+                        pyaedt_ok=True,
+                    ),
+                ),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_preflight",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        venv_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                        uv_ok=True,
+                        pyaedt_ok=True,
+                    ),
+                ),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=1,
+                    ),
+                ),
+            ):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            conn = duckdb.connect(str(db_path))
+            try:
+                rows = conn.execute("SELECT stage, message FROM events ORDER BY ts").fetchall()
+            finally:
+                conn.close()
+            stages = [str(row[0]) for row in rows]
+            messages = [str(row[1]) for row in rows]
+            self.assertIn("CONTROL_TUNNEL_DEGRADED", stages)
+            self.assertIn("CANARY_PASSED", stages)
+            self.assertIn("FULL_ROLLOUT_READY", stages)
+            self.assertFalse(any("reason=tunnel_not_connected" in message for message in messages if "CANARY_FAILED" in message))
 
     def test_sample_canary_failure_records_canary_failed_and_rollback_triggered(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1425,7 +1725,8 @@ class TestPipelineApi(unittest.TestCase):
                     self._pending: list = []
                     self._submitted = 0
 
-                def enqueue_slots(self, slots):
+                def enqueue_slots(self, slots, flush_partial=False):
+                    del flush_partial
                     self._pending.extend(slots)
 
                 def snapshot(self):
@@ -1440,7 +1741,8 @@ class TestPipelineApi(unittest.TestCase):
                 def has_work(self):
                     return bool(self._pending)
 
-                def step(self, *, wait_for_progress=False):
+                def step(self, *, wait_for_progress=False, flush_partial_bundles=False):
+                    del wait_for_progress, flush_partial_bundles
                     if not self._pending:
                         return False
                     conn = duckdb.connect(str(db_path))
@@ -1524,7 +1826,8 @@ class TestPipelineApi(unittest.TestCase):
                     self._step_calls = 0
                     self._submitted = 0
 
-                def enqueue_slots(self, slots):
+                def enqueue_slots(self, slots, flush_partial=False):
+                    del flush_partial
                     self._pending.extend(slots)
 
                 def snapshot(self):
@@ -1539,7 +1842,8 @@ class TestPipelineApi(unittest.TestCase):
                 def has_work(self):
                     return bool(self._pending)
 
-                def step(self, *, wait_for_progress=False):
+                def step(self, *, wait_for_progress=False, flush_partial_bundles=False):
+                    del wait_for_progress, flush_partial_bundles
                     self._step_calls += 1
                     if not self._pending:
                         return False

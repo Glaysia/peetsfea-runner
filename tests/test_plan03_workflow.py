@@ -4,9 +4,14 @@ import tempfile
 import subprocess
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from peetsfea_runner.constants import EXIT_CODE_DOWNLOAD_FAILURE, EXIT_CODE_REMOTE_CLEANUP_FAILURE
+from peetsfea_runner.constants import (
+    EXIT_CODE_DOWNLOAD_FAILURE,
+    EXIT_CODE_REMOTE_CLEANUP_FAILURE,
+    EXIT_CODE_SLURM_FAILURE,
+)
 from peetsfea_runner.pipeline import (
     EXIT_CODE_REMOTE_RUN_FAILURE,
     _WorkflowError,
@@ -27,6 +32,7 @@ from peetsfea_runner.remote_job import _categorize_failure, _resolve_remote_path
 from peetsfea_runner.remote_job import (
     SlotInput,
     WorkflowError,
+    _classify_return_path_failure_stage,
     _build_worker_payload_script_content,
     _build_remote_sbatch_script_content,
     _build_windows_remote_dispatch_script_content,
@@ -34,6 +40,8 @@ from peetsfea_runner.remote_job import (
     _parse_sbatch_job_id,
     _parse_squeue_state_line,
     _read_remote_optional_text_file,
+    _run_completed_process_capture_with_transport_retry,
+    _run_remote_workflow_sbatch,
     _wait_for_remote_sbatch_completion,
     query_slurm_job_state,
     run_remote_job_attempt,
@@ -107,6 +115,9 @@ class TestPlan03Workflow(unittest.TestCase):
             control_plane_host = "127.0.0.1"
             control_plane_port = 8765
             control_plane_ssh_target = "harrypc"
+            control_plane_return_host = "192.168.0.10"
+            control_plane_return_port = 5722
+            control_plane_return_user = "peetsmain"
             tunnel_recovery_grace_seconds = 30
 
         content = _build_worker_payload_script_content(
@@ -119,10 +130,16 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("for i in $(seq 1 8); do", content)
         self.assertIn("wait -n || true", content)
         self.assertIn("ssh -M -S \"$PEETS_TUNNEL_SOCKET\" -fnNT", content)
+        self.assertIn("-p \"$PEETS_CONTROL_RETURN_PORT\"", content)
+        self.assertIn("-o StrictHostKeyChecking=no", content)
+        self.assertIn("-o UserKnownHostsFile=/dev/null", content)
+        self.assertIn("classify_return_path_stage()", content)
+        self.assertIn("RETURN_PATH_DNS_FAILURE", content)
         self.assertIn("if [ -n \"${REMOTE_JOB_DIR:-}\" ]; then", content)
         self.assertIn("rm -rf \"$REMOTE_JOB_DIR\" >/dev/null 2>&1 || true", content)
         self.assertIn("find . -maxdepth 1 -name '*.lock' -type f -delete", content)
         self.assertIn("rm -rf tmp >/dev/null 2>&1 || true", content)
+        self.assertIn("touch results.tgz.ready", content)
         self.assertIn("/internal/workers/register", content)
         self.assertIn("/internal/workers/heartbeat", content)
         self.assertIn("/internal/resources/node", content)
@@ -175,7 +192,10 @@ class TestPlan03Workflow(unittest.TestCase):
             remote_execution_backend = "slurm_batch"
             control_plane_host = "127.0.0.1"
             control_plane_port = 8765
-            control_plane_ssh_target = "harrypc"
+            control_plane_ssh_target = "peetsmain@192.168.0.10"
+            control_plane_return_host = "192.168.0.10"
+            control_plane_return_port = 5722
+            control_plane_return_user = "peetsmain"
             tunnel_recovery_grace_seconds = 30
 
         content = _build_remote_sbatch_script_content(
@@ -195,7 +215,38 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertNotIn("screen -dmS", content)
         self.assertIn("export PEETS_CONTROL_RUN_ID=run_01", content)
         self.assertIn("export PEETS_CONTROL_WORKER_ID=attempt_0001", content)
-        self.assertIn("export PEETS_CONTROL_SSH_TARGET=harrypc", content)
+        self.assertIn("export PEETS_CONTROL_SSH_TARGET=peetsmain@192.168.0.10", content)
+        self.assertIn("export PEETS_CONTROL_RETURN_HOST=192.168.0.10", content)
+        self.assertIn("export PEETS_CONTROL_RETURN_USER=peetsmain", content)
+        self.assertIn("export PEETS_CONTROL_RETURN_PORT=5722", content)
+
+    def test_read_remote_optional_text_file_uses_remote_ssh_port(self) -> None:
+        class _Cfg:
+            host = "gate1-harry"
+            remote_ssh_port = 2202
+
+        with patch("peetsfea_runner.remote_job._run_completed_process") as run_completed:
+            run_completed.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
+            payload = _read_remote_optional_text_file(
+                config=_Cfg(),
+                remote_path="/tmp/job",
+                filenames=("worker.stdout",),
+                stage="worker stdout",
+            )
+
+        self.assertEqual(payload, "ok")
+        command = run_completed.call_args.args[0]
+        self.assertEqual(command[:4], ["ssh", "-p", "2202", "gate1-harry"])
+
+    def test_classify_return_path_failure_stage(self) -> None:
+        self.assertEqual(
+            _classify_return_path_failure_stage("ssh: Could not resolve hostname harrypc: Name or service not known"),
+            "RETURN_PATH_DNS_FAILURE",
+        )
+        self.assertEqual(
+            _classify_return_path_failure_stage("ssh: connect to host 192.168.0.10 port 5722: Connection refused"),
+            "RETURN_PATH_PORT_MISMATCH",
+        )
 
     def test_parse_sbatch_job_id_accepts_parsable_output(self) -> None:
         self.assertEqual(_parse_sbatch_job_id("552740\n"), "552740")
@@ -210,7 +261,7 @@ class TestPlan03Workflow(unittest.TestCase):
             host = "gate1-harry"
 
         with patch(
-            "peetsfea_runner.remote_job._run_completed_process_capture",
+            "peetsfea_runner.remote_job._run_completed_process_capture_with_transport_retry",
             side_effect=[
                 subprocess.CompletedProcess(args=[], returncode=0, stdout="RUNNING|n115\n", stderr=""),
             ],
@@ -218,13 +269,26 @@ class TestPlan03Workflow(unittest.TestCase):
             self.assertEqual(query_slurm_job_state(_Cfg(), slurm_job_id="552740"), ("RUNNING", "n115"))
 
         with patch(
-            "peetsfea_runner.remote_job._run_completed_process_capture",
+            "peetsfea_runner.remote_job._run_completed_process_capture_with_transport_retry",
             side_effect=[
                 subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
                 subprocess.CompletedProcess(args=[], returncode=0, stdout="552740|COMPLETED|n115\n", stderr=""),
             ],
         ):
             self.assertEqual(query_slurm_job_state(_Cfg(), slurm_job_id="552740"), ("COMPLETED", "n115"))
+
+    def test_query_slurm_job_state_returns_unknown_when_both_queries_are_empty(self) -> None:
+        class _Cfg:
+            host = "gate1-harry"
+
+        with patch(
+            "peetsfea_runner.remote_job._run_completed_process_capture_with_transport_retry",
+            side_effect=[
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+            ],
+        ):
+            self.assertEqual(query_slurm_job_state(_Cfg(), slurm_job_id="552740"), ("UNKNOWN", None))
 
     def test_sbatch_failure_keeps_submitted_slurm_job_id_in_attempt_result(self) -> None:
         class _Cfg:
@@ -292,8 +356,9 @@ class TestPlan03Workflow(unittest.TestCase):
 
         self.assertEqual(output, "fallback markers")
         command = mocked_run.call_args.args[0]
-        self.assertIn("if [ -f worker.stdout ]; then cat worker.stdout;", command[2])
-        self.assertIn("elif [ -f slurm-552818.out ]; then cat slurm-552818.out;", command[2])
+        self.assertEqual(command[:4], ["ssh", "-p", "22", "gate1-harry"])
+        self.assertIn("if [ -f worker.stdout ]; then cat worker.stdout;", command[4])
+        self.assertIn("elif [ -f slurm-552818.out ]; then cat slurm-552818.out;", command[4])
 
     def test_wait_for_remote_sbatch_completion_uses_slurm_output_when_worker_stdout_missing(self) -> None:
         class _Cfg:
@@ -333,6 +398,131 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertEqual(first_call["filenames"], ("worker.stdout", "slurm-552818.out"))
         second_call = mocked_read.call_args_list[1].kwargs
         self.assertEqual(second_call["filenames"], ("worker.stderr", "slurm-552818.err"))
+
+    def test_wait_for_remote_sbatch_completion_retries_after_transient_probe_failure(self) -> None:
+        class _Cfg:
+            host = "gate1-harry"
+            time_limit = "00:05:00"
+
+        combined_output = (
+            "__PEETS_FAILED_COUNT__:0\n"
+            "__PEETS_CASE_SUMMARY_BEGIN__\n"
+            "case_01:0\n"
+            "__PEETS_CASE_SUMMARY_END__\n"
+            "__PEETS_RESULTS_TGZ_BEGIN__\n"
+            "Zm9v\n"
+            "__PEETS_RESULTS_TGZ_END__\n"
+        )
+        with (
+            patch(
+                "peetsfea_runner.remote_job.query_slurm_job_state",
+                side_effect=[
+                    WorkflowError(
+                        "squeue failed: Connection closed by 172.16.10.36 port 22",
+                        exit_code=EXIT_CODE_SLURM_FAILURE,
+                    ),
+                    ("RUNNING", "n115"),
+                    ("COMPLETED", "n115"),
+                ],
+            ),
+            patch(
+                "peetsfea_runner.remote_job._read_remote_optional_text_file",
+                side_effect=[combined_output, ""],
+            ),
+            patch("peetsfea_runner.remote_job.time.sleep") as mocked_sleep,
+        ):
+            stdout, stderr, observed_node, state = _wait_for_remote_sbatch_completion(
+                _Cfg(),
+                remote_job_dir="/tmp/peetsfea/run_01/job_0001",
+                slurm_job_id="552818",
+            )
+
+        self.assertEqual(stdout, combined_output)
+        self.assertEqual(stderr, "")
+        self.assertEqual(observed_node, "n115")
+        self.assertEqual(state, "COMPLETED")
+        mocked_sleep.assert_called()
+
+    def test_retryable_transport_capture_retries_connection_closed_once(self) -> None:
+        first = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=255,
+            stdout="",
+            stderr="Connection closed by 172.16.10.36 port 22",
+        )
+        second = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout="552818",
+            stderr="",
+        )
+        with (
+            patch(
+                "peetsfea_runner.remote_job._run_completed_process_capture",
+                side_effect=[first, second],
+            ),
+            patch("peetsfea_runner.remote_job.time.sleep") as mocked_sleep,
+        ):
+            completed = _run_completed_process_capture_with_transport_retry(
+                ["ssh", "-p", "22", "gate1-harry", "sbatch"],
+                stage="sbatch submit",
+                exit_code=11,
+                timeout_seconds=30,
+            )
+        self.assertEqual(completed.returncode, 0)
+        mocked_sleep.assert_called_once_with(5)
+
+    def test_run_remote_workflow_sbatch_collects_results_after_lost_worker_when_marker_exists(self) -> None:
+        class _Cfg:
+            host = "gate1-harry"
+            time_limit = "00:05:00"
+
+        with (
+            patch("peetsfea_runner.remote_job._submit_remote_workflow_sbatch", return_value="552818"),
+            patch(
+                "peetsfea_runner.remote_job._wait_for_remote_sbatch_completion",
+                side_effect=WorkflowError(
+                    "sbatch worker failed job_id=552818: LOST",
+                    exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+                    stdout="worker lost",
+                    stderr="",
+                    slurm_job_id="552818",
+                    observed_node="n115",
+                    worker_terminal_state="LOST",
+                ),
+            ),
+            patch(
+                "peetsfea_runner.remote_job._probe_remote_completion_artifacts",
+                return_value=SimpleNamespace(
+                    collect_probe_state="MARKER_PRESENT",
+                    marker_present=True,
+                    has_results_ready=True,
+                    has_results_archive=True,
+                    has_case_summary=True,
+                    has_failed_count=True,
+                ),
+            ),
+            patch(
+                "peetsfea_runner.remote_job._collect_remote_workflow_result_from_probe",
+                return_value=SimpleNamespace(
+                    case_summary=SimpleNamespace(success_cases=1, failed_cases=0, case_lines=[], success=True),
+                    archive_bytes=b"archive",
+                    submission=SimpleNamespace(stdout="worker lost", stderr="", combined_output="worker lost"),
+                    collect_probe_state="MARKER_PRESENT",
+                    marker_present=True,
+                ),
+            ),
+        ):
+            result, slurm_job_id, observed_node, terminal_state = _run_remote_workflow_sbatch(
+                _Cfg(),
+                remote_job_dir="/tmp/peetsfea/run_01/job_0001",
+                case_count=1,
+            )
+        self.assertEqual(slurm_job_id, "552818")
+        self.assertEqual(observed_node, "n115")
+        self.assertEqual(terminal_state, "LOST")
+        self.assertEqual(result.collect_probe_state, "MARKER_PRESENT")
+        self.assertTrue(result.marker_present)
 
     def test_retry_calls_action_again(self) -> None:
         calls = {"count": 0}
@@ -451,6 +641,14 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertEqual(
             _categorize_failure(exit_code=EXIT_CODE_REMOTE_RUN_FAILURE, message="ssh failed", failed_case_lines=[]),
             "launch",
+        )
+        self.assertEqual(
+            _categorize_failure(
+                exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+                message="sbatch submit failed: Connection closed by 172.16.10.36 port 22",
+                failed_case_lines=[],
+            ),
+            "launch_transient",
         )
 
     def test_tmp_remote_root_is_scoped_per_remote_user(self) -> None:

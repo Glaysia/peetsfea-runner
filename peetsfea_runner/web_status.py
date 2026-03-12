@@ -397,17 +397,32 @@ def _classify_ops_event(*, stage: str, level: str, message: str, account_id: str
         category = "capacity"
         alertable = normalized_stage in {"SLURM_TRUTH_LAG", "CAPACITY_MISMATCH"}
         severity = "WARN" if normalized_stage != "SLURM_TRUTH_REFRESHED" else normalized_level
+    elif normalized_stage in {"ACCOUNT_COOLDOWN"}:
+        category = "capacity"
+        alertable = True
+        severity = "WARN" if normalized_level == "INFO" else normalized_level
     elif normalized_stage in {"CONTROL_TUNNEL_READY", "CONTROL_TUNNEL_HEARTBEAT"}:
         category = "recovery"
         alertable = False
         severity = normalized_level
-    elif normalized_stage in {"CONTROL_TUNNEL_LOST", "CONTROL_TUNNEL_DEGRADED"}:
+    elif normalized_stage in {
+        "CONTROL_TUNNEL_LOST",
+        "CONTROL_TUNNEL_DEGRADED",
+        "RETURN_PATH_DNS_FAILURE",
+        "RETURN_PATH_CONNECT_FAILURE",
+        "RETURN_PATH_AUTH_FAILURE",
+        "RETURN_PATH_PORT_MISMATCH",
+    }:
         category = "recovery"
         alertable = True
         severity = "WARN" if normalized_level == "INFO" else normalized_level
     elif normalized_stage in {"WORKER_LOOP_RECOVERING", "SLURM_WORKERS_REDISCOVERED", "WORKER_DEATH_DETECTED"} or "RECOVER" in normalized_stage:
         category = "recovery"
         alertable = normalized_stage != "CONTROL_TUNNEL_RECOVERED"
+        severity = "WARN" if normalized_level == "INFO" else normalized_level
+    elif normalized_stage in {"RETRY_BACKOFF", "COLLECT_PROBE"}:
+        category = "recovery"
+        alertable = normalized_stage == "COLLECT_PROBE" and "marker_present=False" in message
         severity = "WARN" if normalized_level == "INFO" else normalized_level
     elif normalized_stage in {
         "CUTOVER_READY",
@@ -1047,9 +1062,13 @@ def _overview_payload(db_path: Path, *, run_id: str | None) -> dict[str, object]
     node_summary = _latest_node_resource_payload(db_path, run_id=run_id)
     worker_mix = _worker_mix_payload(db_path, run_id=run_id)
     tunnel_summary = {
+        "active_workers": len(workers),
         "connected_workers": sum(1 for worker in workers if worker.get("tunnel_state") == "CONNECTED"),
         "degraded_workers": sum(1 for worker in workers if worker.get("tunnel_state") == "DEGRADED"),
         "stale_workers": sum(1 for worker in workers if worker.get("is_tunnel_stale")),
+        "live_return_path_workers": sum(
+            1 for worker in workers if worker.get("tunnel_state") == "CONNECTED" and not worker.get("is_tunnel_stale")
+        ),
     }
     return {
         "run_id": run_id,
@@ -1226,6 +1245,7 @@ def make_status_handler(*, db_path: Path):
 
             if parsed.path == "/internal/workers/degraded":
                 reason = str(payload.get("reason") or "tunnel degraded").strip()
+                stage = str(payload.get("stage") or "CONTROL_TUNNEL_LOST").strip().upper()
                 state_store.update_slurm_worker_control_plane(
                     run_id=run_id,
                     worker_id=worker_id,
@@ -1238,7 +1258,7 @@ def make_status_handler(*, db_path: Path):
                     run_id=run_id,
                     job_id="__worker__",
                     level="WARN",
-                    stage="CONTROL_TUNNEL_LOST",
+                    stage=stage,
                     message=f"worker_id={worker_id} reason={reason}",
                 )
                 self._send_json({"ok": True})
@@ -2282,6 +2302,7 @@ def _dashboard_html(*, version: str) -> str:
         <div class="grid">
           <div class="panel"><div class="k">Worker Alive</div><div class="v" id="worker-live">-</div></div>
           <div class="panel"><div class="k">Slot Configured</div><div class="v" id="slot-target">-</div></div>
+          <div class="panel"><div class="k">Return Path Live</div><div class="v" id="return-live">-</div></div>
           <div class="panel"><div class="k">Slot Active</div><div class="v" id="w-active">-</div></div>
           <div class="panel"><div class="k">Slot Idle</div><div class="v" id="slot-idle">-</div></div>
           <div class="panel"><div class="k">Refill Lag</div><div class="v" id="refill-lag">-</div></div>
@@ -2408,6 +2429,7 @@ def _dashboard_html(*, version: str) -> str:
 
       document.getElementById('worker-live').textContent = throughput.active_workers ?? '-';
       document.getElementById('slot-target').textContent = throughput.configured_target_slots ?? '-';
+      document.getElementById('return-live').textContent = tunnel.live_return_path_workers ?? 0;
       document.getElementById('w-active').textContent = throughput.active_slots ?? '-';
       document.getElementById('slot-idle').textContent = Math.max((throughput.configured_target_slots || 0) - (throughput.active_slots || 0), 0);
       document.getElementById('refill-lag').textContent = throughput.recovery_backlog_slots ?? '-';

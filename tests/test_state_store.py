@@ -374,6 +374,8 @@ class TestStateStore(unittest.TestCase):
                 observed_node="n115",
                 slots_configured=4,
                 backend="slurm_batch",
+                collect_probe_state="MARKER_PRESENT",
+                marker_present=True,
             )
             store.upsert_slurm_worker(
                 run_id="run_01",
@@ -397,6 +399,8 @@ class TestStateStore(unittest.TestCase):
             self.assertEqual(active_workers[0]["worker_state"], "RUNNING")
             self.assertEqual(active_workers[0]["observed_node"], "n115")
             self.assertEqual(active_workers[0]["tunnel_state"], "PENDING")
+            self.assertEqual(active_workers[0]["collect_probe_state"], "MARKER_PRESENT")
+            self.assertTrue(active_workers[0]["marker_present"])
             self.assertEqual(len(all_workers), 2)
             self.assertEqual({row["worker_state"] for row in all_workers}, {"RUNNING", "COMPLETED"})
 

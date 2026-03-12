@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 import tempfile
@@ -448,6 +449,7 @@ class TestWebStatus(unittest.TestCase):
                         "run_id": "run_01",
                         "worker_id": "attempt_0001",
                         "tunnel_session_id": "session-1",
+                        "stage": "RETURN_PATH_DNS_FAILURE",
                         "reason": "tunnel heartbeat stale after main restart",
                     }
                 ).encode("utf-8")
@@ -501,7 +503,7 @@ class TestWebStatus(unittest.TestCase):
                 conn.close()
             stages = [str(row[0]) for row in event_rows]
             self.assertIn("CONTROL_TUNNEL_READY", stages)
-            self.assertIn("CONTROL_TUNNEL_LOST", stages)
+            self.assertIn("RETURN_PATH_DNS_FAILURE", stages)
             self.assertIn("CONTROL_TUNNEL_RECOVERED", stages)
 
     def test_api_workers_reports_degraded_and_stale_tunnel_health(self) -> None:
@@ -784,7 +786,7 @@ class TestWebStatus(unittest.TestCase):
                 backend="slurm_batch",
                 tunnel_session_id="session-1",
                 tunnel_state="CONNECTED",
-                heartbeat_ts="2026-03-11T12:00:00Z",
+                heartbeat_ts=datetime.now(timezone.utc).isoformat(),
             )
             store.record_node_resource_snapshot(
                 run_id="run_01",
@@ -855,7 +857,9 @@ class TestWebStatus(unittest.TestCase):
             self.assertEqual(payload["worker_mix"]["busy_workers"], 1)
             self.assertEqual(payload["worker_mix"]["idle_workers"], 0)
             self.assertEqual(payload["worker_mix"]["idle_slots"], 3)
+            self.assertEqual(payload["tunnel_summary"]["active_workers"], 1)
             self.assertEqual(payload["tunnel_summary"]["connected_workers"], 1)
+            self.assertEqual(payload["tunnel_summary"]["live_return_path_workers"], 1)
             self.assertTrue(any(alert["alert_key"] == "CUTOVER_BLOCKED" for alert in payload["alerts"]))
             self.assertEqual(payload["accounts"][0]["account_id"], "account_01")
 
@@ -866,6 +870,7 @@ class TestWebStatus(unittest.TestCase):
         self.assertIn("Process Count", html)
         self.assertIn("Worker Mix", html)
         self.assertIn("Slot Mix", html)
+        self.assertIn("Return Path Live", html)
         self.assertIn("rollout-state", html)
         self.assertIn("rollout-boundary", html)
         self.assertIn("detail-panel", html)
@@ -1223,6 +1228,20 @@ class TestWebStatus(unittest.TestCase):
                 stage="SLURM_WORKERS_REDISCOVERED",
                 message="run_id=run_01 count=1",
             )
+            store.append_event(
+                run_id="run_01",
+                job_id="__worker__",
+                level="WARN",
+                stage="ACCOUNT_COOLDOWN",
+                message="account=account_04 host=gate1-dw16 cooldown_seconds=300 reason=Connection closed by 172.16.10.36 port 22",
+            )
+            store.append_event(
+                run_id="run_01",
+                job_id="job_0001",
+                level="WARN",
+                stage="RETRY_BACKOFF",
+                message="account=account_04 host=gate1-dw16 attempt=1 reason=LAUNCH_TRANSIENT: Connection closed by 172.16.10.36 port 22",
+            )
             server = start_status_server(db_path=str(db_path), host="127.0.0.1", port=0)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -1244,6 +1263,13 @@ class TestWebStatus(unittest.TestCase):
                     event for event in payload["events"] if event["stage"] == "SLURM_WORKERS_REDISCOVERED"
                 )
                 self.assertEqual(rediscovered_event["category"], "recovery")
+
+                cooldown_event = next(event for event in payload["events"] if event["stage"] == "ACCOUNT_COOLDOWN")
+                self.assertEqual(cooldown_event["category"], "capacity")
+                self.assertTrue(cooldown_event["alertable"])
+
+                retry_event = next(event for event in payload["events"] if event["stage"] == "RETRY_BACKOFF")
+                self.assertEqual(retry_event["category"], "recovery")
             finally:
                 server.shutdown()
                 server.server_close()

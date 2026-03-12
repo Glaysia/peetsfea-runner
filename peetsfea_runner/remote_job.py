@@ -36,8 +36,12 @@ class RemoteJobConfig(Protocol):
     control_plane_host: str
     control_plane_port: int
     control_plane_ssh_target: str
+    control_plane_return_host: str
+    control_plane_return_port: int
+    control_plane_return_user: str
     tunnel_heartbeat_timeout_seconds: int
     tunnel_recovery_grace_seconds: int
+    remote_ssh_port: int
     emit_output_variables_csv: bool
 
 
@@ -64,6 +68,8 @@ class RemoteJobAttemptResult:
     slurm_job_id: str | None = None
     observed_node: str | None = None
     worker_terminal_state: str | None = None
+    collect_probe_state: str | None = None
+    marker_present: bool | None = None
 
 
 class WorkflowError(RuntimeError):
@@ -77,6 +83,8 @@ class WorkflowError(RuntimeError):
         slurm_job_id: str | None = None,
         observed_node: str | None = None,
         worker_terminal_state: str | None = None,
+        collect_probe_state: str | None = None,
+        marker_present: bool | None = None,
     ) -> None:
         super().__init__(message)
         self.exit_code = exit_code
@@ -85,6 +93,8 @@ class WorkflowError(RuntimeError):
         self.slurm_job_id = slurm_job_id
         self.observed_node = observed_node
         self.worker_terminal_state = worker_terminal_state
+        self.collect_probe_state = collect_probe_state
+        self.marker_present = marker_present
 
 
 @dataclass(slots=True, frozen=True)
@@ -98,6 +108,8 @@ class _RemoteWorkflowResult:
     case_summary: CaseExecutionSummary
     archive_bytes: bytes
     submission: _RemoteWorkflowSubmission
+    collect_probe_state: str | None = None
+    marker_present: bool | None = None
 
 
 @dataclass(slots=True)
@@ -110,6 +122,16 @@ class _RemoteWorkflowSubmission:
     def combined_output(self) -> str:
         parts = [part.strip() for part in (self.stdout, self.stderr) if part and part.strip()]
         return "\n".join(parts).strip()
+
+
+@dataclass(slots=True)
+class _RemoteCollectProbe:
+    collect_probe_state: str
+    marker_present: bool
+    has_results_ready: bool
+    has_results_archive: bool
+    has_case_summary: bool
+    has_failed_count: bool
 
 
 def _log_stage(message: str) -> None:
@@ -128,6 +150,63 @@ def _remote_scheduler(config: RemoteJobConfig) -> str:
 
 def _remote_execution_backend(config: RemoteJobConfig) -> str:
     return getattr(config, "remote_execution_backend", "foreground_ssh").strip().lower()
+
+
+def _remote_ssh_port(config: RemoteJobConfig) -> int:
+    return int(getattr(config, "remote_ssh_port", 22))
+
+
+def _control_plane_return_host(config: RemoteJobConfig) -> str:
+    explicit = str(getattr(config, "control_plane_return_host", "")).strip()
+    if explicit:
+        return explicit
+    target = str(getattr(config, "control_plane_ssh_target", "")).strip()
+    if "@" in target:
+        return target.split("@", 1)[1].strip()
+    return target
+
+
+def _control_plane_return_user(config: RemoteJobConfig) -> str:
+    explicit = str(getattr(config, "control_plane_return_user", "")).strip()
+    if explicit:
+        return explicit
+    target = str(getattr(config, "control_plane_ssh_target", "")).strip()
+    if "@" in target:
+        return target.split("@", 1)[0].strip()
+    return ""
+
+
+def _control_plane_return_port(config: RemoteJobConfig) -> int:
+    return int(getattr(config, "control_plane_return_port", 5722))
+
+
+def _control_plane_ssh_target(config: RemoteJobConfig) -> str:
+    user = _control_plane_return_user(config)
+    host = _control_plane_return_host(config)
+    if user and host:
+        return f"{user}@{host}"
+    return str(getattr(config, "control_plane_ssh_target", "")).strip()
+
+
+def _ssh_command(config: RemoteJobConfig, *args: str) -> list[str]:
+    return ["ssh", "-p", str(_remote_ssh_port(config)), *args]
+
+
+def _scp_command(config: RemoteJobConfig, *args: str) -> list[str]:
+    return ["scp", "-P", str(_remote_ssh_port(config)), *args]
+
+
+_TRANSIENT_LAUNCH_PATTERNS = (
+    "connection closed by",
+    "kex_exchange_identification",
+    "connection reset",
+    "broken pipe",
+    "connection timed out",
+    "operation timed out",
+    "ssh_exchange_identification",
+)
+_TRANSIENT_LAUNCH_RETURN_CODES = {255}
+_SSH_RETRY_BACKOFF_SECONDS = (5, 15, 30)
 
 
 def _memory_to_mb(mem: str) -> int | None:
@@ -178,6 +257,8 @@ def run_remote_job_attempt(
     slurm_job_id: str | None = None
     observed_node: str | None = None
     worker_terminal_state: str | None = None
+    collect_probe_state: str | None = None
+    marker_present: bool | None = None
     local_job_dir.mkdir(parents=True, exist_ok=True)
     resolved_remote_job_dir = _resolve_remote_path(config=config, path=remote_job_dir)
     _log_stage(
@@ -248,6 +329,8 @@ def run_remote_job_attempt(
                 on_worker_submitted=on_worker_submitted,
                 on_worker_state_change=on_worker_state_change,
             )
+            collect_probe_state = workflow_result.collect_probe_state
+            marker_present = workflow_result.marker_present
         else:
             workflow_result = _run_remote_workflow_noninteractive(
                 config,
@@ -263,6 +346,8 @@ def run_remote_job_attempt(
     except WorkflowError as exc:
         _cleanup_remote_workspace_best_effort(config, remote_job_dir=resolved_remote_job_dir)
         worker_terminal_state = exc.worker_terminal_state or worker_terminal_state
+        collect_probe_state = exc.collect_probe_state or collect_probe_state
+        marker_present = exc.marker_present if exc.marker_present is not None else marker_present
         failure_category = _categorize_failure(
             exit_code=exc.exit_code,
             message=str(exc),
@@ -289,6 +374,8 @@ def run_remote_job_attempt(
             slurm_job_id=exc.slurm_job_id or slurm_job_id,
             observed_node=exc.observed_node or observed_node,
             worker_terminal_state=worker_terminal_state,
+            collect_probe_state=collect_probe_state,
+            marker_present=marker_present,
         )
 
     if workflow_result is None:
@@ -303,6 +390,8 @@ def run_remote_job_attempt(
             slurm_job_id=slurm_job_id,
             observed_node=observed_node,
             worker_terminal_state=worker_terminal_state,
+            collect_probe_state=collect_probe_state,
+            marker_present=marker_present,
         )
 
     _write_failure_artifacts(
@@ -336,6 +425,8 @@ def run_remote_job_attempt(
             slurm_job_id=slurm_job_id,
             observed_node=observed_node,
             worker_terminal_state=worker_terminal_state,
+            collect_probe_state=collect_probe_state,
+            marker_present=marker_present,
         )
 
     _log_stage(f"job attempt success session={session_name}")
@@ -352,6 +443,8 @@ def run_remote_job_attempt(
         slurm_job_id=slurm_job_id,
         observed_node=observed_node,
         worker_terminal_state=worker_terminal_state,
+        collect_probe_state=collect_probe_state,
+        marker_present=marker_present,
     )
 
 
@@ -400,7 +493,7 @@ def _resolve_remote_path(*, config: RemoteJobConfig, path: str) -> str:
 
 
 def _get_remote_home(*, config: RemoteJobConfig) -> str:
-    command = ["ssh", config.host]
+    command = _ssh_command(config, config.host)
     if _remote_platform(config) == "windows":
         command.append('powershell -NoProfile -NonInteractive -Command "$HOME"')
     else:
@@ -444,14 +537,14 @@ def _prepare_remote_workspace(config: RemoteJobConfig, *, remote_job_dir: str) -
             "powershell -NoProfile -NonInteractive -Command "
             + shlex.quote(f"New-Item -ItemType Directory -Force -Path '{remote_job_dir}' | Out-Null")
         )
-        _run_subprocess(
-            ["ssh", config.host, command],
+        _run_subprocess_with_transport_retry(
+            _ssh_command(config, config.host, command),
             stage="ssh",
             exit_code=EXIT_CODE_SSH_FAILURE,
         )
         return
-    _run_subprocess(
-        ["ssh", config.host, f"mkdir -p {shlex.quote(remote_path)}"],
+    _run_subprocess_with_transport_retry(
+        _ssh_command(config, config.host, f"mkdir -p {shlex.quote(remote_path)}"),
         stage="ssh",
         exit_code=EXIT_CODE_SSH_FAILURE,
     )
@@ -484,8 +577,8 @@ def _upload_supporting_files(
     _log_stage(f"upload files target={remote_target}")
     upload_sources = [str(path) for path in project_files]
     upload_sources.extend(str(path.resolve()) for path in supporting_files)
-    _run_subprocess(
-        ["scp", *upload_sources, remote_target],
+    _run_subprocess_with_transport_retry(
+        _scp_command(config, *upload_sources, remote_target),
         stage="scp upload",
         exit_code=EXIT_CODE_SSH_FAILURE,
     )
@@ -495,8 +588,8 @@ def _download_results(config: RemoteJobConfig, *, remote_job_dir: str, local_job
     local_archive = local_job_dir / "results.tgz"
     remote_archive = f"{config.host}:{remote_job_dir}/results.tgz"
     _log_stage(f"download results from={remote_archive} to={local_archive}")
-    _run_subprocess(
-        ["scp", remote_archive, str(local_archive)],
+    _run_subprocess_with_transport_retry(
+        _scp_command(config, remote_archive, str(local_archive)),
         stage="scp download",
         exit_code=EXIT_CODE_DOWNLOAD_FAILURE,
     )
@@ -531,13 +624,13 @@ def _cleanup_remote_workspace(config: RemoteJobConfig, *, remote_job_dir: str) -
             + shlex.quote(f"if (Test-Path '{remote_job_dir}') {{ Remove-Item -Recurse -Force '{remote_job_dir}' }}")
         )
         _run_subprocess(
-            ["ssh", config.host, command],
+            _ssh_command(config, config.host, command),
             stage="remote cleanup",
             exit_code=EXIT_CODE_REMOTE_CLEANUP_FAILURE,
         )
         return
     _run_subprocess(
-        ["ssh", config.host, f"rm -rf {shlex.quote(remote_path)}"],
+        _ssh_command(config, config.host, f"rm -rf {shlex.quote(remote_path)}"),
         stage="remote cleanup",
         exit_code=EXIT_CODE_REMOTE_CLEANUP_FAILURE,
     )
@@ -592,7 +685,7 @@ def _submit_remote_workflow_noninteractive(
     timeout_seconds = _time_limit_to_seconds(config.time_limit) + 900
     _log_stage(f"launch non-interactive remote workflow host={config.host} path={remote_job_dir}")
     completed = _run_completed_process_capture(
-        ["ssh", config.host, command],
+        _ssh_command(config, config.host, command),
         stage="remote run",
         exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
         timeout_seconds=timeout_seconds,
@@ -627,6 +720,29 @@ def _run_remote_workflow_sbatch(
     except WorkflowError as exc:
         if exc.slurm_job_id is None:
             exc.slurm_job_id = slurm_job_id
+        if (exc.worker_terminal_state or "").upper() in {"FAILED", "LOST"}:
+            probe = _probe_remote_completion_artifacts(
+                config=config,
+                remote_job_dir=remote_job_dir,
+                slurm_job_id=slurm_job_id,
+            )
+            exc.collect_probe_state = probe.collect_probe_state
+            exc.marker_present = probe.marker_present
+            if probe.marker_present:
+                workflow_result = _collect_remote_workflow_result_from_probe(
+                    config=config,
+                    remote_job_dir=remote_job_dir,
+                    case_count=case_count,
+                    stdout=exc.stdout,
+                    stderr=exc.stderr,
+                    probe=probe,
+                )
+                return (
+                    workflow_result,
+                    slurm_job_id,
+                    exc.observed_node,
+                    exc.worker_terminal_state or "FAILED",
+                )
         raise
     submission = _RemoteWorkflowSubmission(stdout=stdout, stderr=stderr, return_code=0)
     output = submission.combined_output
@@ -641,6 +757,8 @@ def _run_remote_workflow_sbatch(
             ),
             archive_bytes=_parse_marked_results_archive(output),
             submission=submission,
+            collect_probe_state="NOT_NEEDED",
+            marker_present=True,
         ),
         slurm_job_id,
         observed_node,
@@ -650,8 +768,8 @@ def _run_remote_workflow_sbatch(
 
 def _submit_remote_workflow_sbatch(config: RemoteJobConfig, *, remote_job_dir: str) -> str:
     remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
-    completed = _run_completed_process_capture(
-        ["ssh", config.host, f"cd {shlex.quote(remote_path)} && sbatch --parsable ./remote_sbatch.sh"],
+    completed = _run_completed_process_capture_with_transport_retry(
+        _ssh_command(config, config.host, f"cd {shlex.quote(remote_path)} && sbatch --parsable ./remote_sbatch.sh"),
         stage="sbatch submit",
         exit_code=EXIT_CODE_SLURM_FAILURE,
         timeout_seconds=30,
@@ -669,17 +787,149 @@ def _submit_remote_workflow_sbatch(config: RemoteJobConfig, *, remote_job_dir: s
     return _parse_sbatch_job_id(completed.stdout or "")
 
 
+def _probe_remote_completion_artifacts(
+    *,
+    config: RemoteJobConfig,
+    remote_job_dir: str,
+    slurm_job_id: str,
+) -> _RemoteCollectProbe:
+    remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
+    probe_targets = (
+        "results.tgz.ready",
+        "results.tgz",
+        "case_summary.txt",
+        "failed.count",
+        "worker.stdout",
+        "worker.stderr",
+        f"slurm-{slurm_job_id}.out",
+        f"slurm-{slurm_job_id}.err",
+    )
+    probe_lines = [
+        "set +e",
+        f"cd {shlex.quote(remote_path)} || exit 0",
+    ]
+    for name in probe_targets:
+        probe_lines.append(
+            f"if [ -f {shlex.quote(name)} ]; then echo {shlex.quote(name)}=1; else echo {shlex.quote(name)}=0; fi"
+        )
+    try:
+        output = _run_subprocess_capture(
+            _ssh_command(config, config.host, "bash -lc " + shlex.quote("\n".join(probe_lines))),
+            stage="collect probe",
+            exit_code=EXIT_CODE_DOWNLOAD_FAILURE,
+            timeout_seconds=20,
+        )
+    except WorkflowError:
+        return _RemoteCollectProbe(
+            collect_probe_state="PROBE_FAILED",
+            marker_present=False,
+            has_results_ready=False,
+            has_results_archive=False,
+            has_case_summary=False,
+            has_failed_count=False,
+        )
+    flags: dict[str, bool] = {}
+    for raw in output.splitlines():
+        if "=" not in raw:
+            continue
+        name, value = raw.split("=", 1)
+        flags[name.strip()] = value.strip() == "1"
+    marker_present = bool(flags.get("results.tgz.ready")) or (
+        bool(flags.get("results.tgz"))
+        and bool(flags.get("case_summary.txt"))
+        and bool(flags.get("failed.count"))
+    )
+    return _RemoteCollectProbe(
+        collect_probe_state="MARKER_PRESENT" if marker_present else "MARKER_MISSING",
+        marker_present=marker_present,
+        has_results_ready=bool(flags.get("results.tgz.ready")),
+        has_results_archive=bool(flags.get("results.tgz")),
+        has_case_summary=bool(flags.get("case_summary.txt")),
+        has_failed_count=bool(flags.get("failed.count")),
+    )
+
+
+def _download_results_archive_bytes(config: RemoteJobConfig, *, remote_job_dir: str) -> bytes:
+    remote_archive = f"{config.host}:{remote_job_dir}/results.tgz"
+    with TemporaryDirectory(prefix="peetsfea_results_") as tmpdir:
+        local_archive = Path(tmpdir) / "results.tgz"
+        _run_subprocess_with_transport_retry(
+            _scp_command(config, remote_archive, str(local_archive)),
+            stage="scp download",
+            exit_code=EXIT_CODE_DOWNLOAD_FAILURE,
+        )
+        return local_archive.read_bytes()
+
+
+def _parse_failed_count_text(output: str) -> int:
+    match = re.search(r"(-?\d+)", output)
+    if match is None:
+        raise WorkflowError("Unable to parse failed.count file.", exit_code=EXIT_CODE_REMOTE_RUN_FAILURE)
+    return int(match.group(1))
+
+
+def _collect_remote_workflow_result_from_probe(
+    *,
+    config: RemoteJobConfig,
+    remote_job_dir: str,
+    case_count: int,
+    stdout: str,
+    stderr: str,
+    probe: _RemoteCollectProbe,
+) -> _RemoteWorkflowResult:
+    remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
+    failed_count_text = _read_remote_optional_text_file(
+        config=config,
+        remote_path=remote_path,
+        filenames=("failed.count",),
+        stage="failed.count",
+        timeout_seconds=20,
+    )
+    case_summary_text = _read_remote_optional_text_file(
+        config=config,
+        remote_path=remote_path,
+        filenames=("case_summary.txt",),
+        stage="case summary",
+        timeout_seconds=20,
+    )
+    failed_count = _parse_failed_count_text(failed_count_text)
+    case_lines = _parse_case_summary_lines(case_summary_text)
+    archive_bytes = _download_results_archive_bytes(config=config, remote_job_dir=remote_job_dir)
+    return _RemoteWorkflowResult(
+        case_summary=CaseExecutionSummary(
+            success_cases=case_count - failed_count,
+            failed_cases=failed_count,
+            case_lines=case_lines,
+        ),
+        archive_bytes=archive_bytes,
+        submission=_RemoteWorkflowSubmission(stdout=stdout, stderr=stderr, return_code=0),
+        collect_probe_state=probe.collect_probe_state,
+        marker_present=probe.marker_present,
+    )
+
+
 def query_slurm_job_state(
     config: RemoteJobConfig,
     *,
     slurm_job_id: str,
 ) -> tuple[str, str | None]:
-    completed = _run_completed_process_capture(
-        ["ssh", config.host, f"squeue -h -j {shlex.quote(slurm_job_id)} -o \"%T|%N\""],
+    completed = _run_completed_process_capture_with_transport_retry(
+        _ssh_command(config, config.host, f"squeue -h -j {shlex.quote(slurm_job_id)} -o \"%T|%N\""),
         stage="squeue",
         exit_code=EXIT_CODE_SLURM_FAILURE,
         timeout_seconds=20,
     )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        details = stderr if stderr else stdout
+        raise WorkflowError(
+            f"squeue failed: {details or completed.returncode}",
+            exit_code=EXIT_CODE_SLURM_FAILURE,
+            stdout=stdout,
+            stderr=stderr,
+            slurm_job_id=slurm_job_id,
+        )
     output = (completed.stdout or "").strip()
     if output:
         state, node = _parse_squeue_state_line(output)
@@ -690,12 +940,23 @@ def query_slurm_job_state(
             return "PENDING", None
         return normalized, node.strip() or None
 
-    completed = _run_completed_process_capture(
-        ["ssh", config.host, f"sacct -j {shlex.quote(slurm_job_id)} -P -n -o JobIDRaw,State,NodeList"],
+    completed = _run_completed_process_capture_with_transport_retry(
+        _ssh_command(config, config.host, f"sacct -j {shlex.quote(slurm_job_id)} -P -n -o JobIDRaw,State,NodeList"),
         stage="sacct",
         exit_code=EXIT_CODE_SLURM_FAILURE,
         timeout_seconds=20,
     )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        details = stderr if stderr else stdout
+        raise WorkflowError(
+            f"sacct failed: {details or completed.returncode}",
+            exit_code=EXIT_CODE_SLURM_FAILURE,
+            stdout=stdout,
+            stderr=stderr,
+            slurm_job_id=slurm_job_id,
+        )
     for raw in (completed.stdout or "").splitlines():
         parts = [part.strip() for part in raw.split("|")]
         if len(parts) < 3:
@@ -713,7 +974,7 @@ def query_slurm_job_state(
         if state.startswith("CANCELLED") or state.startswith("FAILED") or state.startswith("TIMEOUT") or state.startswith("OUT_OF_MEMORY") or state.startswith("NODE_FAIL"):
             return "FAILED", node
         return state, node
-    return "LOST", None
+    return "UNKNOWN", None
 
 
 def _parse_squeue_state_line(output: str) -> tuple[str, str]:
@@ -735,18 +996,40 @@ def _wait_for_remote_sbatch_completion(
     started = time.monotonic()
     last_state: str | None = None
     observed_node: str | None = None
+    last_probe_error: str | None = None
     while True:
-        state, node = query_slurm_job_state(config, slurm_job_id=slurm_job_id)
+        try:
+            state, node = query_slurm_job_state(config, slurm_job_id=slurm_job_id)
+            last_probe_error = None
+        except WorkflowError as exc:
+            if exc.slurm_job_id is None:
+                exc.slurm_job_id = slurm_job_id
+            if exc.observed_node is None:
+                exc.observed_node = observed_node
+            if exc.exit_code != EXIT_CODE_SLURM_FAILURE:
+                raise
+            last_probe_error = str(exc)
+            if time.monotonic() - started > timeout_seconds:
+                raise WorkflowError(
+                    f"sbatch job timed out waiting for completion job_id={slurm_job_id}: {last_probe_error}",
+                    exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+                    slurm_job_id=slurm_job_id,
+                    observed_node=observed_node,
+                    worker_terminal_state=last_state or "UNKNOWN",
+                ) from exc
+            time.sleep(5)
+            continue
         observed_node = node or observed_node
         if state != last_state:
             last_state = state
-            if on_worker_state_change is not None:
+            if on_worker_state_change is not None and state != "UNKNOWN":
                 on_worker_state_change(state, observed_node)
-        if state in {"COMPLETED", "FAILED", "LOST"}:
+        if state in {"COMPLETED", "FAILED"}:
             break
         if time.monotonic() - started > timeout_seconds:
+            details = f": {last_probe_error}" if last_probe_error else ""
             raise WorkflowError(
-                f"sbatch job timed out waiting for completion job_id={slurm_job_id}",
+                f"sbatch job timed out waiting for completion job_id={slurm_job_id}{details}",
                 exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
                 slurm_job_id=slurm_job_id,
                 observed_node=observed_node,
@@ -781,6 +1064,12 @@ def _wait_for_remote_sbatch_completion(
         raise
     if state != "COMPLETED" and not _has_remote_workflow_markers("\n".join(part for part in (stdout, stderr) if part)):
         details = _extract_meaningful_remote_failure_details("\n".join(part for part in (stdout, stderr) if part))
+        return_path_stage = _classify_return_path_failure_stage(details)
+        if return_path_stage is not None:
+            details = (
+                f"{details} stage=return_path host={_control_plane_return_host(config)} "
+                f"port={_control_plane_return_port(config)} ssh_target={_control_plane_ssh_target(config)}"
+            )
         raise WorkflowError(
             f"sbatch worker failed job_id={slurm_job_id}: {details or state}",
             exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
@@ -797,6 +1086,126 @@ def _run_subprocess(command: list[str], *, stage: str, exit_code: int, timeout_s
     completed = _run_completed_process(command, stage=stage, exit_code=exit_code, timeout_seconds=timeout_seconds)
     if completed.stdout or completed.stderr:
         return None
+
+
+def _is_launch_transient_message(message: str) -> bool:
+    normalized = message.lower()
+    return any(pattern in normalized for pattern in _TRANSIENT_LAUNCH_PATTERNS)
+
+
+def _is_retryable_transport_failure(*, returncode: int, stdout: str, stderr: str) -> bool:
+    combined = "\n".join(part for part in (stdout, stderr) if part)
+    if _is_launch_transient_message(combined):
+        return True
+    return returncode in _TRANSIENT_LAUNCH_RETURN_CODES
+
+
+def _retry_history_lines(*, stage: str, attempts: list[str]) -> str:
+    if not attempts:
+        return ""
+    history = "\n".join(attempts)
+    return f"{stage} retry history:\n{history}"
+
+
+def _with_retry_history(
+    completed: subprocess.CompletedProcess[str],
+    *,
+    stage: str,
+    attempts: list[str],
+) -> subprocess.CompletedProcess[str]:
+    history = _retry_history_lines(stage=stage, attempts=attempts)
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    if history:
+        stderr = "\n".join(part for part in (history.strip(), stderr.strip()) if part).strip()
+        if stderr:
+            stderr = f"{stderr}\n"
+    return subprocess.CompletedProcess(
+        args=completed.args,
+        returncode=completed.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def _run_completed_process_capture_with_transport_retry(
+    command: list[str],
+    *,
+    stage: str,
+    exit_code: int,
+    timeout_seconds: int | None = None,
+    backoff_seconds: Sequence[int] = _SSH_RETRY_BACKOFF_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    attempts: list[str] = []
+    total_attempts = len(backoff_seconds) + 1
+    last_completed: subprocess.CompletedProcess[str] | None = None
+    for attempt_no in range(1, total_attempts + 1):
+        try:
+            completed = _run_completed_process_capture(
+                command,
+                stage=stage,
+                exit_code=exit_code,
+                timeout_seconds=timeout_seconds,
+            )
+        except WorkflowError as exc:
+            if not _is_launch_transient_message(str(exc)):
+                raise
+            attempts.append(f"attempt={attempt_no} timeout={timeout_seconds}s detail={exc}")
+            if attempt_no >= total_attempts:
+                exc.stderr = "\n".join(part for part in (_retry_history_lines(stage=stage, attempts=attempts), exc.stderr.strip()) if part)
+                raise
+            sleep_seconds = backoff_seconds[attempt_no - 1]
+            _log_stage(
+                f"retry backoff stage={stage} attempt={attempt_no} sleep={sleep_seconds}s reason={exc}"
+            )
+            time.sleep(sleep_seconds)
+            continue
+        last_completed = completed
+        if completed.returncode == 0:
+            return completed
+        if not _is_retryable_transport_failure(
+            returncode=completed.returncode,
+            stdout=completed.stdout or "",
+            stderr=completed.stderr or "",
+        ):
+            return completed
+        attempts.append(
+            f"attempt={attempt_no} rc={completed.returncode} detail={_extract_meaningful_remote_failure_details((completed.stderr or '') + chr(10) + (completed.stdout or '')) or completed.returncode}"
+        )
+        if attempt_no >= total_attempts:
+            return _with_retry_history(completed, stage=stage, attempts=attempts)
+        sleep_seconds = backoff_seconds[attempt_no - 1]
+        _log_stage(
+            f"retry backoff stage={stage} attempt={attempt_no} sleep={sleep_seconds}s "
+            f"rc={completed.returncode}"
+        )
+        time.sleep(sleep_seconds)
+    if last_completed is not None:
+        return last_completed
+    raise WorkflowError(f"{stage} failed before command execution", exit_code=exit_code)
+
+
+def _run_subprocess_with_transport_retry(
+    command: list[str], *, stage: str, exit_code: int, timeout_seconds: int | None = None
+) -> None:
+    completed = _run_completed_process_capture_with_transport_retry(
+        command,
+        stage=stage,
+        exit_code=exit_code,
+        timeout_seconds=timeout_seconds,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        details = stderr if stderr else stdout
+        if details:
+            raise WorkflowError(
+                f"{stage} failed: {details}",
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        raise WorkflowError(f"{stage} failed with return code {completed.returncode}", exit_code=exit_code)
 
 
 def _run_subprocess_capture(
@@ -823,7 +1232,7 @@ def _read_remote_optional_text_file(
         return ""
     command = f"cd {shlex.quote(remote_path)} && " + " ".join(clauses) + " fi"
     return _run_subprocess_capture(
-        ["ssh", config.host, command],
+        _ssh_command(config, config.host, command),
         stage=stage,
         exit_code=EXIT_CODE_DOWNLOAD_FAILURE,
         timeout_seconds=timeout_seconds,
@@ -1381,7 +1790,10 @@ def _build_worker_payload_script_content(
     ) if total_allocated_mem_mb is not None else 0
     control_plane_host = getattr(config, "control_plane_host", "127.0.0.1")
     control_plane_port = int(getattr(config, "control_plane_port", 8765))
-    control_plane_ssh_target = getattr(config, "control_plane_ssh_target", "").strip()
+    control_plane_ssh_target = _control_plane_ssh_target(config)
+    control_plane_return_host = _control_plane_return_host(config)
+    control_plane_return_user = _control_plane_return_user(config)
+    control_plane_return_port = _control_plane_return_port(config)
     heartbeat_interval_seconds = max(5, int(getattr(config, "tunnel_recovery_grace_seconds", 30)))
     payload_lines = [
         "#!/usr/bin/env bash",
@@ -1431,19 +1843,32 @@ def _build_worker_payload_script_content(
         "    resp.read()",
         "PY",
         "}",
+        "classify_return_path_stage() {",
+        "  details=\"$1\"",
+        "  case \"$details\" in",
+        "    *\"Could not resolve hostname\"*|*\"Name or service not known\"*) echo RETURN_PATH_DNS_FAILURE ;;",
+        "    *\"Connection refused\"*) echo RETURN_PATH_PORT_MISMATCH ;;",
+        "    *\"Permission denied\"*|*\"Host key verification failed\"*) echo RETURN_PATH_AUTH_FAILURE ;;",
+        "    *\"Connection timed out\"*|*\"No route to host\"*|*\"Operation timed out\"*) echo RETURN_PATH_CONNECT_FAILURE ;;",
+        "    *) echo CONTROL_TUNNEL_LOST ;;",
+        "  esac",
+        "}",
         "start_control_tunnel() {",
-        "  if [ -z \"$PEETS_CONTROL_SSH_TARGET\" ]; then",
-        "    return 0",
+        "  if [ -z \"$PEETS_CONTROL_RETURN_HOST\" ] || [ -z \"$PEETS_CONTROL_RETURN_USER\" ]; then",
+        "    return 1",
         "  fi",
         "  ssh -M -S \"$PEETS_TUNNEL_SOCKET\" -fnNT \\",
+        "    -p \"$PEETS_CONTROL_RETURN_PORT\" \\",
         "    -o BatchMode=yes \\",
         "    -o ExitOnForwardFailure=yes \\",
+        "    -o StrictHostKeyChecking=no \\",
+        "    -o UserKnownHostsFile=/dev/null \\",
         "    -L 127.0.0.1:${PEETS_CONTROL_LOCAL_PORT}:127.0.0.1:${PEETS_CONTROL_PORT} \\",
-        "    \"$PEETS_CONTROL_SSH_TARGET\"",
+        "    \"${PEETS_CONTROL_RETURN_USER}@${PEETS_CONTROL_RETURN_HOST}\"",
         "}",
         "stop_control_tunnel() {",
         "  if [ -S \"$PEETS_TUNNEL_SOCKET\" ]; then",
-        "    ssh -S \"$PEETS_TUNNEL_SOCKET\" -O exit \"$PEETS_CONTROL_SSH_TARGET\" >/dev/null 2>&1 || true",
+        "    ssh -p \"$PEETS_CONTROL_RETURN_PORT\" -S \"$PEETS_TUNNEL_SOCKET\" -O exit \"${PEETS_CONTROL_RETURN_USER}@${PEETS_CONTROL_RETURN_HOST}\" >/dev/null 2>&1 || true",
         "  fi",
         "}",
         "emit_control_register() {",
@@ -1453,8 +1878,9 @@ def _build_worker_payload_script_content(
         "  control_plane_post /internal/workers/heartbeat \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"tunnel_session_id\\\":\\\"${PEETS_TUNNEL_SESSION_ID}\\\",\\\"observed_node\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\"}\" >/dev/null 2>&1 || true",
         "}",
         "emit_control_degraded() {",
-        "  reason=\"$1\"",
-        "  control_plane_post /internal/workers/degraded \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"tunnel_session_id\\\":\\\"${PEETS_TUNNEL_SESSION_ID}\\\",\\\"reason\\\":\\\"${reason}\\\",\\\"observed_node\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\"}\" >/dev/null 2>&1 || true",
+        "  stage=\"$1\"",
+        "  reason=\"$2\"",
+        "  control_plane_post /internal/workers/degraded \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"tunnel_session_id\\\":\\\"${PEETS_TUNNEL_SESSION_ID}\\\",\\\"stage\\\":\\\"${stage}\\\",\\\"reason\\\":\\\"${reason}\\\",\\\"observed_node\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\"}\" >/dev/null 2>&1 || true",
         "}",
         "emit_control_recovered() {",
         "  control_plane_post /internal/workers/recovered \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"tunnel_session_id\\\":\\\"${PEETS_TUNNEL_SESSION_ID}\\\",\\\"observed_node\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\"}\" >/dev/null 2>&1 || true",
@@ -1506,14 +1932,16 @@ def _build_worker_payload_script_content(
         "  done",
         "}",
         "heartbeat_pid=''",
-        "if start_control_tunnel; then",
+        "if start_control_tunnel 2> control_tunnel_bootstrap.err; then",
         "  emit_control_register",
         "  emit_node_snapshot",
         "  emit_worker_snapshot 0 \"$max_parallel\"",
         "  heartbeat_loop &",
         "  heartbeat_pid=$!",
         "else",
-        "  emit_control_degraded \"ssh tunnel bootstrap failed\"",
+        "  bootstrap_error=$(tr '\\n' ' ' < control_tunnel_bootstrap.err 2>/dev/null | sed 's/[[:space:]]\\+/ /g' | sed 's/^ //;s/ $//')",
+        "  if [ -z \"$bootstrap_error\" ]; then bootstrap_error='ssh tunnel bootstrap failed'; fi",
+        "  emit_control_degraded \"$(classify_return_path_stage \"$bootstrap_error\")\" \"$bootstrap_error\"",
         "fi",
         "teardown_control_plane() {",
         "  if [ -n \"$heartbeat_pid\" ]; then",
@@ -1577,6 +2005,7 @@ def _build_worker_payload_script_content(
             "cleanup_archive() { rm -f \"$archive_path\"; }",
             "trap cleanup_archive EXIT",
             "tar -czf \"$archive_path\" case_* case_summary.txt failed.count",
+            "touch results.tgz.ready",
             "printf '__PEETS_FAILED_COUNT__:%s\\n' \"$(cat failed.count)\"",
             "printf '__PEETS_CASE_SUMMARY_BEGIN__\\n'",
             "cat case_summary.txt",
@@ -1641,6 +2070,10 @@ def _build_remote_sbatch_script_content(
     worker_id: str | None = None,
 ) -> str:
     remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
+    control_plane_ssh_target = _control_plane_ssh_target(config)
+    control_plane_return_host = _control_plane_return_host(config)
+    control_plane_return_user = _control_plane_return_user(config)
+    control_plane_return_port = _control_plane_return_port(config)
     return "\n".join(
         [
             "#!/bin/bash",
@@ -1658,7 +2091,10 @@ def _build_remote_sbatch_script_content(
             f"export PEETS_CONTROL_WORKER_ID={shlex.quote(worker_id or '')}",
             f"export PEETS_CONTROL_HOST={shlex.quote(getattr(config, 'control_plane_host', '127.0.0.1'))}",
             f"export PEETS_CONTROL_PORT={int(getattr(config, 'control_plane_port', 8765))}",
-            f"export PEETS_CONTROL_SSH_TARGET={shlex.quote(getattr(config, 'control_plane_ssh_target', '').strip())}",
+            f"export PEETS_CONTROL_SSH_TARGET={shlex.quote(control_plane_ssh_target)}",
+            f"export PEETS_CONTROL_RETURN_HOST={shlex.quote(control_plane_return_host)}",
+            f"export PEETS_CONTROL_RETURN_USER={shlex.quote(control_plane_return_user)}",
+            f"export PEETS_CONTROL_RETURN_PORT={control_plane_return_port}",
             f"export PEETS_CONTROL_HEARTBEAT_INTERVAL={max(5, int(getattr(config, 'tunnel_recovery_grace_seconds', 30)))}",
             "export REMOTE_JOB_DIR",
             "cd \"$REMOTE_JOB_DIR\"",
@@ -1837,8 +2273,25 @@ def _extract_meaningful_remote_failure_details(output: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _classify_return_path_failure_stage(message: str) -> str | None:
+    normalized = message.lower()
+    if "could not resolve hostname" in normalized or "name or service not known" in normalized:
+        return "RETURN_PATH_DNS_FAILURE"
+    if "connection refused" in normalized:
+        return "RETURN_PATH_PORT_MISMATCH"
+    if "permission denied" in normalized or "host key verification failed" in normalized:
+        return "RETURN_PATH_AUTH_FAILURE"
+    if "connection timed out" in normalized or "operation timed out" in normalized or "no route to host" in normalized:
+        return "RETURN_PATH_CONNECT_FAILURE"
+    return None
+
+
 def _categorize_failure(*, exit_code: int, message: str, failed_case_lines: Sequence[str]) -> str:
     normalized = message.lower()
+    if _classify_return_path_failure_stage(message) is not None:
+        return "return_path"
+    if _is_launch_transient_message(normalized):
+        return "launch_transient"
     if "readiness" in normalized or "preflight" in normalized or "bootstrap" in normalized:
         return "readiness"
     if (

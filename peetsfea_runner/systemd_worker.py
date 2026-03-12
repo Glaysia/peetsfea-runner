@@ -27,6 +27,44 @@ def _normalize_control_plane_ssh_target(target: str) -> str:
     return f"{local_user}@{normalized}"
 
 
+def _split_ssh_target(target: str) -> tuple[str | None, str | None]:
+    normalized = target.strip()
+    if not normalized:
+        return None, None
+    if "@" not in normalized:
+        return None, normalized
+    user, host = normalized.split("@", 1)
+    user = user.strip() or None
+    host = host.strip() or None
+    return user, host
+
+
+def _discover_control_plane_return_host() -> str:
+    try:
+        for family, socktype, proto, _canonname, sockaddr in socket.getaddrinfo(
+            socket.gethostname(),
+            None,
+            family=socket.AF_INET,
+            type=socket.SOCK_STREAM,
+        ):
+            if family != socket.AF_INET or socktype != socket.SOCK_STREAM:
+                continue
+            candidate = sockaddr[0].strip()
+            if candidate and not candidate.startswith("127."):
+                return candidate
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            candidate = str(probe.getsockname()[0]).strip()
+            if candidate and not candidate.startswith("127."):
+                return candidate
+    except OSError:
+        pass
+    return ""
+
+
 def _parse_mem_to_mb(mem: str) -> int | None:
     raw = mem.strip().upper()
     if not raw:
@@ -288,9 +326,22 @@ def _build_config() -> PipelineConfig:
         max_jobs = int(os.getenv("PEETSFEA_MAX_JOBS_PER_ACCOUNT", "10"))
         accounts_registry = (AccountConfig(account_id=account_id, host_alias=host_alias, max_jobs=max_jobs),)
 
-    control_plane_ssh_target = _normalize_control_plane_ssh_target(
-        os.getenv("PEETSFEA_CONTROL_PLANE_SSH_TARGET", "")
+    control_plane_ssh_target = _normalize_control_plane_ssh_target(os.getenv("PEETSFEA_CONTROL_PLANE_SSH_TARGET", ""))
+    target_user, target_host = _split_ssh_target(control_plane_ssh_target)
+    local_user = (os.getenv("USER") or os.getenv("LOGNAME") or "").strip()
+    control_plane_return_user = (
+        os.getenv("PEETSFEA_CONTROL_PLANE_RETURN_USER", "").strip()
+        or target_user
+        or local_user
     )
+    control_plane_return_host = (
+        os.getenv("PEETSFEA_CONTROL_PLANE_RETURN_HOST", "").strip()
+        or target_host
+        or _discover_control_plane_return_host()
+    )
+    control_plane_return_port = int(os.getenv("PEETSFEA_CONTROL_PLANE_RETURN_PORT", "5722"))
+    if control_plane_return_user and control_plane_return_host:
+        control_plane_ssh_target = f"{control_plane_return_user}@{control_plane_return_host}"
 
     return PipelineConfig(
         input_queue_dir=input_queue_dir,
@@ -309,8 +360,12 @@ def _build_config() -> PipelineConfig:
         control_plane_host=os.getenv("PEETSFEA_CONTROL_PLANE_HOST", "127.0.0.1"),
         control_plane_port=int(os.getenv("PEETSFEA_CONTROL_PLANE_PORT", os.getenv("PEETSFEA_WEB_PORT", "8765"))),
         control_plane_ssh_target=control_plane_ssh_target,
+        control_plane_return_host=control_plane_return_host,
+        control_plane_return_port=control_plane_return_port,
+        control_plane_return_user=control_plane_return_user,
         tunnel_heartbeat_timeout_seconds=int(os.getenv("PEETSFEA_TUNNEL_HEARTBEAT_TIMEOUT_SECONDS", "90")),
         tunnel_recovery_grace_seconds=int(os.getenv("PEETSFEA_TUNNEL_RECOVERY_GRACE_SECONDS", "30")),
+        remote_ssh_port=int(os.getenv("PEETSFEA_REMOTE_SSH_PORT", "22")),
         continuous_mode=_env_bool("PEETSFEA_CONTINUOUS_MODE", True),
         ingest_poll_seconds=int(os.getenv("PEETSFEA_INGEST_POLL_SECONDS", "30")),
         ready_sidecar_suffix=os.getenv("PEETSFEA_READY_SIDECAR_SUFFIX", ".ready"),

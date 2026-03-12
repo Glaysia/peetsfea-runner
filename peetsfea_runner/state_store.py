@@ -225,6 +225,8 @@ class StateStore:
                         tunnel_state TEXT NOT NULL DEFAULT 'PENDING',
                         heartbeat_ts TEXT,
                         degraded_reason TEXT,
+                        collect_probe_state TEXT,
+                        marker_present BOOLEAN,
                         submitted_at TEXT,
                         started_at TEXT,
                         ended_at TEXT,
@@ -357,6 +359,8 @@ class StateStore:
                 conn.execute("ALTER TABLE slurm_workers ADD COLUMN IF NOT EXISTS tunnel_state TEXT DEFAULT 'PENDING'")
                 conn.execute("ALTER TABLE slurm_workers ADD COLUMN IF NOT EXISTS heartbeat_ts TEXT")
                 conn.execute("ALTER TABLE slurm_workers ADD COLUMN IF NOT EXISTS degraded_reason TEXT")
+                conn.execute("ALTER TABLE slurm_workers ADD COLUMN IF NOT EXISTS collect_probe_state TEXT")
+                conn.execute("ALTER TABLE slurm_workers ADD COLUMN IF NOT EXISTS marker_present BOOLEAN")
                 conn.execute("ALTER TABLE node_resource_snapshots ADD COLUMN IF NOT EXISTS allocated_mem_mb BIGINT")
                 conn.execute("ALTER TABLE node_resource_snapshots ADD COLUMN IF NOT EXISTS process_count INTEGER DEFAULT 0")
                 conn.execute("ALTER TABLE slot_resource_snapshots ADD COLUMN IF NOT EXISTS allocated_mem_mb BIGINT")
@@ -590,6 +594,8 @@ class StateStore:
         tunnel_state: str | None = None,
         heartbeat_ts: str | None = None,
         degraded_reason: str | None = None,
+        collect_probe_state: str | None = None,
+        marker_present: bool | None = None,
     ) -> None:
         now = _utc_now_iso()
         normalized_state = worker_state.strip().upper()
@@ -602,7 +608,7 @@ class StateStore:
             try:
                 existing = conn.execute(
                     """
-                    SELECT submitted_at, started_at, ended_at, tunnel_session_id, tunnel_state, heartbeat_ts, degraded_reason
+                    SELECT submitted_at, started_at, ended_at, tunnel_session_id, tunnel_state, heartbeat_ts, degraded_reason, collect_probe_state, marker_present
                     FROM slurm_workers
                     WHERE run_id = ? AND worker_id = ?
                     """,
@@ -615,15 +621,17 @@ class StateStore:
                 existing_tunnel_state = existing[4] if existing is not None else None
                 existing_heartbeat_ts = existing[5] if existing is not None else None
                 existing_degraded_reason = existing[6] if existing is not None else None
+                existing_collect_probe_state = existing[7] if existing is not None else None
+                existing_marker_present = existing[8] if existing is not None else None
                 conn.execute(
                     """
                     INSERT INTO slurm_workers (
                         run_id, worker_id, job_id, attempt_no, account_id, host_alias,
                         slurm_job_id, worker_state, observed_node, slots_configured, backend,
-                        tunnel_session_id, tunnel_state, heartbeat_ts, degraded_reason,
+                        tunnel_session_id, tunnel_state, heartbeat_ts, degraded_reason, collect_probe_state, marker_present,
                         submitted_at, started_at, ended_at, last_seen_ts
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (run_id, worker_id) DO UPDATE SET
                         job_id = EXCLUDED.job_id,
                         attempt_no = EXCLUDED.attempt_no,
@@ -638,6 +646,8 @@ class StateStore:
                         tunnel_state = EXCLUDED.tunnel_state,
                         heartbeat_ts = EXCLUDED.heartbeat_ts,
                         degraded_reason = EXCLUDED.degraded_reason,
+                        collect_probe_state = EXCLUDED.collect_probe_state,
+                        marker_present = EXCLUDED.marker_present,
                         submitted_at = EXCLUDED.submitted_at,
                         started_at = EXCLUDED.started_at,
                         ended_at = EXCLUDED.ended_at,
@@ -659,6 +669,8 @@ class StateStore:
                         normalized_tunnel_state if normalized_tunnel_state is not None else (existing_tunnel_state or "PENDING"),
                         heartbeat_ts if heartbeat_ts is not None else existing_heartbeat_ts,
                         degraded_reason if degraded_reason is not None else existing_degraded_reason,
+                        collect_probe_state if collect_probe_state is not None else existing_collect_probe_state,
+                        marker_present if marker_present is not None else existing_marker_present,
                         existing_submitted or submitted_at,
                         existing_started or started_at,
                         existing_ended or ended_at,
@@ -751,6 +763,8 @@ class StateStore:
                             tunnel_state,
                             heartbeat_ts,
                             degraded_reason,
+                            collect_probe_state,
+                            marker_present,
                             submitted_at,
                             started_at,
                             ended_at,
@@ -779,6 +793,8 @@ class StateStore:
                             tunnel_state,
                             heartbeat_ts,
                             degraded_reason,
+                            collect_probe_state,
+                            marker_present,
                             submitted_at,
                             started_at,
                             ended_at,
@@ -807,10 +823,12 @@ class StateStore:
                 "tunnel_state": str(row[11]) if row[11] is not None else None,
                 "heartbeat_ts": row[12],
                 "degraded_reason": row[13],
-                "submitted_at": row[14],
-                "started_at": row[15],
-                "ended_at": row[16],
-                "last_seen_ts": row[17],
+                "collect_probe_state": row[14],
+                "marker_present": bool(row[15]) if row[15] is not None else None,
+                "submitted_at": row[16],
+                "started_at": row[17],
+                "ended_at": row[18],
+                "last_seen_ts": row[19],
             }
             for row in rows
         ]

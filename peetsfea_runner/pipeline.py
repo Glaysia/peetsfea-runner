@@ -29,6 +29,7 @@ from .remote_job import (
     _build_case_slot_command,
     _build_remote_dispatch_script_content,
     _build_remote_job_script_content,
+    _classify_return_path_failure_stage,
     _build_wait_all_command,
     _count_screen_slots,
     _extract_meaningful_remote_failure_details,
@@ -119,8 +120,12 @@ class PipelineConfig:
     control_plane_host: str = "127.0.0.1"
     control_plane_port: int = 8765
     control_plane_ssh_target: str = ""
+    control_plane_return_host: str = ""
+    control_plane_return_port: int = 5722
+    control_plane_return_user: str = ""
     tunnel_heartbeat_timeout_seconds: int = 90
     tunnel_recovery_grace_seconds: int = 30
+    remote_ssh_port: int = 22
     slots_per_job: int = 4
     worker_bundle_multiplier: int = 1
     cores_per_slot: int = 4
@@ -146,6 +151,10 @@ class PipelineConfig:
     public_storage_mode: str = "disabled"
     remote_storage_inode_block_percent: int = 98
     remote_storage_min_free_mb: int = 0
+    launch_transient_same_account_retries: int = 1
+    launch_transient_cooldown_threshold: int = 3
+    launch_transient_cooldown_window_seconds: int = 300
+    launch_transient_cooldown_seconds: int = 300
 
     def validate(self) -> tuple[Path, Path, list[Path], list[AccountConfig]]:
         input_root = Path(self.input_queue_dir).expanduser().resolve()
@@ -166,6 +175,8 @@ class PipelineConfig:
         _ensure_positive("worker_bundle_multiplier", self.worker_bundle_multiplier)
         _ensure_positive("cores_per_slot", self.cores_per_slot)
         _ensure_positive("control_plane_port", self.control_plane_port)
+        _ensure_positive("control_plane_return_port", self.control_plane_return_port)
+        _ensure_positive("remote_ssh_port", self.remote_ssh_port)
         _ensure_positive("tunnel_heartbeat_timeout_seconds", self.tunnel_heartbeat_timeout_seconds)
         _ensure_positive("tunnel_recovery_grace_seconds", self.tunnel_recovery_grace_seconds)
         _ensure_positive("ingest_poll_seconds", self.ingest_poll_seconds)
@@ -188,6 +199,12 @@ class PipelineConfig:
             raise ValueError("remote_storage_inode_block_percent must be in 0..100")
         if self.remote_storage_min_free_mb < 0:
             raise ValueError("remote_storage_min_free_mb must be >= 0")
+        if self.launch_transient_same_account_retries < 0:
+            raise ValueError("launch_transient_same_account_retries must be >= 0")
+        if self.launch_transient_cooldown_threshold < 1:
+            raise ValueError("launch_transient_cooldown_threshold must be >= 1")
+        _ensure_positive("launch_transient_cooldown_window_seconds", self.launch_transient_cooldown_window_seconds)
+        _ensure_positive("launch_transient_cooldown_seconds", self.launch_transient_cooldown_seconds)
         if self.remote_execution_backend not in {"foreground_ssh", "slurm_batch"}:
             raise ValueError("remote_execution_backend must be 'foreground_ssh' or 'slurm_batch'")
         if not self.ready_sidecar_suffix.strip():
@@ -302,8 +319,12 @@ class _RemoteExecutionConfig:
     control_plane_host: str = "127.0.0.1"
     control_plane_port: int = 8765
     control_plane_ssh_target: str = ""
+    control_plane_return_host: str = ""
+    control_plane_return_port: int = 5722
+    control_plane_return_user: str = ""
     tunnel_heartbeat_timeout_seconds: int = 90
     tunnel_recovery_grace_seconds: int = 30
+    remote_ssh_port: int = 22
 
 
 def _scan_input_aedt_files(*, input_root: Path, recursive: bool) -> list[Path]:
@@ -317,6 +338,55 @@ def _storage_boundary_message(*, config: PipelineConfig) -> str:
         "runner_scope=control_plane_orchestration "
         "storage_scope=separate_service_boundary"
     )
+
+
+def _canary_output_csv_present(*, output_root: Path) -> bool:
+    return any(output_root.rglob("output_variables.csv"))
+
+
+def _canary_materialized_output_present(*, output_root: Path) -> bool:
+    return any(output_root.rglob("run.log")) and any(output_root.rglob("exit.code"))
+
+
+def _canary_return_path_ready(*, state_store: StateStore, run_id: str, config: PipelineConfig) -> tuple[bool, str]:
+    if config.remote_execution_backend != "slurm_batch":
+        return True, "non_slurm_batch_backend"
+    workers = state_store.list_slurm_workers(run_id=run_id)
+    if not workers:
+        return False, "worker_not_registered"
+    if not any(str(worker.get("worker_state") or "").upper() in {"RUNNING", "IDLE_DRAINING", "COMPLETED"} for worker in workers):
+        return False, "worker_never_running"
+    if not any(str(worker.get("tunnel_state") or "").upper() == "CONNECTED" for worker in workers):
+        return False, "tunnel_not_connected"
+    if not any(worker.get("heartbeat_ts") for worker in workers):
+        return False, "heartbeat_missing"
+    return True, "ok"
+
+
+def _record_launch_transient_failure(
+    *,
+    account_id: str,
+    history_by_account: dict[str, deque[float]],
+    cooldowns_by_account: dict[str, tuple[float, str]],
+    now_monotonic: float,
+    threshold: int,
+    window_seconds: int,
+    cooldown_seconds: int,
+    reason: str,
+) -> tuple[bool, float | None]:
+    history = history_by_account.setdefault(account_id, deque())
+    history.append(now_monotonic)
+    cutoff = now_monotonic - window_seconds
+    while history and history[0] < cutoff:
+        history.popleft()
+    if len(history) < threshold:
+        return False, None
+    cooldown_until = now_monotonic + cooldown_seconds
+    existing = cooldowns_by_account.get(account_id)
+    if existing is not None:
+        cooldown_until = max(cooldown_until, existing[0])
+    cooldowns_by_account[account_id] = (cooldown_until, reason)
+    return True, cooldown_until
 
 
 def _iter_input_aedt_files(*, input_root: Path, recursive: bool) -> Iterator[Path]:
@@ -504,6 +574,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     slurm_truth_state_by_account: dict[str, _SlurmTruthAccountState] = {}
     cutover_ready_emitted = False
     cutover_blocked_emitted = False
+    launch_transient_history_by_account: dict[str, deque[float]] = {}
+    account_cooldowns: dict[str, tuple[float, str]] = {}
 
     def _append_worker_event(*, level: str, stage: str, message: str) -> None:
         state_store.append_event(run_id=run_id, job_id="__worker__", level=level, stage=stage, message=message)
@@ -539,8 +611,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     control_plane_host=config.control_plane_host,
                     control_plane_port=config.control_plane_port,
                     control_plane_ssh_target=config.control_plane_ssh_target,
+                    control_plane_return_host=config.control_plane_return_host,
+                    control_plane_return_port=config.control_plane_return_port,
+                    control_plane_return_user=config.control_plane_return_user,
                     tunnel_heartbeat_timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
                     tunnel_recovery_grace_seconds=config.tunnel_recovery_grace_seconds,
+                    remote_ssh_port=config.remote_ssh_port,
                 )
                 try:
                     worker_state, observed_node = query_slurm_job_state(
@@ -617,6 +693,52 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
 
     def _capacity_error(account: AccountConfig, exc: Exception) -> None:
         _log_stage(f"capacity query failed account={account.account_id} host={account.host_alias} reason={exc}")
+
+    def _capacity_lookup_with_cooldown(*, account: AccountConfig, pending_buffer_per_account: int) -> AccountCapacitySnapshot:
+        snapshot = query_account_capacity(account=account, pending_buffer_per_account=pending_buffer_per_account)
+        cooldown = account_cooldowns.get(account.account_id)
+        now_monotonic = time.monotonic()
+        if cooldown is None:
+            return snapshot
+        cooldown_until, cooldown_reason = cooldown
+        if cooldown_until <= now_monotonic:
+            del account_cooldowns[account.account_id]
+            return snapshot
+        return AccountCapacitySnapshot(
+            account_id=snapshot.account_id,
+            host_alias=snapshot.host_alias,
+            running_count=snapshot.running_count,
+            pending_count=snapshot.pending_count,
+            allowed_submit=0,
+        )
+
+    def _note_account_cooldown(account_id: str, host_alias: str, reason: str) -> None:
+        now_monotonic = time.monotonic()
+        cooldown_until = now_monotonic + config.launch_transient_cooldown_seconds
+        existing = account_cooldowns.get(account_id)
+        if existing is not None:
+            cooldown_until = max(cooldown_until, existing[0])
+        triggered, triggered_until = _record_launch_transient_failure(
+            account_id=account_id,
+            history_by_account=launch_transient_history_by_account,
+            cooldowns_by_account=account_cooldowns,
+            now_monotonic=now_monotonic,
+            threshold=config.launch_transient_cooldown_threshold,
+            window_seconds=config.launch_transient_cooldown_window_seconds,
+            cooldown_seconds=config.launch_transient_cooldown_seconds,
+            reason=reason,
+        )
+        effective_until = triggered_until or cooldown_until
+        account_cooldowns[account_id] = (effective_until, reason)
+        remaining = max(0, int(effective_until - now_monotonic))
+        _append_worker_event(
+            level="WARN",
+            stage="ACCOUNT_COOLDOWN",
+            message=(
+                f"account={account_id} host={host_alias} cooldown_seconds={remaining} "
+                f"reason={reason} triggered={triggered}"
+            ),
+        )
 
     def _bundle_submitted(bundle: BundleSpec) -> None:
         completed, inflight = state_store.get_slot_throughput_score(run_id=run_id, account_id=bundle.account_id)
@@ -819,8 +941,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     run_id=run_id,
                     remote_run_dir=remote_run_dir,
                     bundle=bundle,
+                    on_account_cooldown=_note_account_cooldown,
                 ),
-                capacity_lookup=query_account_capacity,
+                capacity_lookup=_capacity_lookup_with_cooldown,
                 initial_completed_slots=completed_slots,
                 job_index_start=next_job_index,
                 on_capacity_snapshot=_capacity_log,
@@ -928,6 +1051,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                         run_id=run_id,
                         remote_run_dir=remote_run_dir,
                         bundle=bundle,
+                        on_account_cooldown=_note_account_cooldown,
                     )
                 )
                 if config.execute_remote
@@ -938,7 +1062,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                         bundle=bundle,
                     )
                 ),
-                capacity_lookup=query_account_capacity if config.execute_remote else _local_capacity_lookup,
+                capacity_lookup=_capacity_lookup_with_cooldown if config.execute_remote else _local_capacity_lookup,
                 initial_completed_slots=_current_completed_slots(),
                 job_index_start=next_job_index,
                 on_capacity_snapshot=_capacity_log,
@@ -1097,20 +1221,31 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             f"version={APP_VERSION} total_slots=0 active_slots=0 success_slots=0 failed_slots=0 quarantined_slots=0 "
             f"active_jobs=0 ingest_discovered={discovered_count} ingest_enqueued=0"
         )
+        canary_gate_ok = not canary_candidate
+        canary_gate_reason = "not_canary"
+        if canary_candidate:
+            canary_gate_ok = False
+            canary_gate_reason = "submit_missing"
+            summary = f"{summary} canary_gate={canary_gate_reason}"
         if config.continuous_mode:
             state_store.update_run_summary(run_id=run_id, summary=summary)
         else:
-            state_store.finish_run(run_id, state="SUCCEEDED", summary=summary)
+            state_store.finish_run(run_id, state="SUCCEEDED" if canary_gate_ok else "FAILED", summary=summary)
         if canary_candidate:
             _append_worker_event(
-                level="INFO",
-                stage="CANARY_PASSED",
-                message=f"run_id={run_id} sample.aedt canary finished without dispatch",
+                level="ERROR",
+                stage="CANARY_FAILED",
+                message=f"run_id={run_id} sample.aedt canary failed reason={canary_gate_reason}",
+            )
+            _append_worker_event(
+                level="WARN",
+                stage="ROLLBACK_TRIGGERED",
+                message=f"fallback=01a_01b_only reason={canary_gate_reason}",
             )
         _log_stage(f"pipeline idle run_id={run_id} discovered={discovered_count}")
         return PipelineResult(
-            success=True,
-            exit_code=EXIT_CODE_SUCCESS,
+            success=canary_gate_ok,
+            exit_code=EXIT_CODE_SUCCESS if canary_gate_ok else EXIT_CODE_REMOTE_RUN_FAILURE,
             run_id=run_id,
             remote_run_dir=remote_run_dir,
             local_artifacts_dir=str(output_root),
@@ -1152,8 +1287,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 control_plane_host=config.control_plane_host,
                 control_plane_port=config.control_plane_port,
                 control_plane_ssh_target=config.control_plane_ssh_target,
+                control_plane_return_host=config.control_plane_return_host,
+                control_plane_return_port=config.control_plane_return_port,
+                control_plane_return_user=config.control_plane_return_user,
                 tunnel_heartbeat_timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
                 tunnel_recovery_grace_seconds=config.tunnel_recovery_grace_seconds,
+                remote_ssh_port=config.remote_ssh_port,
             )
             try:
                 cleanup_orphan_sessions_for_run(config=cleanup_cfg, run_id=run_id)
@@ -1187,6 +1326,28 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     if orphan_cleanup_error is not None:
         exit_code = orphan_cleanup_error.exit_code
 
+    canary_gate_reason = "ok"
+    if canary_candidate and success:
+        return_path_ok, return_path_reason = _canary_return_path_ready(
+            state_store=state_store,
+            run_id=run_id,
+            config=config,
+        )
+        if not return_path_ok:
+            _append_worker_event(
+                level="WARN",
+                stage="CONTROL_TUNNEL_DEGRADED",
+                message=f"run_id={run_id} canary_return_path={return_path_reason}",
+            )
+        if not _canary_materialized_output_present(output_root=output_root):
+            success = False
+            exit_code = EXIT_CODE_DOWNLOAD_FAILURE
+            canary_gate_reason = "materialized_output_missing"
+        elif not _canary_output_csv_present(output_root=output_root):
+            success = False
+            exit_code = EXIT_CODE_DOWNLOAD_FAILURE
+            canary_gate_reason = "output_variables_csv_missing"
+
     summary = (
         f"version={APP_VERSION} total_jobs={total_jobs} success_jobs={success_jobs} failed_jobs={failed_jobs} "
         f"quarantined_jobs={quarantined_jobs} total_slots={total_slots} "
@@ -1198,6 +1359,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         f"bootstrapping_accounts={bootstrapping_account_ids} "
         f"readiness_blocked_slots={readiness_blocked_slots}"
     )
+    if canary_candidate:
+        summary = f"{summary} canary_gate={canary_gate_reason}"
     if orphan_cleanup_error is not None:
         summary = f"{summary} orphan_cleanup_error={orphan_cleanup_error}"
 
@@ -1210,7 +1373,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             _append_worker_event(
                 level="INFO",
                 stage="CANARY_PASSED",
-                message=f"run_id={run_id} sample.aedt canary passed",
+                message=f"run_id={run_id} sample.aedt canary passed reason={canary_gate_reason}",
             )
             _append_worker_event(
                 level="INFO",
@@ -1224,12 +1387,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             _append_worker_event(
                 level="ERROR",
                 stage="CANARY_FAILED",
-                message=f"run_id={run_id} sample.aedt canary failed",
+                message=f"run_id={run_id} sample.aedt canary failed reason={canary_gate_reason}",
             )
             _append_worker_event(
                 level="WARN",
                 stage="ROLLBACK_TRIGGERED",
-                message="fallback=01a_01b_only reason=canary_failed",
+                message=f"fallback=01a_01b_only reason={canary_gate_reason}",
             )
     _log_stage(
         f"pipeline end version={APP_VERSION} run_id={run_id} success={success} "
@@ -1450,6 +1613,7 @@ def _run_bundle_with_retry(
     run_id: str,
     remote_run_dir: str,
     bundle: BundleSpec,
+    on_account_cooldown: Callable[[str, str, str], None] | None = None,
 ) -> _BundleRuntimeOutcome:
     if not bundle.slot_inputs:
         return _BundleRuntimeOutcome(
@@ -1495,8 +1659,12 @@ def _run_bundle_with_retry(
         control_plane_host=config.control_plane_host,
         control_plane_port=config.control_plane_port,
         control_plane_ssh_target=config.control_plane_ssh_target,
+        control_plane_return_host=config.control_plane_return_host,
+        control_plane_return_port=config.control_plane_return_port,
+        control_plane_return_user=config.control_plane_return_user,
         tunnel_heartbeat_timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
         tunnel_recovery_grace_seconds=config.tunnel_recovery_grace_seconds,
+        remote_ssh_port=config.remote_ssh_port,
     )
     with TemporaryDirectory(prefix=f"peetsfea_bundle_{bundle.job_id}_") as tmpdir:
         local_bundle_dir = Path(tmpdir) / "bundle"
@@ -1522,7 +1690,8 @@ def _run_bundle_with_retry(
         last_attempt_no = 0
         worker_requeue_slots: list[SlotTaskRef] = []
 
-        for attempt in range(1, config.job_retry_count + 2):
+        max_same_account_attempts = max(config.job_retry_count, config.launch_transient_same_account_retries)
+        for attempt in range(1, max_same_account_attempts + 2):
             if not pending_slots:
                 break
             last_attempt_no = attempt
@@ -1631,6 +1800,8 @@ def _run_bundle_with_retry(
                     observed_node=observed_node,
                     slots_configured=config.slots_per_job,
                     backend=config.remote_execution_backend,
+                    collect_probe_state=None,
+                    marker_present=None,
                 )
 
             def _worker_state_change(worker_state: str, observed_node: str | None) -> None:
@@ -1648,6 +1819,8 @@ def _run_bundle_with_retry(
                     observed_node=observed_node,
                     slots_configured=config.slots_per_job,
                     backend=config.remote_execution_backend,
+                    collect_probe_state=None,
+                    marker_present=None,
                 )
                 if worker_state == "RUNNING":
                     _mark_slot_lifecycle_stage(
@@ -1720,6 +1893,8 @@ def _run_bundle_with_retry(
                     observed_node=result.observed_node,
                     slots_configured=config.slots_per_job,
                     backend=config.remote_execution_backend,
+                    collect_probe_state=result.collect_probe_state,
+                    marker_present=result.marker_present,
                 )
                 if final_worker_state == "LOST":
                     state_store.append_event(
@@ -1731,6 +1906,18 @@ def _run_bundle_with_retry(
                             f"job={bundle.job_id} attempt={attempt} "
                             f"slurm_job_id={result.slurm_job_id} observed_node={result.observed_node or 'unknown'}"
                         ),
+                    )
+                if result.collect_probe_state is not None:
+                    probe_message = (
+                        f"job={bundle.job_id} attempt={attempt} slurm_job_id={result.slurm_job_id} "
+                        f"probe={result.collect_probe_state} marker_present={result.marker_present}"
+                    )
+                    state_store.append_event(
+                        run_id=run_id,
+                        job_id=bundle.job_id,
+                        level="INFO" if result.marker_present else "WARN",
+                        stage="COLLECT_PROBE",
+                        message=probe_message,
                     )
             _mark_slot_lifecycle_stage(
                 state_store=state_store,
@@ -1786,6 +1973,15 @@ def _run_bundle_with_retry(
                     stage=f"FAILURE_{result.failure_category.upper()}",
                     message=terminal_message,
                 )
+                return_path_stage = _classify_return_path_failure_stage(terminal_message)
+                if return_path_stage is not None:
+                    state_store.append_event(
+                        run_id=run_id,
+                        job_id=bundle.job_id,
+                        level="ERROR",
+                        stage=return_path_stage,
+                        message=terminal_message,
+                    )
 
             failed_indices = _parse_failed_case_indices(result.failed_case_lines, len(runnable_slots))
             if not result.success and not failed_indices:
@@ -1801,11 +1997,17 @@ def _run_bundle_with_retry(
             for index, slot in enumerate(runnable_slots):
                 if index in failed_indices:
                     failure_message = terminal_message
+                    effective_worker_requeue_limit = config.worker_requeue_limit
+                    if result.failure_category == "launch_transient":
+                        effective_worker_requeue_limit += max(1, config.launch_transient_same_account_retries)
                     should_requeue = (
                         slot.slot_id not in materialized_slot_ids
-                        and slot.attempt_no <= config.worker_requeue_limit
+                        and slot.attempt_no <= effective_worker_requeue_limit
                     )
-                    if attempt <= config.job_retry_count and result.failure_category != "storage":
+                    retry_limit = config.job_retry_count
+                    if result.failure_category == "launch_transient":
+                        retry_limit = max(retry_limit, config.launch_transient_same_account_retries)
+                    if attempt <= retry_limit and result.failure_category not in {"storage"}:
                         state_store.mark_ingest_state(input_path=str(slot.input_path), state="FAILED")
                         state_store.update_slot_task(
                             run_id=run_id,
@@ -1823,6 +2025,17 @@ def _run_bundle_with_retry(
                             stage="RETRY_QUEUED",
                             message=f"attempt={attempt} reason={failure_message}",
                         )
+                        if result.failure_category == "launch_transient":
+                            state_store.append_event(
+                                run_id=run_id,
+                                job_id=bundle.job_id,
+                                level="WARN",
+                                stage="RETRY_BACKOFF",
+                                message=(
+                                    f"account={bundle.account_id} host={bundle.host_alias} "
+                                    f"attempt={attempt} reason={failure_message}"
+                                ),
+                            )
                         retry_slots.append(
                             SlotTaskRef(
                                 run_id=slot.run_id,
@@ -1868,6 +2081,9 @@ def _run_bundle_with_retry(
                                 attempt_no=slot.attempt_no + 1,
                             )
                         )
+                        if result.failure_category == "launch_transient":
+                            if on_account_cooldown is not None:
+                                on_account_cooldown(bundle.account_id, bundle.host_alias, failure_message)
                     else:
                         state_store.mark_ingest_state(input_path=str(slot.input_path), state="FAILED")
                         state_store.quarantine_job(
