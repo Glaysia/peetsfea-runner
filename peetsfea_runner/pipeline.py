@@ -38,6 +38,7 @@ from .remote_job import (
     _parse_case_summary_lines,
     cleanup_orphan_session,
     cleanup_orphan_sessions_for_run,
+    query_slurm_job_state,
     run_remote_job_attempt,
 )
 from .scheduler import (
@@ -64,6 +65,10 @@ def _log_stage(message: str) -> None:
     print(f"[peetsfea][{timestamp}] {message}", flush=True)
 
 
+def _is_sample_canary_input(path: Path) -> bool:
+    return path.name == "sample.aedt"
+
+
 @dataclass(slots=True)
 class AccountConfig:
     account_id: str
@@ -72,6 +77,7 @@ class AccountConfig:
     enabled: bool = True
     platform: str = "linux"
     scheduler: str = "slurm"
+    remote_execution_backend: str = "foreground_ssh"
 
 
 @dataclass(slots=True, frozen=True)
@@ -81,6 +87,13 @@ class _ReadyArtifactState:
     ready_mode: str
     ready_error: str | None = None
     locked: bool = False
+
+
+@dataclass(slots=True)
+class _SlurmTruthAccountState:
+    last_running_count: int | None = None
+    last_pending_count: int | None = None
+    mismatch_streak: int = 0
 
 
 @dataclass(slots=True)
@@ -102,7 +115,14 @@ class PipelineConfig:
     time_limit: str = "05:00:00"
     remote_root: str = "~/aedt_runs"
     execute_remote: bool = False
+    remote_execution_backend: str = "foreground_ssh"
+    control_plane_host: str = "127.0.0.1"
+    control_plane_port: int = 8765
+    control_plane_ssh_target: str = ""
+    tunnel_heartbeat_timeout_seconds: int = 90
+    tunnel_recovery_grace_seconds: int = 30
     slots_per_job: int = 4
+    worker_bundle_multiplier: int = 1
     cores_per_slot: int = 4
     job_retry_count: int = 1
     worker_requeue_limit: int = 1
@@ -112,6 +132,7 @@ class PipelineConfig:
     # Backward-compatible alias for old callers/docs
     max_jobs_per_account: int = 10
     local_artifacts_dir: str = "./output"
+    emit_output_variables_csv: bool = True
     host: str = "gate1-harry"
     # 11-01 continuous ingest settings
     continuous_mode: bool = True
@@ -121,6 +142,10 @@ class PipelineConfig:
     pending_buffer_per_account: int = 3
     capacity_scope: str = "all_user_jobs"
     balance_metric: str = "slot_throughput"
+    input_source_policy: str = "sample_only"
+    public_storage_mode: str = "disabled"
+    remote_storage_inode_block_percent: int = 98
+    remote_storage_min_free_mb: int = 0
 
     def validate(self) -> tuple[Path, Path, list[Path], list[AccountConfig]]:
         input_root = Path(self.input_queue_dir).expanduser().resolve()
@@ -138,7 +163,11 @@ class PipelineConfig:
         _ensure_positive("ntasks", self.ntasks)
         _ensure_positive("cpus_per_job", self.cpus_per_job)
         _ensure_positive("slots_per_job", self.slots_per_job)
+        _ensure_positive("worker_bundle_multiplier", self.worker_bundle_multiplier)
         _ensure_positive("cores_per_slot", self.cores_per_slot)
+        _ensure_positive("control_plane_port", self.control_plane_port)
+        _ensure_positive("tunnel_heartbeat_timeout_seconds", self.tunnel_heartbeat_timeout_seconds)
+        _ensure_positive("tunnel_recovery_grace_seconds", self.tunnel_recovery_grace_seconds)
         _ensure_positive("ingest_poll_seconds", self.ingest_poll_seconds)
         _ensure_positive("run_rotation_hours", self.run_rotation_hours)
         if self.job_retry_count < 0:
@@ -151,9 +180,19 @@ class PipelineConfig:
             raise ValueError("capacity_scope must be 'all_user_jobs'")
         if self.balance_metric != "slot_throughput":
             raise ValueError("balance_metric must be 'slot_throughput'")
+        if self.input_source_policy not in {"sample_only", "allow_original"}:
+            raise ValueError("input_source_policy must be 'sample_only' or 'allow_original'")
+        if self.public_storage_mode not in {"disabled", "private_only", "public_nas"}:
+            raise ValueError("public_storage_mode must be 'disabled', 'private_only', or 'public_nas'")
+        if self.remote_storage_inode_block_percent < 0 or self.remote_storage_inode_block_percent > 100:
+            raise ValueError("remote_storage_inode_block_percent must be in 0..100")
+        if self.remote_storage_min_free_mb < 0:
+            raise ValueError("remote_storage_min_free_mb must be >= 0")
+        if self.remote_execution_backend not in {"foreground_ssh", "slurm_batch"}:
+            raise ValueError("remote_execution_backend must be 'foreground_ssh' or 'slurm_batch'")
         if not self.ready_sidecar_suffix.strip():
             raise ValueError("ready_sidecar_suffix must not be empty")
-        for name in ("partition", "mem", "time_limit", "remote_root", "metadata_db_path"):
+        for name in ("partition", "mem", "time_limit", "remote_root", "metadata_db_path", "control_plane_host"):
             if not getattr(self, name).strip():
                 raise ValueError(f"{name} must not be empty")
         if self.cpus_per_job < (self.slots_per_job * self.cores_per_slot):
@@ -259,10 +298,25 @@ class _RemoteExecutionConfig:
     cores_per_slot: int
     platform: str = "linux"
     scheduler: str = "slurm"
+    remote_execution_backend: str = "foreground_ssh"
+    control_plane_host: str = "127.0.0.1"
+    control_plane_port: int = 8765
+    control_plane_ssh_target: str = ""
+    tunnel_heartbeat_timeout_seconds: int = 90
+    tunnel_recovery_grace_seconds: int = 30
 
 
 def _scan_input_aedt_files(*, input_root: Path, recursive: bool) -> list[Path]:
     return list(_iter_input_aedt_files(input_root=input_root, recursive=recursive))
+
+
+def _storage_boundary_message(*, config: PipelineConfig) -> str:
+    return (
+        f"input_source_policy={config.input_source_policy} "
+        f"public_storage_mode={config.public_storage_mode} "
+        "runner_scope=control_plane_orchestration "
+        "storage_scope=separate_service_boundary"
+    )
 
 
 def _iter_input_aedt_files(*, input_root: Path, recursive: bool) -> Iterator[Path]:
@@ -303,6 +357,12 @@ def _configured_target_slots(*, config: PipelineConfig, accounts: list[AccountCo
     return sum(max(1, account.max_jobs) for account in accounts) * config.slots_per_job
 
 
+def _worker_bundle_slot_limit(*, config: PipelineConfig) -> int:
+    if config.remote_execution_backend != "slurm_batch":
+        return config.slots_per_job
+    return max(config.slots_per_job, config.slots_per_job * config.worker_bundle_multiplier)
+
+
 def _continuous_backlog_limits(*, config: PipelineConfig, accounts: list[AccountConfig]) -> tuple[int, int]:
     low_watermark = max(config.slots_per_job, _configured_target_slots(config=config, accounts=accounts))
     high_watermark = max(low_watermark, low_watermark * 2)
@@ -323,6 +383,8 @@ def _blocked_readiness_snapshot(*, account: AccountConfig, reason: str) -> Accou
         module_ok=False,
         binaries_ok=False,
         ansys_ok=False,
+        storage_ready=False,
+        storage_reason=reason,
     )
 
 
@@ -341,6 +403,76 @@ def _update_readiness_snapshot(
     )
 
 
+def _reconcile_slurm_truth(
+    *,
+    snapshot: AccountCapacitySnapshot,
+    local_active_jobs: int,
+    previous_state: _SlurmTruthAccountState | None,
+) -> tuple[_SlurmTruthAccountState, list[tuple[str, str, str]]]:
+    previous = previous_state or _SlurmTruthAccountState()
+    next_state = _SlurmTruthAccountState(
+        last_running_count=snapshot.running_count,
+        last_pending_count=snapshot.pending_count,
+        mismatch_streak=0,
+    )
+    events: list[tuple[str, str, str]] = []
+    if (
+        previous.last_running_count != snapshot.running_count
+        or previous.last_pending_count != snapshot.pending_count
+        or previous_state is None
+    ):
+        events.append(
+            (
+                "INFO",
+                "SLURM_TRUTH_REFRESHED",
+                (
+                    f"account={snapshot.account_id} host={snapshot.host_alias} "
+                    f"remote_running={snapshot.running_count} remote_pending={snapshot.pending_count} "
+                    f"local_active_jobs={local_active_jobs} allowed_submit={snapshot.allowed_submit}"
+                ),
+            )
+        )
+
+    remote_visible = max(0, snapshot.running_count) + max(0, snapshot.pending_count)
+    if remote_visible < max(0, local_active_jobs):
+        mismatch_streak = previous.mismatch_streak + 1
+        next_state.mismatch_streak = mismatch_streak
+        stage = "SLURM_TRUTH_LAG" if mismatch_streak == 1 else "CAPACITY_MISMATCH"
+        level = "INFO" if mismatch_streak == 1 else "WARN"
+        events.append(
+            (
+                level,
+                stage,
+                (
+                    f"account={snapshot.account_id} host={snapshot.host_alias} "
+                    f"remote_visible={remote_visible} local_active_jobs={local_active_jobs} "
+                    f"mismatch_streak={mismatch_streak}"
+                ),
+            )
+        )
+    return next_state, events
+
+
+def _parse_optional_iso(ts: object) -> datetime | None:
+    if ts is None:
+        return None
+    text = str(ts).strip()
+    if not text:
+        return None
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _is_stale_worker_heartbeat(*, heartbeat_ts: object, timeout_seconds: int) -> bool:
+    parsed = _parse_optional_iso(heartbeat_ts)
+    if parsed is None:
+        return True
+    age_seconds = (datetime.now(tz=timezone.utc) - parsed).total_seconds()
+    return age_seconds > max(1, timeout_seconds)
+
+
 def run_pipeline(config: PipelineConfig) -> PipelineResult:
     if not isinstance(config, PipelineConfig):
         raise TypeError("config must be a PipelineConfig")
@@ -355,6 +487,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         state_store.start_run(run_id)
     remote_run_dir = _join_remote_root(config.remote_root, run_id)
     total_inputs_label = "streaming" if config.continuous_mode else str(len(aedt_files))
+    canary_candidate = (not config.continuous_mode) and bool(aedt_files) and all(
+        _is_sample_canary_input(path) for path in aedt_files
+    )
     _log_stage(
         f"pipeline start version={APP_VERSION} run_id={run_id} "
         f"total_inputs={total_inputs_label} execute_remote={config.execute_remote}"
@@ -366,6 +501,98 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     if queued_slots:
         _log_stage(f"restored queued slots run_id={run_id} count={len(queued_slots)}")
 
+    slurm_truth_state_by_account: dict[str, _SlurmTruthAccountState] = {}
+    cutover_ready_emitted = False
+    cutover_blocked_emitted = False
+
+    def _append_worker_event(*, level: str, stage: str, message: str) -> None:
+        state_store.append_event(run_id=run_id, job_id="__worker__", level=level, stage=stage, message=message)
+
+    _append_worker_event(
+        level="INFO",
+        stage="SERVICE_BOUNDARY",
+        message=_storage_boundary_message(config=config),
+    )
+
+    if config.execute_remote and config.remote_execution_backend == "slurm_batch":
+        active_workers = state_store.list_active_slurm_workers(run_id=run_id)
+        if active_workers:
+            account_by_id = {account.account_id: account for account in accounts}
+            refreshed = 0
+            for worker in active_workers:
+                account = account_by_id.get(str(worker["account_id"]))
+                if account is None:
+                    continue
+                remote_cfg = _RemoteExecutionConfig(
+                    host=account.host_alias,
+                    partition=config.partition,
+                    nodes=config.nodes,
+                    ntasks=config.ntasks,
+                    cpus_per_job=config.cpus_per_job,
+                    mem=config.mem,
+                    time_limit=config.time_limit,
+                    slots_per_job=config.slots_per_job,
+                    cores_per_slot=config.cores_per_slot,
+                    platform=account.platform,
+                    scheduler=account.scheduler,
+                    remote_execution_backend=config.remote_execution_backend,
+                    control_plane_host=config.control_plane_host,
+                    control_plane_port=config.control_plane_port,
+                    control_plane_ssh_target=config.control_plane_ssh_target,
+                    tunnel_heartbeat_timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
+                    tunnel_recovery_grace_seconds=config.tunnel_recovery_grace_seconds,
+                )
+                try:
+                    worker_state, observed_node = query_slurm_job_state(
+                        remote_cfg,
+                        slurm_job_id=str(worker["slurm_job_id"]),
+                    )
+                except Exception:
+                    continue
+                state_store.upsert_slurm_worker(
+                    run_id=run_id,
+                    worker_id=str(worker["worker_id"]),
+                    job_id=str(worker["job_id"]),
+                    attempt_no=int(worker["attempt_no"]),
+                    account_id=str(worker["account_id"]),
+                    host_alias=str(worker["host_alias"]),
+                    slurm_job_id=str(worker["slurm_job_id"]),
+                    worker_state=worker_state,
+                    observed_node=observed_node,
+                    slots_configured=int(worker["slots_configured"]),
+                    backend=str(worker["backend"]),
+                    tunnel_session_id=str(worker["tunnel_session_id"]) if worker.get("tunnel_session_id") else None,
+                    tunnel_state=str(worker["tunnel_state"]) if worker.get("tunnel_state") else None,
+                    heartbeat_ts=str(worker["heartbeat_ts"]) if worker.get("heartbeat_ts") else None,
+                    degraded_reason=str(worker["degraded_reason"]) if worker.get("degraded_reason") else None,
+                )
+                if worker_state in {"RUNNING", "IDLE_DRAINING"} and _is_stale_worker_heartbeat(
+                    heartbeat_ts=worker.get("heartbeat_ts"),
+                    timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
+                ):
+                    state_store.update_slurm_worker_control_plane(
+                        run_id=run_id,
+                        worker_id=str(worker["worker_id"]),
+                        tunnel_state="DEGRADED",
+                        degraded_reason="tunnel heartbeat stale after main restart",
+                        observed_node=observed_node,
+                    )
+                    _append_worker_event(
+                        level="WARN",
+                        stage="CONTROL_TUNNEL_LOST",
+                        message=(
+                            f"worker_id={worker['worker_id']} slurm_job_id={worker['slurm_job_id']} "
+                            f"reason=tunnel heartbeat stale after main restart"
+                        ),
+                    )
+                refreshed += 1
+            if refreshed:
+                _append_worker_event(
+                    level="INFO",
+                    stage="SLURM_WORKERS_REDISCOVERED",
+                    message=f"run_id={run_id} count={refreshed}",
+                )
+
     def _capacity_log(snapshot: AccountCapacitySnapshot) -> None:
         state_store.record_account_capacity_snapshot(
             account_id=snapshot.account_id,
@@ -374,6 +601,15 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             pending_count=snapshot.pending_count,
             allowed_submit=snapshot.allowed_submit,
         )
+        local_active_jobs = state_store.count_active_jobs_by_account(run_id=run_id).get(snapshot.account_id, 0)
+        truth_state, truth_events = _reconcile_slurm_truth(
+            snapshot=snapshot,
+            local_active_jobs=local_active_jobs,
+            previous_state=slurm_truth_state_by_account.get(snapshot.account_id),
+        )
+        slurm_truth_state_by_account[snapshot.account_id] = truth_state
+        for level, stage, message in truth_events:
+            _append_worker_event(level=level, stage=stage, message=message)
         _log_stage(
             f"capacity account={snapshot.account_id} running={snapshot.running_count} "
             f"pending={snapshot.pending_count} allowed_submit={snapshot.allowed_submit}"
@@ -424,6 +660,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             ansys_ok=snapshot.ansys_ok,
             uv_ok=snapshot.uv_ok,
             pyaedt_ok=snapshot.pyaedt_ok,
+            storage_ready=snapshot.storage_ready,
+            storage_reason=snapshot.storage_reason,
+            inode_use_percent=snapshot.inode_use_percent,
+            free_mb=snapshot.free_mb,
         )
         if snapshot.ready:
             _log_stage(
@@ -444,7 +684,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             )
 
     def _resolve_dispatch_accounts() -> list[AccountConfig]:
-        nonlocal ready_account_ids, blocked_account_ids, bootstrapping_account_ids
+        nonlocal ready_account_ids, blocked_account_ids, bootstrapping_account_ids, cutover_ready_emitted
         if not config.execute_remote:
             ready_account_ids = [account.account_id for account in accounts]
             blocked_account_ids = []
@@ -457,7 +697,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         bootstrapping_account_ids = []
         for account in accounts:
             try:
-                snapshot = query_account_readiness(account=account)
+                snapshot = query_account_readiness(
+                    account=account,
+                    remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
+                    remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                )
             except Exception as exc:
                 snapshot = _blocked_readiness_snapshot(account=account, reason=str(exc))
             _record_readiness(snapshot)
@@ -498,7 +742,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     message=f"account={account.account_id} host={account.host_alias}",
                 )
                 try:
-                    snapshot = query_account_preflight(account=account)
+                    snapshot = query_account_preflight(
+                        account=account,
+                        remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
+                        remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                    )
                 except Exception as exc:
                     snapshot = _update_readiness_snapshot(
                         snapshot,
@@ -508,7 +756,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     )
             elif snapshot.ready:
                 try:
-                    snapshot = query_account_preflight(account=account)
+                    snapshot = query_account_preflight(
+                        account=account,
+                        remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
+                        remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                    )
                 except Exception as exc:
                     snapshot = _update_readiness_snapshot(
                         snapshot,
@@ -523,15 +775,35 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 ready_account_ids.append(account.account_id)
             else:
                 blocked_account_ids.append(account.account_id)
+        if config.execute_remote and canary_candidate and ready_accounts and not cutover_ready_emitted:
+            _append_worker_event(
+                level="INFO",
+                stage="CUTOVER_READY",
+                message=(
+                    f"run_id={run_id} canary=sample.aedt ready_accounts={','.join(ready_account_ids)} "
+                    f"blocked_accounts={','.join(blocked_account_ids) or 'none'}"
+                ),
+            )
+            cutover_ready_emitted = True
         return ready_accounts
 
     def _run_slot_batch(slot_batch: list[SlotTaskRef]) -> bool:
-        nonlocal max_inflight_jobs, next_job_index, terminal_jobs, replacement_jobs, readiness_blocked_slots
+        nonlocal max_inflight_jobs, next_job_index, terminal_jobs, replacement_jobs, readiness_blocked_slots, cutover_blocked_emitted
         if not slot_batch:
             return False
         dispatch_accounts = _resolve_dispatch_accounts()
         if not dispatch_accounts:
             readiness_blocked_slots = len(slot_batch)
+            if config.execute_remote and not cutover_blocked_emitted:
+                _append_worker_event(
+                    level="WARN",
+                    stage="CUTOVER_BLOCKED",
+                    message=(
+                        f"run_id={run_id} queued_slots={len(slot_batch)} "
+                        f"blocked_accounts={','.join(blocked_account_ids) or 'none'}"
+                    ),
+                )
+                cutover_blocked_emitted = True
             return False
         completed_slots = _current_completed_slots()
         if config.execute_remote:
@@ -539,6 +811,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 slot_queue=slot_batch,
                 accounts=dispatch_accounts,
                 slots_per_job=config.slots_per_job,
+                bundle_slot_limit=_worker_bundle_slot_limit(config=config),
                 pending_buffer_per_account=config.pending_buffer_per_account,
                 worker=lambda bundle: _run_bundle_with_retry(
                     config=config,
@@ -622,7 +895,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         next_scan_monotonic = 0.0
 
         def _start_controller(*, force: bool = False) -> bool:
-            nonlocal controller, queued_slots, readiness_blocked_slots
+            nonlocal controller, queued_slots, readiness_blocked_slots, cutover_blocked_emitted
             if controller is not None:
                 return True
             if not queued_slots:
@@ -632,10 +905,21 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             dispatch_accounts = _resolve_dispatch_accounts()
             if not dispatch_accounts:
                 readiness_blocked_slots = len(queued_slots)
+                if config.execute_remote and not cutover_blocked_emitted:
+                    _append_worker_event(
+                        level="WARN",
+                        stage="CUTOVER_BLOCKED",
+                        message=(
+                            f"run_id={run_id} queued_slots={len(queued_slots)} "
+                            f"blocked_accounts={','.join(blocked_account_ids) or 'none'}"
+                        ),
+                    )
+                    cutover_blocked_emitted = True
                 return False
             controller = SlotWorkerController(
                 accounts=dispatch_accounts,
                 slots_per_job=config.slots_per_job,
+                bundle_slot_limit=_worker_bundle_slot_limit(config=config) if config.execute_remote else None,
                 pending_buffer_per_account=config.pending_buffer_per_account,
                 worker=(
                     lambda bundle: _run_bundle_with_retry(
@@ -671,9 +955,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     else (lambda _bundle, outcome: False)
                 ),
             )
-            controller.enqueue_slots(queued_slots)
+            controller.enqueue_slots(queued_slots, flush_partial=force)
             queued_slots = []
-            controller.step(wait_for_progress=False)
+            controller.step(wait_for_progress=False, flush_partial_bundles=force)
             return True
 
         while True:
@@ -710,7 +994,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 filtered_scan_results = [
                     path
                     for path in scan_results
-                    if path not in queued_scan_paths and not Path(f"{path}{config.ready_sidecar_suffix}").exists()
+                    if path not in queued_scan_paths
                 ]
                 has_active_ingest_backlog = bool(
                     pending_scan_files or rescan_scan_files or queued_slots or controller is not None
@@ -738,7 +1022,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     total_slots += len(slots)
                     if controller is not None:
                         controller.enqueue_slots(slots)
-                        controller.step(wait_for_progress=False)
+                        allow_partial_flush = not pending_scan_files and not rescan_scan_files
+                        controller.step(wait_for_progress=False, flush_partial_bundles=allow_partial_flush)
                     else:
                         queued_slots.extend(slots)
                         if len(queued_slots) >= config.slots_per_job:
@@ -753,7 +1038,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     + controller_snapshot.inflight_slots
                 )
                 wait_for_progress = not pending_scan_files and not rescan_scan_files
-                progressed = controller.step(wait_for_progress=wait_for_progress)
+                progressed = controller.step(
+                    wait_for_progress=wait_for_progress,
+                    flush_partial_bundles=wait_for_progress,
+                )
                 if progressed:
                     continue
                 if not controller.has_work() and not queued_slots and not pending_scan_files and not rescan_scan_files:
@@ -769,6 +1057,16 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
 
             if controller is None and blocked_account_ids and backlog_slots >= high_watermark:
                 readiness_blocked_slots = backlog_slots
+                if config.execute_remote and not cutover_blocked_emitted:
+                    _append_worker_event(
+                        level="WARN",
+                        stage="CUTOVER_BLOCKED",
+                        message=(
+                            f"run_id={run_id} backlog_slots={backlog_slots} "
+                            f"blocked_accounts={','.join(blocked_account_ids) or 'none'}"
+                        ),
+                    )
+                    cutover_blocked_emitted = True
                 break
     else:
         slots, discovered_count = _ingest_slot_queue(
@@ -803,6 +1101,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             state_store.update_run_summary(run_id=run_id, summary=summary)
         else:
             state_store.finish_run(run_id, state="SUCCEEDED", summary=summary)
+        if canary_candidate:
+            _append_worker_event(
+                level="INFO",
+                stage="CANARY_PASSED",
+                message=f"run_id={run_id} sample.aedt canary finished without dispatch",
+            )
         _log_stage(f"pipeline idle run_id={run_id} discovered={discovered_count}")
         return PipelineResult(
             success=True,
@@ -844,6 +1148,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 cores_per_slot=config.cores_per_slot,
                 platform=account.platform,
                 scheduler=account.scheduler,
+                remote_execution_backend=config.remote_execution_backend,
+                control_plane_host=config.control_plane_host,
+                control_plane_port=config.control_plane_port,
+                control_plane_ssh_target=config.control_plane_ssh_target,
+                tunnel_heartbeat_timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
+                tunnel_recovery_grace_seconds=config.tunnel_recovery_grace_seconds,
             )
             try:
                 cleanup_orphan_sessions_for_run(config=cleanup_cfg, run_id=run_id)
@@ -895,6 +1205,32 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         state_store.update_run_summary(run_id=run_id, summary=summary)
     else:
         state_store.finish_run(run_id, state="SUCCEEDED" if success else "FAILED", summary=summary)
+    if canary_candidate:
+        if success:
+            _append_worker_event(
+                level="INFO",
+                stage="CANARY_PASSED",
+                message=f"run_id={run_id} sample.aedt canary passed",
+            )
+            _append_worker_event(
+                level="INFO",
+                stage="FULL_ROLLOUT_READY",
+                message=(
+                    f"run_id={run_id} next_stage=full_backlog "
+                    f"fallback=disabled until next_failure {_storage_boundary_message(config=config)}"
+                ),
+            )
+        else:
+            _append_worker_event(
+                level="ERROR",
+                stage="CANARY_FAILED",
+                message=f"run_id={run_id} sample.aedt canary failed",
+            )
+            _append_worker_event(
+                level="WARN",
+                stage="ROLLBACK_TRIGGERED",
+                message="fallback=01a_01b_only reason=canary_failed",
+            )
     _log_stage(
         f"pipeline end version={APP_VERSION} run_id={run_id} success={success} "
         f"total_jobs={total_jobs} failed_jobs={failed_jobs} quarantined_jobs={quarantined_jobs}"
@@ -1155,6 +1491,12 @@ def _run_bundle_with_retry(
         cores_per_slot=config.cores_per_slot,
         platform=bundle.platform,
         scheduler=bundle.scheduler,
+        remote_execution_backend=config.remote_execution_backend,
+        control_plane_host=config.control_plane_host,
+        control_plane_port=config.control_plane_port,
+        control_plane_ssh_target=config.control_plane_ssh_target,
+        tunnel_heartbeat_timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
+        tunnel_recovery_grace_seconds=config.tunnel_recovery_grace_seconds,
     )
     with TemporaryDirectory(prefix=f"peetsfea_bundle_{bundle.job_id}_") as tmpdir:
         local_bundle_dir = Path(tmpdir) / "bundle"
@@ -1240,7 +1582,7 @@ def _run_bundle_with_retry(
                 state_store.update_slot_task(
                     run_id=run_id,
                     slot_id=slot.slot_id,
-                    state="ASSIGNED",
+                    state="LEASED",
                     attempt_no=attempt,
                     job_id=bundle.job_id,
                     account_id=bundle.account_id,
@@ -1250,7 +1592,7 @@ def _run_bundle_with_retry(
                     run_id=run_id,
                     slot_id=slot.slot_id,
                     level="INFO",
-                    stage="ASSIGNED",
+                    stage="LEASED",
                     message=f"job={bundle.job_id} attempt={attempt}",
                 )
 
@@ -1261,8 +1603,8 @@ def _run_bundle_with_retry(
                 attempt_no=attempt,
                 job_id=bundle.job_id,
                 account_id=bundle.account_id,
-                state="UPLOADING",
-                message=f"job={bundle.job_id} attempt={attempt}",
+                state="DOWNLOADING",
+                message=f"job={bundle.job_id} attempt={attempt} leased_to_worker",
             )
 
             state_store.update_job_status(run_id=run_id, job_id=bundle.job_id, status="RUNNING", attempt_no=attempt)
@@ -1272,6 +1614,52 @@ def _run_bundle_with_retry(
                 attempt_no=attempt,
                 node=bundle.host_alias,
             )
+            submitted_slurm_job_id: str | None = None
+
+            def _worker_submitted(slurm_job_id: str, observed_node: str | None) -> None:
+                nonlocal submitted_slurm_job_id
+                submitted_slurm_job_id = slurm_job_id
+                state_store.upsert_slurm_worker(
+                    run_id=run_id,
+                    worker_id=attempt_id,
+                    job_id=bundle.job_id,
+                    attempt_no=attempt,
+                    account_id=bundle.account_id,
+                    host_alias=bundle.host_alias,
+                    slurm_job_id=slurm_job_id,
+                    worker_state="SUBMITTED",
+                    observed_node=observed_node,
+                    slots_configured=config.slots_per_job,
+                    backend=config.remote_execution_backend,
+                )
+
+            def _worker_state_change(worker_state: str, observed_node: str | None) -> None:
+                if submitted_slurm_job_id is None:
+                    return
+                state_store.upsert_slurm_worker(
+                    run_id=run_id,
+                    worker_id=attempt_id,
+                    job_id=bundle.job_id,
+                    attempt_no=attempt,
+                    account_id=bundle.account_id,
+                    host_alias=bundle.host_alias,
+                    slurm_job_id=submitted_slurm_job_id,
+                    worker_state=worker_state,
+                    observed_node=observed_node,
+                    slots_configured=config.slots_per_job,
+                    backend=config.remote_execution_backend,
+                )
+                if worker_state == "RUNNING":
+                    _mark_slot_lifecycle_stage(
+                        state_store=state_store,
+                        run_id=run_id,
+                        slots=runnable_slots,
+                        attempt_no=attempt,
+                        job_id=bundle.job_id,
+                        account_id=bundle.account_id,
+                        state="RUNNING",
+                        message=f"job={bundle.job_id} attempt={attempt} worker_active",
+                    )
 
             def _delete_after_upload() -> None:
                 if config.delete_input_after_upload:
@@ -1285,20 +1673,12 @@ def _run_bundle_with_retry(
                             message="uploaded; waiting for terminal materialization",
                         )
                         state_store.mark_ingest_state(input_path=str(slot.input_path), state="UPLOADED")
-                _mark_slot_lifecycle_stage(
-                    state_store=state_store,
-                    run_id=run_id,
-                    slots=runnable_slots,
-                    attempt_no=attempt,
-                    job_id=bundle.job_id,
-                    account_id=bundle.account_id,
-                    state="RUNNING",
-                    message=f"job={bundle.job_id} attempt={attempt} uploaded",
-                )
 
             try:
                 result = run_remote_job_attempt(
                     config=remote_cfg,
+                    run_id=run_id,
+                    worker_id=attempt_id,
                     slot_inputs=[
                         SlotInput(
                             slot_id=slot.slot_id,
@@ -1313,6 +1693,8 @@ def _run_bundle_with_retry(
                     local_job_dir=local_bundle_dir,
                     session_name=session_name,
                     on_upload_success=_delete_after_upload,
+                    on_worker_submitted=_worker_submitted if config.remote_execution_backend == "slurm_batch" else None,
+                    on_worker_state_change=_worker_state_change if config.remote_execution_backend == "slurm_batch" else None,
                 )
             except Exception as exc:  # pragma: no cover
                 result = RemoteJobAttemptResult(
@@ -1324,6 +1706,42 @@ def _run_bundle_with_retry(
                     failed_case_lines=[],
                     failure_category="launch",
                 )
+            if result.slurm_job_id:
+                final_worker_state = result.worker_terminal_state or ("COMPLETED" if result.success else "FAILED")
+                state_store.upsert_slurm_worker(
+                    run_id=run_id,
+                    worker_id=attempt_id,
+                    job_id=bundle.job_id,
+                    attempt_no=attempt,
+                    account_id=bundle.account_id,
+                    host_alias=bundle.host_alias,
+                    slurm_job_id=result.slurm_job_id,
+                    worker_state=final_worker_state,
+                    observed_node=result.observed_node,
+                    slots_configured=config.slots_per_job,
+                    backend=config.remote_execution_backend,
+                )
+                if final_worker_state == "LOST":
+                    state_store.append_event(
+                        run_id=run_id,
+                        job_id=bundle.job_id,
+                        level="WARN",
+                        stage="WORKER_DEATH_DETECTED",
+                        message=(
+                            f"job={bundle.job_id} attempt={attempt} "
+                            f"slurm_job_id={result.slurm_job_id} observed_node={result.observed_node or 'unknown'}"
+                        ),
+                    )
+            _mark_slot_lifecycle_stage(
+                state_store=state_store,
+                run_id=run_id,
+                slots=runnable_slots,
+                attempt_no=attempt,
+                job_id=bundle.job_id,
+                account_id=bundle.account_id,
+                state="UPLOADING",
+                message=f"job={bundle.job_id} attempt={attempt} worker_collecting_results",
+            )
             materialized_slot_ids = _materialize_slot_outputs(
                 local_bundle_dir=local_bundle_dir,
                 slots=runnable_slots,
@@ -1387,7 +1805,7 @@ def _run_bundle_with_retry(
                         slot.slot_id not in materialized_slot_ids
                         and slot.attempt_no <= config.worker_requeue_limit
                     )
-                    if attempt <= config.job_retry_count:
+                    if attempt <= config.job_retry_count and result.failure_category != "storage":
                         state_store.mark_ingest_state(input_path=str(slot.input_path), state="FAILED")
                         state_store.update_slot_task(
                             run_id=run_id,
@@ -1427,7 +1845,7 @@ def _run_bundle_with_retry(
                         state_store.update_slot_task(
                             run_id=run_id,
                             slot_id=slot.slot_id,
-                            state="RETRY_QUEUED",
+                            state="LEASE_EXPIRED",
                             attempt_no=slot.attempt_no + 1,
                             job_id=bundle.job_id,
                             account_id=None,
@@ -1437,7 +1855,7 @@ def _run_bundle_with_retry(
                             run_id=run_id,
                             slot_id=slot.slot_id,
                             level="WARN",
-                            stage="RETRY_QUEUED",
+                            stage="LEASE_EXPIRED",
                             message=f"worker_requeue attempt_no={slot.attempt_no + 1} reason={failure_message}",
                         )
                         worker_requeue_slots.append(
@@ -1864,7 +2282,7 @@ def _local_capacity_lookup(*, account: AccountConfig, pending_buffer_per_account
         host_alias=account.host_alias,
         running_count=0,
         pending_count=0,
-        allowed_submit=max(0, account.max_jobs) + max(0, pending_buffer_per_account),
+        allowed_submit=max(0, account.max_jobs),
     )
 
 

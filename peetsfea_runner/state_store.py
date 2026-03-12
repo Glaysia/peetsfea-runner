@@ -199,6 +199,113 @@ class StateStore:
                         ansys_ok BOOLEAN NOT NULL,
                         uv_ok BOOLEAN NOT NULL DEFAULT FALSE,
                         pyaedt_ok BOOLEAN NOT NULL DEFAULT FALSE,
+                        storage_ready BOOLEAN NOT NULL DEFAULT TRUE,
+                        storage_reason TEXT NOT NULL DEFAULT 'ok',
+                        inode_use_percent INTEGER,
+                        free_mb BIGINT,
+                        ts TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS slurm_workers (
+                        run_id TEXT NOT NULL,
+                        worker_id TEXT NOT NULL,
+                        job_id TEXT NOT NULL,
+                        attempt_no INTEGER NOT NULL,
+                        account_id TEXT NOT NULL,
+                        host_alias TEXT NOT NULL,
+                        slurm_job_id TEXT NOT NULL,
+                        worker_state TEXT NOT NULL,
+                        observed_node TEXT,
+                        slots_configured INTEGER NOT NULL,
+                        backend TEXT NOT NULL,
+                        tunnel_session_id TEXT,
+                        tunnel_state TEXT NOT NULL DEFAULT 'PENDING',
+                        heartbeat_ts TEXT,
+                        degraded_reason TEXT,
+                        submitted_at TEXT,
+                        started_at TEXT,
+                        ended_at TEXT,
+                        last_seen_ts TEXT NOT NULL,
+                        PRIMARY KEY (run_id, worker_id)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS node_resource_snapshots (
+                        run_id TEXT NOT NULL,
+                        host TEXT NOT NULL,
+                        allocated_mem_mb BIGINT,
+                        total_mem_mb BIGINT,
+                        used_mem_mb BIGINT,
+                        free_mem_mb BIGINT,
+                        load_1 DOUBLE,
+                        load_5 DOUBLE,
+                        load_15 DOUBLE,
+                        tmp_total_mb BIGINT,
+                        tmp_used_mb BIGINT,
+                        tmp_free_mb BIGINT,
+                        process_count INTEGER NOT NULL DEFAULT 0,
+                        running_worker_count INTEGER NOT NULL DEFAULT 0,
+                        active_slot_count INTEGER NOT NULL DEFAULT 0,
+                        ts TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS worker_resource_snapshots (
+                        run_id TEXT NOT NULL,
+                        worker_id TEXT NOT NULL,
+                        host TEXT NOT NULL,
+                        slurm_job_id TEXT,
+                        configured_slots INTEGER NOT NULL DEFAULT 0,
+                        active_slots INTEGER NOT NULL DEFAULT 0,
+                        idle_slots INTEGER NOT NULL DEFAULT 0,
+                        rss_mb BIGINT,
+                        cpu_pct DOUBLE,
+                        tunnel_state TEXT,
+                        process_count INTEGER NOT NULL DEFAULT 0,
+                        ts TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS slot_resource_snapshots (
+                        run_id TEXT NOT NULL,
+                        slot_id TEXT NOT NULL,
+                        worker_id TEXT,
+                        host TEXT,
+                        allocated_mem_mb BIGINT,
+                        used_mem_mb BIGINT,
+                        load_1 DOUBLE,
+                        rss_mb BIGINT,
+                        cpu_pct DOUBLE,
+                        process_count INTEGER NOT NULL DEFAULT 0,
+                        active_process_count INTEGER NOT NULL DEFAULT 0,
+                        artifact_bytes BIGINT NOT NULL DEFAULT 0,
+                        progress_ts TEXT,
+                        state TEXT,
+                        ts TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS resource_summary_snapshots (
+                        run_id TEXT NOT NULL,
+                        host TEXT NOT NULL,
+                        allocated_mem_mb BIGINT,
+                        used_mem_mb BIGINT,
+                        free_mem_mb BIGINT,
+                        load_1 DOUBLE,
+                        running_worker_count INTEGER NOT NULL DEFAULT 0,
+                        active_slot_count INTEGER NOT NULL DEFAULT 0,
+                        stale BOOLEAN NOT NULL DEFAULT FALSE,
                         ts TEXT NOT NULL
                     )
                     """
@@ -233,9 +340,29 @@ class StateStore:
                 conn.execute(
                     "ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS pyaedt_ok BOOLEAN DEFAULT FALSE"
                 )
+                conn.execute(
+                    "ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS storage_ready BOOLEAN DEFAULT TRUE"
+                )
+                conn.execute(
+                    "ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS storage_reason TEXT DEFAULT 'ok'"
+                )
+                conn.execute(
+                    "ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS inode_use_percent INTEGER"
+                )
+                conn.execute("ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS free_mb BIGINT")
                 conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_present BOOLEAN DEFAULT FALSE")
                 conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_mode TEXT DEFAULT 'SIDECAR'")
                 conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_error TEXT")
+                conn.execute("ALTER TABLE slurm_workers ADD COLUMN IF NOT EXISTS tunnel_session_id TEXT")
+                conn.execute("ALTER TABLE slurm_workers ADD COLUMN IF NOT EXISTS tunnel_state TEXT DEFAULT 'PENDING'")
+                conn.execute("ALTER TABLE slurm_workers ADD COLUMN IF NOT EXISTS heartbeat_ts TEXT")
+                conn.execute("ALTER TABLE slurm_workers ADD COLUMN IF NOT EXISTS degraded_reason TEXT")
+                conn.execute("ALTER TABLE node_resource_snapshots ADD COLUMN IF NOT EXISTS allocated_mem_mb BIGINT")
+                conn.execute("ALTER TABLE node_resource_snapshots ADD COLUMN IF NOT EXISTS process_count INTEGER DEFAULT 0")
+                conn.execute("ALTER TABLE slot_resource_snapshots ADD COLUMN IF NOT EXISTS allocated_mem_mb BIGINT")
+                conn.execute("ALTER TABLE slot_resource_snapshots ADD COLUMN IF NOT EXISTS used_mem_mb BIGINT")
+                conn.execute("ALTER TABLE slot_resource_snapshots ADD COLUMN IF NOT EXISTS load_1 DOUBLE")
+                conn.execute("ALTER TABLE slot_resource_snapshots ADD COLUMN IF NOT EXISTS process_count INTEGER DEFAULT 0")
             finally:
                 conn.close()
 
@@ -426,6 +553,267 @@ class StateStore:
         completed = int(completed_row[0]) if completed_row is not None else 0
         inflight = int(inflight_row[0]) if inflight_row is not None else 0
         return completed, inflight
+
+    def count_active_jobs_by_account(self, *, run_id: str) -> dict[str, int]:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT account_id, COUNT(*)
+                    FROM jobs
+                    WHERE run_id = ? AND status IN ('PENDING', 'SUBMITTED', 'RUNNING')
+                    GROUP BY account_id
+                    ORDER BY account_id
+                    """,
+                    [run_id],
+                ).fetchall()
+            finally:
+                conn.close()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def upsert_slurm_worker(
+        self,
+        *,
+        run_id: str,
+        worker_id: str,
+        job_id: str,
+        attempt_no: int,
+        account_id: str,
+        host_alias: str,
+        slurm_job_id: str,
+        worker_state: str,
+        slots_configured: int,
+        backend: str,
+        observed_node: str | None = None,
+        tunnel_session_id: str | None = None,
+        tunnel_state: str | None = None,
+        heartbeat_ts: str | None = None,
+        degraded_reason: str | None = None,
+    ) -> None:
+        now = _utc_now_iso()
+        normalized_state = worker_state.strip().upper()
+        normalized_tunnel_state = tunnel_state.strip().upper() if tunnel_state is not None else None
+        submitted_at = now if normalized_state in {"SUBMITTED", "PENDING", "RUNNING", "IDLE_DRAINING", "COMPLETED", "FAILED", "LOST"} else None
+        started_at = now if normalized_state in {"RUNNING", "IDLE_DRAINING", "COMPLETED", "FAILED", "LOST"} else None
+        ended_at = now if normalized_state in {"COMPLETED", "FAILED", "LOST"} else None
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                existing = conn.execute(
+                    """
+                    SELECT submitted_at, started_at, ended_at, tunnel_session_id, tunnel_state, heartbeat_ts, degraded_reason
+                    FROM slurm_workers
+                    WHERE run_id = ? AND worker_id = ?
+                    """,
+                    [run_id, worker_id],
+                ).fetchone()
+                existing_submitted = existing[0] if existing is not None else None
+                existing_started = existing[1] if existing is not None else None
+                existing_ended = existing[2] if existing is not None else None
+                existing_tunnel_session_id = existing[3] if existing is not None else None
+                existing_tunnel_state = existing[4] if existing is not None else None
+                existing_heartbeat_ts = existing[5] if existing is not None else None
+                existing_degraded_reason = existing[6] if existing is not None else None
+                conn.execute(
+                    """
+                    INSERT INTO slurm_workers (
+                        run_id, worker_id, job_id, attempt_no, account_id, host_alias,
+                        slurm_job_id, worker_state, observed_node, slots_configured, backend,
+                        tunnel_session_id, tunnel_state, heartbeat_ts, degraded_reason,
+                        submitted_at, started_at, ended_at, last_seen_ts
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (run_id, worker_id) DO UPDATE SET
+                        job_id = EXCLUDED.job_id,
+                        attempt_no = EXCLUDED.attempt_no,
+                        account_id = EXCLUDED.account_id,
+                        host_alias = EXCLUDED.host_alias,
+                        slurm_job_id = EXCLUDED.slurm_job_id,
+                        worker_state = EXCLUDED.worker_state,
+                        observed_node = EXCLUDED.observed_node,
+                        slots_configured = EXCLUDED.slots_configured,
+                        backend = EXCLUDED.backend,
+                        tunnel_session_id = EXCLUDED.tunnel_session_id,
+                        tunnel_state = EXCLUDED.tunnel_state,
+                        heartbeat_ts = EXCLUDED.heartbeat_ts,
+                        degraded_reason = EXCLUDED.degraded_reason,
+                        submitted_at = EXCLUDED.submitted_at,
+                        started_at = EXCLUDED.started_at,
+                        ended_at = EXCLUDED.ended_at,
+                        last_seen_ts = EXCLUDED.last_seen_ts
+                    """,
+                    [
+                        run_id,
+                        worker_id,
+                        job_id,
+                        attempt_no,
+                        account_id,
+                        host_alias,
+                        slurm_job_id,
+                        normalized_state,
+                        observed_node,
+                        slots_configured,
+                        backend,
+                        tunnel_session_id if tunnel_session_id is not None else existing_tunnel_session_id,
+                        normalized_tunnel_state if normalized_tunnel_state is not None else (existing_tunnel_state or "PENDING"),
+                        heartbeat_ts if heartbeat_ts is not None else existing_heartbeat_ts,
+                        degraded_reason if degraded_reason is not None else existing_degraded_reason,
+                        existing_submitted or submitted_at,
+                        existing_started or started_at,
+                        existing_ended or ended_at,
+                        now,
+                    ],
+                )
+            finally:
+                conn.close()
+
+    def get_slurm_worker(self, *, run_id: str, worker_id: str) -> dict[str, object] | None:
+        rows = self.list_slurm_workers(run_id=run_id)
+        for row in rows:
+            if row["worker_id"] == worker_id:
+                return row
+        return None
+
+    def update_slurm_worker_control_plane(
+        self,
+        *,
+        run_id: str,
+        worker_id: str,
+        tunnel_state: str,
+        tunnel_session_id: str | None = None,
+        heartbeat_ts: str | None = None,
+        observed_node: str | None = None,
+        degraded_reason: str | None = None,
+    ) -> None:
+        now = heartbeat_ts or _utc_now_iso()
+        normalized_tunnel_state = tunnel_state.strip().upper()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    UPDATE slurm_workers
+                    SET
+                        tunnel_session_id = COALESCE(?, tunnel_session_id),
+                        tunnel_state = ?,
+                        heartbeat_ts = ?,
+                        observed_node = COALESCE(?, observed_node),
+                        degraded_reason = ?,
+                        last_seen_ts = ?
+                    WHERE run_id = ? AND worker_id = ?
+                    """,
+                    [
+                        tunnel_session_id,
+                        normalized_tunnel_state,
+                        now,
+                        observed_node,
+                        degraded_reason,
+                        now,
+                        run_id,
+                        worker_id,
+                    ],
+                )
+            finally:
+                conn.close()
+
+    def list_active_slurm_workers(self, *, run_id: str) -> list[dict[str, object]]:
+        return self.list_slurm_workers(
+            run_id=run_id,
+            worker_states=("SUBMITTED", "PENDING", "RUNNING", "IDLE_DRAINING"),
+        )
+
+    def list_slurm_workers(
+        self,
+        *,
+        run_id: str,
+        worker_states: tuple[str, ...] | None = None,
+    ) -> list[dict[str, object]]:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                if worker_states:
+                    placeholders = ", ".join(["?"] * len(worker_states))
+                    rows = conn.execute(
+                        f"""
+                        SELECT
+                            worker_id,
+                            job_id,
+                            attempt_no,
+                            account_id,
+                            host_alias,
+                            slurm_job_id,
+                            worker_state,
+                            observed_node,
+                            slots_configured,
+                            backend,
+                            tunnel_session_id,
+                            tunnel_state,
+                            heartbeat_ts,
+                            degraded_reason,
+                            submitted_at,
+                            started_at,
+                            ended_at,
+                            last_seen_ts
+                        FROM slurm_workers
+                        WHERE run_id = ? AND worker_state IN ({placeholders})
+                        ORDER BY submitted_at, worker_id
+                        """,
+                        [run_id, *worker_states],
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT
+                            worker_id,
+                            job_id,
+                            attempt_no,
+                            account_id,
+                            host_alias,
+                            slurm_job_id,
+                            worker_state,
+                            observed_node,
+                            slots_configured,
+                            backend,
+                            tunnel_session_id,
+                            tunnel_state,
+                            heartbeat_ts,
+                            degraded_reason,
+                            submitted_at,
+                            started_at,
+                            ended_at,
+                            last_seen_ts
+                        FROM slurm_workers
+                        WHERE run_id = ?
+                        ORDER BY submitted_at, worker_id
+                        """,
+                        [run_id],
+                    ).fetchall()
+            finally:
+                conn.close()
+        return [
+            {
+                "worker_id": str(row[0]),
+                "job_id": str(row[1]),
+                "attempt_no": int(row[2]),
+                "account_id": str(row[3]),
+                "host_alias": str(row[4]),
+                "slurm_job_id": str(row[5]),
+                "worker_state": str(row[6]),
+                "observed_node": row[7],
+                "slots_configured": int(row[8]),
+                "backend": str(row[9]),
+                "tunnel_session_id": row[10],
+                "tunnel_state": str(row[11]) if row[11] is not None else None,
+                "heartbeat_ts": row[12],
+                "degraded_reason": row[13],
+                "submitted_at": row[14],
+                "started_at": row[15],
+                "ended_at": row[16],
+                "last_seen_ts": row[17],
+            }
+            for row in rows
+        ]
 
     def list_schedulable_slot_tasks(self, *, run_id: str) -> list[tuple[str, str, str, int]]:
         with self._lock:
@@ -939,6 +1327,10 @@ class StateStore:
         ansys_ok: bool,
         uv_ok: bool = False,
         pyaedt_ok: bool = False,
+        storage_ready: bool = True,
+        storage_reason: str = "ok",
+        inode_use_percent: int | None = None,
+        free_mb: int | None = None,
     ) -> None:
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
@@ -960,8 +1352,12 @@ class StateStore:
                         ansys_ok,
                         uv_ok,
                         pyaedt_ok,
+                        storage_ready,
+                        storage_reason,
+                        inode_use_percent,
+                        free_mb,
                         ts
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         account_id,
@@ -978,8 +1374,219 @@ class StateStore:
                         ansys_ok,
                         uv_ok,
                         pyaedt_ok,
+                        storage_ready,
+                        storage_reason,
+                        inode_use_percent,
+                        free_mb,
                         _utc_now_iso(),
                     ],
                 )
             finally:
                 conn.close()
+
+    def record_node_resource_snapshot(
+        self,
+        *,
+        run_id: str,
+        host: str,
+        allocated_mem_mb: int | None,
+        total_mem_mb: int | None,
+        used_mem_mb: int | None,
+        free_mem_mb: int | None,
+        load_1: float | None,
+        load_5: float | None,
+        load_15: float | None,
+        tmp_total_mb: int | None,
+        tmp_used_mb: int | None,
+        tmp_free_mb: int | None,
+        process_count: int,
+        running_worker_count: int,
+        active_slot_count: int,
+        ts: str | None = None,
+    ) -> None:
+        snapshot_ts = ts or _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO node_resource_snapshots (
+                        run_id, host, allocated_mem_mb, total_mem_mb, used_mem_mb, free_mem_mb,
+                        load_1, load_5, load_15, tmp_total_mb, tmp_used_mb, tmp_free_mb,
+                        process_count, running_worker_count, active_slot_count, ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        run_id,
+                        host,
+                        allocated_mem_mb,
+                        total_mem_mb,
+                        used_mem_mb,
+                        free_mem_mb,
+                        load_1,
+                        load_5,
+                        load_15,
+                        tmp_total_mb,
+                        tmp_used_mb,
+                        tmp_free_mb,
+                        process_count,
+                        running_worker_count,
+                        active_slot_count,
+                        snapshot_ts,
+                    ],
+                )
+            finally:
+                conn.close()
+
+    def record_worker_resource_snapshot(
+        self,
+        *,
+        run_id: str,
+        worker_id: str,
+        host: str,
+        slurm_job_id: str | None,
+        configured_slots: int,
+        active_slots: int,
+        idle_slots: int,
+        rss_mb: int | None,
+        cpu_pct: float | None,
+        tunnel_state: str | None,
+        process_count: int,
+        ts: str | None = None,
+    ) -> None:
+        snapshot_ts = ts or _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO worker_resource_snapshots (
+                        run_id, worker_id, host, slurm_job_id, configured_slots, active_slots,
+                        idle_slots, rss_mb, cpu_pct, tunnel_state, process_count, ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        run_id,
+                        worker_id,
+                        host,
+                        slurm_job_id,
+                        configured_slots,
+                        active_slots,
+                        idle_slots,
+                        rss_mb,
+                        cpu_pct,
+                        tunnel_state,
+                        process_count,
+                        snapshot_ts,
+                    ],
+                )
+            finally:
+                conn.close()
+
+    def record_slot_resource_snapshot(
+        self,
+        *,
+        run_id: str,
+        slot_id: str,
+        worker_id: str | None,
+        host: str | None,
+        allocated_mem_mb: int | None,
+        used_mem_mb: int | None,
+        load_1: float | None,
+        rss_mb: int | None,
+        cpu_pct: float | None,
+        process_count: int,
+        active_process_count: int,
+        artifact_bytes: int,
+        progress_ts: str | None,
+        state: str | None,
+        ts: str | None = None,
+    ) -> None:
+        snapshot_ts = ts or _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO slot_resource_snapshots (
+                        run_id, slot_id, worker_id, host, allocated_mem_mb, used_mem_mb, load_1,
+                        rss_mb, cpu_pct, process_count, active_process_count, artifact_bytes, progress_ts, state, ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        run_id,
+                        slot_id,
+                        worker_id,
+                        host,
+                        allocated_mem_mb,
+                        used_mem_mb,
+                        load_1,
+                        rss_mb,
+                        cpu_pct,
+                        process_count,
+                        active_process_count,
+                        artifact_bytes,
+                        progress_ts,
+                        state,
+                        snapshot_ts,
+                    ],
+                )
+            finally:
+                conn.close()
+
+    def record_resource_summary_snapshot(
+        self,
+        *,
+        run_id: str,
+        host: str,
+        allocated_mem_mb: int | None,
+        used_mem_mb: int | None,
+        free_mem_mb: int | None,
+        load_1: float | None,
+        running_worker_count: int,
+        active_slot_count: int,
+        stale: bool,
+        ts: str | None = None,
+    ) -> None:
+        snapshot_ts = ts or _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO resource_summary_snapshots (
+                        run_id, host, allocated_mem_mb, used_mem_mb, free_mem_mb,
+                        load_1, running_worker_count, active_slot_count, stale, ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        run_id,
+                        host,
+                        allocated_mem_mb,
+                        used_mem_mb,
+                        free_mem_mb,
+                        load_1,
+                        running_worker_count,
+                        active_slot_count,
+                        stale,
+                        snapshot_ts,
+                    ],
+                )
+            finally:
+                conn.close()
+
+    def count_active_slots(self, *, run_id: str) -> int:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM slot_tasks
+                    WHERE run_id = ? AND state IN ('ASSIGNED', 'LEASED', 'DOWNLOADING', 'UPLOADING', 'RUNNING', 'COLLECTING')
+                    """,
+                    [run_id],
+                ).fetchone()
+            finally:
+                conn.close()
+        return int(row[0] or 0)

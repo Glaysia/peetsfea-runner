@@ -100,7 +100,20 @@ class TestScheduler(unittest.TestCase):
 
         self.assertEqual(snapshot.running_count, 2)
         self.assertEqual(snapshot.pending_count, 2)
-        self.assertEqual(snapshot.allowed_submit, (10 - 2) + (3 - 2))
+        self.assertEqual(snapshot.allowed_submit, 6)
+
+    def test_query_account_capacity_clamps_when_visible_occupied_exceeds_max_jobs(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+
+        snapshot = query_account_capacity(
+            account=account,
+            pending_buffer_per_account=3,
+            run_command=lambda _cmd: (0, "R\nR\nR\nR\nR\nR\nPD\nPD\nPD\nPD\nPD\n", ""),
+        )
+
+        self.assertEqual(snapshot.running_count, 6)
+        self.assertEqual(snapshot.pending_count, 5)
+        self.assertEqual(snapshot.allowed_submit, 0)
 
     def test_query_account_capacity_raises_on_command_timeout(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
@@ -151,6 +164,40 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(snapshot.status, "DISABLED_FOR_DISPATCH")
         self.assertEqual(snapshot.reason, "venv,python,ansys")
 
+    def test_query_account_readiness_blocks_storage_when_inode_full(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_readiness(
+            account=account,
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_READY__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1 storage=1 inode_pct=100 free_mb=12345\n",
+                "",
+            ),
+        )
+        self.assertFalse(snapshot.ready)
+        self.assertEqual(snapshot.status, "BLOCKED_STORAGE")
+        self.assertEqual(snapshot.reason, "inode_pct=100")
+        self.assertFalse(snapshot.storage_ready)
+        self.assertEqual(snapshot.inode_use_percent, 100)
+        self.assertEqual(snapshot.free_mb, 12345)
+
+    def test_query_account_readiness_ignores_gpfs_inode_pressure(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_readiness(
+            account=account,
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_READY__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1 storage=1 inode_pct=100 free_mb=12345 fs_type=gpfs\n",
+                "",
+            ),
+        )
+        self.assertTrue(snapshot.ready)
+        self.assertEqual(snapshot.status, "READY")
+        self.assertEqual(snapshot.reason, "ok")
+        self.assertTrue(snapshot.storage_ready)
+        self.assertEqual(snapshot.inode_use_percent, 100)
+        self.assertEqual(snapshot.free_mb, 12345)
+
     def test_query_account_readiness_marks_bootstrap_required_for_missing_runtime(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
         snapshot = query_account_readiness(
@@ -180,6 +227,37 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(snapshot.reason, "uv,pyaedt")
         self.assertFalse(snapshot.uv_ok)
         self.assertFalse(snapshot.pyaedt_ok)
+
+    def test_query_account_preflight_blocks_storage_when_free_mb_below_threshold(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_preflight(
+            account=account,
+            remote_storage_min_free_mb=2048,
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1 uv=1 pyaedt=1 storage=1 inode_pct=10 free_mb=1024\n",
+                "",
+            ),
+        )
+        self.assertFalse(snapshot.ready)
+        self.assertEqual(snapshot.status, "BLOCKED_STORAGE")
+        self.assertEqual(snapshot.reason, "free_mb=1024")
+        self.assertFalse(snapshot.storage_ready)
+
+    def test_query_account_preflight_ignores_gpfs_inode_pressure(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_preflight(
+            account=account,
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1 uv=1 pyaedt=1 storage=1 inode_pct=100 free_mb=20480 fs_type=gpfs\n",
+                "",
+            ),
+        )
+        self.assertTrue(snapshot.ready)
+        self.assertEqual(snapshot.status, "READY")
+        self.assertEqual(snapshot.reason, "ok")
+        self.assertTrue(snapshot.storage_ready)
 
     def test_bootstrap_account_runtime_requires_success_marker(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
@@ -294,6 +372,35 @@ class TestScheduler(unittest.TestCase):
             self.assertEqual(sorted(batch.results), [1, 8, 8])
             self.assertEqual(batch.submitted_jobs, 3)
 
+    def test_run_slot_bundles_can_prefetch_more_slots_than_pool_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            slots = [
+                SlotTaskRef(
+                    run_id="run_01",
+                    slot_id=f"w_{idx:04d}",
+                    input_path=root / f"in_{idx}.aedt",
+                    relative_path=Path(f"in_{idx}.aedt"),
+                    output_dir=root / f"out_{idx}.aedt_all",
+                )
+                for idx in range(1, 7)
+            ]
+            account = _Account(account_id="a1", host_alias="h1", max_jobs=10)
+
+            batch = run_slot_bundles(
+                slot_queue=slots,
+                accounts=[account],
+                slots_per_job=4,
+                bundle_slot_limit=8,
+                pending_buffer_per_account=3,
+                worker=lambda bundle: bundle.slot_count,
+                capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 0, 0, 99),
+                max_workers=1,
+            )
+
+            self.assertEqual(batch.results, [6])
+            self.assertEqual(batch.submitted_jobs, 1)
+
     def test_run_slot_bundles_skips_blocked_account(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -315,7 +422,7 @@ class TestScheduler(unittest.TestCase):
             def _capacity_lookup(*, account, pending_buffer_per_account):
                 if account.account_id == "a1":
                     return AccountCapacitySnapshot("a1", "h1", 10, 3, 0)
-                return AccountCapacitySnapshot("a2", "h2", 0, 0, 10 + pending_buffer_per_account)
+                return AccountCapacitySnapshot("a2", "h2", 0, 0, 10)
 
             batch = run_slot_bundles(
                 slot_queue=slots,
@@ -381,9 +488,9 @@ class TestScheduler(unittest.TestCase):
                 capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 7, 1, 2),
             )
 
-            self.assertEqual(batch.submitted_jobs, 10)
+            self.assertEqual(batch.submitted_jobs, 2)
             self.assertEqual(sum(batch.results), 12)
-            self.assertLessEqual(batch.max_inflight_jobs, 4)
+            self.assertLessEqual(batch.max_inflight_jobs, 2)
 
     def test_run_slot_workers_submits_replacement_bundle_from_backlog(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -450,6 +557,51 @@ class TestScheduler(unittest.TestCase):
             self.assertEqual(batch.submitted_jobs, 1)
             self.assertEqual(batch.results, [1])
 
+    def test_slot_worker_controller_waits_for_full_slot_pool_before_new_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            slots = [
+                SlotTaskRef(
+                    run_id="run_01",
+                    slot_id=f"w_{idx:04d}",
+                    input_path=root / f"in_{idx}.aedt",
+                    relative_path=Path(f"in_{idx}.aedt"),
+                    output_dir=root / f"out_{idx}.aedt_all",
+                )
+                for idx in range(1, 5)
+            ]
+            account = _Account(account_id="a1", host_alias="h1", max_jobs=10)
+            submitted: list[int] = []
+            release_event = threading.Event()
+
+            def _worker(bundle):
+                submitted.append(bundle.slot_count)
+                self.assertTrue(release_event.wait(timeout=2))
+                return bundle.slot_count
+
+            controller = SlotWorkerController(
+                accounts=[account],
+                slots_per_job=4,
+                bundle_slot_limit=4,
+                pending_buffer_per_account=3,
+                worker=_worker,
+                capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 0, 0, 10),
+                max_workers=10,
+            )
+            controller.enqueue_slots(slots[:3])
+            progressed = controller.step(wait_for_progress=False)
+            self.assertFalse(progressed)
+            self.assertEqual(controller.snapshot().inflight_jobs, 0)
+
+            controller.enqueue_slots([slots[3]])
+            controller.step(wait_for_progress=False)
+            self.assertEqual(controller.snapshot().inflight_jobs, 1)
+            release_event.set()
+            while controller.has_work():
+                controller.step(wait_for_progress=False, flush_partial_bundles=True)
+
+            self.assertEqual(submitted, [4])
+
     def test_run_slot_workers_recovers_terminal_worker_with_replacement_before_run_end(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -507,7 +659,7 @@ class TestScheduler(unittest.TestCase):
             self.assertEqual(batch.replacement_jobs, 1)
             self.assertLessEqual(batch.max_inflight_jobs, 2)
 
-    def test_run_slot_workers_does_not_double_count_inflight_workers_against_capacity(self) -> None:
+    def test_run_slot_workers_counts_local_submissions_against_capacity_until_observed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             slots = [
@@ -535,7 +687,7 @@ class TestScheduler(unittest.TestCase):
                 slots_per_job=1,
                 pending_buffer_per_account=3,
                 worker=_worker,
-                capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 7, 0, 6),
+                capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 7, 0, 3),
                 max_workers=10,
             )
             controller.enqueue_slots(slots)
@@ -546,6 +698,172 @@ class TestScheduler(unittest.TestCase):
                 controller.step(wait_for_progress=False)
 
             self.assertEqual(len(submitted_job_ids), 10)
+
+    def test_slot_worker_controller_does_not_oversubmit_when_remote_snapshot_stays_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            slots = [
+                SlotTaskRef(
+                    run_id="run_01",
+                    slot_id=f"w_{idx:04d}",
+                    input_path=root / f"in_{idx}.aedt",
+                    relative_path=Path(f"in_{idx}.aedt"),
+                    output_dir=root / f"out_{idx}.aedt_all",
+                )
+                for idx in range(1, 9)
+            ]
+            account = _Account(account_id="dw16", host_alias="h1", max_jobs=10)
+            submitted_job_ids: list[str] = []
+            release_event = threading.Event()
+
+            def _worker(bundle):
+                submitted_job_ids.append(bundle.job_id)
+                self.assertTrue(release_event.wait(timeout=2))
+                return bundle.job_id
+
+            controller = SlotWorkerController(
+                accounts=[account],
+                slots_per_job=1,
+                pending_buffer_per_account=3,
+                worker=_worker,
+                capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("dw16", "h1", 7, 0, 3),
+                max_workers=10,
+            )
+            controller.enqueue_slots(slots)
+            controller.step(wait_for_progress=False)
+            self.assertEqual(controller.snapshot().inflight_jobs, 3)
+            progressed = controller.step(wait_for_progress=False)
+            self.assertFalse(progressed)
+            self.assertEqual(controller.snapshot().inflight_jobs, 3)
+            release_event.set()
+            while controller.has_work():
+                controller.step(wait_for_progress=False)
+
+            self.assertEqual(len(submitted_job_ids), 8)
+
+    def test_run_slot_bundles_counts_local_submissions_against_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            slots = [
+                SlotTaskRef(
+                    run_id="run_01",
+                    slot_id=f"w_{idx:04d}",
+                    input_path=root / f"in_{idx}.aedt",
+                    relative_path=Path(f"in_{idx}.aedt"),
+                    output_dir=root / f"out_{idx}.aedt_all",
+                )
+                for idx in range(1, 7)
+            ]
+            account = _Account(account_id="a1", host_alias="h1", max_jobs=10)
+            release_event = threading.Event()
+            submitted_job_ids: list[str] = []
+
+            def _worker(bundle):
+                submitted_job_ids.append(bundle.job_id)
+                if len(submitted_job_ids) == 3:
+                    release_event.set()
+                elif len(submitted_job_ids) < 3:
+                    self.assertTrue(release_event.wait(timeout=2))
+                return bundle.job_id
+
+            batch = run_slot_bundles(
+                slot_queue=slots,
+                accounts=[account],
+                slots_per_job=1,
+                pending_buffer_per_account=3,
+                worker=_worker,
+                capacity_lookup=lambda **_kwargs: AccountCapacitySnapshot("a1", "h1", 7, 0, 3),
+                max_workers=10,
+            )
+
+            self.assertEqual(batch.max_inflight_jobs, 3)
+
+    def test_slot_worker_controller_rebalances_backlog_to_account_with_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            slots = [
+                SlotTaskRef(
+                    run_id="run_01",
+                    slot_id=f"w_{idx:04d}",
+                    input_path=root / f"in_{idx}.aedt",
+                    relative_path=Path(f"in_{idx}.aedt"),
+                    output_dir=root / f"out_{idx}.aedt_all",
+                )
+                for idx in range(1, 5)
+            ]
+            accounts = [
+                _Account(account_id="a1", host_alias="h1", max_jobs=10),
+                _Account(account_id="a2", host_alias="h2", max_jobs=10),
+            ]
+            submitted_accounts: list[str] = []
+
+            def _capacity_lookup(*, account, pending_buffer_per_account):
+                if account.account_id == "a1":
+                    return AccountCapacitySnapshot("a1", "h1", 10, 0, 0)
+                return AccountCapacitySnapshot("a2", "h2", 0, 0, 10)
+
+            controller = SlotWorkerController(
+                accounts=accounts,
+                slots_per_job=2,
+                pending_buffer_per_account=3,
+                worker=lambda bundle: submitted_accounts.append(bundle.account_id) or bundle.account_id,
+                capacity_lookup=_capacity_lookup,
+                max_workers=2,
+            )
+            controller.enqueue_slots(slots)
+            result = controller.finalize()
+
+            self.assertEqual(result.results, ["a2", "a2"])
+
+    def test_slot_worker_controller_rebalances_underfilled_capacity_across_multiple_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            slots = [
+                SlotTaskRef(
+                    run_id="run_01",
+                    slot_id=f"w_{idx:04d}",
+                    input_path=root / f"in_{idx}.aedt",
+                    relative_path=Path(f"in_{idx}.aedt"),
+                    output_dir=root / f"out_{idx}.aedt_all",
+                )
+                for idx in range(1, 13)
+            ]
+            accounts = [
+                _Account(account_id="blocked", host_alias="h1", max_jobs=10),
+                _Account(account_id="dhj02", host_alias="h2", max_jobs=10),
+                _Account(account_id="jji0930", host_alias="h3", max_jobs=10),
+            ]
+            submitted_accounts: list[str] = []
+
+            def _capacity_lookup(*, account, pending_buffer_per_account):
+                if account.account_id == "blocked":
+                    return AccountCapacitySnapshot("blocked", "h1", 10, 0, 0)
+                if account.account_id == "dhj02":
+                    return AccountCapacitySnapshot("dhj02", "h2", 3, 0, 3)
+                return AccountCapacitySnapshot("jji0930", "h3", 2, 0, 4)
+
+            controller = SlotWorkerController(
+                accounts=accounts,
+                slots_per_job=2,
+                pending_buffer_per_account=3,
+                worker=lambda bundle: submitted_accounts.append(bundle.account_id) or bundle.account_id,
+                capacity_lookup=_capacity_lookup,
+                max_workers=4,
+            )
+            controller.enqueue_slots(slots)
+            result = controller.finalize()
+
+            self.assertEqual(len(result.results), 6)
+            self.assertNotIn("blocked", submitted_accounts)
+            self.assertIn("dhj02", submitted_accounts)
+            self.assertIn("jji0930", submitted_accounts)
+
+    def test_local_capacity_lookup_respects_account_max_jobs_only(self) -> None:
+        from peetsfea_runner.pipeline import _local_capacity_lookup
+
+        account = _Account(account_id="a1", host_alias="h1", max_jobs=10)
+        snapshot = _local_capacity_lookup(account=account, pending_buffer_per_account=3)
+        self.assertEqual(snapshot.allowed_submit, 10)
 
     def test_slot_worker_controller_does_not_submit_when_capacity_is_full(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

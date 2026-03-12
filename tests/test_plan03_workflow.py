@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import tempfile
+import subprocess
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from peetsfea_runner.constants import EXIT_CODE_DOWNLOAD_FAILURE, EXIT_CODE_REMOTE_CLEANUP_FAILURE
@@ -22,8 +25,18 @@ from peetsfea_runner.pipeline import (
 )
 from peetsfea_runner.remote_job import _categorize_failure, _resolve_remote_path
 from peetsfea_runner.remote_job import (
+    SlotInput,
+    WorkflowError,
+    _build_worker_payload_script_content,
+    _build_remote_sbatch_script_content,
     _build_windows_remote_dispatch_script_content,
     _build_windows_remote_job_script_content,
+    _parse_sbatch_job_id,
+    _parse_squeue_state_line,
+    _read_remote_optional_text_file,
+    _wait_for_remote_sbatch_completion,
+    query_slurm_job_state,
+    run_remote_job_attempt,
 )
 
 
@@ -43,10 +56,20 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("\"$VENV_DIR/bin/python\" run_sim.py", content)
         self.assertIn("os.environ['TMPDIR'] = str(tmpdir)", content)
         self.assertIn("hfss.solve_in_batch(file_name='./project.aedt', cores=cores, tasks=tasks)", content)
+        self.assertIn("EMIT_OUTPUT_VARIABLES_CSV: bool = True", content)
+        self.assertIn("OUTPUT_VARIABLES_CSV_NAME: str = 'output_variables.csv'", content)
+        self.assertIn("def extract_output_variables_csv(hfss: Hfss, workdir: Path, project_file: Path) -> None:", content)
+        self.assertIn("write_output_variables_csv(workdir, row)", content)
+        self.assertIn("(workdir / OUTPUT_VARIABLES_ERROR_LOG_NAME).write_text(str(exc), encoding='utf-8')", content)
         self.assertNotIn("cores=[cores]", content)
         self.assertNotIn("tasks=[tasks]", content)
         self.assertIn('if [ -e "$MINICONDA_DIR" ]; then', content)
         self.assertIn('rm -rf "$MINICONDA_DIR"', content)
+
+    def test_remote_script_can_disable_output_variables_csv_export(self) -> None:
+        content = _build_remote_job_script_content(emit_output_variables_csv=False)
+        self.assertIn("EMIT_OUTPUT_VARIABLES_CSV: bool = False", content)
+        self.assertIn("if not EMIT_OUTPUT_VARIABLES_CSV:", content)
 
     def test_remote_dispatch_script_uses_noninteractive_srun_without_screen(self) -> None:
         class _Cfg:
@@ -69,12 +92,44 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertNotIn("srun --pty", content)
         self.assertIn("__PEETS_FAILED_COUNT__", content)
         self.assertIn("max_parallel=4", content)
+        self.assertIn("export REMOTE_JOB_DIR", content)
         self.assertIn("wait -n || true", content)
         self.assertIn("if PEETS_SLOT_CORES=4 PEETS_SLOT_TASKS=1 bash ../remote_job.sh > run.log 2>&1; then", content)
         self.assertIn("echo \"$rc\" > exit.code", content)
         self.assertIn("archive_path=$(mktemp /tmp/peetsfea-results.", content)
         self.assertIn('tar -czf "$archive_path" case_* case_summary.txt failed.count', content)
         self.assertNotIn("tar --exclude='.venv' --exclude='results.tgz' --exclude='.env_initialized' -czf results.tgz .", content)
+
+    def test_worker_payload_can_refill_pool_with_prefetched_cases(self) -> None:
+        class _Cfg:
+            slots_per_job = 4
+            cores_per_slot = 4
+            control_plane_host = "127.0.0.1"
+            control_plane_port = 8765
+            control_plane_ssh_target = "harrypc"
+            tunnel_recovery_grace_seconds = 30
+
+        content = _build_worker_payload_script_content(
+            config=_Cfg(),
+            case_count=8,
+            run_id="run_01",
+            worker_id="attempt_0001",
+        )
+        self.assertIn("max_parallel=4", content)
+        self.assertIn("for i in $(seq 1 8); do", content)
+        self.assertIn("wait -n || true", content)
+        self.assertIn("ssh -M -S \"$PEETS_TUNNEL_SOCKET\" -fnNT", content)
+        self.assertIn("if [ -n \"${REMOTE_JOB_DIR:-}\" ]; then", content)
+        self.assertIn("rm -rf \"$REMOTE_JOB_DIR\" >/dev/null 2>&1 || true", content)
+        self.assertIn("find . -maxdepth 1 -name '*.lock' -type f -delete", content)
+        self.assertIn("rm -rf tmp >/dev/null 2>&1 || true", content)
+        self.assertIn("/internal/workers/register", content)
+        self.assertIn("/internal/workers/heartbeat", content)
+        self.assertIn("/internal/resources/node", content)
+        self.assertIn("/internal/resources/worker", content)
+        self.assertIn("/internal/resources/slot", content)
+        self.assertIn("PEETS_CONTROL_WORKER_ID=attempt_0001", content)
+        self.assertIn("PEETS_CONTROL_RUN_ID=run_01", content)
 
     def test_windows_remote_scripts_use_powershell_without_slurm(self) -> None:
         class _Cfg:
@@ -103,6 +158,181 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertNotIn("bash -lc", dispatch_content)
         self.assertIn("remote_job.ps1", dispatch_content)
         self.assertIn("__PEETS_RESULTS_TGZ_BEGIN__", dispatch_content)
+
+    def test_remote_sbatch_script_contains_worker_job_submission_shape(self) -> None:
+        class _Cfg:
+            host = "gate1-harry"
+            partition = "cpu2"
+            nodes = 1
+            ntasks = 1
+            cpus_per_job = 16
+            mem = "960G"
+            time_limit = "05:00:00"
+            slots_per_job = 4
+            cores_per_slot = 4
+            platform = "linux"
+            scheduler = "slurm"
+            remote_execution_backend = "slurm_batch"
+            control_plane_host = "127.0.0.1"
+            control_plane_port = 8765
+            control_plane_ssh_target = "harrypc"
+            tunnel_recovery_grace_seconds = 30
+
+        content = _build_remote_sbatch_script_content(
+            config=_Cfg(),
+            remote_job_dir="/tmp/peetsfea/run_01/job_0001",
+            run_id="run_01",
+            worker_id="attempt_0001",
+        )
+        self.assertTrue(content.startswith("#!/bin/bash\n"))
+        self.assertIn("#SBATCH -p cpu2", content)
+        self.assertIn("#SBATCH -c 16", content)
+        self.assertIn("#SBATCH -o slurm-%j.out", content)
+        self.assertIn("#SBATCH -e slurm-%j.err", content)
+        self.assertIn('cd "$REMOTE_JOB_DIR"', content)
+        self.assertIn("export REMOTE_JOB_DIR", content)
+        self.assertIn("/bin/bash ./remote_worker_payload.sh > worker.stdout 2> worker.stderr", content)
+        self.assertNotIn("screen -dmS", content)
+        self.assertIn("export PEETS_CONTROL_RUN_ID=run_01", content)
+        self.assertIn("export PEETS_CONTROL_WORKER_ID=attempt_0001", content)
+        self.assertIn("export PEETS_CONTROL_SSH_TARGET=harrypc", content)
+
+    def test_parse_sbatch_job_id_accepts_parsable_output(self) -> None:
+        self.assertEqual(_parse_sbatch_job_id("552740\n"), "552740")
+        self.assertEqual(_parse_sbatch_job_id("552741;cpu2\n"), "552741")
+
+    def test_parse_squeue_state_line_handles_node_and_missing_separator(self) -> None:
+        self.assertEqual(_parse_squeue_state_line("RUNNING|n115"), ("RUNNING", "n115"))
+        self.assertEqual(_parse_squeue_state_line("PENDING"), ("PENDING", ""))
+
+    def test_query_slurm_job_state_prefers_squeue_and_falls_back_to_sacct(self) -> None:
+        class _Cfg:
+            host = "gate1-harry"
+
+        with patch(
+            "peetsfea_runner.remote_job._run_completed_process_capture",
+            side_effect=[
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="RUNNING|n115\n", stderr=""),
+            ],
+        ):
+            self.assertEqual(query_slurm_job_state(_Cfg(), slurm_job_id="552740"), ("RUNNING", "n115"))
+
+        with patch(
+            "peetsfea_runner.remote_job._run_completed_process_capture",
+            side_effect=[
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="552740|COMPLETED|n115\n", stderr=""),
+            ],
+        ):
+            self.assertEqual(query_slurm_job_state(_Cfg(), slurm_job_id="552740"), ("COMPLETED", "n115"))
+
+    def test_sbatch_failure_keeps_submitted_slurm_job_id_in_attempt_result(self) -> None:
+        class _Cfg:
+            host = "gate1-harry"
+            partition = "cpu2"
+            nodes = 1
+            ntasks = 1
+            cpus_per_job = 16
+            mem = "960G"
+            time_limit = "05:00:00"
+            slots_per_job = 4
+            cores_per_slot = 4
+            platform = "linux"
+            scheduler = "slurm"
+            remote_execution_backend = "slurm_batch"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "sample.aedt"
+            input_path.write_text("placeholder", encoding="utf-8")
+            local_job_dir = Path(tmpdir) / "out"
+            local_job_dir.mkdir(parents=True, exist_ok=True)
+
+            with (
+                patch("peetsfea_runner.remote_job._prepare_remote_workspace"),
+                patch("peetsfea_runner.remote_job._upload_supporting_files"),
+                patch("peetsfea_runner.remote_job._cleanup_remote_workspace") as cleanup_mock,
+                patch("peetsfea_runner.remote_job._extract_local_results_archive"),
+                patch("peetsfea_runner.remote_job._submit_remote_workflow_sbatch", return_value="552818"),
+                patch(
+                    "peetsfea_runner.remote_job._wait_for_remote_sbatch_completion",
+                    side_effect=WorkflowError(
+                        "worker failed",
+                        exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+                        stdout="stdout",
+                        stderr="stderr",
+                    ),
+                ),
+            ):
+                result = run_remote_job_attempt(
+                    config=_Cfg(),
+                    slot_inputs=[SlotInput(slot_id="slot_0001", input_path=input_path)],
+                    remote_job_dir="/tmp/peetsfea/run_01/job_0001/a1",
+                    local_job_dir=local_job_dir,
+                    session_name="s",
+                )
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.slurm_job_id, "552818")
+            cleanup_mock.assert_called()
+
+    def test_read_remote_optional_text_file_falls_back_to_slurm_output(self) -> None:
+        class _Cfg:
+            host = "gate1-harry"
+
+        with patch(
+            "peetsfea_runner.remote_job._run_completed_process",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="fallback markers", stderr=""),
+        ) as mocked_run:
+            output = _read_remote_optional_text_file(
+                config=_Cfg(),
+                remote_path="/tmp/peetsfea/run_01/job_0001",
+                filenames=("worker.stdout", "slurm-552818.out"),
+                stage="worker stdout",
+            )
+
+        self.assertEqual(output, "fallback markers")
+        command = mocked_run.call_args.args[0]
+        self.assertIn("if [ -f worker.stdout ]; then cat worker.stdout;", command[2])
+        self.assertIn("elif [ -f slurm-552818.out ]; then cat slurm-552818.out;", command[2])
+
+    def test_wait_for_remote_sbatch_completion_uses_slurm_output_when_worker_stdout_missing(self) -> None:
+        class _Cfg:
+            host = "gate1-harry"
+            time_limit = "00:05:00"
+
+        combined_output = (
+            "__PEETS_FAILED_COUNT__:0\n"
+            "__PEETS_CASE_SUMMARY_BEGIN__\n"
+            "case_01:0\n"
+            "__PEETS_CASE_SUMMARY_END__\n"
+            "__PEETS_RESULTS_TGZ_BEGIN__\n"
+            "Zm9v\n"
+            "__PEETS_RESULTS_TGZ_END__\n"
+        )
+        with (
+            patch(
+                "peetsfea_runner.remote_job.query_slurm_job_state",
+                return_value=("COMPLETED", "n115"),
+            ),
+            patch(
+                "peetsfea_runner.remote_job._read_remote_optional_text_file",
+                side_effect=[combined_output, ""],
+            ) as mocked_read,
+        ):
+            stdout, stderr, observed_node, state = _wait_for_remote_sbatch_completion(
+                _Cfg(),
+                remote_job_dir="/tmp/peetsfea/run_01/job_0001",
+                slurm_job_id="552818",
+            )
+
+        self.assertEqual(stdout, combined_output)
+        self.assertEqual(stderr, "")
+        self.assertEqual(observed_node, "n115")
+        self.assertEqual(state, "COMPLETED")
+        first_call = mocked_read.call_args_list[0].kwargs
+        self.assertEqual(first_call["filenames"], ("worker.stdout", "slurm-552818.out"))
+        second_call = mocked_read.call_args_list[1].kwargs
+        self.assertEqual(second_call["filenames"], ("worker.stderr", "slurm-552818.err"))
 
     def test_retry_calls_action_again(self) -> None:
         calls = {"count": 0}
@@ -235,6 +465,22 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertEqual(
             resolved,
             "/tmp/dhj02/peetsfea-runner/20260306_115056/account_02/job_0011/a2",
+        )
+
+    def test_slurm_batch_tmp_remote_root_is_promoted_to_shared_home_path(self) -> None:
+        class _Cfg:
+            host = "gate1-dhj02"
+            scheduler = "slurm"
+            remote_execution_backend = "slurm_batch"
+
+        with patch("peetsfea_runner.remote_job._get_remote_home", return_value="/home/dhj02"):
+            resolved = _resolve_remote_path(
+                config=_Cfg(),
+                path="/tmp/peetsfea-runner/20260306_115056/account_02/job_0011/a2",
+            )
+        self.assertEqual(
+            resolved,
+            "/home/dhj02/aedt_runs/20260306_115056/account_02/job_0011/a2",
         )
 
 

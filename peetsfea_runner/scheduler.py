@@ -89,6 +89,10 @@ class AccountReadinessSnapshot:
     ansys_ok: bool
     uv_ok: bool = False
     pyaedt_ok: bool = False
+    storage_ready: bool = True
+    storage_reason: str = "ok"
+    inode_use_percent: int | None = None
+    free_mb: int | None = None
 
 
 @dataclass(slots=True)
@@ -115,6 +119,48 @@ PENDING_STATES = frozenset({"PD", "PENDING"})
 _READINESS_MARKER = "__PEETSFEA_READY__:"
 _PREFLIGHT_MARKER = "__PEETSFEA_PREFLIGHT__:"
 _BOOTSTRAP_MARKER = "__PEETSFEA_BOOTSTRAP__:ok"
+
+
+def _parse_marker_values(*, marker_line: str, marker_prefix: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for chunk in marker_line[len(marker_prefix) :].split():
+        if "=" not in chunk:
+            continue
+        key, raw_value = chunk.split("=", 1)
+        values[key.strip()] = raw_value.strip()
+    return values
+
+
+def _storage_snapshot_from_values(
+    *,
+    values: dict[str, str],
+    remote_storage_inode_block_percent: int,
+    remote_storage_min_free_mb: int,
+) -> tuple[bool, str, int | None, int | None]:
+    raw_inode = values.get("inode_pct", "")
+    raw_free_mb = values.get("free_mb", "")
+    fs_type = values.get("fs_type", "").strip().lower()
+    try:
+        inode_use_percent = int(raw_inode) if raw_inode else None
+    except ValueError:
+        inode_use_percent = None
+    try:
+        free_mb = int(raw_free_mb) if raw_free_mb else None
+    except ValueError:
+        free_mb = None
+
+    reasons: list[str] = []
+    inode_guard_enabled = fs_type not in {"gpfs"}
+    if inode_guard_enabled and remote_storage_inode_block_percent > 0 and inode_use_percent is not None:
+        if inode_use_percent >= remote_storage_inode_block_percent:
+            reasons.append(f"inode_pct={inode_use_percent}")
+    if remote_storage_min_free_mb > 0 and free_mb is not None:
+        if free_mb < remote_storage_min_free_mb:
+            reasons.append(f"free_mb={free_mb}")
+
+    if reasons:
+        return False, ",".join(reasons), inode_use_percent, free_mb
+    return True, "ok", inode_use_percent, free_mb
 
 
 def _account_platform(account: AccountConfigLike) -> str:
@@ -214,9 +260,8 @@ def query_account_capacity(
         raise RuntimeError(f"capacity query failed account={account.account_id}: {details}")
 
     running_count, pending_count, _ = parse_squeue_state_counts(stdout.splitlines())
-    allow_running = max(0, account.max_jobs - running_count)
-    allow_pending = max(0, pending_buffer_per_account - pending_count)
-    allowed_submit = allow_running + allow_pending
+    visible_occupied = max(0, running_count) + max(0, pending_count)
+    allowed_submit = max(0, account.max_jobs - visible_occupied)
     return AccountCapacitySnapshot(
         account_id=account.account_id,
         host_alias=account.host_alias,
@@ -226,17 +271,19 @@ def query_account_capacity(
     )
 
 
-def _parse_readiness_marker(*, account: AccountConfigLike, text: str) -> AccountReadinessSnapshot:
+def _parse_readiness_marker(
+    *,
+    account: AccountConfigLike,
+    text: str,
+    remote_storage_inode_block_percent: int = 98,
+    remote_storage_min_free_mb: int = 0,
+) -> AccountReadinessSnapshot:
     marker_line = next((line.strip() for line in text.splitlines() if line.strip().startswith(_READINESS_MARKER)), None)
     if marker_line is None:
         raise RuntimeError(f"readiness check failed account={account.account_id}: missing readiness marker")
 
-    values: dict[str, bool] = {}
-    for chunk in marker_line[len(_READINESS_MARKER) :].split():
-        if "=" not in chunk:
-            continue
-        key, raw_value = chunk.split("=", 1)
-        values[key.strip()] = raw_value.strip() == "1"
+    raw_values = _parse_marker_values(marker_line=marker_line, marker_prefix=_READINESS_MARKER)
+    values = {key: raw_value == "1" for key, raw_value in raw_values.items()}
 
     home_ok = values.get("home", False)
     runtime_path_ok = values.get("runtime", False)
@@ -245,6 +292,11 @@ def _parse_readiness_marker(*, account: AccountConfigLike, text: str) -> Account
     module_ok = values.get("module", False)
     binaries_ok = values.get("binaries", False)
     ansys_ok = values.get("ansys", False)
+    storage_ready, storage_reason, inode_use_percent, free_mb = _storage_snapshot_from_values(
+        values=raw_values,
+        remote_storage_inode_block_percent=remote_storage_inode_block_percent,
+        remote_storage_min_free_mb=remote_storage_min_free_mb,
+    )
     bootstrap_needed = not runtime_path_ok or not venv_ok or not python_ok or not binaries_ok
     hard_blocked = not home_ok or not module_ok or not ansys_ok
     failed_checks = [
@@ -260,8 +312,11 @@ def _parse_readiness_marker(*, account: AccountConfigLike, text: str) -> Account
         )
         if not check_ok
     ]
-    ready = not failed_checks
-    if ready:
+    ready = not failed_checks and storage_ready
+    if not storage_ready:
+        status = "BLOCKED_STORAGE"
+        reason = storage_reason
+    elif ready:
         status = "READY"
         reason = "ok"
     elif bootstrap_needed and not hard_blocked:
@@ -283,6 +338,10 @@ def _parse_readiness_marker(*, account: AccountConfigLike, text: str) -> Account
         module_ok=module_ok,
         binaries_ok=binaries_ok,
         ansys_ok=ansys_ok,
+        storage_ready=storage_ready,
+        storage_reason=storage_reason,
+        inode_use_percent=inode_use_percent,
+        free_mb=free_mb,
     )
 
 
@@ -300,9 +359,13 @@ $VenvOk = [int](Test-Path (Join-Path $VenvDir 'Scripts\python.exe'))
 $PythonOk = [int](Test-Path $CondaPython)
 $BinariesOk = [int]($RuntimeOk -and $VenvOk -and $PythonOk)
 $AnsysOk = 0
+$StorageOk = 1
+$InodePct = 0
+$FreeMb = 0
+$FsType = 'windows'
 if (Get-Command ansysedt.exe -ErrorAction SilentlyContinue) { $AnsysOk = 1 }
 elseif (Test-Path 'C:\Program Files\ANSYS Inc') { $AnsysOk = 1 }
-Write-Output ('__PEETSFEA_READY__:home={0} runtime={1} venv={2} python={3} module={4} binaries={5} ansys={6}' -f $HomeOk,$RuntimeOk,$VenvOk,$PythonOk,$ModuleOk,$BinariesOk,$AnsysOk)
+Write-Output ('__PEETSFEA_READY__:home={0} runtime={1} venv={2} python={3} module={4} binaries={5} ansys={6} storage={7} inode_pct={8} free_mb={9} fs_type={10}' -f $HomeOk,$RuntimeOk,$VenvOk,$PythonOk,$ModuleOk,$BinariesOk,$AnsysOk,$StorageOk,$InodePct,$FreeMb,$FsType)
 """
 
 
@@ -321,6 +384,10 @@ $VenvOk = [int](Test-Path $VenvPython)
 $PythonOk = [int](Test-Path $CondaPython)
 $BinariesOk = [int]($RuntimeOk -and $VenvOk -and $PythonOk)
 $AnsysOk = 0
+$StorageOk = 1
+$InodePct = 0
+$FreeMb = 0
+$FsType = 'windows'
 if (Get-Command ansysedt.exe -ErrorAction SilentlyContinue) { $AnsysOk = 1 }
 elseif (Test-Path 'C:\Program Files\ANSYS Inc') { $AnsysOk = 1 }
 $UvOk = 0
@@ -333,7 +400,7 @@ if ($VenvOk) {
   & $VenvPython -c "import ansys.aedt.core" *> $null
   if ($LASTEXITCODE -eq 0) { $PyaedtOk = 1 }
 }
-Write-Output ('__PEETSFEA_PREFLIGHT__:home={0} runtime={1} venv={2} python={3} module={4} binaries={5} ansys={6} uv={7} pyaedt={8}' -f $HomeOk,$RuntimeOk,$VenvOk,$PythonOk,$ModuleOk,$BinariesOk,$AnsysOk,$UvOk,$PyaedtOk)
+Write-Output ('__PEETSFEA_PREFLIGHT__:home={0} runtime={1} venv={2} python={3} module={4} binaries={5} ansys={6} uv={7} pyaedt={8} storage={9} inode_pct={10} free_mb={11} fs_type={12}' -f $HomeOk,$RuntimeOk,$VenvOk,$PythonOk,$ModuleOk,$BinariesOk,$AnsysOk,$UvOk,$PyaedtOk,$StorageOk,$InodePct,$FreeMb,$FsType)
 """
 
 
@@ -379,6 +446,8 @@ def _query_windows_account_readiness(
     run_command: Callable[[list[str]], tuple[int, str, str]] | None,
     ssh_connect_timeout_seconds: int,
     command_timeout_seconds: int,
+    remote_storage_inode_block_percent: int,
+    remote_storage_min_free_mb: int,
 ) -> AccountReadinessSnapshot:
     return_code, stdout, stderr = _run_windows_ssh_script(
         account=account,
@@ -390,7 +459,12 @@ def _query_windows_account_readiness(
     )
     combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
     if combined_output:
-        snapshot = _parse_readiness_marker(account=account, text=combined_output)
+        snapshot = _parse_readiness_marker(
+            account=account,
+            text=combined_output,
+            remote_storage_inode_block_percent=remote_storage_inode_block_percent,
+            remote_storage_min_free_mb=remote_storage_min_free_mb,
+        )
         if return_code != 0 and snapshot.ready:
             raise RuntimeError(
                 f"readiness check failed account={account.account_id}: "
@@ -407,6 +481,8 @@ def _query_windows_account_preflight(
     run_command: Callable[[list[str]], tuple[int, str, str]] | None,
     ssh_connect_timeout_seconds: int,
     command_timeout_seconds: int,
+    remote_storage_inode_block_percent: int,
+    remote_storage_min_free_mb: int,
 ) -> AccountReadinessSnapshot:
     return_code, stdout, stderr = _run_windows_ssh_script(
         account=account,
@@ -418,7 +494,12 @@ def _query_windows_account_preflight(
     )
     combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
     if combined_output:
-        snapshot = _parse_preflight_marker(account=account, text=combined_output)
+        snapshot = _parse_preflight_marker(
+            account=account,
+            text=combined_output,
+            remote_storage_inode_block_percent=remote_storage_inode_block_percent,
+            remote_storage_min_free_mb=remote_storage_min_free_mb,
+        )
         if return_code != 0 and snapshot.ready:
             raise RuntimeError(
                 f"preflight check failed account={account.account_id}: "
@@ -435,6 +516,8 @@ def query_account_readiness(
     run_command: Callable[[list[str]], tuple[int, str, str]] | None = None,
     ssh_connect_timeout_seconds: int = 5,
     command_timeout_seconds: int = 12,
+    remote_storage_inode_block_percent: int = 98,
+    remote_storage_min_free_mb: int = 0,
 ) -> AccountReadinessSnapshot:
     if (_account_platform(account), _account_scheduler(account)) == ("windows", "none"):
         return _query_windows_account_readiness(
@@ -442,6 +525,8 @@ def query_account_readiness(
             run_command=run_command,
             ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
             command_timeout_seconds=command_timeout_seconds,
+            remote_storage_inode_block_percent=remote_storage_inode_block_percent,
+            remote_storage_min_free_mb=remote_storage_min_free_mb,
         )
     if (_account_platform(account), _account_scheduler(account)) != ("linux", "slurm"):
         raise RuntimeError(
@@ -484,7 +569,11 @@ fi
 if command -v ansysedt >/dev/null 2>&1 || command -v ansysedtsv >/dev/null 2>&1 || command -v electronicsdesktop >/dev/null 2>&1; then
   ANSYS_OK=1
 fi
-printf '__PEETSFEA_READY__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK"
+STORAGE_OK=1
+INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5+0}' || echo 0)
+FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {print $4+0}' || echo 0)
+FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
+printf '__PEETSFEA_READY__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE"
 """
     command = [
         "ssh",
@@ -517,7 +606,12 @@ printf '__PEETSFEA_READY__:home=%s runtime=%s venv=%s python=%s module=%s binari
 
     combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
     if combined_output:
-        snapshot = _parse_readiness_marker(account=account, text=combined_output)
+        snapshot = _parse_readiness_marker(
+            account=account,
+            text=combined_output,
+            remote_storage_inode_block_percent=remote_storage_inode_block_percent,
+            remote_storage_min_free_mb=remote_storage_min_free_mb,
+        )
         if return_code != 0 and snapshot.ready:
             raise RuntimeError(
                 f"readiness check failed account={account.account_id}: "
@@ -531,17 +625,19 @@ printf '__PEETSFEA_READY__:home=%s runtime=%s venv=%s python=%s module=%s binari
     raise RuntimeError(f"readiness check failed account={account.account_id}: {details}")
 
 
-def _parse_preflight_marker(*, account: AccountConfigLike, text: str) -> AccountReadinessSnapshot:
+def _parse_preflight_marker(
+    *,
+    account: AccountConfigLike,
+    text: str,
+    remote_storage_inode_block_percent: int = 98,
+    remote_storage_min_free_mb: int = 0,
+) -> AccountReadinessSnapshot:
     marker_line = next((line.strip() for line in text.splitlines() if line.strip().startswith(_PREFLIGHT_MARKER)), None)
     if marker_line is None:
         raise RuntimeError(f"preflight check failed account={account.account_id}: missing preflight marker")
 
-    values: dict[str, bool] = {}
-    for chunk in marker_line[len(_PREFLIGHT_MARKER) :].split():
-        if "=" not in chunk:
-            continue
-        key, raw_value = chunk.split("=", 1)
-        values[key.strip()] = raw_value.strip() == "1"
+    raw_values = _parse_marker_values(marker_line=marker_line, marker_prefix=_PREFLIGHT_MARKER)
+    values = {key: raw_value == "1" for key, raw_value in raw_values.items()}
 
     home_ok = values.get("home", False)
     runtime_path_ok = values.get("runtime", False)
@@ -552,6 +648,11 @@ def _parse_preflight_marker(*, account: AccountConfigLike, text: str) -> Account
     ansys_ok = values.get("ansys", False)
     uv_ok = values.get("uv", False)
     pyaedt_ok = values.get("pyaedt", False)
+    storage_ready, storage_reason, inode_use_percent, free_mb = _storage_snapshot_from_values(
+        values=raw_values,
+        remote_storage_inode_block_percent=remote_storage_inode_block_percent,
+        remote_storage_min_free_mb=remote_storage_min_free_mb,
+    )
     failed_checks = [
         check_name
         for check_name, check_ok in (
@@ -567,13 +668,13 @@ def _parse_preflight_marker(*, account: AccountConfigLike, text: str) -> Account
         )
         if not check_ok
     ]
-    ready = not failed_checks
+    ready = not failed_checks and storage_ready
     return AccountReadinessSnapshot(
         account_id=account.account_id,
         host_alias=account.host_alias,
         ready=ready,
-        status="READY" if ready else "PREFLIGHT_FAILED",
-        reason="ok" if ready else ",".join(failed_checks),
+        status="READY" if ready else ("BLOCKED_STORAGE" if not storage_ready else "PREFLIGHT_FAILED"),
+        reason="ok" if ready else (storage_reason if not storage_ready else ",".join(failed_checks)),
         home_ok=home_ok,
         runtime_path_ok=runtime_path_ok,
         venv_ok=venv_ok,
@@ -583,6 +684,10 @@ def _parse_preflight_marker(*, account: AccountConfigLike, text: str) -> Account
         ansys_ok=ansys_ok,
         uv_ok=uv_ok,
         pyaedt_ok=pyaedt_ok,
+        storage_ready=storage_ready,
+        storage_reason=storage_reason,
+        inode_use_percent=inode_use_percent,
+        free_mb=free_mb,
     )
 
 
@@ -592,6 +697,8 @@ def query_account_preflight(
     run_command: Callable[[list[str]], tuple[int, str, str]] | None = None,
     ssh_connect_timeout_seconds: int = 5,
     command_timeout_seconds: int = 20,
+    remote_storage_inode_block_percent: int = 98,
+    remote_storage_min_free_mb: int = 0,
 ) -> AccountReadinessSnapshot:
     if (_account_platform(account), _account_scheduler(account)) == ("windows", "none"):
         return _query_windows_account_preflight(
@@ -599,6 +706,8 @@ def query_account_preflight(
             run_command=run_command,
             ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
             command_timeout_seconds=command_timeout_seconds,
+            remote_storage_inode_block_percent=remote_storage_inode_block_percent,
+            remote_storage_min_free_mb=remote_storage_min_free_mb,
         )
     if (_account_platform(account), _account_scheduler(account)) != ("linux", "slurm"):
         raise RuntimeError(
@@ -650,7 +759,11 @@ fi
 if [ "$PYTHON_OK" -eq 1 ] && "$VENV_DIR/bin/python" -c "import ansys.aedt.core" >/dev/null 2>&1; then
   PYAEDT_OK=1
 fi
-printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK"
+STORAGE_OK=1
+INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5+0}' || echo 0)
+FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {print $4+0}' || echo 0)
+FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
+printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE"
 """
     command = [
         "ssh",
@@ -683,7 +796,12 @@ printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s venv=%s python=%s module=%s bi
 
     combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
     if combined_output:
-        snapshot = _parse_preflight_marker(account=account, text=combined_output)
+        snapshot = _parse_preflight_marker(
+            account=account,
+            text=combined_output,
+            remote_storage_inode_block_percent=remote_storage_inode_block_percent,
+            remote_storage_min_free_mb=remote_storage_min_free_mb,
+        )
         if return_code != 0 and snapshot.ready:
             raise RuntimeError(
                 f"preflight check failed account={account.account_id}: "
@@ -926,6 +1044,7 @@ def run_slot_bundles(
     slot_queue: list[SlotTaskRef],
     accounts: list[AccountConfigLike],
     slots_per_job: int,
+    bundle_slot_limit: int | None = None,
     pending_buffer_per_account: int,
     worker: Callable[[BundleSpec], T],
     capacity_lookup: Callable[..., AccountCapacitySnapshot] = query_account_capacity,
@@ -939,6 +1058,11 @@ def run_slot_bundles(
 ) -> BalancedBatchResult[T]:
     if slots_per_job <= 0:
         raise ValueError("slots_per_job must be > 0")
+    resolved_bundle_slot_limit = slots_per_job if bundle_slot_limit is None else bundle_slot_limit
+    if resolved_bundle_slot_limit <= 0:
+        raise ValueError("bundle_slot_limit must be > 0")
+    if resolved_bundle_slot_limit < slots_per_job:
+        raise ValueError("bundle_slot_limit must be >= slots_per_job")
     if pending_buffer_per_account < 0:
         raise ValueError("pending_buffer_per_account must be >= 0")
     if idle_sleep_seconds <= 0:
@@ -951,6 +1075,7 @@ def run_slot_bundles(
     queue = deque(slot_queue)
     completed_slots: dict[str, int] = dict(initial_completed_slots or {})
     inflight_slots: dict[str, int] = {}
+    inflight_jobs: dict[str, int] = {}
     results: list[T] = []
     max_inflight_jobs = 0
     submitted_jobs = 0
@@ -972,6 +1097,7 @@ def run_slot_bundles(
                     results.append(future.result())
                 finally:
                     inflight_slots[account_id] = max(0, inflight_slots.get(account_id, 0) - slot_count)
+                    inflight_jobs[account_id] = max(0, inflight_jobs.get(account_id, 0) - 1)
                     completed_slots[account_id] = completed_slots.get(account_id, 0) + slot_count
 
             if not queue:
@@ -995,8 +1121,19 @@ def run_slot_bundles(
                 if on_capacity_snapshot is not None:
                     on_capacity_snapshot(snapshot)
 
+            effective_snapshots = [
+                AccountCapacitySnapshot(
+                    account_id=snapshot.account_id,
+                    host_alias=snapshot.host_alias,
+                    running_count=snapshot.running_count,
+                    pending_count=snapshot.pending_count,
+                    allowed_submit=max(0, snapshot.allowed_submit - inflight_jobs.get(snapshot.account_id, 0)),
+                )
+                for snapshot in snapshots
+            ]
+
             selected = pick_balanced_account(
-                capacities=snapshots,
+                capacities=effective_snapshots,
                 completed_slots_by_account=completed_slots,
                 inflight_slots_by_account=inflight_slots,
             )
@@ -1007,7 +1144,7 @@ def run_slot_bundles(
                 raise RuntimeError("No eligible account available for bundle submission.")
 
             bundle_inputs: list[SlotTaskRef] = []
-            while queue and len(bundle_inputs) < slots_per_job:
+            while queue and len(bundle_inputs) < resolved_bundle_slot_limit:
                 bundle_inputs.append(queue.popleft())
             if not bundle_inputs:
                 continue
@@ -1025,6 +1162,7 @@ def run_slot_bundles(
             future = executor.submit(worker, bundle)
             inflight_futures[future] = (selected.account_id, len(bundle_inputs))
             inflight_slots[selected.account_id] = inflight_slots.get(selected.account_id, 0) + len(bundle_inputs)
+            inflight_jobs[selected.account_id] = inflight_jobs.get(selected.account_id, 0) + 1
             submitted_jobs += 1
             max_inflight_jobs = max(max_inflight_jobs, len(inflight_futures))
             if on_bundle_submitted is not None:
@@ -1047,6 +1185,7 @@ class SlotWorkerController(Generic[T]):
         *,
         accounts: list[AccountConfigLike],
         slots_per_job: int,
+        bundle_slot_limit: int | None = None,
         pending_buffer_per_account: int,
         worker: Callable[[BundleSpec], T],
         capacity_lookup: Callable[..., AccountCapacitySnapshot] = query_account_capacity,
@@ -1062,6 +1201,11 @@ class SlotWorkerController(Generic[T]):
     ) -> None:
         if slots_per_job <= 0:
             raise ValueError("slots_per_job must be > 0")
+        resolved_bundle_slot_limit = slots_per_job if bundle_slot_limit is None else bundle_slot_limit
+        if resolved_bundle_slot_limit <= 0:
+            raise ValueError("bundle_slot_limit must be > 0")
+        if resolved_bundle_slot_limit < slots_per_job:
+            raise ValueError("bundle_slot_limit must be >= slots_per_job")
         if pending_buffer_per_account < 0:
             raise ValueError("pending_buffer_per_account must be >= 0")
         if idle_sleep_seconds <= 0:
@@ -1073,6 +1217,7 @@ class SlotWorkerController(Generic[T]):
 
         self._accounts = list(accounts)
         self._slots_per_job = slots_per_job
+        self._bundle_slot_limit = resolved_bundle_slot_limit
         self._pending_buffer_per_account = pending_buffer_per_account
         self._worker = worker
         self._capacity_lookup = capacity_lookup
@@ -1085,20 +1230,15 @@ class SlotWorkerController(Generic[T]):
         self._terminal_bundle_lookup = terminal_bundle_lookup
 
         self._source_queue: deque[SlotTaskRef] = deque()
-        self._pending_bundles_by_account: dict[str, deque[list[SlotTaskRef]]] = {}
-        self._pending_seed_bundles: list[list[SlotTaskRef]] = []
+        self._pending_bundles: deque[list[SlotTaskRef]] = deque()
         self._inflight_slots: dict[str, int] = {}
         self._inflight_workers: dict[str, int] = {}
-        self._target_workers_by_account: dict[str, int] = {}
-        self._seeded_workers_by_account: dict[str, int] = {}
         self._results: list[T] = []
         self._max_inflight_jobs = 0
         self._submitted_jobs = 0
         self._terminal_jobs = 0
         self._replacement_jobs = 0
         self._job_counter = job_index_start - 1
-        self._seed_account_cursor = 0
-        self._backlog_account_cursor = 0
 
         if max_workers is None:
             max_workers = max(1, sum(max(1, account.max_jobs) for account in self._accounts))
@@ -1108,21 +1248,17 @@ class SlotWorkerController(Generic[T]):
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._future_to_bundle: dict[Future[T], BundleSpec] = {}
 
-    def enqueue_slots(self, slots: Sequence[SlotTaskRef]) -> None:
+    def enqueue_slots(self, slots: Sequence[SlotTaskRef], *, flush_partial: bool = False) -> None:
         if not slots:
             return
         self._source_queue.extend(slots)
-        self._materialize_pending_bundles()
+        self._materialize_pending_bundles(flush_partial=flush_partial)
 
     def has_work(self) -> bool:
-        return bool(self._source_queue) or any(self._pending_bundles_by_account.values()) or bool(self._future_to_bundle)
+        return bool(self._source_queue) or bool(self._pending_bundles) or bool(self._future_to_bundle)
 
     def snapshot(self) -> SlotWorkerControllerSnapshot:
-        pending_slots = sum(
-            len(bundle)
-            for queue in self._pending_bundles_by_account.values()
-            for bundle in queue
-        )
+        pending_slots = sum(len(bundle) for bundle in self._pending_bundles)
         inflight_slots = sum(self._inflight_slots.values())
         return SlotWorkerControllerSnapshot(
             queued_slots=len(self._source_queue),
@@ -1132,9 +1268,9 @@ class SlotWorkerController(Generic[T]):
             submitted_jobs=self._submitted_jobs,
         )
 
-    def step(self, *, wait_for_progress: bool = False) -> bool:
+    def step(self, *, wait_for_progress: bool = False, flush_partial_bundles: bool = False) -> bool:
         progressed = self._collect_done_futures()
-        self._materialize_pending_bundles()
+        self._materialize_pending_bundles(flush_partial=flush_partial_bundles)
 
         snapshots: list[AccountCapacitySnapshot] = []
         for account in self._accounts:
@@ -1151,7 +1287,7 @@ class SlotWorkerController(Generic[T]):
             if self._on_capacity_snapshot is not None:
                 self._on_capacity_snapshot(snapshot)
 
-        if any(queue for queue in self._pending_bundles_by_account.values()) and not snapshots and not self._future_to_bundle:
+        if self._pending_bundles and not snapshots and not self._future_to_bundle:
             raise RuntimeError("No account capacity snapshots available for worker startup.")
 
         if self._submit_pending_bundles(snapshots):
@@ -1171,7 +1307,7 @@ class SlotWorkerController(Generic[T]):
     def finalize(self) -> BalancedBatchResult[T]:
         try:
             while self.has_work():
-                self.step(wait_for_progress=True)
+                self.step(wait_for_progress=True, flush_partial_bundles=True)
         finally:
             self._executor.shutdown(wait=True)
         return BalancedBatchResult(
@@ -1211,137 +1347,88 @@ class SlotWorkerController(Generic[T]):
 
     def _submit_pending_bundles(self, snapshots: Sequence[AccountCapacitySnapshot]) -> bool:
         submitted_any = False
-        snapshot_by_account = {snapshot.account_id: snapshot for snapshot in snapshots}
-        for account in self._accounts:
-            queue = self._pending_bundles_by_account.get(account.account_id)
-            if not queue:
-                continue
-            snapshot = snapshot_by_account.get(account.account_id)
-            if snapshot is None:
-                continue
-            target_workers = self._target_workers_by_account.get(account.account_id, 0)
-            if target_workers <= 0:
-                continue
-            inflight_workers = self._inflight_workers.get(account.account_id, 0)
-            external_occupied = max(
-                0,
-                max(0, snapshot.running_count) + max(0, snapshot.pending_count) - inflight_workers,
-            )
-            target_available_workers = max(
-                0,
-                target_workers - external_occupied,
-            )
-            allowed_submit_workers = max(
-                0,
-                snapshot.allowed_submit,
-            )
-            available_workers = min(target_available_workers, allowed_submit_workers)
-            if available_workers <= 0:
-                print(
-                    "[peetsfea] "
-                    f"dispatch gate account={account.account_id} "
-                    f"target_available={target_available_workers} "
-                    f"allowed_submit={allowed_submit_workers} "
-                    f"inflight_local={inflight_workers} "
-                    f"external_occupied={external_occupied}",
-                    flush=True,
+        while self._pending_bundles and len(self._future_to_bundle) < self._max_workers:
+            eligible: list[AccountCapacitySnapshot] = []
+            for snapshot in snapshots:
+                submitted_unobserved = self._inflight_workers.get(snapshot.account_id, 0)
+                effective_allowed = max(0, snapshot.allowed_submit - submitted_unobserved)
+                eligible.append(
+                    AccountCapacitySnapshot(
+                        account_id=snapshot.account_id,
+                        host_alias=snapshot.host_alias,
+                        running_count=snapshot.running_count,
+                        pending_count=snapshot.pending_count,
+                        allowed_submit=effective_allowed,
+                    )
                 )
-            while queue and available_workers > 0 and len(self._future_to_bundle) < self._max_workers:
-                bundle_slots = queue.popleft()
-                if bundle_slots in self._pending_seed_bundles:
-                    self._pending_seed_bundles.remove(bundle_slots)
-                self._job_counter += 1
-                bundle = BundleSpec(
-                    job_id=f"job_{self._job_counter:04d}",
-                    job_index=self._job_counter,
-                    account_id=account.account_id,
-                    host_alias=account.host_alias,
-                    slot_inputs=tuple(bundle_slots),
-                    platform=_account_platform(account),
-                    scheduler=_account_scheduler(account),
-                )
-                future = self._executor.submit(self._worker, bundle)
-                self._future_to_bundle[future] = bundle
-                self._inflight_slots[bundle.account_id] = self._inflight_slots.get(bundle.account_id, 0) + bundle.slot_count
-                self._inflight_workers[bundle.account_id] = self._inflight_workers.get(bundle.account_id, 0) + 1
-                self._submitted_jobs += 1
-                self._max_inflight_jobs = max(self._max_inflight_jobs, len(self._future_to_bundle))
-                available_workers -= 1
-                submitted_any = True
-                if self._on_bundle_submitted is not None:
-                    self._on_bundle_submitted(bundle)
+
+            selected = pick_balanced_account(
+                capacities=eligible,
+                completed_slots_by_account=self._completed_slots,
+                inflight_slots_by_account=self._inflight_slots,
+            )
+            if selected is None:
+                for snapshot in snapshots:
+                    inflight_workers = self._inflight_workers.get(snapshot.account_id, 0)
+                    print(
+                        "[peetsfea] "
+                        f"dispatch gate account={snapshot.account_id} "
+                        f"allowed_submit={snapshot.allowed_submit} "
+                        f"submitted_unobserved={inflight_workers}",
+                        flush=True,
+                    )
+                break
+
+            bundle_slots = self._pending_bundles.popleft()
+            self._job_counter += 1
+            bundle = BundleSpec(
+                job_id=f"job_{self._job_counter:04d}",
+                job_index=self._job_counter,
+                account_id=selected.account_id,
+                host_alias=selected.host_alias,
+                slot_inputs=tuple(bundle_slots),
+                platform=_account_platform(selected),
+                scheduler=_account_scheduler(selected),
+            )
+            future = self._executor.submit(self._worker, bundle)
+            self._future_to_bundle[future] = bundle
+            self._inflight_slots[bundle.account_id] = self._inflight_slots.get(bundle.account_id, 0) + bundle.slot_count
+            self._inflight_workers[bundle.account_id] = self._inflight_workers.get(bundle.account_id, 0) + 1
+            self._submitted_jobs += 1
+            self._max_inflight_jobs = max(self._max_inflight_jobs, len(self._future_to_bundle))
+            submitted_any = True
+            if self._on_bundle_submitted is not None:
+                self._on_bundle_submitted(bundle)
         return submitted_any
 
-    def _next_seed_account(self) -> AccountConfigLike | None:
-        if not self._accounts:
-            return None
-        account_count = len(self._accounts)
-        for offset in range(account_count):
-            index = (self._seed_account_cursor + offset) % account_count
-            account = self._accounts[index]
-            seeded = self._seeded_workers_by_account.get(account.account_id, 0)
-            if seeded >= account.max_jobs:
-                continue
-            self._seed_account_cursor = (index + 1) % account_count
-            return account
-        return None
-
-    def _queue_bundle(self, *, account: AccountConfigLike, assigned: Sequence[SlotTaskRef]) -> list[SlotTaskRef] | None:
+    def _queue_bundle(self, *, assigned: Sequence[SlotTaskRef]) -> list[SlotTaskRef] | None:
         if not assigned:
             return None
         bundle_slots = list(assigned)
-        self._pending_bundles_by_account.setdefault(account.account_id, deque()).append(bundle_slots)
+        self._pending_bundles.append(bundle_slots)
         return bundle_slots
 
-    def _materialize_pending_bundles(self) -> None:
+    def _materialize_pending_bundles(self, *, flush_partial: bool = False) -> None:
         while self._source_queue:
-            account = self._next_seed_account()
-            if account is None:
+            if len(self._source_queue) < self._slots_per_job and not flush_partial:
                 break
-            if not self._source_queue:
-                break
-            assigned = [self._source_queue.popleft()]
-            self._seeded_workers_by_account[account.account_id] = self._seeded_workers_by_account.get(account.account_id, 0) + 1
-            self._target_workers_by_account[account.account_id] = self._target_workers_by_account.get(account.account_id, 0) + 1
-            bundle_slots = self._queue_bundle(account=account, assigned=assigned)
-            if bundle_slots is not None:
-                self._pending_seed_bundles.append(bundle_slots)
-
-        while self._source_queue and self._pending_seed_bundles:
-            progressed = False
-            for bundle_slots in list(self._pending_seed_bundles):
-                if not self._source_queue:
-                    break
-                if len(bundle_slots) >= self._slots_per_job:
-                    continue
-                bundle_slots.append(self._source_queue.popleft())
-                progressed = True
-            self._pending_seed_bundles = [
-                bundle_slots for bundle_slots in self._pending_seed_bundles if len(bundle_slots) < self._slots_per_job
-            ]
-            if not progressed:
-                break
-
-        while self._source_queue:
-            account = self._accounts[self._backlog_account_cursor % len(self._accounts)]
-            self._backlog_account_cursor += 1
             assigned: list[SlotTaskRef] = []
-            while self._source_queue and len(assigned) < self._slots_per_job:
+            while self._source_queue and len(assigned) < self._bundle_slot_limit:
                 assigned.append(self._source_queue.popleft())
             if not assigned:
                 break
-            self._queue_bundle(account=account, assigned=assigned)
+            self._queue_bundle(assigned=assigned)
 
     def _queue_bundles_for_account(self, *, account: AccountConfigLike, slots: Sequence[SlotTaskRef]) -> int:
         queued_jobs = 0
         recovery_queue = deque(slots)
         while recovery_queue:
             assigned: list[SlotTaskRef] = []
-            while recovery_queue and len(assigned) < self._slots_per_job:
+            while recovery_queue and len(assigned) < self._bundle_slot_limit:
                 assigned.append(recovery_queue.popleft())
             if not assigned:
                 break
-            self._queue_bundle(account=account, assigned=assigned)
+            self._queue_bundle(assigned=assigned)
             queued_jobs += 1
         return queued_jobs
 
@@ -1351,6 +1438,7 @@ def run_slot_workers(
     slot_queue: list[SlotTaskRef],
     accounts: list[AccountConfigLike],
     slots_per_job: int,
+    bundle_slot_limit: int | None = None,
     pending_buffer_per_account: int,
     worker: Callable[[BundleSpec], T],
     capacity_lookup: Callable[..., AccountCapacitySnapshot] = query_account_capacity,
@@ -1369,6 +1457,7 @@ def run_slot_workers(
     controller = SlotWorkerController(
         accounts=accounts,
         slots_per_job=slots_per_job,
+        bundle_slot_limit=bundle_slot_limit,
         pending_buffer_per_account=pending_buffer_per_account,
         worker=worker,
         capacity_lookup=capacity_lookup,

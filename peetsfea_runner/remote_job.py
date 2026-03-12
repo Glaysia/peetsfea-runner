@@ -32,6 +32,13 @@ class RemoteJobConfig(Protocol):
     cores_per_slot: int
     platform: str
     scheduler: str
+    remote_execution_backend: str
+    control_plane_host: str
+    control_plane_port: int
+    control_plane_ssh_target: str
+    tunnel_heartbeat_timeout_seconds: int
+    tunnel_recovery_grace_seconds: int
+    emit_output_variables_csv: bool
 
 
 @dataclass(slots=True)
@@ -54,14 +61,30 @@ class RemoteJobAttemptResult:
     message: str
     failed_case_lines: list[str]
     failure_category: str | None = None
+    slurm_job_id: str | None = None
+    observed_node: str | None = None
+    worker_terminal_state: str | None = None
 
 
 class WorkflowError(RuntimeError):
-    def __init__(self, message: str, *, exit_code: int, stdout: str = "", stderr: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        exit_code: int,
+        stdout: str = "",
+        stderr: str = "",
+        slurm_job_id: str | None = None,
+        observed_node: str | None = None,
+        worker_terminal_state: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.exit_code = exit_code
         self.stdout = stdout
         self.stderr = stderr
+        self.slurm_job_id = slurm_job_id
+        self.observed_node = observed_node
+        self.worker_terminal_state = worker_terminal_state
 
 
 @dataclass(slots=True, frozen=True)
@@ -103,15 +126,46 @@ def _remote_scheduler(config: RemoteJobConfig) -> str:
     return getattr(config, "scheduler", default).strip().lower()
 
 
+def _remote_execution_backend(config: RemoteJobConfig) -> str:
+    return getattr(config, "remote_execution_backend", "foreground_ssh").strip().lower()
+
+
+def _memory_to_mb(mem: str) -> int | None:
+    raw = str(mem).strip().upper()
+    if not raw:
+        return None
+    multiplier = 1
+    if raw.endswith("TB") or raw.endswith("T"):
+        multiplier = 1024 * 1024
+        raw = raw[:-2] if raw.endswith("TB") else raw[:-1]
+    elif raw.endswith("GB") or raw.endswith("G"):
+        multiplier = 1024
+        raw = raw[:-2] if raw.endswith("GB") else raw[:-1]
+    elif raw.endswith("MB") or raw.endswith("M"):
+        multiplier = 1
+        raw = raw[:-2] if raw.endswith("MB") else raw[:-1]
+    elif raw.endswith("KB") or raw.endswith("K"):
+        multiplier = 1 / 1024
+        raw = raw[:-2] if raw.endswith("KB") else raw[:-1]
+    try:
+        return int(float(raw) * multiplier)
+    except ValueError:
+        return None
+
+
 def run_remote_job_attempt(
     *,
     config: RemoteJobConfig,
+    run_id: str | None = None,
+    worker_id: str | None = None,
     aedt_path: Path | None = None,
     slot_inputs: Sequence[SlotInput] | None = None,
     remote_job_dir: str,
     local_job_dir: Path,
     session_name: str,
     on_upload_success: Callable[[], None] | None = None,
+    on_worker_submitted: Callable[[str, str | None], None] | None = None,
+    on_worker_state_change: Callable[[str, str | None], None] | None = None,
 ) -> RemoteJobAttemptResult:
     inputs = _normalize_slot_inputs(
         config=config,
@@ -121,6 +175,9 @@ def run_remote_job_attempt(
     case_count = len(inputs)
 
     workflow_result: _RemoteWorkflowResult | None = None
+    slurm_job_id: str | None = None
+    observed_node: str | None = None
+    worker_terminal_state: str | None = None
     local_job_dir.mkdir(parents=True, exist_ok=True)
     resolved_remote_job_dir = _resolve_remote_path(config=config, path=remote_job_dir)
     _log_stage(
@@ -140,33 +197,72 @@ def run_remote_job_attempt(
             remote_script = (
                 _write_windows_remote_job_script(tmpdir_path)
                 if _remote_platform(config) == "windows"
-                else _write_remote_job_script(tmpdir_path)
+                else _write_remote_job_script(tmpdir_path, config=config)
             )
-            remote_dispatch_script = _write_remote_dispatch_script(
-                tmpdir_path,
-                config=config,
-                remote_job_dir=resolved_remote_job_dir,
-                case_count=case_count,
-            )
-            _upload_files(
+            supporting_files = [remote_script]
+            if (_remote_platform(config), _remote_scheduler(config), _remote_execution_backend(config)) == (
+                "linux",
+                "slurm",
+                "slurm_batch",
+            ):
+                remote_worker_payload = _write_remote_worker_payload_script(
+                    tmpdir_path,
+                    config=config,
+                    case_count=case_count,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                )
+                remote_sbatch_script = _write_remote_sbatch_script(
+                    tmpdir_path,
+                    config=config,
+                    remote_job_dir=resolved_remote_job_dir,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                )
+                supporting_files.extend([remote_worker_payload, remote_sbatch_script])
+            else:
+                remote_dispatch_script = _write_remote_dispatch_script(
+                    tmpdir_path,
+                    config=config,
+                    remote_job_dir=resolved_remote_job_dir,
+                    case_count=case_count,
+                )
+                supporting_files.append(remote_dispatch_script)
+            _upload_supporting_files(
                 config,
                 project_files=staged_projects,
                 remote_job_dir=resolved_remote_job_dir,
-                remote_script=remote_script,
-                remote_dispatch_script=remote_dispatch_script,
+                supporting_files=supporting_files,
             )
             if on_upload_success is not None:
                 on_upload_success()
-        workflow_result = _run_remote_workflow_noninteractive(
-            config,
-            remote_job_dir=resolved_remote_job_dir,
-            case_count=case_count,
-        )
+        if (_remote_platform(config), _remote_scheduler(config), _remote_execution_backend(config)) == (
+            "linux",
+            "slurm",
+            "slurm_batch",
+        ):
+            workflow_result, slurm_job_id, observed_node, worker_terminal_state = _run_remote_workflow_sbatch(
+                config,
+                remote_job_dir=resolved_remote_job_dir,
+                case_count=case_count,
+                on_worker_submitted=on_worker_submitted,
+                on_worker_state_change=on_worker_state_change,
+            )
+        else:
+            workflow_result = _run_remote_workflow_noninteractive(
+                config,
+                remote_job_dir=resolved_remote_job_dir,
+                case_count=case_count,
+            )
+            slurm_job_id = None
+            observed_node = None
         local_archive = local_job_dir / ("results.zip" if _remote_platform(config) == "windows" else "results.tgz")
         local_archive.write_bytes(workflow_result.archive_bytes)
         _extract_local_results_archive(local_job_dir=local_job_dir, archive_name=local_archive.name)
         _cleanup_remote_workspace(config, remote_job_dir=resolved_remote_job_dir)
     except WorkflowError as exc:
+        _cleanup_remote_workspace_best_effort(config, remote_job_dir=resolved_remote_job_dir)
+        worker_terminal_state = exc.worker_terminal_state or worker_terminal_state
         failure_category = _categorize_failure(
             exit_code=exc.exit_code,
             message=str(exc),
@@ -190,6 +286,9 @@ def run_remote_job_attempt(
             message=str(exc),
             failed_case_lines=[],
             failure_category=failure_category,
+            slurm_job_id=exc.slurm_job_id or slurm_job_id,
+            observed_node=exc.observed_node or observed_node,
+            worker_terminal_state=worker_terminal_state,
         )
 
     if workflow_result is None:
@@ -201,6 +300,9 @@ def run_remote_job_attempt(
             message="Case summary missing.",
             failed_case_lines=[],
             failure_category="collect",
+            slurm_job_id=slurm_job_id,
+            observed_node=observed_node,
+            worker_terminal_state=worker_terminal_state,
         )
 
     _write_failure_artifacts(
@@ -231,6 +333,9 @@ def run_remote_job_attempt(
             ),
             failed_case_lines=case_summary.case_lines,
             failure_category="solve",
+            slurm_job_id=slurm_job_id,
+            observed_node=observed_node,
+            worker_terminal_state=worker_terminal_state,
         )
 
     _log_stage(f"job attempt success session={session_name}")
@@ -244,6 +349,9 @@ def run_remote_job_attempt(
             f"(success={case_summary.success_cases}, failed={case_summary.failed_cases})."
         ),
         failed_case_lines=[],
+        slurm_job_id=slurm_job_id,
+        observed_node=observed_node,
+        worker_terminal_state=worker_terminal_state,
     )
 
 
@@ -277,6 +385,12 @@ def _resolve_remote_path(*, config: RemoteJobConfig, path: str) -> str:
             return home
         return f"{home}/{path[2:]}"
     if path == "/tmp/peetsfea-runner" or path.startswith("/tmp/peetsfea-runner/"):
+        if _remote_scheduler(config) == "slurm" and _remote_execution_backend(config) == "slurm_batch":
+            home = _get_remote_home(config=config)
+            shared_root = f"{home}/aedt_runs"
+            if path == "/tmp/peetsfea-runner":
+                return shared_root
+            return f"{shared_root}{path[len('/tmp/peetsfea-runner'):]}"
         remote_user = _get_remote_user(config=config)
         scoped_root = f"/tmp/{remote_user}/peetsfea-runner"
         if path == "/tmp/peetsfea-runner":
@@ -351,11 +465,25 @@ def _upload_files(
     remote_script: Path,
     remote_dispatch_script: Path,
 ) -> None:
+    _upload_supporting_files(
+        config,
+        project_files=project_files,
+        remote_job_dir=remote_job_dir,
+        supporting_files=[remote_script, remote_dispatch_script],
+    )
+
+
+def _upload_supporting_files(
+    config: RemoteJobConfig,
+    *,
+    project_files: Sequence[Path],
+    remote_job_dir: str,
+    supporting_files: Sequence[Path],
+) -> None:
     remote_target = f"{config.host}:{remote_job_dir}/"
     _log_stage(f"upload files target={remote_target}")
     upload_sources = [str(path) for path in project_files]
-    upload_sources.append(str(remote_script.resolve()))
-    upload_sources.append(str(remote_dispatch_script.resolve()))
+    upload_sources.extend(str(path.resolve()) for path in supporting_files)
     _run_subprocess(
         ["scp", *upload_sources, remote_target],
         stage="scp upload",
@@ -415,6 +543,13 @@ def _cleanup_remote_workspace(config: RemoteJobConfig, *, remote_job_dir: str) -
     )
 
 
+def _cleanup_remote_workspace_best_effort(config: RemoteJobConfig, *, remote_job_dir: str) -> None:
+    try:
+        _cleanup_remote_workspace(config, remote_job_dir=remote_job_dir)
+    except WorkflowError as exc:
+        _log_stage(f"cleanup remote workspace skipped path={remote_job_dir} reason={exc}")
+
+
 def _run_remote_workflow_noninteractive(
     config: RemoteJobConfig,
     *,
@@ -471,6 +606,193 @@ def _submit_remote_workflow_noninteractive(
     return submission
 
 
+def _run_remote_workflow_sbatch(
+    config: RemoteJobConfig,
+    *,
+    remote_job_dir: str,
+    case_count: int,
+    on_worker_submitted: Callable[[str, str | None], None] | None = None,
+    on_worker_state_change: Callable[[str, str | None], None] | None = None,
+) -> tuple[_RemoteWorkflowResult, str, str | None, str]:
+    slurm_job_id = _submit_remote_workflow_sbatch(config=config, remote_job_dir=remote_job_dir)
+    if on_worker_submitted is not None:
+        on_worker_submitted(slurm_job_id, None)
+    try:
+        stdout, stderr, observed_node, terminal_state = _wait_for_remote_sbatch_completion(
+            config=config,
+            remote_job_dir=remote_job_dir,
+            slurm_job_id=slurm_job_id,
+            on_worker_state_change=on_worker_state_change,
+        )
+    except WorkflowError as exc:
+        if exc.slurm_job_id is None:
+            exc.slurm_job_id = slurm_job_id
+        raise
+    submission = _RemoteWorkflowSubmission(stdout=stdout, stderr=stderr, return_code=0)
+    output = submission.combined_output
+    failed_count = _parse_marked_failed_count(output)
+    case_lines = _parse_marked_case_summary_lines(output)
+    return (
+        _RemoteWorkflowResult(
+            case_summary=CaseExecutionSummary(
+                success_cases=case_count - failed_count,
+                failed_cases=failed_count,
+                case_lines=case_lines,
+            ),
+            archive_bytes=_parse_marked_results_archive(output),
+            submission=submission,
+        ),
+        slurm_job_id,
+        observed_node,
+        terminal_state,
+    )
+
+
+def _submit_remote_workflow_sbatch(config: RemoteJobConfig, *, remote_job_dir: str) -> str:
+    remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
+    completed = _run_completed_process_capture(
+        ["ssh", config.host, f"cd {shlex.quote(remote_path)} && sbatch --parsable ./remote_sbatch.sh"],
+        stage="sbatch submit",
+        exit_code=EXIT_CODE_SLURM_FAILURE,
+        timeout_seconds=30,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        details = stderr if stderr else stdout
+        raise WorkflowError(
+            f"sbatch submit failed: {details or completed.returncode}",
+            exit_code=EXIT_CODE_SLURM_FAILURE,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    return _parse_sbatch_job_id(completed.stdout or "")
+
+
+def query_slurm_job_state(
+    config: RemoteJobConfig,
+    *,
+    slurm_job_id: str,
+) -> tuple[str, str | None]:
+    completed = _run_completed_process_capture(
+        ["ssh", config.host, f"squeue -h -j {shlex.quote(slurm_job_id)} -o \"%T|%N\""],
+        stage="squeue",
+        exit_code=EXIT_CODE_SLURM_FAILURE,
+        timeout_seconds=20,
+    )
+    output = (completed.stdout or "").strip()
+    if output:
+        state, node = _parse_squeue_state_line(output)
+        normalized = state.strip().upper()
+        if normalized in {"RUNNING", "COMPLETING", "CG"}:
+            return "RUNNING", node.strip() or None
+        if normalized in {"PENDING", "CONFIGURING", "PD"}:
+            return "PENDING", None
+        return normalized, node.strip() or None
+
+    completed = _run_completed_process_capture(
+        ["ssh", config.host, f"sacct -j {shlex.quote(slurm_job_id)} -P -n -o JobIDRaw,State,NodeList"],
+        stage="sacct",
+        exit_code=EXIT_CODE_SLURM_FAILURE,
+        timeout_seconds=20,
+    )
+    for raw in (completed.stdout or "").splitlines():
+        parts = [part.strip() for part in raw.split("|")]
+        if len(parts) < 3:
+            continue
+        if parts[0] != slurm_job_id:
+            continue
+        state = parts[1].upper()
+        node = parts[2] or None
+        if state.startswith("COMPLETED"):
+            return "COMPLETED", node
+        if state.startswith("RUNNING"):
+            return "RUNNING", node
+        if state.startswith("PENDING"):
+            return "PENDING", node
+        if state.startswith("CANCELLED") or state.startswith("FAILED") or state.startswith("TIMEOUT") or state.startswith("OUT_OF_MEMORY") or state.startswith("NODE_FAIL"):
+            return "FAILED", node
+        return state, node
+    return "LOST", None
+
+
+def _parse_squeue_state_line(output: str) -> tuple[str, str]:
+    first_line = output.strip().splitlines()[0].strip()
+    if "|" not in first_line:
+        return first_line, ""
+    state, node = first_line.split("|", 1)
+    return state.strip(), node.strip()
+
+
+def _wait_for_remote_sbatch_completion(
+    config: RemoteJobConfig,
+    *,
+    remote_job_dir: str,
+    slurm_job_id: str,
+    on_worker_state_change: Callable[[str, str | None], None] | None = None,
+) -> tuple[str, str, str | None, str]:
+    timeout_seconds = _time_limit_to_seconds(config.time_limit) + 900
+    started = time.monotonic()
+    last_state: str | None = None
+    observed_node: str | None = None
+    while True:
+        state, node = query_slurm_job_state(config, slurm_job_id=slurm_job_id)
+        observed_node = node or observed_node
+        if state != last_state:
+            last_state = state
+            if on_worker_state_change is not None:
+                on_worker_state_change(state, observed_node)
+        if state in {"COMPLETED", "FAILED", "LOST"}:
+            break
+        if time.monotonic() - started > timeout_seconds:
+            raise WorkflowError(
+                f"sbatch job timed out waiting for completion job_id={slurm_job_id}",
+                exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+                slurm_job_id=slurm_job_id,
+                observed_node=observed_node,
+                worker_terminal_state=state,
+            )
+        time.sleep(5)
+
+    if state == "COMPLETED" and on_worker_state_change is not None:
+        on_worker_state_change("IDLE_DRAINING", observed_node)
+
+    remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
+    try:
+        stdout = _read_remote_optional_text_file(
+            config=config,
+            remote_path=remote_path,
+            filenames=("worker.stdout", f"slurm-{slurm_job_id}.out"),
+            stage="worker stdout",
+        )
+        stderr = _read_remote_optional_text_file(
+            config=config,
+            remote_path=remote_path,
+            filenames=("worker.stderr", f"slurm-{slurm_job_id}.err"),
+            stage="worker stderr",
+        )
+    except WorkflowError as exc:
+        if exc.slurm_job_id is None:
+            exc.slurm_job_id = slurm_job_id
+        if exc.observed_node is None:
+            exc.observed_node = observed_node
+        if exc.worker_terminal_state is None:
+            exc.worker_terminal_state = state
+        raise
+    if state != "COMPLETED" and not _has_remote_workflow_markers("\n".join(part for part in (stdout, stderr) if part)):
+        details = _extract_meaningful_remote_failure_details("\n".join(part for part in (stdout, stderr) if part))
+        raise WorkflowError(
+            f"sbatch worker failed job_id={slurm_job_id}: {details or state}",
+            exit_code=EXIT_CODE_REMOTE_RUN_FAILURE,
+            stdout=stdout,
+            stderr=stderr,
+            slurm_job_id=slurm_job_id,
+            observed_node=observed_node,
+            worker_terminal_state=state,
+        )
+    return stdout, stderr, observed_node, state
+
+
 def _run_subprocess(command: list[str], *, stage: str, exit_code: int, timeout_seconds: int | None = None) -> None:
     completed = _run_completed_process(command, stage=stage, exit_code=exit_code, timeout_seconds=timeout_seconds)
     if completed.stdout or completed.stderr:
@@ -482,6 +804,30 @@ def _run_subprocess_capture(
 ) -> str:
     completed = _run_completed_process(command, stage=stage, exit_code=exit_code, timeout_seconds=timeout_seconds)
     return (completed.stdout or "").strip()
+
+
+def _read_remote_optional_text_file(
+    *,
+    config: RemoteJobConfig,
+    remote_path: str,
+    filenames: Sequence[str],
+    stage: str,
+    timeout_seconds: int | None = None,
+) -> str:
+    clauses: list[str] = []
+    for index, filename in enumerate(filenames):
+        keyword = "if" if index == 0 else "elif"
+        quoted = shlex.quote(filename)
+        clauses.append(f"{keyword} [ -f {quoted} ]; then cat {quoted};")
+    if not clauses:
+        return ""
+    command = f"cd {shlex.quote(remote_path)} && " + " ".join(clauses) + " fi"
+    return _run_subprocess_capture(
+        ["ssh", config.host, command],
+        stage=stage,
+        exit_code=EXIT_CODE_DOWNLOAD_FAILURE,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _run_completed_process_capture(
@@ -562,7 +908,7 @@ def _remote_path_for_shell(*, config: RemoteJobConfig, path: str) -> str:
     return path
 
 
-def _build_remote_job_script_content() -> str:
+def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) -> str:
     lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
@@ -671,6 +1017,7 @@ def _build_remote_job_script_content() -> str:
         "cat > run_sim.py <<'PY'",
         "from __future__ import annotations",
         "",
+        "import csv",
         "import os",
         "import socket",
         "import subprocess",
@@ -681,6 +1028,9 @@ def _build_remote_job_script_content() -> str:
         "",
         "",
         "AEDT_FILENAME: str = 'project.aedt'",
+        f"EMIT_OUTPUT_VARIABLES_CSV: bool = {str(bool(emit_output_variables_csv))}",
+        "OUTPUT_VARIABLES_CSV_NAME: str = 'output_variables.csv'",
+        "OUTPUT_VARIABLES_ERROR_LOG_NAME: str = 'output_variables.error.log'",
         "USE_GRAPHIC: bool = False",
         "ANSYS_EXECUTABLE: str = '/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt'",
         "",
@@ -720,6 +1070,93 @@ def _build_remote_job_script_content() -> str:
         "        process.wait(timeout=5)",
         "",
         "",
+        "def normalize_report_column_name(column_name: str) -> str:",
+        "    stripped = column_name.strip().strip('\"')",
+        "    if stripped.lower().startswith('freq '):",
+        "        return 'Freq'",
+        "    if ' [' in stripped:",
+        "        stripped = stripped.split(' [', 1)[0]",
+        "    return stripped",
+        "",
+        "",
+        "def build_output_variable_variations(hfss: Hfss) -> dict[str, list[str]]:",
+        "    variations = dict(hfss.available_variations.nominal_values)",
+        "    if 'Freq' not in variations:",
+        "        variations['Freq'] = ['All']",
+        "    return variations",
+        "",
+        "",
+        "def get_all_report_names(hfss: Hfss) -> list[str]:",
+        "    return list(hfss.post.all_report_names)",
+        "",
+        "",
+        "def create_output_variables_report(hfss: Hfss) -> str:",
+        "    report_names_before = set(get_all_report_names(hfss))",
+        "    report = hfss.post.create_report(",
+        "        expressions=hfss.output_variables,",
+        "        setup_sweep_name=hfss.nominal_adaptive,",
+        "        variations=build_output_variable_variations(hfss),",
+        "        primary_sweep_variable='Freq',",
+        "        report_category='Output Variables',",
+        "        plot_type='Data Table',",
+        "    )",
+        "    if not report:",
+        "        raise RuntimeError('Failed to create output variables report')",
+        "    report_names_after = get_all_report_names(hfss)",
+        "    created_report_names = [name for name in report_names_after if name not in report_names_before]",
+        "    if not created_report_names:",
+        "        raise RuntimeError('Could not identify created output variables report')",
+        "    hfss.oreportsetup.UpdateReports(report_names_after)  # type: ignore[attr-defined]",
+        "    return created_report_names[-1]",
+        "",
+        "",
+        "def parse_output_variables_csv(exported_csv_path: Path) -> dict[str, object]:",
+        "    with exported_csv_path.open('r', encoding='utf-8', newline='') as handle:",
+        "        reader = csv.DictReader(handle)",
+        "        row = next(reader, None)",
+        "    if row is None:",
+        "        return {}",
+        "    flattened: dict[str, object] = {}",
+        "    for raw_key, value in row.items():",
+        "        key = normalize_report_column_name(str(raw_key))",
+        "        if key == 'Freq':",
+        "            continue",
+        "        flattened[key] = value",
+        "    return flattened",
+        "",
+        "",
+        "def write_output_variables_csv(workdir: Path, row: dict[str, object]) -> None:",
+        "    output_csv_path = workdir / OUTPUT_VARIABLES_CSV_NAME",
+        "    ordered_columns = ['source_aedt_path', 'source_case_dir', 'source_aedt_name']",
+        "    remaining_columns = sorted(column for column in row if column not in ordered_columns)",
+        "    columns = ordered_columns + remaining_columns",
+        "    with output_csv_path.open('w', encoding='utf-8', newline='') as handle:",
+        "        writer = csv.writer(handle)",
+        "        writer.writerow(columns)",
+        "        writer.writerow([row.get(column, '') for column in columns])",
+        "",
+        "",
+        "def extract_output_variables_csv(hfss: Hfss, workdir: Path, project_file: Path) -> None:",
+        "    if not EMIT_OUTPUT_VARIABLES_CSV:",
+        "        return",
+        "    row: dict[str, object] = {",
+        "        'source_aedt_path': str(project_file.resolve()),",
+        "        'source_case_dir': str(workdir.resolve()),",
+        "        'source_aedt_name': project_file.name,",
+        "    }",
+        "    if not hfss.output_variables:",
+        "        write_output_variables_csv(workdir, row)",
+        "        return",
+        "    report_dir = workdir / 'tmp' / 'output_variables_report'",
+        "    report_dir.mkdir(parents=True, exist_ok=True)",
+        "    report_name = create_output_variables_report(hfss)",
+        "    exported_csv_path = Path(hfss.post.export_report_to_csv(str(report_dir), report_name))",
+        "    if not exported_csv_path.exists():",
+        "        raise RuntimeError('Output Variables report export failed')",
+        "    row.update(parse_output_variables_csv(exported_csv_path))",
+        "    write_output_variables_csv(workdir, row)",
+        "",
+        "",
         "def main() -> None:",
         "    workdir = Path.cwd()",
         "    project_file = workdir / AEDT_FILENAME",
@@ -751,6 +1188,11 @@ def _build_remote_job_script_content() -> str:
         "            hfss.save_project()",
         "        except Exception as exc:",
         "            print(f'[WARN] save_project failed but solve completed: {exc}')",
+        "        try:",
+        "            extract_output_variables_csv(hfss, workdir, project_file)",
+        "        except Exception as exc:",
+        "            (workdir / OUTPUT_VARIABLES_ERROR_LOG_NAME).write_text(str(exc), encoding='utf-8')",
+        "            print(f'[WARN] output variable csv export failed but solve completed: {exc}')",
         "    finally:",
         "        if hfss is not None:",
         "            hfss.release_desktop(close_projects=True, close_desktop=True)",
@@ -809,9 +1251,14 @@ def _build_windows_remote_job_script_content() -> str:
     return "\n".join(lines) + "\n"
 
 
-def _write_remote_job_script(tmpdir: Path) -> Path:
+def _write_remote_job_script(tmpdir: Path, *, config: RemoteJobConfig) -> Path:
     script = tmpdir / "remote_job.sh"
-    script.write_text(_build_remote_job_script_content(), encoding="utf-8")
+    script.write_text(
+        _build_remote_job_script_content(
+            emit_output_variables_csv=getattr(config, "emit_output_variables_csv", True),
+        ),
+        encoding="utf-8",
+    )
     return script
 
 
@@ -851,6 +1298,7 @@ def _build_remote_dispatch_script_content(*, config: RemoteJobConfig, remote_job
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         f"REMOTE_JOB_DIR={shlex.quote(remote_path)}",
+        "export REMOTE_JOB_DIR",
         "cd \"$REMOTE_JOB_DIR\"",
         "tar -czf - remote_job.sh project_*.aedt | \\",
         "  " + _build_noninteractive_srun_command(
@@ -910,15 +1358,171 @@ def _build_windows_remote_dispatch_script_content(*, config: RemoteJobConfig, re
 
 
 def _build_noninteractive_srun_command(*, config: RemoteJobConfig, remote_job_dir: str, case_count: int) -> str:
+    payload = _build_worker_payload_script_content(config=config, case_count=case_count)
+    return (
+        f"srun -D /tmp -p {config.partition} -N {config.nodes} -n {config.ntasks} "
+        f"-c {config.cpus_per_job} --mem={config.mem} --time={config.time_limit} "
+        f"bash -lc {shlex.quote(payload)}"
+    )
+
+
+def _build_worker_payload_script_content(
+    *,
+    config: RemoteJobConfig,
+    case_count: int,
+    run_id: str | None = None,
+    worker_id: str | None = None,
+) -> str:
     max_parallel = max(1, int(getattr(config, "slots_per_job", case_count)))
+    total_allocated_mem_mb = _memory_to_mb(getattr(config, "mem", ""))
+    slot_allocated_mem_mb = max(
+        1,
+        int(total_allocated_mem_mb / max_parallel) if total_allocated_mem_mb is not None else 0,
+    ) if total_allocated_mem_mb is not None else 0
+    control_plane_host = getattr(config, "control_plane_host", "127.0.0.1")
+    control_plane_port = int(getattr(config, "control_plane_port", 8765))
+    control_plane_ssh_target = getattr(config, "control_plane_ssh_target", "").strip()
+    heartbeat_interval_seconds = max(5, int(getattr(config, "tunnel_recovery_grace_seconds", 30)))
     payload_lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "workdir=$(mktemp -d /tmp/peetsfea-slot.XXXXXX)",
-        "cleanup() { rm -rf \"$workdir\"; }",
+        "cleanup() {",
+        "  rc=$?",
+        "  cd /tmp >/dev/null 2>&1 || true",
+        "  rm -rf \"$workdir\"",
+        "  if [ -n \"${REMOTE_JOB_DIR:-}\" ]; then",
+        "    rm -rf \"$REMOTE_JOB_DIR\" >/dev/null 2>&1 || true",
+        "  fi",
+        "  exit \"$rc\"",
+        "}",
         "trap cleanup EXIT",
         "cd \"$workdir\"",
         "tar -xzf -",
+        f"PEETS_CONTROL_RUN_ID={shlex.quote(run_id or '')}",
+        f"PEETS_CONTROL_WORKER_ID={shlex.quote(worker_id or '')}",
+        f"PEETS_CONTROL_HOST={shlex.quote(control_plane_host)}",
+        f"PEETS_CONTROL_PORT={control_plane_port}",
+        f"PEETS_CONTROL_SSH_TARGET={shlex.quote(control_plane_ssh_target)}",
+        f"PEETS_CONTROL_HEARTBEAT_INTERVAL={heartbeat_interval_seconds}",
+        f"max_parallel={max_parallel}",
+        "PEETS_CONTROL_LOCAL_PORT=$((PEETS_CONTROL_PORT + 1000))",
+        "PEETS_TUNNEL_SOCKET=\"$workdir/control-plane.sock\"",
+        "PEETS_TUNNEL_SESSION_ID=\"${SLURM_JOB_ID:-nojob}-${PEETS_CONTROL_WORKER_ID:-worker}-$$\"",
+        "PEETS_CONTROL_API_URL=\"http://127.0.0.1:${PEETS_CONTROL_LOCAL_PORT}\"",
+        "control_plane_post() {",
+        "  endpoint=\"$1\"",
+        "  payload=\"$2\"",
+        "  control_python=\"$(command -v python3 || command -v python || true)\"",
+        "  if [ -z \"$control_python\" ]; then",
+        "    return 1",
+        "  fi",
+        "  CONTROL_API_URL=\"$PEETS_CONTROL_API_URL\" CONTROL_ENDPOINT=\"$endpoint\" CONTROL_PAYLOAD=\"$payload\" \"$control_python\" - <<'PY'",
+        "from __future__ import annotations",
+        "import os",
+        "import urllib.request",
+        "req = urllib.request.Request(",
+        "    os.environ['CONTROL_API_URL'] + os.environ['CONTROL_ENDPOINT'],",
+        "    data=os.environ['CONTROL_PAYLOAD'].encode('utf-8'),",
+        "    headers={'Content-Type': 'application/json'},",
+        "    method='POST',",
+        ")",
+        "with urllib.request.urlopen(req, timeout=5) as resp:",
+        "    resp.read()",
+        "PY",
+        "}",
+        "start_control_tunnel() {",
+        "  if [ -z \"$PEETS_CONTROL_SSH_TARGET\" ]; then",
+        "    return 0",
+        "  fi",
+        "  ssh -M -S \"$PEETS_TUNNEL_SOCKET\" -fnNT \\",
+        "    -o BatchMode=yes \\",
+        "    -o ExitOnForwardFailure=yes \\",
+        "    -L 127.0.0.1:${PEETS_CONTROL_LOCAL_PORT}:127.0.0.1:${PEETS_CONTROL_PORT} \\",
+        "    \"$PEETS_CONTROL_SSH_TARGET\"",
+        "}",
+        "stop_control_tunnel() {",
+        "  if [ -S \"$PEETS_TUNNEL_SOCKET\" ]; then",
+        "    ssh -S \"$PEETS_TUNNEL_SOCKET\" -O exit \"$PEETS_CONTROL_SSH_TARGET\" >/dev/null 2>&1 || true",
+        "  fi",
+        "}",
+        "emit_control_register() {",
+        "  control_plane_post /internal/workers/register \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"tunnel_session_id\\\":\\\"${PEETS_TUNNEL_SESSION_ID}\\\",\\\"slurm_job_id\\\":\\\"${SLURM_JOB_ID:-}\\\",\\\"observed_node\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\"}\" >/dev/null 2>&1 || true",
+        "}",
+        "emit_control_heartbeat() {",
+        "  control_plane_post /internal/workers/heartbeat \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"tunnel_session_id\\\":\\\"${PEETS_TUNNEL_SESSION_ID}\\\",\\\"observed_node\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\"}\" >/dev/null 2>&1 || true",
+        "}",
+        "emit_control_degraded() {",
+        "  reason=\"$1\"",
+        "  control_plane_post /internal/workers/degraded \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"tunnel_session_id\\\":\\\"${PEETS_TUNNEL_SESSION_ID}\\\",\\\"reason\\\":\\\"${reason}\\\",\\\"observed_node\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\"}\" >/dev/null 2>&1 || true",
+        "}",
+        "emit_control_recovered() {",
+        "  control_plane_post /internal/workers/recovered \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"tunnel_session_id\\\":\\\"${PEETS_TUNNEL_SESSION_ID}\\\",\\\"observed_node\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\"}\" >/dev/null 2>&1 || true",
+        "}",
+        "emit_node_snapshot() {",
+        "  total_mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)",
+        "  avail_mem_mb=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)",
+        "  used_mem_mb=$(( total_mem_mb - avail_mem_mb ))",
+        "  process_count=$(find /proc -maxdepth 1 -type d -regex '.*/[0-9]+' 2>/dev/null | wc -l | awk '{print $1+0}')",
+        "  tmp_stats=$(df -Pm \"${TMPDIR:-/tmp}\" | awk 'NR==2 {print $2\" \"$3\" \"$4}')",
+        "  tmp_total_mb=$(printf '%s' \"$tmp_stats\" | awk '{print $1}')",
+        "  tmp_used_mb=$(printf '%s' \"$tmp_stats\" | awk '{print $2}')",
+        "  tmp_free_mb=$(printf '%s' \"$tmp_stats\" | awk '{print $3}')",
+        "  load_1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)",
+        "  load_5=$(awk '{print $2}' /proc/loadavg 2>/dev/null || echo 0)",
+        "  load_15=$(awk '{print $3}' /proc/loadavg 2>/dev/null || echo 0)",
+        "  control_plane_post /internal/resources/node \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"host\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\",\\\"allocated_mem_mb\\\":${total_mem_mb:-0},\\\"total_mem_mb\\\":${total_mem_mb:-0},\\\"used_mem_mb\\\":${used_mem_mb:-0},\\\"free_mem_mb\\\":${avail_mem_mb:-0},\\\"load_1\\\":${load_1:-0},\\\"load_5\\\":${load_5:-0},\\\"load_15\\\":${load_15:-0},\\\"tmp_total_mb\\\":${tmp_total_mb:-0},\\\"tmp_used_mb\\\":${tmp_used_mb:-0},\\\"tmp_free_mb\\\":${tmp_free_mb:-0},\\\"process_count\\\":${process_count:-0},\\\"running_worker_count\\\":1,\\\"active_slot_count\\\":$(jobs -pr | wc -l)}\" >/dev/null 2>&1 || true",
+        "}",
+        "emit_worker_snapshot() {",
+        "  active_slots=\"${1:-0}\"",
+        "  idle_slots=\"${2:-0}\"",
+        "  rss_mb=$(awk '/VmRSS/ {print int($2/1024)}' /proc/$$/status 2>/dev/null || echo 0)",
+        "  cpu_pct=$(ps -p $$ -o %cpu= 2>/dev/null | awk '{print $1+0}' || echo 0)",
+        "  process_count=$(ps --no-headers --ppid $$ 2>/dev/null | wc -l | awk '{print $1+0}')",
+        "  control_plane_post /internal/resources/worker \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"host\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\",\\\"slurm_job_id\\\":\\\"${SLURM_JOB_ID:-}\\\",\\\"configured_slots\\\":${max_parallel},\\\"active_slots\\\":${active_slots},\\\"idle_slots\\\":${idle_slots},\\\"rss_mb\\\":${rss_mb:-0},\\\"cpu_pct\\\":${cpu_pct:-0},\\\"tunnel_state\\\":\\\"CONNECTED\\\",\\\"process_count\\\":${process_count:-0}}\" >/dev/null 2>&1 || true",
+        "}",
+        "emit_slot_snapshot() {",
+        "  slot_id=\"$1\"",
+        "  slot_state=\"$2\"",
+        "  artifact_bytes=\"$3\"",
+        "  used_mem_mb=$(awk '/VmRSS/ {print int($2/1024)}' /proc/$$/status 2>/dev/null || echo 0)",
+        f"  allocated_mem_mb={slot_allocated_mem_mb}",
+        "  load_1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)",
+        "  rss_mb=$(awk '/VmRSS/ {print int($2/1024)}' /proc/$$/status 2>/dev/null || echo 0)",
+        "  cpu_pct=$(ps -p $$ -o %cpu= 2>/dev/null | awk '{print $1+0}' || echo 0)",
+        "  active_process_count=$(ps --no-headers --ppid $$ 2>/dev/null | wc -l | awk '{print $1+0}')",
+        "  process_count=$(( active_process_count + 1 ))",
+        "  progress_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+        "  control_plane_post /internal/resources/slot \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"slot_id\\\":\\\"${slot_id}\\\",\\\"host\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\",\\\"allocated_mem_mb\\\":${allocated_mem_mb:-0},\\\"used_mem_mb\\\":${used_mem_mb:-0},\\\"load_1\\\":${load_1:-0},\\\"rss_mb\\\":${rss_mb:-0},\\\"cpu_pct\\\":${cpu_pct:-0},\\\"process_count\\\":${process_count:-0},\\\"active_process_count\\\":${active_process_count:-0},\\\"artifact_bytes\\\":${artifact_bytes:-0},\\\"progress_ts\\\":\\\"${progress_ts}\\\",\\\"state\\\":\\\"${slot_state}\\\"}\" >/dev/null 2>&1 || true",
+        "}",
+        "heartbeat_loop() {",
+        "  while sleep \"$PEETS_CONTROL_HEARTBEAT_INTERVAL\"; do",
+        "    emit_control_heartbeat",
+        "    emit_node_snapshot",
+        "    active_now=$(jobs -pr | wc -l)",
+        "    idle_now=$(( max_parallel - active_now ))",
+        "    if [ \"$idle_now\" -lt 0 ]; then idle_now=0; fi",
+        "    emit_worker_snapshot \"$active_now\" \"$idle_now\"",
+        "  done",
+        "}",
+        "heartbeat_pid=''",
+        "if start_control_tunnel; then",
+        "  emit_control_register",
+        "  emit_node_snapshot",
+        "  emit_worker_snapshot 0 \"$max_parallel\"",
+        "  heartbeat_loop &",
+        "  heartbeat_pid=$!",
+        "else",
+        "  emit_control_degraded \"ssh tunnel bootstrap failed\"",
+        "fi",
+        "teardown_control_plane() {",
+        "  if [ -n \"$heartbeat_pid\" ]; then",
+        "    kill \"$heartbeat_pid\" >/dev/null 2>&1 || true",
+        "    wait \"$heartbeat_pid\" >/dev/null 2>&1 || true",
+        "  fi",
+        "  stop_control_tunnel",
+        "}",
+        "trap teardown_control_plane EXIT",
     ]
     for case_index in range(1, case_count + 1):
         case_name = f"case_{case_index:02d}"
@@ -931,7 +1535,6 @@ def _build_noninteractive_srun_command(*, config: RemoteJobConfig, remote_job_di
         )
     payload_lines.extend(
         [
-            f"max_parallel={max_parallel}",
             "for i in $(seq 1 " + str(case_count) + "); do",
             "  while [ \"$(jobs -pr | wc -l)\" -ge \"$max_parallel\" ]; do",
             "    wait -n || true",
@@ -941,16 +1544,29 @@ def _build_noninteractive_srun_command(*, config: RemoteJobConfig, remote_job_di
             "    cd \"$case_dir\"",
             "    mkdir -p tmp",
             "    export TMPDIR=\"$PWD/tmp\"",
+            "    emit_slot_snapshot \"$case_dir\" \"RUNNING\" 0",
             f"    if PEETS_SLOT_CORES={config.cores_per_slot} PEETS_SLOT_TASKS=1 bash ../remote_job.sh > run.log 2>&1; then",
             "      rc=0",
             "    else",
             "      rc=$?",
             "    fi",
             "    echo \"$rc\" > exit.code",
+            "    find . -maxdepth 1 -name '*.lock' -type f -delete >/dev/null 2>&1 || true",
+            "    rm -rf tmp >/dev/null 2>&1 || true",
+            "    artifact_bytes=$(du -sb . 2>/dev/null | awk '{print $1+0}')",
+            "    if [ \"$rc\" -eq 0 ]; then",
+            "      emit_slot_snapshot \"$case_dir\" \"SUCCEEDED\" \"$artifact_bytes\"",
+            "    else",
+            "      emit_slot_snapshot \"$case_dir\" \"FAILED\" \"$artifact_bytes\"",
+            "    fi",
             "  ) &",
             "done",
             "while [ \"$(jobs -pr | wc -l)\" -gt 0 ]; do",
             "  wait -n || true",
+            "  active_now=$(jobs -pr | wc -l)",
+            "  idle_now=$(( max_parallel - active_now ))",
+            "  if [ \"$idle_now\" -lt 0 ]; then idle_now=0; fi",
+            "  emit_worker_snapshot \"$active_now\" \"$idle_now\"",
             "done",
         ]
     )
@@ -968,14 +1584,97 @@ def _build_noninteractive_srun_command(*, config: RemoteJobConfig, remote_job_di
             "printf '__PEETS_RESULTS_TGZ_BEGIN__\\n'",
             "base64 -w0 \"$archive_path\"",
             "printf '\\n__PEETS_RESULTS_TGZ_END__\\n'",
+            "emit_control_recovered",
         ]
     )
     payload = "\n".join(payload_lines)
-    return (
-        f"srun -D /tmp -p {config.partition} -N {config.nodes} -n {config.ntasks} "
-        f"-c {config.cpus_per_job} --mem={config.mem} --time={config.time_limit} "
-        f"bash -lc {shlex.quote(payload)}"
+    return payload
+
+
+def _write_remote_worker_payload_script(
+    tmpdir: Path,
+    *,
+    config: RemoteJobConfig,
+    case_count: int,
+    run_id: str | None = None,
+    worker_id: str | None = None,
+) -> Path:
+    script = tmpdir / "remote_worker_payload.sh"
+    script.write_text(
+        _build_worker_payload_script_content(
+            config=config,
+            case_count=case_count,
+            run_id=run_id,
+            worker_id=worker_id,
+        ),
+        encoding="utf-8",
     )
+    return script
+
+
+def _write_remote_sbatch_script(
+    tmpdir: Path,
+    *,
+    config: RemoteJobConfig,
+    remote_job_dir: str,
+    run_id: str | None = None,
+    worker_id: str | None = None,
+) -> Path:
+    script = tmpdir / "remote_sbatch.sh"
+    script.write_text(
+        _build_remote_sbatch_script_content(
+            config=config,
+            remote_job_dir=remote_job_dir,
+            run_id=run_id,
+            worker_id=worker_id,
+        ),
+        encoding="utf-8",
+    )
+    return script
+
+
+def _build_remote_sbatch_script_content(
+    *,
+    config: RemoteJobConfig,
+    remote_job_dir: str,
+    run_id: str | None = None,
+    worker_id: str | None = None,
+) -> str:
+    remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
+    return "\n".join(
+        [
+            "#!/bin/bash",
+            f"#SBATCH -p {config.partition}",
+            f"#SBATCH -N {config.nodes}",
+            f"#SBATCH -n {config.ntasks}",
+            f"#SBATCH -c {config.cpus_per_job}",
+            f"#SBATCH --mem={config.mem}",
+            f"#SBATCH --time={config.time_limit}",
+            "#SBATCH -o slurm-%j.out",
+            "#SBATCH -e slurm-%j.err",
+            "set -euo pipefail",
+            f"REMOTE_JOB_DIR={shlex.quote(remote_path)}",
+            f"export PEETS_CONTROL_RUN_ID={shlex.quote(run_id or '')}",
+            f"export PEETS_CONTROL_WORKER_ID={shlex.quote(worker_id or '')}",
+            f"export PEETS_CONTROL_HOST={shlex.quote(getattr(config, 'control_plane_host', '127.0.0.1'))}",
+            f"export PEETS_CONTROL_PORT={int(getattr(config, 'control_plane_port', 8765))}",
+            f"export PEETS_CONTROL_SSH_TARGET={shlex.quote(getattr(config, 'control_plane_ssh_target', '').strip())}",
+            f"export PEETS_CONTROL_HEARTBEAT_INTERVAL={max(5, int(getattr(config, 'tunnel_recovery_grace_seconds', 30)))}",
+            "export REMOTE_JOB_DIR",
+            "cd \"$REMOTE_JOB_DIR\"",
+            "tar -czf - remote_job.sh project_*.aedt | /bin/bash ./remote_worker_payload.sh > worker.stdout 2> worker.stderr",
+        ]
+    ) + "\n"
+
+
+def _parse_sbatch_job_id(output: str) -> str:
+    text = output.strip()
+    if not text:
+        raise WorkflowError("Unable to parse sbatch job id.", exit_code=EXIT_CODE_SLURM_FAILURE)
+    token = text.splitlines()[-1].strip().split(";", 1)[0].strip()
+    if not token.isdigit():
+        raise WorkflowError("Unable to parse sbatch job id.", exit_code=EXIT_CODE_SLURM_FAILURE)
+    return token
 
 
 def _count_screen_slots(output: str) -> int:
@@ -1142,6 +1841,15 @@ def _categorize_failure(*, exit_code: int, message: str, failed_case_lines: Sequ
     normalized = message.lower()
     if "readiness" in normalized or "preflight" in normalized or "bootstrap" in normalized:
         return "readiness"
+    if (
+        "storage" in normalized
+        or "inode_pct=" in normalized
+        or "free_mb=" in normalized
+        or "no space left" in normalized
+        or "disk quota" in normalized
+        or ("scp upload failed" in normalized and "write remote" in normalized)
+    ):
+        return "storage"
     if exit_code == EXIT_CODE_REMOTE_CLEANUP_FAILURE or "cleanup" in normalized:
         return "cleanup"
     if exit_code == EXIT_CODE_DOWNLOAD_FAILURE or "archive" in normalized or "download" in normalized:

@@ -14,6 +14,8 @@ from peetsfea_runner.systemd_worker import (
     _AutorecoveryControlState,
     _WorkerRuntimeState,
     _build_config,
+    _heartbeat_once,
+    _normalize_control_plane_ssh_target,
     _run_worker_iteration,
 )
 
@@ -60,6 +62,31 @@ class TestSystemdWorker(unittest.TestCase):
         self.assertEqual(len(config.accounts_registry), 2)
         self.assertEqual(config.accounts_registry[1].platform, "windows")
         self.assertEqual(config.accounts_registry[1].scheduler, "none")
+
+    def test_normalize_control_plane_ssh_target_prefixes_local_user(self) -> None:
+        with patch.dict(environ, {"USER": "peetsmain"}, clear=False):
+            self.assertEqual(_normalize_control_plane_ssh_target("harrypc"), "peetsmain@harrypc")
+
+    def test_normalize_control_plane_ssh_target_preserves_explicit_user(self) -> None:
+        with patch.dict(environ, {"USER": "peetsmain"}, clear=False):
+            self.assertEqual(_normalize_control_plane_ssh_target("admin@harrypc"), "admin@harrypc")
+
+    def test_build_config_normalizes_control_plane_ssh_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                environ,
+                {
+                    "PEETSFEA_INPUT_QUEUE_DIR": str(Path(tmpdir) / "in"),
+                    "PEETSFEA_OUTPUT_ROOT_DIR": str(Path(tmpdir) / "out"),
+                    "PEETSFEA_DB_PATH": str(Path(tmpdir) / "state.duckdb"),
+                    "PEETSFEA_CONTROL_PLANE_SSH_TARGET": "harrypc",
+                    "USER": "peetsmain",
+                },
+                clear=False,
+            ):
+                config = _build_config()
+
+        self.assertEqual(config.control_plane_ssh_target, "peetsmain@harrypc")
 
     def test_run_worker_iteration_marks_idle_when_pipeline_is_idle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -317,6 +344,66 @@ class TestSystemdWorker(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(recovery_events, 1)
+
+    def test_heartbeat_once_records_resource_snapshots_for_active_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                metadata_db_path=str(db_path),
+                continuous_mode=False,
+                mem="512G",
+                slots_per_job=4,
+            )
+            store = StateStore(db_path)
+            store.initialize()
+            runtime_state = _WorkerRuntimeState(run_id="run_01", status="ACTIVE")
+            store.start_run("run_01")
+
+            with (
+                patch("peetsfea_runner.systemd_worker._read_meminfo_mb", return_value=(1024, 256, 768)),
+                patch("peetsfea_runner.systemd_worker._load_average", return_value=(1.0, 0.8, 0.6)),
+                patch("peetsfea_runner.systemd_worker._tmp_usage_mb", return_value=(100, 25, 75)),
+                patch("peetsfea_runner.systemd_worker._read_self_rss_mb", return_value=128),
+                patch("peetsfea_runner.systemd_worker._system_process_count", return_value=321),
+            ):
+                _heartbeat_once(
+                    store=store,
+                    config=config,
+                    service_name="peetsfea-runner",
+                    host="mainpc",
+                    pid=1234,
+                    runtime_state=runtime_state,
+                )
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                node_row = conn.execute(
+                    """
+                    SELECT allocated_mem_mb, total_mem_mb, used_mem_mb, free_mem_mb, load_1, process_count, running_worker_count, active_slot_count
+                    FROM node_resource_snapshots
+                    """
+                ).fetchone()
+                worker_row = conn.execute(
+                    """
+                    SELECT configured_slots, active_slots, idle_slots, rss_mb, process_count
+                    FROM worker_resource_snapshots
+                    """
+                ).fetchone()
+                summary_row = conn.execute(
+                    """
+                    SELECT allocated_mem_mb, used_mem_mb, free_mem_mb, load_1, stale
+                    FROM resource_summary_snapshots
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(node_row, (512 * 1024, 1024, 256, 768, 1.0, 321, 0, 0))
+            self.assertEqual(worker_row, (4, 0, 4, 128, 321))
+            self.assertEqual(summary_row, (512 * 1024, 256, 768, 1.0, False))
 
 
 if __name__ == "__main__":

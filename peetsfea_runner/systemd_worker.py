@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import threading
 import time
@@ -14,6 +15,174 @@ from .web_status import start_status_server
 
 
 APP_VERSION = get_version()
+
+
+def _normalize_control_plane_ssh_target(target: str) -> str:
+    normalized = target.strip()
+    if not normalized or "@" in normalized:
+        return normalized
+    local_user = (os.getenv("USER") or os.getenv("LOGNAME") or "").strip()
+    if not local_user:
+        return normalized
+    return f"{local_user}@{normalized}"
+
+
+def _parse_mem_to_mb(mem: str) -> int | None:
+    raw = mem.strip().upper()
+    if not raw:
+        return None
+    multiplier = 1
+    if raw.endswith("TB") or raw.endswith("T"):
+        multiplier = 1024 * 1024
+        raw = raw[:-2] if raw.endswith("TB") else raw[:-1]
+    elif raw.endswith("GB") or raw.endswith("G"):
+        multiplier = 1024
+        raw = raw[:-2] if raw.endswith("GB") else raw[:-1]
+    elif raw.endswith("MB") or raw.endswith("M"):
+        multiplier = 1
+        raw = raw[:-2] if raw.endswith("MB") else raw[:-1]
+    elif raw.endswith("KB") or raw.endswith("K"):
+        multiplier = 1 / 1024
+        raw = raw[:-2] if raw.endswith("KB") else raw[:-1]
+    try:
+        return int(float(raw) * multiplier)
+    except ValueError:
+        return None
+
+
+def _read_meminfo_mb() -> tuple[int | None, int | None, int | None]:
+    meminfo_path = Path("/proc/meminfo")
+    if not meminfo_path.exists():
+        return None, None, None
+    values: dict[str, int] = {}
+    for line in meminfo_path.read_text(encoding="utf-8").splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        parts = value.strip().split()
+        if not parts:
+            continue
+        try:
+            values[key.strip()] = int(parts[0])
+        except ValueError:
+            continue
+    total_kb = values.get("MemTotal")
+    available_kb = values.get("MemAvailable")
+    if total_kb is None or available_kb is None:
+        return None, None, None
+    total_mb = total_kb // 1024
+    free_mb = available_kb // 1024
+    used_mb = max(total_mb - free_mb, 0)
+    return total_mb, used_mb, free_mb
+
+
+def _read_self_rss_mb() -> int | None:
+    status_path = Path("/proc/self/status")
+    if not status_path.exists():
+        return None
+    for line in status_path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("VmRSS:"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    return int(parts[1]) // 1024
+                except ValueError:
+                    return None
+    return None
+
+
+def _load_average() -> tuple[float | None, float | None, float | None]:
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except OSError:
+        return None, None, None
+    return float(load1), float(load5), float(load15)
+
+
+def _tmp_usage_mb() -> tuple[int | None, int | None, int | None]:
+    usage = shutil.disk_usage(Path(os.getenv("TMPDIR", "/tmp")))
+    total_mb = usage.total // (1024 * 1024)
+    free_mb = usage.free // (1024 * 1024)
+    used_mb = usage.used // (1024 * 1024)
+    return total_mb, used_mb, free_mb
+
+
+def _system_process_count() -> int:
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return 0
+    count = 0
+    for entry in proc_root.iterdir():
+        if entry.name.isdigit():
+            count += 1
+    return count
+
+
+def _record_local_resource_snapshots(
+    *,
+    store: StateStore,
+    config: PipelineConfig,
+    service_name: str,
+    host: str,
+    pid: int,
+    runtime_state: _WorkerRuntimeState,
+) -> None:
+    run_id, _status = runtime_state.snapshot()
+    if not run_id:
+        return
+    total_mem_mb, used_mem_mb, free_mem_mb = _read_meminfo_mb()
+    load_1, load_5, load_15 = _load_average()
+    tmp_total_mb, tmp_used_mb, tmp_free_mb = _tmp_usage_mb()
+    active_slot_count = store.count_active_slots(run_id=run_id)
+    running_worker_count = len(store.list_active_slurm_workers(run_id=run_id))
+    configured_mem_mb = _parse_mem_to_mb(config.mem)
+    worker_status = store.get_slurm_worker(run_id=run_id, worker_id=f"{service_name}:{host}:{pid}")
+    tunnel_state = None
+    if worker_status is not None:
+        tunnel_state = str(worker_status.get("tunnel_state") or "")
+    rss_mb = _read_self_rss_mb()
+    process_count = _system_process_count()
+    store.record_node_resource_snapshot(
+        run_id=run_id,
+        host=host,
+        allocated_mem_mb=configured_mem_mb,
+        total_mem_mb=total_mem_mb,
+        used_mem_mb=used_mem_mb,
+        free_mem_mb=free_mem_mb,
+        load_1=load_1,
+        load_5=load_5,
+        load_15=load_15,
+        tmp_total_mb=tmp_total_mb,
+        tmp_used_mb=tmp_used_mb,
+        tmp_free_mb=tmp_free_mb,
+        process_count=process_count,
+        running_worker_count=running_worker_count,
+        active_slot_count=active_slot_count,
+    )
+    store.record_worker_resource_snapshot(
+        run_id=run_id,
+        worker_id=f"{service_name}:{host}:{pid}",
+        host=host,
+        slurm_job_id=None,
+        configured_slots=config.slots_per_job,
+        active_slots=active_slot_count,
+        idle_slots=max(config.slots_per_job - active_slot_count, 0),
+        rss_mb=rss_mb,
+        cpu_pct=None,
+        tunnel_state=tunnel_state,
+        process_count=process_count,
+    )
+    store.record_resource_summary_snapshot(
+        run_id=run_id,
+        host=host,
+        allocated_mem_mb=configured_mem_mb,
+        used_mem_mb=used_mem_mb,
+        free_mem_mb=free_mem_mb,
+        load_1=load_1,
+        running_worker_count=running_worker_count,
+        active_slot_count=active_slot_count,
+        stale=False,
+    )
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -119,6 +288,10 @@ def _build_config() -> PipelineConfig:
         max_jobs = int(os.getenv("PEETSFEA_MAX_JOBS_PER_ACCOUNT", "10"))
         accounts_registry = (AccountConfig(account_id=account_id, host_alias=host_alias, max_jobs=max_jobs),)
 
+    control_plane_ssh_target = _normalize_control_plane_ssh_target(
+        os.getenv("PEETSFEA_CONTROL_PLANE_SSH_TARGET", "")
+    )
+
     return PipelineConfig(
         input_queue_dir=input_queue_dir,
         output_root_dir=output_root_dir,
@@ -127,26 +300,39 @@ def _build_config() -> PipelineConfig:
         metadata_db_path=metadata_db_path,
         accounts_registry=accounts_registry,
         execute_remote=_env_bool("PEETSFEA_EXECUTE_REMOTE", True),
+        remote_execution_backend=os.getenv("PEETSFEA_REMOTE_EXECUTION_BACKEND", "foreground_ssh"),
         partition=os.getenv("PEETSFEA_PARTITION", "cpu2"),
         cpus_per_job=int(os.getenv("PEETSFEA_CPUS_PER_JOB", "16")),
         mem=os.getenv("PEETSFEA_MEM", "960G"),
         time_limit=os.getenv("PEETSFEA_TIME_LIMIT", "05:00:00"),
         remote_root=os.getenv("PEETSFEA_REMOTE_ROOT", "~/aedt_runs"),
+        control_plane_host=os.getenv("PEETSFEA_CONTROL_PLANE_HOST", "127.0.0.1"),
+        control_plane_port=int(os.getenv("PEETSFEA_CONTROL_PLANE_PORT", os.getenv("PEETSFEA_WEB_PORT", "8765"))),
+        control_plane_ssh_target=control_plane_ssh_target,
+        tunnel_heartbeat_timeout_seconds=int(os.getenv("PEETSFEA_TUNNEL_HEARTBEAT_TIMEOUT_SECONDS", "90")),
+        tunnel_recovery_grace_seconds=int(os.getenv("PEETSFEA_TUNNEL_RECOVERY_GRACE_SECONDS", "30")),
         continuous_mode=_env_bool("PEETSFEA_CONTINUOUS_MODE", True),
         ingest_poll_seconds=int(os.getenv("PEETSFEA_INGEST_POLL_SECONDS", "30")),
         ready_sidecar_suffix=os.getenv("PEETSFEA_READY_SIDECAR_SUFFIX", ".ready"),
         slots_per_job=int(os.getenv("PEETSFEA_SLOTS_PER_JOB", "4")),
+        worker_bundle_multiplier=int(os.getenv("PEETSFEA_WORKER_BUNDLE_MULTIPLIER", "1")),
         cores_per_slot=int(os.getenv("PEETSFEA_CORES_PER_SLOT", "4")),
         worker_requeue_limit=int(os.getenv("PEETSFEA_WORKER_REQUEUE_LIMIT", "1")),
         run_rotation_hours=int(os.getenv("PEETSFEA_RUN_ROTATION_HOURS", "24")),
         pending_buffer_per_account=int(os.getenv("PEETSFEA_PENDING_BUFFER_PER_ACCOUNT", "3")),
         capacity_scope=os.getenv("PEETSFEA_CAPACITY_SCOPE", "all_user_jobs"),
         balance_metric=os.getenv("PEETSFEA_BALANCE_METRIC", "slot_throughput"),
+        input_source_policy=os.getenv("PEETSFEA_INPUT_SOURCE_POLICY", "sample_only"),
+        public_storage_mode=os.getenv("PEETSFEA_PUBLIC_STORAGE_MODE", "disabled"),
+        remote_storage_inode_block_percent=int(os.getenv("PEETSFEA_REMOTE_STORAGE_INODE_BLOCK_PERCENT", "98")),
+        remote_storage_min_free_mb=int(os.getenv("PEETSFEA_REMOTE_STORAGE_MIN_FREE_MB", "0")),
     )
 
 
 def _start_embedded_web_if_enabled() -> None:
-    if not _env_bool("PEETSFEA_EMBED_WEB", True):
+    backend = os.getenv("PEETSFEA_REMOTE_EXECUTION_BACKEND", "foreground_ssh").strip().lower()
+    embed_web = _env_bool("PEETSFEA_EMBED_WEB", True)
+    if not embed_web and backend != "slurm_batch":
         return
     repo_root = Path(__file__).resolve().parent.parent
     db_path = os.getenv("PEETSFEA_DB_PATH", str(repo_root / "peetsfea_runner.duckdb"))
@@ -164,6 +350,7 @@ def _start_embedded_web_if_enabled() -> None:
 def _heartbeat_once(
     *,
     store: StateStore,
+    config: PipelineConfig,
     service_name: str,
     host: str,
     pid: int,
@@ -177,11 +364,20 @@ def _heartbeat_once(
         run_id=run_id,
         status=status,
     )
+    _record_local_resource_snapshots(
+        store=store,
+        config=config,
+        service_name=service_name,
+        host=host,
+        pid=pid,
+        runtime_state=runtime_state,
+    )
 
 
 def _heartbeat_loop(
     *,
     store: StateStore,
+    config: PipelineConfig,
     service_name: str,
     host: str,
     pid: int,
@@ -191,6 +387,7 @@ def _heartbeat_loop(
 ) -> None:
     _heartbeat_once(
         store=store,
+        config=config,
         service_name=service_name,
         host=host,
         pid=pid,
@@ -199,6 +396,7 @@ def _heartbeat_loop(
     while not stop_event.wait(interval_seconds):
         _heartbeat_once(
             store=store,
+            config=config,
             service_name=service_name,
             host=host,
             pid=pid,
@@ -362,6 +560,7 @@ def run_user_worker_loop() -> None:
         target=_heartbeat_loop,
         kwargs={
             "store": store,
+            "config": config,
             "service_name": service_name,
             "host": host,
             "pid": pid,

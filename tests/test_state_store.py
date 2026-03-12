@@ -38,6 +38,11 @@ class TestStateStore(unittest.TestCase):
             self.assertIn("slot_events", names)
             self.assertIn("ingest_index", names)
             self.assertIn("account_capacity_snapshots", names)
+            self.assertIn("slurm_workers", names)
+            self.assertIn("node_resource_snapshots", names)
+            self.assertIn("worker_resource_snapshots", names)
+            self.assertIn("slot_resource_snapshots", names)
+            self.assertIn("resource_summary_snapshots", names)
 
     def test_job_lifecycle_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -302,6 +307,241 @@ class TestStateStore(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(tuple(row), (2, 1, 10))
+
+    def test_count_active_jobs_by_account_counts_pending_submitted_and_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            store.start_run("run_01")
+            store.create_job(
+                run_id="run_01",
+                job_id="job_0001",
+                input_path="/in/a.aedt",
+                output_path="/out/a.aedt.out",
+                account_id="account_01",
+            )
+            store.update_job_status(run_id="run_01", job_id="job_0001", status="SUBMITTED", attempt_no=1)
+            store.create_job(
+                run_id="run_01",
+                job_id="job_0002",
+                input_path="/in/b.aedt",
+                output_path="/out/b.aedt.out",
+                account_id="account_01",
+            )
+            store.update_job_status(run_id="run_01", job_id="job_0002", status="RUNNING", attempt_no=1)
+            store.create_job(
+                run_id="run_01",
+                job_id="job_0003",
+                input_path="/in/c.aedt",
+                output_path="/out/c.aedt.out",
+                account_id="account_02",
+            )
+            store.update_job_status(run_id="run_01", job_id="job_0003", status="SUCCEEDED", attempt_no=1)
+
+            counts = store.count_active_jobs_by_account(run_id="run_01")
+            self.assertEqual(counts, {"account_01": 2})
+
+    def test_slurm_worker_upsert_tracks_lifecycle_and_active_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            store.start_run("run_01")
+
+            store.upsert_slurm_worker(
+                run_id="run_01",
+                worker_id="attempt_0001",
+                job_id="job_0001",
+                attempt_no=1,
+                account_id="account_01",
+                host_alias="gate1-harry",
+                slurm_job_id="552740",
+                worker_state="SUBMITTED",
+                observed_node=None,
+                slots_configured=4,
+                backend="slurm_batch",
+            )
+            store.upsert_slurm_worker(
+                run_id="run_01",
+                worker_id="attempt_0001",
+                job_id="job_0001",
+                attempt_no=1,
+                account_id="account_01",
+                host_alias="gate1-harry",
+                slurm_job_id="552740",
+                worker_state="RUNNING",
+                observed_node="n115",
+                slots_configured=4,
+                backend="slurm_batch",
+            )
+            store.upsert_slurm_worker(
+                run_id="run_01",
+                worker_id="attempt_0002",
+                job_id="job_0002",
+                attempt_no=1,
+                account_id="account_01",
+                host_alias="gate1-harry",
+                slurm_job_id="552741",
+                worker_state="COMPLETED",
+                observed_node="n108",
+                slots_configured=4,
+                backend="slurm_batch",
+            )
+
+            active_workers = store.list_active_slurm_workers(run_id="run_01")
+            all_workers = store.list_slurm_workers(run_id="run_01")
+
+            self.assertEqual(len(active_workers), 1)
+            self.assertEqual(active_workers[0]["worker_id"], "attempt_0001")
+            self.assertEqual(active_workers[0]["worker_state"], "RUNNING")
+            self.assertEqual(active_workers[0]["observed_node"], "n115")
+            self.assertEqual(active_workers[0]["tunnel_state"], "PENDING")
+            self.assertEqual(len(all_workers), 2)
+            self.assertEqual({row["worker_state"] for row in all_workers}, {"RUNNING", "COMPLETED"})
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT submitted_at, started_at, ended_at
+                    FROM slurm_workers
+                    WHERE run_id = 'run_01' AND worker_id = 'attempt_0001'
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertIsNotNone(row[0])
+            self.assertIsNotNone(row[1])
+            self.assertIsNone(row[2])
+
+    def test_update_slurm_worker_control_plane_tracks_tunnel_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            store.start_run("run_01")
+            store.upsert_slurm_worker(
+                run_id="run_01",
+                worker_id="attempt_0001",
+                job_id="job_0001",
+                attempt_no=1,
+                account_id="account_01",
+                host_alias="gate1-harry",
+                slurm_job_id="552740",
+                worker_state="RUNNING",
+                observed_node="n115",
+                slots_configured=4,
+                backend="slurm_batch",
+            )
+
+            store.update_slurm_worker_control_plane(
+                run_id="run_01",
+                worker_id="attempt_0001",
+                tunnel_state="CONNECTED",
+                tunnel_session_id="session-1",
+                observed_node="n115",
+            )
+            store.update_slurm_worker_control_plane(
+                run_id="run_01",
+                worker_id="attempt_0001",
+                tunnel_state="DEGRADED",
+                degraded_reason="tunnel heartbeat stale after main restart",
+            )
+
+            row = store.get_slurm_worker(run_id="run_01", worker_id="attempt_0001")
+            assert row is not None
+            self.assertEqual(row["tunnel_session_id"], "session-1")
+            self.assertEqual(row["tunnel_state"], "DEGRADED")
+            self.assertEqual(row["degraded_reason"], "tunnel heartbeat stale after main restart")
+            self.assertIsNotNone(row["heartbeat_ts"])
+
+    def test_resource_snapshot_tables_record_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            store.start_run("run_01")
+            store.record_node_resource_snapshot(
+                run_id="run_01",
+                host="mainpc",
+                allocated_mem_mb=960 * 1024,
+                total_mem_mb=1024,
+                used_mem_mb=256,
+                free_mem_mb=768,
+                load_1=0.5,
+                load_5=0.4,
+                load_15=0.3,
+                tmp_total_mb=100,
+                tmp_used_mb=10,
+                tmp_free_mb=90,
+                process_count=123,
+                running_worker_count=2,
+                active_slot_count=5,
+            )
+            store.record_worker_resource_snapshot(
+                run_id="run_01",
+                worker_id="attempt_0001",
+                host="n108",
+                slurm_job_id="552740",
+                configured_slots=4,
+                active_slots=3,
+                idle_slots=1,
+                rss_mb=512,
+                cpu_pct=88.5,
+                tunnel_state="CONNECTED",
+                process_count=5,
+            )
+            store.record_slot_resource_snapshot(
+                run_id="run_01",
+                slot_id="w_001",
+                worker_id="attempt_0001",
+                host="n108",
+                allocated_mem_mb=240 * 1024,
+                used_mem_mb=128,
+                load_1=1.5,
+                rss_mb=128,
+                cpu_pct=25.0,
+                process_count=3,
+                active_process_count=2,
+                artifact_bytes=4096,
+                progress_ts="2026-03-11T12:00:00+00:00",
+                state="RUNNING",
+            )
+            store.record_resource_summary_snapshot(
+                run_id="run_01",
+                host="mainpc",
+                allocated_mem_mb=960 * 1024,
+                used_mem_mb=256,
+                free_mem_mb=768,
+                load_1=0.5,
+                running_worker_count=2,
+                active_slot_count=5,
+                stale=False,
+            )
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                node_row = conn.execute(
+                    "SELECT allocated_mem_mb, total_mem_mb, used_mem_mb, process_count, running_worker_count, active_slot_count FROM node_resource_snapshots"
+                ).fetchone()
+                worker_row = conn.execute(
+                    "SELECT configured_slots, active_slots, rss_mb, tunnel_state FROM worker_resource_snapshots"
+                ).fetchone()
+                slot_row = conn.execute(
+                    "SELECT allocated_mem_mb, used_mem_mb, load_1, rss_mb, process_count, active_process_count, artifact_bytes, state FROM slot_resource_snapshots"
+                ).fetchone()
+                summary_row = conn.execute(
+                    "SELECT allocated_mem_mb, used_mem_mb, active_slot_count, stale FROM resource_summary_snapshots"
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(node_row, (960 * 1024, 1024, 256, 123, 2, 5))
+            self.assertEqual(worker_row, (4, 3, 512, "CONNECTED"))
+            self.assertEqual(slot_row, (240 * 1024, 128, 1.5, 128, 3, 2, 4096, "RUNNING"))
+            self.assertEqual(summary_row, (960 * 1024, 256, 5, False))
 
 
 if __name__ == "__main__":
