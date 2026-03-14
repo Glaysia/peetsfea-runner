@@ -85,6 +85,19 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("EMIT_OUTPUT_VARIABLES_CSV: bool = False", content)
         self.assertIn("if not EMIT_OUTPUT_VARIABLES_CSV:", content)
 
+    def test_remote_script_merges_nominal_variations_into_csv_row_before_outputs(self) -> None:
+        content = _build_remote_job_script_content()
+        self.assertIn("import json", content)
+        self.assertIn("def build_output_variable_row_variations(hfss: Hfss) -> dict[str, object]:", content)
+        self.assertIn("if name == 'Freq':", content)
+        self.assertIn("row[str(name)] = serialize_row_value(value)", content)
+        self.assertIn("for key, value in build_output_variable_row_variations(hfss).items():", content)
+        self.assertIn("row.setdefault(key, value)", content)
+        self.assertLess(
+            content.index("for key, value in build_output_variable_row_variations(hfss).items():"),
+            content.index("if not hfss.output_variables:"),
+        )
+
     def test_remote_dispatch_script_uses_noninteractive_srun_without_screen(self) -> None:
         class _Cfg:
             partition = "cpu2"
@@ -95,13 +108,14 @@ class TestPlan03Workflow(unittest.TestCase):
             time_limit = "05:00:00"
             slots_per_job = 4
             cores_per_slot = 4
+            slurm_exclude_nodes = ("n108", "n109")
 
         content = _build_remote_dispatch_script_content(
             config=_Cfg(),
             remote_job_dir="/tmp/peetsfea/run_01/job_0001",
             case_count=2,
         )
-        self.assertIn("srun -D /tmp -p cpu2 -N 1 -n 1 -c 16 --mem=960G --time=05:00:00", content)
+        self.assertIn("srun -D /tmp -p cpu2 -N 1 -n 1 -c 16 --mem=960G --time=05:00:00 --exclude=n108,n109", content)
         self.assertNotIn("screen -dmS", content)
         self.assertNotIn("srun --pty", content)
         self.assertIn("__PEETS_FAILED_COUNT__", content)
@@ -203,6 +217,7 @@ class TestPlan03Workflow(unittest.TestCase):
             control_plane_return_port = 5722
             control_plane_return_user = "peetsmain"
             tunnel_recovery_grace_seconds = 30
+            slurm_exclude_nodes = ("n108", "n109")
 
         content = _build_remote_sbatch_script_content(
             config=_Cfg(),
@@ -215,6 +230,7 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("#SBATCH -c 16", content)
         self.assertIn("#SBATCH -o slurm-%j.out", content)
         self.assertIn("#SBATCH -e slurm-%j.err", content)
+        self.assertIn("#SBATCH --exclude=n108,n109", content)
         self.assertIn('cd "$REMOTE_JOB_DIR"', content)
         self.assertIn("export REMOTE_JOB_DIR", content)
         self.assertIn("/bin/bash ./remote_worker_payload.sh > worker.stdout 2> worker.stderr", content)

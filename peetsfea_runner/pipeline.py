@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import csv
 from collections import deque
+import json
 import os
 import shutil
 import time
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha1
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -60,10 +62,195 @@ from .version import get_version
 
 APP_VERSION = get_version()
 
+_CANARY_SOURCE_COLUMNS = frozenset(
+    {
+        "source_aedt_path",
+        "source_case_dir",
+        "source_aedt_name",
+    }
+)
+_CANARY_INPUT_SENTINELS = frozenset(
+    {
+        "coil_groups_0__count_mode",
+        "coil_shape_inner_margin_x",
+        "coil_spacing_tx_vertical_center_gap_mm",
+        "ferrite_present",
+        "tx_region_z_parts_dd_z_mm",
+    }
+)
+_CANARY_OUTPUT_SENTINELS = frozenset({"k_ratio", "Lrx_uH"})
+_CANARY_REQUIRED_COLUMNS = _CANARY_SOURCE_COLUMNS | _CANARY_INPUT_SENTINELS | _CANARY_OUTPUT_SENTINELS
+_DISPATCH_MODE_ALLOWED = frozenset({"run", "drain"})
+_BAD_NODE_TMP_FREE_THRESHOLD_MB = 65536
+_BAD_NODE_COOLDOWN_HOURS = 8
+_BAD_NODE_NO_SPACE_MARKER = "No space left on device"
+
 
 def _log_stage(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[peetsfea][{timestamp}] {message}", flush=True)
+
+
+def _dispatch_mode_control_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "tmp" / "runtime" / "dispatch.mode"
+
+
+def _read_dispatch_mode(*, control_path: Path | None = None) -> tuple[str, str | None]:
+    path = _dispatch_mode_control_path() if control_path is None else control_path
+    try:
+        raw_value = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "run", None
+    except OSError as exc:
+        return "run", f"dispatch.mode read failed path={path} fallback=run reason={exc}"
+
+    normalized = raw_value.strip().lower()
+    if normalized in _DISPATCH_MODE_ALLOWED:
+        return normalized, None
+    if not normalized:
+        raw_label = "<empty>"
+    else:
+        raw_label = raw_value.strip()
+    return "run", f"dispatch.mode invalid value={raw_label!r} path={path} fallback=run"
+
+
+def _bad_nodes_control_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "tmp" / "runtime" / "bad_nodes.json"
+
+
+def _load_bad_node_policy_entries(*, control_path: Path | None = None) -> tuple[list[dict[str, object]], list[str]]:
+    path = _bad_nodes_control_path() if control_path is None else control_path
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return [], []
+    except OSError as exc:
+        return [], [f"bad_nodes.json read failed path={path} fallback=none reason={exc}"]
+    except json.JSONDecodeError as exc:
+        return [], [f"bad_nodes.json parse failed path={path} fallback=none reason={exc}"]
+
+    if isinstance(payload, list):
+        raw_entries = payload
+    elif isinstance(payload, dict):
+        raw_entries = payload.get("bad_nodes")
+        if raw_entries is None:
+            raw_entries = payload.get("nodes")
+        if not isinstance(raw_entries, list):
+            return [], [f"bad_nodes.json invalid payload path={path} fallback=none reason=missing_list"]
+    else:
+        return [], [f"bad_nodes.json invalid payload path={path} fallback=none reason=unsupported_type"]
+
+    normalized_entries: list[dict[str, object]] = []
+    warnings: list[str] = []
+    for index, entry in enumerate(raw_entries):
+        if not isinstance(entry, dict):
+            warnings.append(f"bad_nodes.json invalid entry path={path} index={index} reason=not_object")
+            continue
+        normalized_entries.append(dict(entry))
+    return normalized_entries, warnings
+
+
+def _load_active_bad_nodes(
+    *,
+    control_path: Path | None = None,
+    now: datetime | None = None,
+) -> tuple[tuple[str, ...], list[str]]:
+    path = _bad_nodes_control_path() if control_path is None else control_path
+    reference = now or datetime.now(tz=timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+
+    raw_entries, warnings = _load_bad_node_policy_entries(control_path=path)
+
+    active_nodes: list[str] = []
+    for index, entry in enumerate(raw_entries):
+        node = str(entry.get("node", "")).strip()
+        reason = str(entry.get("reason", "")).strip()
+        first_seen_at = _parse_optional_iso(entry.get("first_seen_at"))
+        expires_at = _parse_optional_iso(entry.get("expires_at"))
+        if not node:
+            warnings.append(f"bad_nodes.json invalid entry path={path} index={index} reason=node_missing")
+            continue
+        if first_seen_at is None:
+            warnings.append(f"bad_nodes.json invalid entry path={path} index={index} node={node} reason=first_seen_at_missing")
+        if not reason:
+            warnings.append(f"bad_nodes.json invalid entry path={path} index={index} node={node} reason=reason_missing")
+        if expires_at is None:
+            warnings.append(f"bad_nodes.json invalid entry path={path} index={index} node={node} reason=expires_at_missing")
+            continue
+        if expires_at <= reference:
+            continue
+        active_nodes.append(node)
+
+    return tuple(dict.fromkeys(active_nodes)), warnings
+
+
+def _register_bad_node_candidate(
+    *,
+    node: str,
+    reason: str,
+    control_path: Path | None = None,
+    observed_at: datetime | None = None,
+    cooldown_hours: int = _BAD_NODE_COOLDOWN_HOURS,
+) -> tuple[dict[str, str] | None, list[str]]:
+    path = _bad_nodes_control_path() if control_path is None else control_path
+    reference = observed_at or datetime.now(tz=timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    normalized_node = str(node).strip()
+    normalized_reason = str(reason).strip()
+    if not normalized_node:
+        return None, [f"bad_nodes.json register failed path={path} reason=node_missing"]
+    if not normalized_reason:
+        return None, [f"bad_nodes.json register failed path={path} node={normalized_node} reason=reason_missing"]
+
+    entries, warnings = _load_bad_node_policy_entries(control_path=path)
+    if any(
+        "read failed" in warning or "parse failed" in warning or "invalid payload" in warning
+        for warning in warnings
+    ):
+        return None, warnings
+
+    expires_at = reference + timedelta(hours=max(1, cooldown_hours))
+    registered_entry: dict[str, str] | None = None
+    for entry in entries:
+        if str(entry.get("node", "")).strip() != normalized_node:
+            continue
+        existing_first_seen = _parse_optional_iso(entry.get("first_seen_at")) or reference
+        existing_expires_at = _parse_optional_iso(entry.get("expires_at")) or reference
+        first_seen_at = min(existing_first_seen, reference)
+        effective_expires_at = max(existing_expires_at, expires_at)
+        entry["node"] = normalized_node
+        entry["reason"] = normalized_reason
+        entry["first_seen_at"] = first_seen_at.isoformat()
+        entry["expires_at"] = effective_expires_at.isoformat()
+        registered_entry = {
+            "node": normalized_node,
+            "reason": normalized_reason,
+            "first_seen_at": entry["first_seen_at"],
+            "expires_at": entry["expires_at"],
+        }
+        break
+    if registered_entry is None:
+        registered_entry = {
+            "node": normalized_node,
+            "reason": normalized_reason,
+            "first_seen_at": reference.isoformat(),
+            "expires_at": expires_at.isoformat(),
+        }
+        entries.append(dict(registered_entry))
+
+    serialized_entries = sorted(entries, key=lambda item: str(item.get("node", "")).strip())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"bad_nodes": serialized_entries}, indent=2, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        warnings.append(f"bad_nodes.json write failed path={path} node={normalized_node} reason={exc}")
+        return None, warnings
+    return registered_entry, warnings
 
 
 def _is_sample_canary_input(path: Path) -> bool:
@@ -325,6 +512,7 @@ class _RemoteExecutionConfig:
     tunnel_heartbeat_timeout_seconds: int = 90
     tunnel_recovery_grace_seconds: int = 30
     remote_ssh_port: int = 22
+    slurm_exclude_nodes: tuple[str, ...] = ()
 
 
 def _scan_input_aedt_files(*, input_root: Path, recursive: bool) -> list[Path]:
@@ -340,8 +528,20 @@ def _storage_boundary_message(*, config: PipelineConfig) -> str:
     )
 
 
-def _canary_output_csv_present(*, output_root: Path) -> bool:
-    return any(output_root.rglob("output_variables.csv"))
+def _canary_output_csv_gate_reason(*, output_root: Path) -> str:
+    csv_paths = sorted(output_root.rglob("output_variables.csv"))
+    if not csv_paths:
+        return "output_variables_csv_missing"
+    for csv_path in csv_paths:
+        try:
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                header = next(csv.reader(handle), [])
+        except (OSError, csv.Error):
+            header = []
+        normalized_header = {column.strip() for column in header if column.strip()}
+        if _CANARY_REQUIRED_COLUMNS.issubset(normalized_header):
+            return "ok"
+    return "output_variables_csv_schema_invalid"
 
 
 def _canary_materialized_output_present(*, output_root: Path) -> bool:
@@ -585,6 +785,77 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         stage="SERVICE_BOUNDARY",
         message=_storage_boundary_message(config=config),
     )
+    if canary_candidate:
+        _append_worker_event(
+            level="INFO",
+            stage="CANARY_STARTED",
+            message=(
+                f"run_id={run_id} sample.aedt validation_lane=started "
+                f"continuous_mode={config.continuous_mode} execute_remote={config.execute_remote} "
+                f"input_dir={config.input_queue_dir} output_root={config.output_root_dir} "
+                f"db_path={config.metadata_db_path} "
+                f"delete_failed_dir={config.delete_failed_quarantine_dir}"
+            ),
+        )
+
+    dispatch_mode_path = _dispatch_mode_control_path()
+    dispatch_mode_warnings: set[str] = set()
+    dispatch_drain_emitted = False
+    bad_node_policy_warnings: set[str] = set()
+    bad_node_registrations: set[tuple[str, str]] = set()
+
+    def _current_dispatch_mode() -> str:
+        mode, warning = _read_dispatch_mode(control_path=dispatch_mode_path)
+        if warning is not None and warning not in dispatch_mode_warnings:
+            _log_stage(warning)
+            _append_worker_event(level="WARN", stage="DISPATCH_MODE_INVALID", message=warning)
+            dispatch_mode_warnings.add(warning)
+        return mode
+
+    def _dispatch_drained(*, queued_count: int, inflight_jobs: int = 0) -> bool:
+        nonlocal dispatch_drain_emitted
+        if _current_dispatch_mode() != "drain":
+            return False
+        if not dispatch_drain_emitted:
+            message = (
+                f"run_id={run_id} path={dispatch_mode_path} mode=drain "
+                f"queued_slots={queued_count} inflight_jobs={inflight_jobs}"
+            )
+            _log_stage(f"dispatch drain active {message}")
+            _append_worker_event(level="INFO", stage="DISPATCH_DRAIN_ACTIVE", message=message)
+            dispatch_drain_emitted = True
+        return True
+
+    def _emit_bad_node_policy_warnings(warnings: list[str]) -> None:
+        for warning in warnings:
+            if warning in bad_node_policy_warnings:
+                continue
+            _log_stage(warning)
+            _append_worker_event(level="WARN", stage="BAD_NODES_INVALID", message=warning)
+            bad_node_policy_warnings.add(warning)
+
+    def _register_bad_node(*, node: str, reason: str) -> None:
+        registered_entry, warnings = _register_bad_node_candidate(node=node, reason=reason)
+        _emit_bad_node_policy_warnings(warnings)
+        if registered_entry is None:
+            return
+        key = (registered_entry["node"], registered_entry["reason"])
+        if key in bad_node_registrations:
+            return
+        _append_worker_event(
+            level="WARN",
+            stage="BAD_NODE_REGISTERED",
+            message=(
+                f"node={registered_entry['node']} reason={registered_entry['reason']} "
+                f"expires_at={registered_entry['expires_at']}"
+            ),
+        )
+        bad_node_registrations.add(key)
+
+    for host, tmp_free_mb, _snapshot_ts in state_store.list_latest_low_tmp_nodes(
+        tmp_free_threshold_mb=_BAD_NODE_TMP_FREE_THRESHOLD_MB
+    ):
+        _register_bad_node(node=host, reason=f"tmp_free_mb={tmp_free_mb}")
 
     if config.execute_remote and config.remote_execution_backend == "slurm_batch":
         active_workers = state_store.list_active_slurm_workers(run_id=run_id)
@@ -770,6 +1041,14 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     next_job_index = state_store.get_next_job_index(run_id=run_id)
     controller: SlotWorkerController[_BundleRuntimeOutcome] | None = None
 
+    def _record_batch(batch: object) -> None:
+        nonlocal max_inflight_jobs, next_job_index, terminal_jobs, replacement_jobs
+        max_inflight_jobs = max(max_inflight_jobs, int(batch.max_inflight_jobs))
+        next_job_index += int(batch.submitted_jobs)
+        terminal_jobs += int(batch.terminal_jobs)
+        replacement_jobs += int(batch.replacement_jobs)
+        outcomes.extend(batch.results)
+
     def _current_completed_slots() -> dict[str, int]:
         return {
             account.account_id: state_store.get_slot_throughput_score(run_id=run_id, account_id=account.account_id)[0]
@@ -923,6 +1202,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         nonlocal max_inflight_jobs, next_job_index, terminal_jobs, replacement_jobs, readiness_blocked_slots, cutover_blocked_emitted
         if not slot_batch:
             return False
+        if _dispatch_drained(queued_count=len(slot_batch)):
+            return False
         dispatch_accounts = _resolve_dispatch_accounts()
         if not dispatch_accounts:
             readiness_blocked_slots = len(slot_batch)
@@ -981,11 +1262,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 recovery_slots_lookup=lambda _bundle, outcome: (),
                 terminal_bundle_lookup=lambda _bundle, outcome: False,
             )
-        max_inflight_jobs = max(max_inflight_jobs, batch.max_inflight_jobs)
-        next_job_index += batch.submitted_jobs
-        terminal_jobs += batch.terminal_jobs
-        replacement_jobs += batch.replacement_jobs
-        outcomes.extend(batch.results)
+        _record_batch(batch)
         return True
 
     def _dispatch_queued_slots(*, max_slots: int | None = None) -> None:
@@ -1034,6 +1311,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             if not queued_slots:
                 return False
             if not force and len(queued_slots) < config.slots_per_job:
+                return False
+            if _dispatch_drained(queued_count=len(queued_slots)):
                 return False
             dispatch_accounts = _resolve_dispatch_accounts()
             if not dispatch_accounts:
@@ -1095,6 +1374,19 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             return True
 
         while True:
+            if controller is not None and _current_dispatch_mode() == "drain":
+                released_slots = controller.release_unsubmitted_slots()
+                if released_slots:
+                    queued_slots = released_slots + queued_slots
+                controller_snapshot = controller.snapshot()
+                if not controller.has_work():
+                    _record_batch(controller.finalize())
+                    controller = None
+                else:
+                    _dispatch_drained(
+                        queued_count=len(queued_slots),
+                        inflight_jobs=controller_snapshot.inflight_jobs,
+                    )
             controller_has_work = controller is not None and controller.has_work()
             if (
                 not controller_has_work
@@ -1154,7 +1446,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 discovered_count += len(slots)
                 if slots:
                     total_slots += len(slots)
-                    if controller is not None:
+                    if controller is not None and _current_dispatch_mode() != "drain":
                         controller.enqueue_slots(slots)
                         allow_partial_flush = not pending_scan_files and not rescan_scan_files
                         controller.step(wait_for_progress=False, flush_partial_bundles=allow_partial_flush)
@@ -1178,11 +1470,17 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 )
                 if progressed:
                     continue
-                if not controller.has_work() and not queued_slots and not pending_scan_files and not rescan_scan_files:
-                    break
+                if not controller.has_work():
+                    _record_batch(controller.finalize())
+                    controller = None
+                    if not queued_slots and not pending_scan_files and not rescan_scan_files:
+                        break
+                    continue
 
             if controller is None and not pending_scan_files and not rescan_scan_files:
                 if queued_slots:
+                    if _dispatch_drained(queued_count=len(queued_slots)):
+                        break
                     if _start_controller(force=True):
                         continue
                     readiness_blocked_slots = len(queued_slots)
@@ -1219,17 +1517,16 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         _dispatch_queued_slots()
 
     if config.continuous_mode and controller is not None:
-        batch = controller.finalize()
-        max_inflight_jobs = max(max_inflight_jobs, batch.max_inflight_jobs)
-        next_job_index += batch.submitted_jobs
-        terminal_jobs += batch.terminal_jobs
-        replacement_jobs += batch.replacement_jobs
-        outcomes.extend(batch.results)
+        _record_batch(controller.finalize())
+
+    remaining_queued_slots = len(queued_slots)
+    dispatch_mode = _current_dispatch_mode()
 
     if total_slots == 0:
         summary = (
             f"version={APP_VERSION} total_slots=0 active_slots=0 success_slots=0 failed_slots=0 quarantined_slots=0 "
-            f"active_jobs=0 ingest_discovered={discovered_count} ingest_enqueued=0"
+            f"active_jobs=0 ingest_discovered={discovered_count} ingest_enqueued=0 "
+            f"queued_slots={remaining_queued_slots} dispatch_mode={dispatch_mode}"
         )
         canary_gate_ok = not canary_candidate
         canary_gate_reason = "not_canary"
@@ -1269,7 +1566,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             success_slots=0,
             failed_slots=0,
             quarantined_slots=0,
-            queued_slots=0,
+            queued_slots=remaining_queued_slots,
             terminal_jobs=0,
             replacement_jobs=0,
             ready_accounts=tuple(ready_account_ids),
@@ -1353,10 +1650,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             success = False
             exit_code = EXIT_CODE_DOWNLOAD_FAILURE
             canary_gate_reason = "materialized_output_missing"
-        elif not _canary_output_csv_present(output_root=output_root):
-            success = False
-            exit_code = EXIT_CODE_DOWNLOAD_FAILURE
-            canary_gate_reason = "output_variables_csv_missing"
+        else:
+            csv_gate_reason = _canary_output_csv_gate_reason(output_root=output_root)
+            if csv_gate_reason != "ok":
+                success = False
+                exit_code = EXIT_CODE_DOWNLOAD_FAILURE
+                canary_gate_reason = csv_gate_reason
 
     summary = (
         f"version={APP_VERSION} total_jobs={total_jobs} success_jobs={success_jobs} failed_jobs={failed_jobs} "
@@ -1365,6 +1664,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         f"quarantined_slots={quarantined_slots} failed_job_ids={failed_job_ids} "
         f"active_jobs=0 max_inflight_jobs={max_inflight_jobs} "
         f"terminal_jobs={terminal_jobs} replacement_jobs={replacement_jobs} "
+        f"queued_slots={remaining_queued_slots} dispatch_mode={dispatch_mode} "
         f"ready_accounts={ready_account_ids} blocked_accounts={blocked_account_ids} "
         f"bootstrapping_accounts={bootstrapping_account_ids} "
         f"readiness_blocked_slots={readiness_blocked_slots}"
@@ -1425,7 +1725,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         success_slots=success_slots,
         failed_slots=failed_slots,
         quarantined_slots=quarantined_slots,
-        queued_slots=readiness_blocked_slots,
+        queued_slots=remaining_queued_slots,
         terminal_jobs=terminal_jobs,
         replacement_jobs=replacement_jobs,
         ready_accounts=tuple(ready_account_ids),
@@ -1653,6 +1953,28 @@ def _run_bundle_with_retry(
         message=f"bundle queued account={bundle.account_id} slots={bundle.slot_count}",
     )
 
+    excluded_nodes, bad_node_warnings = _load_active_bad_nodes()
+    for warning in dict.fromkeys(bad_node_warnings):
+        _log_stage(warning)
+        state_store.append_event(
+            run_id=run_id,
+            job_id="__worker__",
+            level="WARN",
+            stage="BAD_NODES_INVALID",
+            message=warning,
+        )
+    if excluded_nodes:
+        state_store.append_event(
+            run_id=run_id,
+            job_id=bundle.job_id,
+            level="INFO",
+            stage="BAD_NODE_EXCLUDE_ACTIVE",
+            message=(
+                f"account={bundle.account_id} host={bundle.host_alias} "
+                f"nodes={','.join(excluded_nodes)}"
+            ),
+        )
+
     remote_cfg = _RemoteExecutionConfig(
         host=bundle.host_alias,
         partition=config.partition,
@@ -1675,6 +1997,7 @@ def _run_bundle_with_retry(
         tunnel_heartbeat_timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
         tunnel_recovery_grace_seconds=config.tunnel_recovery_grace_seconds,
         remote_ssh_port=config.remote_ssh_port,
+        slurm_exclude_nodes=excluded_nodes,
     )
     with TemporaryDirectory(prefix=f"peetsfea_bundle_{bundle.job_id}_") as tmpdir:
         local_bundle_dir = Path(tmpdir) / "bundle"
@@ -1974,6 +2297,35 @@ def _run_bundle_with_retry(
             )
             terminal_exit_code = result.exit_code
             terminal_message = formatted_result_message
+
+            if (
+                result.observed_node
+                and _BAD_NODE_NO_SPACE_MARKER.lower() in formatted_result_message.lower()
+            ):
+                registered_entry, register_warnings = _register_bad_node_candidate(
+                    node=result.observed_node,
+                    reason=_BAD_NODE_NO_SPACE_MARKER,
+                )
+                for warning in dict.fromkeys(register_warnings):
+                    _log_stage(warning)
+                    state_store.append_event(
+                        run_id=run_id,
+                        job_id="__worker__",
+                        level="WARN",
+                        stage="BAD_NODES_INVALID",
+                        message=warning,
+                    )
+                if registered_entry is not None:
+                    state_store.append_event(
+                        run_id=run_id,
+                        job_id=bundle.job_id,
+                        level="WARN",
+                        stage="BAD_NODE_REGISTERED",
+                        message=(
+                            f"node={registered_entry['node']} reason={registered_entry['reason']} "
+                            f"expires_at={registered_entry['expires_at']}"
+                        ),
+                    )
 
             if not result.success and result.failure_category:
                 state_store.append_event(

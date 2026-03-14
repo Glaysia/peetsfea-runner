@@ -1268,6 +1268,15 @@ class SlotWorkerController(Generic[T]):
             submitted_jobs=self._submitted_jobs,
         )
 
+    def release_unsubmitted_slots(self) -> list[SlotTaskRef]:
+        released: list[SlotTaskRef] = []
+        while self._pending_bundles:
+            released.extend(self._pending_bundles.popleft())
+        if self._source_queue:
+            released.extend(self._source_queue)
+            self._source_queue.clear()
+        return released
+
     def step(self, *, wait_for_progress: bool = False, flush_partial_bundles: bool = False) -> bool:
         progressed = self._collect_done_futures()
         self._materialize_pending_bundles(flush_partial=flush_partial_bundles)

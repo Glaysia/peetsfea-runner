@@ -43,6 +43,7 @@ class RemoteJobConfig(Protocol):
     tunnel_recovery_grace_seconds: int
     remote_ssh_port: int
     emit_output_variables_csv: bool
+    slurm_exclude_nodes: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -186,6 +187,16 @@ def _control_plane_ssh_target(config: RemoteJobConfig) -> str:
     if user and host:
         return f"{user}@{host}"
     return str(getattr(config, "control_plane_ssh_target", "")).strip()
+
+
+def _slurm_exclude_nodes(config: RemoteJobConfig) -> tuple[str, ...]:
+    raw_nodes = getattr(config, "slurm_exclude_nodes", ())
+    if isinstance(raw_nodes, str):
+        iterable = raw_nodes.split(",")
+    else:
+        iterable = raw_nodes
+    normalized = [str(node).strip() for node in iterable if str(node).strip()]
+    return tuple(dict.fromkeys(normalized))
 
 
 def _ssh_command(config: RemoteJobConfig, *args: str) -> list[str]:
@@ -1427,6 +1438,7 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "from __future__ import annotations",
         "",
         "import csv",
+        "import json",
         "import os",
         "import socket",
         "import subprocess",
@@ -1495,6 +1507,31 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "    return value",
         "",
         "",
+        "def serialize_row_value(value: object) -> object:",
+        "    value = normalize_scalar(value)",
+        "    if value is None:",
+        "        return ''",
+        "    if isinstance(value, (str, int, float, bool)):",
+        "        return value",
+        "    if isinstance(value, (list, tuple)):",
+        "        normalized_items = [serialize_row_value(item) for item in value]",
+        "        if len(normalized_items) == 0:",
+        "            return ''",
+        "        if len(normalized_items) == 1:",
+        "            return normalized_items[0]",
+        "        return json.dumps(normalized_items)",
+        "    return str(value)",
+        "",
+        "",
+        "def build_output_variable_row_variations(hfss: Hfss) -> dict[str, object]:",
+        "    row: dict[str, object] = {}",
+        "    for name, value in dict(hfss.available_variations.nominal_values).items():",
+        "        if name == 'Freq':",
+        "            continue",
+        "        row[str(name)] = serialize_row_value(value)",
+        "    return row",
+        "",
+        "",
         "def first_value(values: object) -> object:",
         "    if values is None:",
         "        return ''",
@@ -1545,6 +1582,8 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "        'source_case_dir': str(workdir.resolve()),",
         "        'source_aedt_name': project_file.name,",
         "    }",
+        "    for key, value in build_output_variable_row_variations(hfss).items():",
+        "        row.setdefault(key, value)",
         "    if not hfss.output_variables:",
         "        write_output_variables_csv(workdir, row)",
         "        return",
@@ -1788,9 +1827,11 @@ def _build_windows_remote_dispatch_script_content(*, config: RemoteJobConfig, re
 
 def _build_noninteractive_srun_command(*, config: RemoteJobConfig, remote_job_dir: str, case_count: int) -> str:
     payload = _build_worker_payload_script_content(config=config, case_count=case_count)
+    exclude_nodes = _slurm_exclude_nodes(config)
+    exclude_arg = f" --exclude={','.join(exclude_nodes)}" if exclude_nodes else ""
     return (
         f"srun -D /tmp -p {config.partition} -N {config.nodes} -n {config.ntasks} "
-        f"-c {config.cpus_per_job} --mem={config.mem} --time={config.time_limit} "
+        f"-c {config.cpus_per_job} --mem={config.mem} --time={config.time_limit}{exclude_arg} "
         f"bash -lc {shlex.quote(payload)}"
     )
 
@@ -2094,6 +2135,8 @@ def _build_remote_sbatch_script_content(
     control_plane_return_host = _control_plane_return_host(config)
     control_plane_return_user = _control_plane_return_user(config)
     control_plane_return_port = _control_plane_return_port(config)
+    exclude_nodes = _slurm_exclude_nodes(config)
+    exclude_lines = [f"#SBATCH --exclude={','.join(exclude_nodes)}"] if exclude_nodes else []
     return "\n".join(
         [
             "#!/bin/bash",
@@ -2103,6 +2146,7 @@ def _build_remote_sbatch_script_content(
             f"#SBATCH -c {config.cpus_per_job}",
             f"#SBATCH --mem={config.mem}",
             f"#SBATCH --time={config.time_limit}",
+            *exclude_lines,
             "#SBATCH -o slurm-%j.out",
             "#SBATCH -e slurm-%j.err",
             "set -euo pipefail",

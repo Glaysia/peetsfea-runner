@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,6 +24,17 @@ from peetsfea_runner.pipeline import (
 from peetsfea_runner.remote_job import CaseExecutionSummary, RemoteJobAttemptResult
 from peetsfea_runner.scheduler import AccountCapacitySnapshot, AccountReadinessSnapshot
 from peetsfea_runner.state_store import StateStore
+
+
+def _valid_canary_output_csv() -> str:
+    header = (
+        "source_aedt_path,source_case_dir,source_aedt_name,"
+        "coil_groups_0__count_mode,coil_shape_inner_margin_x,"
+        "coil_spacing_tx_vertical_center_gap_mm,ferrite_present,"
+        "tx_region_z_parts_dd_z_mm,k_ratio,Lrx_uH"
+    )
+    row = "/path,/case,sample.aedt,tx,1.0mm,2.0mm,true,3.0mm,0.91,12.5"
+    return f"{header}\n{row}\n"
 
 
 class TestPipelineApi(unittest.TestCase):
@@ -265,6 +277,413 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIsNotNone(row[5])
             self.assertIsNotNone(row[6])
             self.assertIsNotNone(row[7])
+
+    def test_slurm_batch_backend_applies_active_bad_node_excludes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "fixture_01.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            (input_dir / "fixture_01.aedt.ready").write_text("", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            bad_nodes_path = Path(tmpdir) / "runtime" / "bad_nodes.json"
+            bad_nodes_path.parent.mkdir(parents=True, exist_ok=True)
+            bad_nodes_path.write_text(
+                json.dumps(
+                    {
+                        "bad_nodes": [
+                            {
+                                "node": "n108",
+                                "reason": "No space left on device",
+                                "first_seen_at": "2026-03-12T14:00:00+00:00",
+                                "expires_at": "2026-03-13T14:00:00+00:00",
+                            },
+                            {
+                                "node": "n109",
+                                "reason": "tmp_free_mb=1024",
+                                "first_seen_at": "2026-03-12T15:00:00+00:00",
+                                "expires_at": "2026-03-13T15:00:00+00:00",
+                            },
+                            {
+                                "node": "n110",
+                                "reason": "expired",
+                                "first_seen_at": "2026-03-11T15:00:00+00:00",
+                                "expires_at": "2026-03-12T15:00:00+00:00",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                continuous_mode=False,
+                execute_remote=True,
+                remote_execution_backend="slurm_batch",
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+            )
+
+            def _mock_attempt(
+                *,
+                config=None,
+                local_job_dir=None,
+                on_upload_success=None,
+                on_worker_submitted=None,
+                on_worker_state_change=None,
+                **kwargs,
+            ):
+                self.assertIsNotNone(config)
+                self.assertEqual(tuple(getattr(config, "slurm_exclude_nodes", ())), ("n108", "n109"))
+                if on_upload_success is not None:
+                    on_upload_success()
+                if on_worker_submitted is not None:
+                    on_worker_submitted("552740", None)
+                if on_worker_state_change is not None:
+                    on_worker_state_change("PENDING", None)
+                    on_worker_state_change("RUNNING", "n115")
+                assert local_job_dir is not None
+                case_dir = Path(local_job_dir) / "case_01"
+                (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
+                (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
+                (case_dir / "run.log").write_text("log", encoding="utf-8")
+                (case_dir / "exit.code").write_text("0", encoding="utf-8")
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=0,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=1, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                    slurm_job_id="552740",
+                    observed_node="n115",
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline._bad_nodes_control_path", return_value=bad_nodes_path),
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_readiness",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        venv_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                        uv_ok=True,
+                        pyaedt_ok=True,
+                    ),
+                ),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_preflight",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        venv_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                        uv_ok=True,
+                        pyaedt_ok=True,
+                    ),
+                ),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=1,
+                    ),
+                ),
+            ):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            conn = duckdb.connect(str(db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT stage, message
+                    FROM events
+                    WHERE run_id = ?
+                    ORDER BY ts
+                    """,
+                    [result.run_id],
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertIn(
+                ("BAD_NODE_EXCLUDE_ACTIVE", "account=account_01 host=gate1-harry nodes=n108,n109"),
+                rows,
+            )
+
+    def test_slurm_batch_backend_registers_low_tmp_node_before_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "fixture_01.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            (input_dir / "fixture_01.aedt.ready").write_text("", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            bad_nodes_path = Path(tmpdir) / "runtime" / "bad_nodes.json"
+            store = StateStore(db_path)
+            store.initialize()
+            store.record_node_resource_snapshot(
+                run_id="seed_run",
+                host="n108",
+                allocated_mem_mb=0,
+                total_mem_mb=1024,
+                used_mem_mb=512,
+                free_mem_mb=512,
+                load_1=1.0,
+                load_5=1.0,
+                load_15=1.0,
+                tmp_total_mb=131072,
+                tmp_used_mb=67072,
+                tmp_free_mb=64000,
+                process_count=4,
+                running_worker_count=1,
+                active_slot_count=4,
+            )
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                continuous_mode=False,
+                execute_remote=True,
+                remote_execution_backend="slurm_batch",
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+            )
+
+            def _mock_attempt(
+                *,
+                config=None,
+                local_job_dir=None,
+                on_upload_success=None,
+                on_worker_submitted=None,
+                on_worker_state_change=None,
+                **kwargs,
+            ):
+                self.assertIsNotNone(config)
+                self.assertEqual(tuple(getattr(config, "slurm_exclude_nodes", ())), ("n108",))
+                if on_upload_success is not None:
+                    on_upload_success()
+                if on_worker_submitted is not None:
+                    on_worker_submitted("552740", None)
+                if on_worker_state_change is not None:
+                    on_worker_state_change("PENDING", None)
+                    on_worker_state_change("RUNNING", "n115")
+                assert local_job_dir is not None
+                case_dir = Path(local_job_dir) / "case_01"
+                (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
+                (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
+                (case_dir / "run.log").write_text("log", encoding="utf-8")
+                (case_dir / "exit.code").write_text("0", encoding="utf-8")
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=0,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=1, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                    slurm_job_id="552740",
+                    observed_node="n115",
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline._bad_nodes_control_path", return_value=bad_nodes_path),
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_readiness",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        venv_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                        uv_ok=True,
+                        pyaedt_ok=True,
+                    ),
+                ),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_preflight",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        venv_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                        uv_ok=True,
+                        pyaedt_ok=True,
+                    ),
+                ),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=1,
+                    ),
+                ),
+            ):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            payload = json.loads(bad_nodes_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["bad_nodes"][0]["node"], "n108")
+            self.assertEqual(payload["bad_nodes"][0]["reason"], "tmp_free_mb=64000")
+
+    def test_slurm_batch_backend_registers_bad_node_after_no_space_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "fixture_01.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            (input_dir / "fixture_01.aedt.ready").write_text("", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            bad_nodes_path = Path(tmpdir) / "runtime" / "bad_nodes.json"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                continuous_mode=False,
+                execute_remote=True,
+                remote_execution_backend="slurm_batch",
+                job_retry_count=0,
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+            )
+
+            def _mock_attempt(
+                *,
+                local_job_dir=None,
+                on_upload_success=None,
+                on_worker_submitted=None,
+                on_worker_state_change=None,
+                **kwargs,
+            ):
+                if on_upload_success is not None:
+                    on_upload_success()
+                if on_worker_submitted is not None:
+                    on_worker_submitted("552740", None)
+                if on_worker_state_change is not None:
+                    on_worker_state_change("PENDING", None)
+                    on_worker_state_change("RUNNING", "n115")
+                assert local_job_dir is not None
+                case_dir = Path(local_job_dir) / "case_01"
+                case_dir.mkdir(parents=True, exist_ok=True)
+                (case_dir / "run.log").write_text("No space left on device", encoding="utf-8")
+                return RemoteJobAttemptResult(
+                    success=False,
+                    exit_code=13,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=0, failed_cases=1, case_lines=[]),
+                    message="No space left on device while writing result archive",
+                    failed_case_lines=[],
+                    failure_category="storage",
+                    slurm_job_id="552740",
+                    observed_node="n115",
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline._bad_nodes_control_path", return_value=bad_nodes_path),
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_readiness",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        venv_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                        uv_ok=True,
+                        pyaedt_ok=True,
+                    ),
+                ),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_preflight",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        venv_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                        uv_ok=True,
+                        pyaedt_ok=True,
+                    ),
+                ),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=1,
+                    ),
+                ),
+            ):
+                result = run_pipeline(config)
+
+            self.assertFalse(result.success)
+            payload = json.loads(bad_nodes_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["bad_nodes"][0]["node"], "n115")
+            self.assertEqual(payload["bad_nodes"][0]["reason"], "No space left on device")
 
     def test_slurm_batch_does_not_mark_slots_running_before_worker_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1141,7 +1560,7 @@ class TestPipelineApi(unittest.TestCase):
                 (case_dir / "run.log").write_text("log", encoding="utf-8")
                 (case_dir / "exit.code").write_text("0", encoding="utf-8")
                 (case_dir / "output_variables.csv").write_text(
-                    "source_aedt_path,source_case_dir,source_aedt_name\n/path,/case,sample.aedt\n",
+                    _valid_canary_output_csv(),
                     encoding="utf-8",
                 )
                 StateStore(db_path).update_slurm_worker_control_plane(
@@ -1227,11 +1646,18 @@ class TestPipelineApi(unittest.TestCase):
                 conn.close()
             stages = [str(row[0]) for row in rows]
             messages = [str(row[0]) for row in message_rows]
+            self.assertIn("CANARY_STARTED", stages)
             self.assertIn("CUTOVER_READY", stages)
             self.assertIn("SLURM_TRUTH_REFRESHED", stages)
             self.assertIn("CANARY_PASSED", stages)
             self.assertIn("FULL_ROLLOUT_READY", stages)
             self.assertIn("SERVICE_BOUNDARY", stages)
+            self.assertLess(stages.index("CANARY_STARTED"), stages.index("CUTOVER_READY"))
+            started_message = messages[stages.index("CANARY_STARTED")]
+            self.assertIn("input_dir=", started_message)
+            self.assertIn("output_root=", started_message)
+            self.assertIn("db_path=", started_message)
+            self.assertIn("delete_failed_dir=", started_message)
             self.assertTrue(any("input_source_policy=sample_only" in message for message in messages))
 
     def test_sample_canary_allows_full_rollout_when_output_materializes_without_live_return_path(self) -> None:
@@ -1267,7 +1693,7 @@ class TestPipelineApi(unittest.TestCase):
                 (case_dir / "run.log").write_text("log", encoding="utf-8")
                 (case_dir / "exit.code").write_text("0", encoding="utf-8")
                 (case_dir / "output_variables.csv").write_text(
-                    "source_aedt_path,source_case_dir,source_aedt_name\n/path,/case,sample.aedt\n",
+                    _valid_canary_output_csv(),
                     encoding="utf-8",
                 )
                 return RemoteJobAttemptResult(
@@ -1349,6 +1775,138 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIn("CANARY_PASSED", stages)
             self.assertIn("FULL_ROLLOUT_READY", stages)
             self.assertFalse(any("reason=tunnel_not_connected" in message for message in messages if "CANARY_FAILED" in message))
+
+    def test_sample_canary_rejects_schema_invalid_output_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "sample.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            (input_dir / "sample.aedt.ready").write_text("", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                continuous_mode=False,
+                execute_remote=True,
+                remote_execution_backend="slurm_batch",
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+            )
+
+            def _mock_attempt(
+                *,
+                local_job_dir=None,
+                on_upload_success=None,
+                on_worker_submitted=None,
+                on_worker_state_change=None,
+                run_id=None,
+                worker_id=None,
+                **kwargs,
+            ):
+                if on_upload_success is not None:
+                    on_upload_success()
+                if on_worker_submitted is not None:
+                    on_worker_submitted("552742", None)
+                if on_worker_state_change is not None:
+                    on_worker_state_change("RUNNING", "n115")
+                assert local_job_dir is not None
+                case_dir = Path(local_job_dir) / "case_01"
+                (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
+                (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
+                (case_dir / "run.log").write_text("log", encoding="utf-8")
+                (case_dir / "exit.code").write_text("0", encoding="utf-8")
+                (case_dir / "output_variables.csv").write_text(
+                    "source_aedt_path,source_case_dir,source_aedt_name\n/path,/case,sample.aedt\n",
+                    encoding="utf-8",
+                )
+                StateStore(db_path).update_slurm_worker_control_plane(
+                    run_id=str(run_id),
+                    worker_id=str(worker_id),
+                    tunnel_state="CONNECTED",
+                    tunnel_session_id="t_02",
+                    heartbeat_ts="2026-03-12T04:00:00+00:00",
+                    observed_node="n115",
+                )
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=0,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=1, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                    slurm_job_id="552742",
+                    observed_node="n115",
+                    worker_terminal_state="COMPLETED",
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_readiness",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        venv_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                        uv_ok=True,
+                        pyaedt_ok=True,
+                    ),
+                ),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_preflight",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        venv_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                        uv_ok=True,
+                        pyaedt_ok=True,
+                    ),
+                ),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=1,
+                    ),
+                ),
+            ):
+                result = run_pipeline(config)
+
+            self.assertFalse(result.success)
+            conn = duckdb.connect(str(db_path))
+            try:
+                rows = conn.execute("SELECT stage, message FROM events ORDER BY ts").fetchall()
+            finally:
+                conn.close()
+            stages = [str(row[0]) for row in rows]
+            messages = [str(row[1]) for row in rows]
+            self.assertIn("CANARY_FAILED", stages)
+            self.assertIn("ROLLBACK_TRIGGERED", stages)
+            self.assertTrue(any("reason=output_variables_csv_schema_invalid" in message for message in messages))
 
     def test_sample_canary_failure_records_canary_failed_and_rollback_triggered(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1496,6 +2054,7 @@ class TestPipelineApi(unittest.TestCase):
             finally:
                 conn.close()
             stages = [str(row[0]) for row in rows]
+            self.assertIn("CANARY_STARTED", stages)
             self.assertIn("CUTOVER_BLOCKED", stages)
             self.assertIn("CANARY_FAILED", stages)
             self.assertIn("ROLLBACK_TRIGGERED", stages)
@@ -1650,6 +2209,129 @@ class TestPipelineApi(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(state, "SUCCEEDED")
+
+    def test_continuous_mode_drain_leaves_slot_queued_until_run_mode_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            (input_dir / "sample_01.aedt").write_text("placeholder", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            control_path = Path(tmpdir) / "runtime" / "dispatch.mode"
+            control_path.parent.mkdir(parents=True, exist_ok=True)
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=False,
+                continuous_mode=True,
+            )
+
+            with patch("peetsfea_runner.pipeline._dispatch_mode_control_path", return_value=control_path):
+                control_path.write_text(" drain \n", encoding="utf-8")
+                drained = run_pipeline(config)
+
+                conn = duckdb.connect(str(db_path))
+                try:
+                    queued_state = conn.execute(
+                        "SELECT state FROM slot_tasks WHERE run_id = ? LIMIT 1",
+                        [drained.run_id],
+                    ).fetchone()[0]
+                finally:
+                    conn.close()
+
+                control_path.write_text(" run \n", encoding="utf-8")
+                resumed = run_pipeline(config)
+
+            self.assertTrue(drained.success)
+            self.assertEqual(drained.total_jobs, 0)
+            self.assertEqual(drained.queued_slots, 1)
+            self.assertIn("dispatch_mode=drain", drained.summary)
+            self.assertEqual(queued_state, "QUEUED")
+
+            self.assertTrue(resumed.success)
+            self.assertEqual(resumed.run_id, drained.run_id)
+            self.assertEqual(resumed.total_jobs, 1)
+            self.assertEqual(resumed.queued_slots, 0)
+            self.assertIn("dispatch_mode=run", resumed.summary)
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                resumed_state = conn.execute(
+                    "SELECT state FROM slot_tasks WHERE run_id = ? LIMIT 1",
+                    [resumed.run_id],
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(resumed_state, "SUCCEEDED")
+
+    def test_pipeline_missing_dispatch_mode_defaults_to_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            (input_dir / "sample_01.aedt").write_text("placeholder", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            missing_control_path = Path(tmpdir) / "runtime" / "dispatch.mode"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=False,
+                continuous_mode=False,
+            )
+
+            with patch("peetsfea_runner.pipeline._dispatch_mode_control_path", return_value=missing_control_path):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.total_jobs, 1)
+            self.assertEqual(result.queued_slots, 0)
+            self.assertIn("dispatch_mode=run", result.summary)
+
+    def test_pipeline_invalid_dispatch_mode_falls_back_to_run_and_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            (input_dir / "sample_01.aedt").write_text("placeholder", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            control_path = Path(tmpdir) / "runtime" / "dispatch.mode"
+            control_path.parent.mkdir(parents=True, exist_ok=True)
+            control_path.write_text("pause-now", encoding="utf-8")
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=False,
+                continuous_mode=False,
+            )
+
+            with patch("peetsfea_runner.pipeline._dispatch_mode_control_path", return_value=control_path):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.total_jobs, 1)
+            self.assertIn("dispatch_mode=run", result.summary)
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                warning_rows = conn.execute(
+                    """
+                    SELECT level, stage, message
+                    FROM events
+                    WHERE run_id = ? AND stage = 'DISPATCH_MODE_INVALID'
+                    ORDER BY ts
+                    """,
+                    [result.run_id],
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertEqual(len(warning_rows), 1)
+            self.assertEqual((warning_rows[0][0], warning_rows[0][1]), ("WARN", "DISPATCH_MODE_INVALID"))
+            self.assertIn("fallback=run", str(warning_rows[0][2]))
+            self.assertIn("pause-now", str(warning_rows[0][2]))
 
     def test_pipeline_dispatches_backlog_without_batch_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

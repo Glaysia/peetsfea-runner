@@ -1456,6 +1456,32 @@ class StateStore:
             finally:
                 conn.close()
 
+    def list_latest_low_tmp_nodes(self, *, tmp_free_threshold_mb: int) -> list[tuple[str, int, str]]:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    WITH ranked AS (
+                        SELECT
+                            host,
+                            tmp_free_mb,
+                            ts,
+                            ROW_NUMBER() OVER (PARTITION BY host ORDER BY ts DESC) AS row_no
+                        FROM node_resource_snapshots
+                        WHERE tmp_free_mb IS NOT NULL
+                    )
+                    SELECT host, tmp_free_mb, ts
+                    FROM ranked
+                    WHERE row_no = 1 AND tmp_free_mb < ?
+                    ORDER BY host
+                    """,
+                    [tmp_free_threshold_mb],
+                ).fetchall()
+            finally:
+                conn.close()
+        return [(str(row[0]), int(row[1]), str(row[2])) for row in rows]
+
     def record_worker_resource_snapshot(
         self,
         *,
