@@ -68,13 +68,19 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("OUTPUT_VARIABLES_CSV_NAME: str = 'output_variables.csv'", content)
         self.assertIn("def extract_output_variables_csv(hfss: Hfss, workdir: Path, project_file: Path) -> None:", content)
         self.assertIn("def reopen_solved_project(project_file: Path, grpc_port: int) -> Hfss:", content)
-        self.assertIn("solution_data = hfss.post.get_solution_data(", content)
+        self.assertIn("def get_all_report_names(hfss: Hfss) -> list[str]:", content)
+        self.assertIn("def create_output_variables_report(hfss: Hfss) -> str | None:", content)
+        self.assertIn("def create_input_parameter_report(hfss: Hfss) -> str | None:", content)
+        self.assertIn("def create_parameter_reports(hfss: Hfss) -> list[str]:", content)
+        self.assertIn("def export_all_reports(hfss: Hfss, workdir: Path) -> dict[str, Path]:", content)
+        self.assertIn("reports_dir = workdir / 'all_reports'", content)
+        self.assertIn("hfss.post.export_report_to_csv", content)
         self.assertIn("reopened_hfss = reopen_solved_project(project_file, grpc_port)", content)
         self.assertIn("solve_hfss.release_desktop(close_projects=True, close_desktop=False)", content)
         self.assertIn("write_output_variables_csv(workdir, row)", content)
         self.assertIn("error_log_path.unlink()", content)
         self.assertIn("(workdir / OUTPUT_VARIABLES_ERROR_LOG_NAME).write_text(str(exc), encoding='utf-8')", content)
-        self.assertNotIn("export_report_to_csv", content)
+        self.assertIn("merge_report_rows(", content)
         self.assertNotIn("cores=[cores]", content)
         self.assertNotIn("tasks=[tasks]", content)
         self.assertIn('if [ -e "$MINICONDA_DIR" ]; then', content)
@@ -91,11 +97,12 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("def build_output_variable_row_variations(hfss: Hfss) -> dict[str, object]:", content)
         self.assertIn("if name == 'Freq':", content)
         self.assertIn("row[str(name)] = serialize_row_value(value)", content)
-        self.assertIn("for key, value in build_output_variable_row_variations(hfss).items():", content)
-        self.assertIn("row.setdefault(key, value)", content)
+        self.assertIn("def write_synthetic_input_report(workdir: Path, hfss: Hfss) -> Path:", content)
+        self.assertIn("canonical_input_path = write_synthetic_input_report(workdir, hfss)", content)
+        self.assertIn("merge_report_rows(", content)
         self.assertLess(
-            content.index("for key, value in build_output_variable_row_variations(hfss).items():"),
-            content.index("if not hfss.output_variables:"),
+            content.index("def build_output_variable_row_variations(hfss: Hfss) -> dict[str, object]:"),
+            content.index("def write_synthetic_input_report(workdir: Path, hfss: Hfss) -> Path:"),
         )
 
     def test_remote_dispatch_script_uses_noninteractive_srun_without_screen(self) -> None:
@@ -598,7 +605,7 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn('code=97; echo "$code" > "$case_dir/exit.code";', command)
 
     def test_case_slot_command_contains_case_name_and_core_count(self) -> None:
-        command = _build_case_slot_command(case_index=3, cores_per_slot=4)
+        command = _build_case_slot_command(case_index=3, cores_per_slot=4, tasks_per_slot=1)
         self.assertIn("case_03", command)
         self.assertIn("PEETS_SLOT_CORES=4", command)
         self.assertIn("PEETS_SLOT_TASKS=1", command)

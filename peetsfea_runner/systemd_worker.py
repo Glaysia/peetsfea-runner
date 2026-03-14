@@ -372,8 +372,11 @@ def _build_config() -> PipelineConfig:
         slots_per_job=int(os.getenv("PEETSFEA_SLOTS_PER_JOB", "4")),
         worker_bundle_multiplier=int(os.getenv("PEETSFEA_WORKER_BUNDLE_MULTIPLIER", "1")),
         cores_per_slot=int(os.getenv("PEETSFEA_CORES_PER_SLOT", "4")),
+        tasks_per_slot=int(os.getenv("PEETSFEA_TASKS_PER_SLOT", "1")),
         worker_requeue_limit=int(os.getenv("PEETSFEA_WORKER_REQUEUE_LIMIT", "1")),
+        retain_aedtresults=_env_bool("PEETSFEA_RETAIN_AEDTRESULTS", True),
         run_rotation_hours=int(os.getenv("PEETSFEA_RUN_ROTATION_HOURS", "24")),
+        run_namespace=os.getenv("PEETSFEA_RUN_NAMESPACE", "").strip(),
         pending_buffer_per_account=int(os.getenv("PEETSFEA_PENDING_BUFFER_PER_ACCOUNT", "3")),
         capacity_scope=os.getenv("PEETSFEA_CAPACITY_SCOPE", "all_user_jobs"),
         balance_metric=os.getenv("PEETSFEA_BALANCE_METRIC", "slot_throughput"),
@@ -469,7 +472,10 @@ def _run_worker_iteration(
 ) -> PipelineResult:
     current_run_id, _status = runtime_state.snapshot()
     if config.continuous_mode:
-        current_run_id = store.ensure_continuous_run(rotation_hours=config.run_rotation_hours)
+        current_run_id = store.ensure_continuous_run(
+            rotation_hours=config.run_rotation_hours,
+            namespace=config.run_namespace,
+        )
     runtime_state.set(run_id=current_run_id, status="ACTIVE")
     store.append_event(
         run_id=current_run_id or "__worker__",

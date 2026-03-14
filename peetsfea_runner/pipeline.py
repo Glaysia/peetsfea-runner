@@ -5,6 +5,7 @@ from collections import deque
 import json
 import os
 import shutil
+import socket
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -89,6 +90,20 @@ _BAD_NODE_NO_SPACE_MARKER = "No space left on device"
 def _log_stage(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[peetsfea][{timestamp}] {message}", flush=True)
+
+
+def _should_auto_register_low_tmp_node(*, host: str, accounts: tuple[AccountConfig, ...]) -> bool:
+    normalized_host = host.strip().lower()
+    if not normalized_host:
+        return False
+    reserved_hosts = {
+        "localhost",
+        "127.0.0.1",
+        socket.gethostname().strip().lower(),
+        socket.getfqdn().strip().lower(),
+    }
+    reserved_hosts.update(account.host_alias.strip().lower() for account in accounts if account.host_alias.strip())
+    return normalized_host not in reserved_hosts
 
 
 def _dispatch_mode_control_path() -> Path:
@@ -316,9 +331,11 @@ class PipelineConfig:
     slots_per_job: int = 4
     worker_bundle_multiplier: int = 1
     cores_per_slot: int = 4
+    tasks_per_slot: int = 1
     job_retry_count: int = 1
     worker_requeue_limit: int = 1
     scan_recursive: bool = True
+    retain_aedtresults: bool = True
     # License policy
     license_observe_only: bool = True
     # Backward-compatible alias for old callers/docs
@@ -331,6 +348,7 @@ class PipelineConfig:
     ingest_poll_seconds: int = 30
     ready_sidecar_suffix: str = ".ready"
     run_rotation_hours: int = 24
+    run_namespace: str = ""
     pending_buffer_per_account: int = 3
     capacity_scope: str = "all_user_jobs"
     balance_metric: str = "slot_throughput"
@@ -361,6 +379,7 @@ class PipelineConfig:
         _ensure_positive("slots_per_job", self.slots_per_job)
         _ensure_positive("worker_bundle_multiplier", self.worker_bundle_multiplier)
         _ensure_positive("cores_per_slot", self.cores_per_slot)
+        _ensure_positive("tasks_per_slot", self.tasks_per_slot)
         _ensure_positive("control_plane_port", self.control_plane_port)
         _ensure_positive("control_plane_return_port", self.control_plane_return_port)
         _ensure_positive("remote_ssh_port", self.remote_ssh_port)
@@ -500,6 +519,7 @@ class _RemoteExecutionConfig:
     time_limit: str
     slots_per_job: int
     cores_per_slot: int
+    tasks_per_slot: int
     platform: str = "linux"
     scheduler: str = "slurm"
     remote_execution_backend: str = "foreground_ssh"
@@ -751,7 +771,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     state_store = StateStore(Path(config.metadata_db_path))
     state_store.initialize()
     if config.continuous_mode:
-        run_id = state_store.ensure_continuous_run(rotation_hours=config.run_rotation_hours)
+        run_id = state_store.ensure_continuous_run(
+            rotation_hours=config.run_rotation_hours,
+            namespace=config.run_namespace,
+        )
     else:
         run_id = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
         state_store.start_run(run_id)
@@ -855,6 +878,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     for host, tmp_free_mb, _snapshot_ts in state_store.list_latest_low_tmp_nodes(
         tmp_free_threshold_mb=_BAD_NODE_TMP_FREE_THRESHOLD_MB
     ):
+        if not _should_auto_register_low_tmp_node(host=host, accounts=accounts):
+            continue
         _register_bad_node(node=host, reason=f"tmp_free_mb={tmp_free_mb}")
 
     if config.execute_remote and config.remote_execution_backend == "slurm_batch":
@@ -876,6 +901,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     time_limit=config.time_limit,
                     slots_per_job=config.slots_per_job,
                     cores_per_slot=config.cores_per_slot,
+                    tasks_per_slot=config.tasks_per_slot,
                     platform=account.platform,
                     scheduler=account.scheduler,
                     remote_execution_backend=config.remote_execution_backend,
@@ -1588,6 +1614,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 time_limit=config.time_limit,
                 slots_per_job=config.slots_per_job,
                 cores_per_slot=config.cores_per_slot,
+                tasks_per_slot=config.tasks_per_slot,
                 platform=account.platform,
                 scheduler=account.scheduler,
                 remote_execution_backend=config.remote_execution_backend,
@@ -1985,6 +2012,7 @@ def _run_bundle_with_retry(
         time_limit=config.time_limit,
         slots_per_job=config.slots_per_job,
         cores_per_slot=config.cores_per_slot,
+        tasks_per_slot=config.tasks_per_slot,
         platform=bundle.platform,
         scheduler=bundle.scheduler,
         remote_execution_backend=config.remote_execution_backend,
@@ -2266,6 +2294,7 @@ def _run_bundle_with_retry(
                 local_bundle_dir=local_bundle_dir,
                 slots=runnable_slots,
                 staged_input_paths=staged_input_paths,
+                retain_aedtresults=config.retain_aedtresults,
             )
             if not result.success or result.failure_category:
                 _materialize_slot_failure_artifacts(
@@ -2571,6 +2600,7 @@ def _materialize_slot_outputs(
     local_bundle_dir: Path,
     slots: list[SlotTaskRef],
     staged_input_paths: dict[str, Path] | None = None,
+    retain_aedtresults: bool = True,
 ) -> set[str]:
     materialized_slot_ids: set[str] = set()
     for index, slot in enumerate(slots, start=1):
@@ -2584,6 +2614,8 @@ def _materialize_slot_outputs(
             if item.name == "tmp":
                 continue
             target_name = _rename_case_output_name(case_name=item.name, input_name=slot.input_path.name)
+            if not retain_aedtresults and target_name.endswith(".aedtresults"):
+                continue
             target_path = slot.output_dir / target_name
             if item.is_dir():
                 shutil.copytree(item, target_path, dirs_exist_ok=True)

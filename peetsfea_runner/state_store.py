@@ -15,6 +15,11 @@ def _utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+def _run_prefix(namespace: str) -> str:
+    normalized = namespace.strip()
+    return f"{normalized}_" if normalized else ""
+
+
 @dataclass(slots=True)
 class StateStore:
     db_path: Path
@@ -382,21 +387,34 @@ class StateStore:
             finally:
                 conn.close()
 
-    def ensure_continuous_run(self, *, rotation_hours: int) -> str:
+    def ensure_continuous_run(self, *, rotation_hours: int, namespace: str = "") -> str:
         now = datetime.now(tz=timezone.utc)
         now_iso = now.isoformat()
+        prefix = _run_prefix(namespace)
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
             try:
-                row = conn.execute(
-                    """
-                    SELECT run_id, started_at
-                    FROM runs
-                    WHERE state = 'RUNNING'
-                    ORDER BY started_at DESC
-                    LIMIT 1
-                    """
-                ).fetchone()
+                if prefix:
+                    row = conn.execute(
+                        """
+                        SELECT run_id, started_at
+                        FROM runs
+                        WHERE state = 'RUNNING' AND run_id LIKE ?
+                        ORDER BY started_at DESC
+                        LIMIT 1
+                        """,
+                        [f"{prefix}%"],
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        """
+                        SELECT run_id, started_at
+                        FROM runs
+                        WHERE state = 'RUNNING'
+                        ORDER BY started_at DESC
+                        LIMIT 1
+                        """
+                    ).fetchone()
                 if row is not None:
                     run_id = str(row[0])
                     started_at_raw = row[1]
@@ -413,8 +431,7 @@ class StateStore:
                         """,
                         [now_iso, "ROLLED", f"auto-rolled after {rotation_hours}h", run_id],
                     )
-
-                new_run_id = now.strftime("%Y%m%d_%H%M%S")
+                new_run_id = f"{prefix}{now.strftime('%Y%m%d_%H%M%S')}"
                 conn.execute(
                     "INSERT INTO runs (run_id, started_at, state) VALUES (?, ?, ?)",
                     [new_run_id, now_iso, "RUNNING"],

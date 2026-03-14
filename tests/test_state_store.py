@@ -231,6 +231,20 @@ class TestStateStore(unittest.TestCase):
             run2 = store.ensure_continuous_run(rotation_hours=24)
             self.assertEqual(run1, run2)
 
+    def test_ensure_continuous_run_namespaces_are_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            preserve_run = store.ensure_continuous_run(rotation_hours=24, namespace="preserve_results")
+            prune_run = store.ensure_continuous_run(rotation_hours=24, namespace="prune_results")
+            preserve_run_again = store.ensure_continuous_run(rotation_hours=24, namespace="preserve_results")
+
+            self.assertTrue(preserve_run.startswith("preserve_results_"))
+            self.assertTrue(prune_run.startswith("prune_results_"))
+            self.assertEqual(preserve_run, preserve_run_again)
+            self.assertNotEqual(preserve_run, prune_run)
+
     def test_slot_delete_lifecycle_can_mark_pending_and_retained(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "state.duckdb"

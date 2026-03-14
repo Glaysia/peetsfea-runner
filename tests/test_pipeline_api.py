@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime, timedelta, timezone
 import json
 import tempfile
 import unittest
@@ -20,6 +21,7 @@ from peetsfea_runner.pipeline import (
     _record_launch_transient_failure,
     _reconcile_slurm_truth,
     _materialize_slot_outputs,
+    _should_auto_register_low_tmp_node,
 )
 from peetsfea_runner.remote_job import CaseExecutionSummary, RemoteJobAttemptResult
 from peetsfea_runner.scheduler import AccountCapacitySnapshot, AccountReadinessSnapshot
@@ -92,6 +94,9 @@ class TestPipelineApi(unittest.TestCase):
             self.assertTrue(config.continuous_mode)
             self.assertEqual(config.ready_sidecar_suffix, ".ready")
             self.assertEqual(config.run_rotation_hours, 24)
+            self.assertEqual(config.tasks_per_slot, 1)
+            self.assertTrue(config.retain_aedtresults)
+            self.assertEqual(config.run_namespace, "")
             self.assertFalse((input_dir / "sample.aedt.ready").exists())
 
     def test_record_launch_transient_failure_triggers_cooldown_after_threshold(self) -> None:
@@ -147,6 +152,20 @@ class TestPipelineApi(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "remote_execution_backend"):
                 config.validate()
+
+    def test_auto_register_low_tmp_node_skips_control_plane_and_gate_hosts(self) -> None:
+        accounts = (
+            AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),
+            AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
+        )
+        with (
+            patch("peetsfea_runner.pipeline.socket.gethostname", return_value="5950xlinux"),
+            patch("peetsfea_runner.pipeline.socket.getfqdn", return_value="5950xlinux.local"),
+        ):
+            self.assertFalse(_should_auto_register_low_tmp_node(host="5950xlinux", accounts=accounts))
+            self.assertFalse(_should_auto_register_low_tmp_node(host="5950xlinux.local", accounts=accounts))
+            self.assertFalse(_should_auto_register_low_tmp_node(host="gate1-harry", accounts=accounts))
+            self.assertTrue(_should_auto_register_low_tmp_node(host="n108", accounts=accounts))
 
     def test_slurm_batch_backend_records_worker_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -289,6 +308,7 @@ class TestPipelineApi(unittest.TestCase):
             db_path = Path(tmpdir) / "state.duckdb"
             bad_nodes_path = Path(tmpdir) / "runtime" / "bad_nodes.json"
             bad_nodes_path.parent.mkdir(parents=True, exist_ok=True)
+            now = datetime.now(tz=timezone.utc)
             bad_nodes_path.write_text(
                 json.dumps(
                     {
@@ -296,20 +316,20 @@ class TestPipelineApi(unittest.TestCase):
                             {
                                 "node": "n108",
                                 "reason": "No space left on device",
-                                "first_seen_at": "2026-03-12T14:00:00+00:00",
-                                "expires_at": "2026-03-13T14:00:00+00:00",
+                                "first_seen_at": (now - timedelta(hours=2)).isoformat(),
+                                "expires_at": (now + timedelta(hours=2)).isoformat(),
                             },
                             {
                                 "node": "n109",
                                 "reason": "tmp_free_mb=1024",
-                                "first_seen_at": "2026-03-12T15:00:00+00:00",
-                                "expires_at": "2026-03-13T15:00:00+00:00",
+                                "first_seen_at": (now - timedelta(hours=1)).isoformat(),
+                                "expires_at": (now + timedelta(hours=3)).isoformat(),
                             },
                             {
                                 "node": "n110",
                                 "reason": "expired",
-                                "first_seen_at": "2026-03-11T15:00:00+00:00",
-                                "expires_at": "2026-03-12T15:00:00+00:00",
+                                "first_seen_at": (now - timedelta(days=2)).isoformat(),
+                                "expires_at": (now - timedelta(hours=1)).isoformat(),
                             },
                         ]
                     }
@@ -3012,6 +3032,40 @@ class TestPipelineApi(unittest.TestCase):
                 "source_aedt_path,source_case_dir,source_aedt_name,Loss\n"
                 "/tmp/project.aedt,/tmp/case_01,project.aedt,1.23\n",
             )
+
+    def test_materialize_slot_outputs_can_skip_aedtresults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            input_file = root / "nested" / "sample.aedt"
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            input_file.write_text("input", encoding="utf-8")
+            output_dir = root / "out" / "nested" / "sample.aedt.out"
+            local_bundle_dir = root / "bundle"
+            case_dir = local_bundle_dir / "case_01"
+            (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
+            (case_dir / "project.aedtresults" / "trace.txt").write_text("trace", encoding="utf-8")
+            (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
+            (case_dir / "output_variables.csv").write_text(
+                "source_aedt_path,source_case_dir,source_aedt_name,Loss\n"
+                "/tmp/project.aedt,/tmp/case_01,project.aedt,1.23\n",
+                encoding="utf-8",
+            )
+
+            _materialize_slot_outputs(
+                local_bundle_dir=local_bundle_dir,
+                slots=[
+                    SimpleNamespace(
+                        slot_id="w_001",
+                        input_path=input_file,
+                        output_dir=output_dir,
+                    )
+                ],
+                retain_aedtresults=False,
+            )
+
+            self.assertTrue((output_dir / "sample.aedt").is_file())
+            self.assertTrue((output_dir / "output_variables.csv").is_file())
+            self.assertFalse((output_dir / "sample.aedtresults").exists())
 
     def test_failed_remote_attempt_still_materializes_case_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
