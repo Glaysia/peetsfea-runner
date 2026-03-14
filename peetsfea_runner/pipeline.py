@@ -304,6 +304,7 @@ class PipelineConfig:
     input_queue_dir: str
     output_root_dir: str = "./output"
     delete_input_after_upload: bool = True
+    rename_input_to_done_on_success: bool = False
     delete_failed_quarantine_dir: str = "./output/_delete_failed"
     metadata_db_path: str = "./peetsfea_runner.duckdb"
     accounts_registry: tuple[AccountConfig, ...] = field(
@@ -2708,6 +2709,10 @@ def _rename_case_output_name(*, case_name: str, input_name: str) -> str:
     return case_name
 
 
+def _done_path_for_input(path: Path) -> Path:
+    return path.with_name(f"{path.name}.done")
+
+
 def _delete_slot_input_files(
     *,
     config: PipelineConfig,
@@ -2752,10 +2757,27 @@ def _finalize_slot_input_cleanup(
         )
         deleted_slot_ids.add(slot.slot_id)
         return
+    if (
+        (not config.delete_input_after_upload)
+        and config.rename_input_to_done_on_success
+        and _slot_output_has_materialized_artifacts(
+            output_dir=slot.output_dir,
+            input_name=slot.input_path.name,
+        )
+    ):
+        if _rename_slot_input_to_done(
+            config=config,
+            state_store=state_store,
+            run_id=run_id,
+            slot=slot,
+        ):
+            return
 
     retain_reason = "delete disabled"
     if config.delete_input_after_upload:
         retain_reason = "materialized output missing; input retained"
+    elif config.rename_input_to_done_on_success:
+        retain_reason = "rename to .done failed; input retained"
     state_store.mark_slot_delete_retained(run_id=run_id, slot_id=slot.slot_id)
     state_store.append_slot_event(
         run_id=run_id,
@@ -2764,6 +2786,45 @@ def _finalize_slot_input_cleanup(
         stage="DELETE_RETAINED",
         message=retain_reason,
     )
+
+
+def _rename_slot_input_to_done(
+    *,
+    config: PipelineConfig,
+    state_store: StateStore,
+    run_id: str,
+    slot: SlotTaskRef,
+) -> bool:
+    path = slot.input_path
+    ready_path = _ready_path_for_input(path, config.ready_sidecar_suffix)
+    done_path = _done_path_for_input(path)
+    for retry in range(3):
+        try:
+            if path.exists():
+                if done_path.exists():
+                    done_path.unlink()
+                path.replace(done_path)
+            if ready_path.exists():
+                ready_path.unlink()
+            state_store.mark_slot_delete_retained(run_id=run_id, slot_id=slot.slot_id)
+            state_store.append_slot_event(
+                run_id=run_id,
+                slot_id=slot.slot_id,
+                level="INFO",
+                stage="INPUT_DONE_RENAMED",
+                message=str(done_path),
+            )
+            return True
+        except OSError as exc:
+            state_store.append_slot_event(
+                run_id=run_id,
+                slot_id=slot.slot_id,
+                level="WARN",
+                stage="DONE_RENAME_RETRYING",
+                message=f"retry={retry + 1} error={exc}",
+            )
+            time.sleep(0.2)
+    return False
 
 
 def _delete_slot_input_file(

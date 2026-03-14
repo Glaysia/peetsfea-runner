@@ -87,6 +87,7 @@ class TestPipelineApi(unittest.TestCase):
             config.validate()
             self.assertEqual(config.output_root_dir, "./output")
             self.assertTrue(config.delete_input_after_upload)
+            self.assertFalse(config.rename_input_to_done_on_success)
             self.assertEqual(config.delete_failed_quarantine_dir, "./output/_delete_failed")
             self.assertTrue(config.license_observe_only)
             self.assertTrue(config.emit_output_variables_csv)
@@ -2895,6 +2896,111 @@ class TestPipelineApi(unittest.TestCase):
 
             self.assertTrue(input_file.exists())
             self.assertTrue(ready_file.exists())
+            conn = duckdb.connect(str(db_path))
+            try:
+                state = conn.execute(
+                    "SELECT delete_final_state FROM file_lifecycle ORDER BY updated_at DESC LIMIT 1"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(state, "RETAINED")
+
+    def test_terminal_input_is_renamed_done_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "foo.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            ready_file = input_dir / "foo.aedt.ready"
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                execute_remote=True,
+                delete_input_after_upload=False,
+                rename_input_to_done_on_success=True,
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+            )
+
+            def _mock_attempt(*, local_job_dir=None, on_upload_success=None, **kwargs):
+                if on_upload_success is not None:
+                    on_upload_success()
+                assert local_job_dir is not None
+                case_dir = Path(local_job_dir) / "case_01"
+                (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
+                (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
+                (case_dir / "run.log").write_text("log", encoding="utf-8")
+                (case_dir / "exit.code").write_text("0", encoding="utf-8")
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=0,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=1, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.scheduler.time.sleep"),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_readiness",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        venv_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                        uv_ok=True,
+                        pyaedt_ok=True,
+                    ),
+                ),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_preflight",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        venv_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                        uv_ok=True,
+                        pyaedt_ok=True,
+                    ),
+                ),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=10,
+                    ),
+                ),
+            ):
+                run_pipeline(config)
+
+            self.assertFalse(input_file.exists())
+            self.assertFalse(ready_file.exists())
+            self.assertTrue((input_dir / "foo.aedt.done").exists())
             conn = duckdb.connect(str(db_path))
             try:
                 state = conn.execute(

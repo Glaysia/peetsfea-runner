@@ -37,6 +37,7 @@ class LaneSpec:
     tasks_per_slot: int
     retain_aedtresults: bool
     delete_input_after_upload: bool
+    rename_input_to_done_on_success: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +87,7 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
         tasks_per_slot=4,
         retain_aedtresults=True,
         delete_input_after_upload=False,
+        rename_input_to_done_on_success=True,
     )
     prune_results_lane = LaneSpec(
         lane_id="prune_results",
@@ -102,6 +104,7 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
         tasks_per_slot=1,
         retain_aedtresults=False,
         delete_input_after_upload=False,
+        rename_input_to_done_on_success=True,
     )
     return ServiceProfile(
         repo_root=resolved_repo_root,
@@ -160,6 +163,7 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
         input_queue_dir=str(lane.input_root),
         output_root_dir=str(lane.output_root),
         delete_input_after_upload=lane.delete_input_after_upload,
+        rename_input_to_done_on_success=lane.rename_input_to_done_on_success,
         delete_failed_quarantine_dir=str(profile.delete_failed_root),
         metadata_db_path=str(profile.db_path),
         accounts_registry=lane.accounts,

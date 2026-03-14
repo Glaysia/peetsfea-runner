@@ -35,12 +35,14 @@ class TestBuiltInService(unittest.TestCase):
         self.assertEqual(lane_by_id["preserve_results"].cores_per_slot, 32)
         self.assertEqual(lane_by_id["preserve_results"].tasks_per_slot, 4)
         self.assertTrue(lane_by_id["preserve_results"].retain_aedtresults)
+        self.assertTrue(lane_by_id["preserve_results"].rename_input_to_done_on_success)
         self.assertEqual([account.host_alias for account in lane_by_id["preserve_results"].accounts], ["gate1-harry"])
         self.assertEqual(lane_by_id["prune_results"].cpus_per_job, 20)
         self.assertEqual(lane_by_id["prune_results"].slots_per_job, 5)
         self.assertEqual(lane_by_id["prune_results"].cores_per_slot, 4)
         self.assertEqual(lane_by_id["prune_results"].tasks_per_slot, 1)
         self.assertFalse(lane_by_id["prune_results"].retain_aedtresults)
+        self.assertTrue(lane_by_id["prune_results"].rename_input_to_done_on_success)
         self.assertEqual(
             [account.host_alias for account in lane_by_id["prune_results"].accounts],
             ["gate1-dhj02", "gate1-jji0930", "gate1-dw16"],
@@ -104,11 +106,13 @@ class TestBuiltInService(unittest.TestCase):
             self.assertEqual(preserve_cfg.run_namespace, "preserve_results")
             self.assertEqual(preserve_cfg.tasks_per_slot, 4)
             self.assertTrue(preserve_cfg.retain_aedtresults)
+            self.assertTrue(preserve_cfg.rename_input_to_done_on_success)
             self.assertEqual(preserve_cfg.input_source_policy, "allow_original")
             self.assertEqual(len(preserve_cfg.accounts_registry), 1)
             self.assertEqual(prune_cfg.run_namespace, "prune_results")
             self.assertEqual(prune_cfg.tasks_per_slot, 1)
             self.assertFalse(prune_cfg.retain_aedtresults)
+            self.assertTrue(prune_cfg.rename_input_to_done_on_success)
             self.assertEqual(len(prune_cfg.accounts_registry), 3)
 
 
