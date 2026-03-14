@@ -128,7 +128,7 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("__PEETS_FAILED_COUNT__", content)
         self.assertIn("max_parallel=4", content)
         self.assertIn("export REMOTE_JOB_DIR", content)
-        self.assertIn("wait -n || true", content)
+        self.assertIn("wait -n \"${case_pids[@]}\" || true", content)
         self.assertIn("if PEETS_SLOT_CORES=4 PEETS_SLOT_TASKS=1 bash ../remote_job.sh > run.log 2>&1; then", content)
         self.assertIn("echo \"$rc\" > exit.code", content)
         self.assertIn("archive_path=$(mktemp /tmp/peetsfea-results.", content)
@@ -155,7 +155,7 @@ class TestPlan03Workflow(unittest.TestCase):
         )
         self.assertIn("max_parallel=4", content)
         self.assertIn("for i in $(seq 1 8); do", content)
-        self.assertIn("wait -n || true", content)
+        self.assertIn("wait -n \"${case_pids[@]}\" || true", content)
         self.assertIn("ssh -M -S \"$PEETS_TUNNEL_SOCKET\" -fnNT", content)
         self.assertIn("-p \"$PEETS_CONTROL_RETURN_PORT\"", content)
         self.assertIn("-o StrictHostKeyChecking=no", content)
@@ -174,6 +174,11 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("/internal/resources/slot", content)
         self.assertIn("PEETS_CONTROL_WORKER_ID=attempt_0001", content)
         self.assertIn("PEETS_CONTROL_RUN_ID=run_01", content)
+        self.assertIn("case_pids=()", content)
+        self.assertIn("count_case_jobs()", content)
+        self.assertIn("case_pids+=(\"$!\")", content)
+        self.assertIn("wait -n \"${case_pids[@]}\" || true", content)
+        self.assertNotIn("while [ \"$(jobs -pr | wc -l)\" -gt 0 ]; do", content)
 
     def test_windows_remote_scripts_use_powershell_without_slurm(self) -> None:
         class _Cfg:
