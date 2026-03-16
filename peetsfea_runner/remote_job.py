@@ -1393,7 +1393,7 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "  export LC_ALL=C.UTF-8",
         "  unset LANGUAGE",
         "  export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81",
-        "  module load ansys-electronics/v252",
+        "  source /opt/ohpc/admin/lmod/lmod/init/bash",
         "  touch .env_initialized",
         "fi",
         "",
@@ -2003,6 +2003,7 @@ def _build_enroot_remote_job_script_content(*, config: RemoteJobConfig) -> str:
         "unset LANGUAGE",
         f"export ANSYSEM_ROOT252={shlex.quote(_remote_ansysem_root(config))}",
         "export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81",
+        "source /opt/ohpc/admin/lmod/lmod/init/bash",
         marker.rstrip("\n"),
     ]
     return "\n".join(lines) + "\n" + remainder

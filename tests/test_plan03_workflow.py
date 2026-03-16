@@ -59,7 +59,7 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("export LC_ALL=C.UTF-8", content)
         self.assertIn("unset LANGUAGE", content)
         self.assertIn("export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81", content)
-        self.assertIn("module load ansys-electronics/v252", content)
+        self.assertIn("source /opt/ohpc/admin/lmod/lmod/init/bash", content)
         self.assertIn("MINICONDA_DIR=\"$HOME/miniconda3\"", content)
         self.assertIn("ensure_miniconda() {", content)
         self.assertIn("ensure_conda_python312() {", content)
@@ -232,6 +232,7 @@ class TestPlan03Workflow(unittest.TestCase):
 
         self.assertIn("export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81", content)
         self.assertIn("export ANSYSEM_ROOT252=/mnt/AnsysEM", content)
+        self.assertIn("source /opt/ohpc/admin/lmod/lmod/init/bash", content)
         self.assertNotIn("module load ansys-electronics/v252", content)
         self.assertNotIn("ensure_miniconda()", content)
         self.assertNotIn("\"$VENV_DIR/bin/python\" -m uv pip install pyaedt==0.25.1", content)
