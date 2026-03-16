@@ -43,6 +43,7 @@ class LaneSpec:
 @dataclass(frozen=True, slots=True)
 class ServiceProfile:
     repo_root: Path
+    ssh_config_path: Path | None
     input_queue_root: Path
     output_root: Path
     delete_failed_root: Path
@@ -66,6 +67,7 @@ class ServiceProfile:
 
 def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
     resolved_repo_root = (repo_root or Path(__file__).resolve().parent.parent).expanduser().resolve()
+    ssh_config_path = resolved_repo_root / ".ssh" / "config"
     service_user = getpass.getuser().strip() or "peets"
     input_queue_root = resolved_repo_root / "input_queue"
     output_root = resolved_repo_root / "output"
@@ -80,7 +82,9 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
         lane_id="preserve_results",
         input_root=input_queue_root / "preserve_results",
         output_root=output_root / "preserve_results",
-        accounts=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),),
+        accounts=(
+            AccountConfig(account_id="account_07", host_alias="gate1-wjddn5916", max_jobs=10),
+        ),
         cpus_per_job=32,
         slots_per_job=1,
         cores_per_slot=32,
@@ -94,9 +98,11 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
         input_root=input_queue_root / "prune_results",
         output_root=output_root / "prune_results",
         accounts=(
+            AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),
             AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
             AccountConfig(account_id="account_03", host_alias="gate1-jji0930", max_jobs=10),
-            AccountConfig(account_id="account_04", host_alias="gate1-dw16", max_jobs=10),
+            AccountConfig(account_id="account_04", host_alias="gate1-hmlee31", max_jobs=10),
+            AccountConfig(account_id="account_05", host_alias="gate1-dw16", max_jobs=10),
         ),
         cpus_per_job=20,
         slots_per_job=5,
@@ -108,6 +114,7 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
     )
     return ServiceProfile(
         repo_root=resolved_repo_root,
+        ssh_config_path=ssh_config_path if ssh_config_path.is_file() else None,
         input_queue_root=input_queue_root,
         output_root=output_root,
         delete_failed_root=delete_failed_root,
@@ -185,6 +192,7 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
         tunnel_heartbeat_timeout_seconds=90,
         tunnel_recovery_grace_seconds=30,
         remote_ssh_port=22,
+        ssh_config_path=str(profile.ssh_config_path) if profile.ssh_config_path is not None else "",
         slots_per_job=lane.slots_per_job,
         worker_bundle_multiplier=1,
         cores_per_slot=lane.cores_per_slot,

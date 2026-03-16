@@ -329,6 +329,11 @@ class PipelineConfig:
     tunnel_heartbeat_timeout_seconds: int = 90
     tunnel_recovery_grace_seconds: int = 30
     remote_ssh_port: int = 22
+    ssh_config_path: str = ""
+    remote_container_runtime: str = "none"
+    remote_container_image: str = ""
+    remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252"
+    remote_ansys_executable: str = ""
     slots_per_job: int = 4
     worker_bundle_multiplier: int = 1
     cores_per_slot: int = 4
@@ -414,11 +419,28 @@ class PipelineConfig:
         _ensure_positive("launch_transient_cooldown_seconds", self.launch_transient_cooldown_seconds)
         if self.remote_execution_backend not in {"foreground_ssh", "slurm_batch"}:
             raise ValueError("remote_execution_backend must be 'foreground_ssh' or 'slurm_batch'")
+        if self.remote_container_runtime not in {"none", "enroot"}:
+            raise ValueError("remote_container_runtime must be 'none' or 'enroot'")
         if not self.ready_sidecar_suffix.strip():
             raise ValueError("ready_sidecar_suffix must not be empty")
-        for name in ("partition", "mem", "time_limit", "remote_root", "metadata_db_path", "control_plane_host"):
+        for name in (
+            "partition",
+            "mem",
+            "time_limit",
+            "remote_root",
+            "metadata_db_path",
+            "control_plane_host",
+            "remote_container_ansys_root",
+        ):
             if not getattr(self, name).strip():
                 raise ValueError(f"{name} must not be empty")
+        ssh_config_path = self.ssh_config_path.strip()
+        if ssh_config_path:
+            ssh_config = Path(ssh_config_path).expanduser().resolve()
+            if not ssh_config.exists():
+                raise FileNotFoundError(f"ssh_config_path not found: {ssh_config}")
+            if not ssh_config.is_file():
+                raise ValueError(f"ssh_config_path must be a file: {ssh_config}")
         if self.cpus_per_job < (self.slots_per_job * self.cores_per_slot):
             raise ValueError(
                 f"cpus_per_job must be >= slots_per_job * cores_per_slot ({self.slots_per_job * self.cores_per_slot})"
@@ -438,6 +460,16 @@ class PipelineConfig:
             scheduler = account.scheduler.strip().lower()
             if (platform, scheduler) not in {("linux", "slurm"), ("windows", "none")}:
                 raise ValueError("account platform/scheduler must be linux/slurm or windows/none")
+        if self.remote_container_runtime == "enroot":
+            if self.remote_execution_backend != "slurm_batch":
+                raise ValueError("remote_container_runtime='enroot' requires remote_execution_backend='slurm_batch'")
+            for account in accounts:
+                platform = account.platform.strip().lower()
+                scheduler = account.scheduler.strip().lower()
+                if (platform, scheduler) != ("linux", "slurm"):
+                    raise ValueError("remote_container_runtime='enroot' requires all accounts to be linux/slurm")
+            if not self.remote_container_image.strip():
+                raise ValueError("remote_container_image must not be empty when remote_container_runtime='enroot'")
 
         files: list[Path] = []
         if not self.continuous_mode:
@@ -533,6 +565,11 @@ class _RemoteExecutionConfig:
     tunnel_heartbeat_timeout_seconds: int = 90
     tunnel_recovery_grace_seconds: int = 30
     remote_ssh_port: int = 22
+    ssh_config_path: str = ""
+    remote_container_runtime: str = "none"
+    remote_container_image: str = ""
+    remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252"
+    remote_ansys_executable: str = ""
     slurm_exclude_nodes: tuple[str, ...] = ()
 
 
@@ -915,6 +952,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     tunnel_heartbeat_timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
                     tunnel_recovery_grace_seconds=config.tunnel_recovery_grace_seconds,
                     remote_ssh_port=config.remote_ssh_port,
+                    ssh_config_path=config.ssh_config_path,
+                    remote_container_runtime=config.remote_container_runtime,
+                    remote_container_image=config.remote_container_image,
+                    remote_container_ansys_root=config.remote_container_ansys_root,
+                    remote_ansys_executable=config.remote_ansys_executable,
                 )
                 try:
                     worker_state, observed_node = query_slurm_job_state(
@@ -992,8 +1034,26 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     def _capacity_error(account: AccountConfig, exc: Exception) -> None:
         _log_stage(f"capacity query failed account={account.account_id} host={account.host_alias} reason={exc}")
 
+    def _ssh_config_kwargs() -> dict[str, str]:
+        ssh_config_path = config.ssh_config_path.strip()
+        if not ssh_config_path:
+            return {}
+        return {"ssh_config_path": ssh_config_path}
+
+    def _container_runtime_kwargs() -> dict[str, str]:
+        return {
+            "remote_container_runtime": config.remote_container_runtime,
+            "remote_container_image": config.remote_container_image,
+            "remote_container_ansys_root": config.remote_container_ansys_root,
+            "remote_ansys_executable": config.remote_ansys_executable,
+        }
+
     def _capacity_lookup_with_cooldown(*, account: AccountConfig, pending_buffer_per_account: int) -> AccountCapacitySnapshot:
-        snapshot = query_account_capacity(account=account, pending_buffer_per_account=pending_buffer_per_account)
+        snapshot = query_account_capacity(
+            account=account,
+            pending_buffer_per_account=pending_buffer_per_account,
+            **_ssh_config_kwargs(),
+        )
         local_active_jobs = state_store.count_active_jobs_by_account(run_id=run_id).get(account.account_id, 0)
         remote_visible_workers = max(0, snapshot.running_count) + max(0, snapshot.pending_count)
         submitted_not_visible_workers = max(0, local_active_jobs - remote_visible_workers)
@@ -1139,6 +1199,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     account=account,
                     remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
                     remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                    **_container_runtime_kwargs(),
+                    **_ssh_config_kwargs(),
                 )
             except Exception as exc:
                 snapshot = _blocked_readiness_snapshot(account=account, reason=str(exc))
@@ -1161,7 +1223,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     message=f"account={account.account_id} host={account.host_alias} reason={snapshot.reason}",
                 )
                 try:
-                    bootstrap_account_runtime(account=account)
+                    bootstrap_account_runtime(
+                        account=account,
+                        **_container_runtime_kwargs(),
+                        **_ssh_config_kwargs(),
+                    )
                 except Exception as exc:
                     failed_snapshot = _update_readiness_snapshot(
                         snapshot,
@@ -1184,6 +1250,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                         account=account,
                         remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
                         remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                        **_container_runtime_kwargs(),
+                        **_ssh_config_kwargs(),
                     )
                 except Exception as exc:
                     snapshot = _update_readiness_snapshot(
@@ -1198,6 +1266,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                         account=account,
                         remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
                         remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                        **_container_runtime_kwargs(),
+                        **_ssh_config_kwargs(),
                     )
                 except Exception as exc:
                     snapshot = _update_readiness_snapshot(
@@ -1628,6 +1698,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 tunnel_heartbeat_timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
                 tunnel_recovery_grace_seconds=config.tunnel_recovery_grace_seconds,
                 remote_ssh_port=config.remote_ssh_port,
+                ssh_config_path=config.ssh_config_path,
+                remote_container_runtime=config.remote_container_runtime,
+                remote_container_image=config.remote_container_image,
+                remote_container_ansys_root=config.remote_container_ansys_root,
+                remote_ansys_executable=config.remote_ansys_executable,
             )
             try:
                 cleanup_orphan_sessions_for_run(config=cleanup_cfg, run_id=run_id)
@@ -1662,6 +1737,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         exit_code = orphan_cleanup_error.exit_code
 
     canary_gate_reason = "ok"
+    if canary_candidate and readiness_blocked_slots > 0:
+        canary_gate_reason = "readiness_blocked"
+    elif canary_candidate and orphan_cleanup_error is not None:
+        canary_gate_reason = "orphan_cleanup_failed"
     if canary_candidate and success:
         return_path_ok, return_path_reason = _canary_return_path_ready(
             state_store=state_store,
@@ -2026,6 +2105,11 @@ def _run_bundle_with_retry(
         tunnel_heartbeat_timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
         tunnel_recovery_grace_seconds=config.tunnel_recovery_grace_seconds,
         remote_ssh_port=config.remote_ssh_port,
+        ssh_config_path=config.ssh_config_path,
+        remote_container_runtime=config.remote_container_runtime,
+        remote_container_image=config.remote_container_image,
+        remote_container_ansys_root=config.remote_container_ansys_root,
+        remote_ansys_executable=config.remote_ansys_executable,
         slurm_exclude_nodes=excluded_nodes,
     )
     with TemporaryDirectory(prefix=f"peetsfea_bundle_{bundle.job_id}_") as tmpdir:

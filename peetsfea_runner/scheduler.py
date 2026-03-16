@@ -172,16 +172,44 @@ def _account_scheduler(account: AccountConfigLike) -> str:
     return getattr(account, "scheduler", default).strip().lower()
 
 
-def _windows_ssh_command(account: AccountConfigLike, command: str) -> list[str]:
-    return [
+def _container_runtime(runtime: str) -> str:
+    normalized = str(runtime).strip().lower()
+    return normalized or "none"
+
+
+def _remote_shell_path(path: str) -> str:
+    normalized = str(path).strip()
+    if normalized == "~":
+        return "$HOME"
+    if normalized.startswith("~/"):
+        return f"$HOME/{normalized[2:]}"
+    return normalized
+
+
+def _double_quoted_shell_value(value: str) -> str:
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _normalized_ssh_config_path(ssh_config_path: str) -> str:
+    return str(ssh_config_path).strip()
+
+
+def _ssh_base_command(*, ssh_connect_timeout_seconds: int, ssh_config_path: str = "") -> list[str]:
+    command = [
         "ssh",
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=5",
-        account.host_alias,
-        command,
+        f"ConnectTimeout={ssh_connect_timeout_seconds}",
     ]
+    normalized_path = _normalized_ssh_config_path(ssh_config_path)
+    if normalized_path:
+        command.extend(["-F", normalized_path])
+    return command
+
+
+def _windows_ssh_command(account: AccountConfigLike, command: str, *, ssh_config_path: str = "") -> list[str]:
+    return [*_ssh_base_command(ssh_connect_timeout_seconds=5, ssh_config_path=ssh_config_path), account.host_alias, command]
 
 
 def parse_squeue_state_counts(lines: Sequence[str]) -> tuple[int, int, dict[str, int]]:
@@ -203,6 +231,7 @@ def query_account_capacity(
     run_command: Callable[[list[str]], tuple[int, str, str]] | None = None,
     ssh_connect_timeout_seconds: int = 5,
     command_timeout_seconds: int = 8,
+    ssh_config_path: str = "",
 ) -> AccountCapacitySnapshot:
     if (_account_platform(account), _account_scheduler(account)) == ("windows", "none"):
         return AccountCapacitySnapshot(
@@ -225,11 +254,10 @@ def query_account_capacity(
         raise ValueError("command_timeout_seconds must be > 0")
 
     command = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        f"ConnectTimeout={ssh_connect_timeout_seconds}",
+        *_ssh_base_command(
+            ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+            ssh_config_path=ssh_config_path,
+        ),
         account.host_alias,
         "squeue -u $USER -h -o \"%T\"",
     ]
@@ -284,6 +312,8 @@ def _parse_readiness_marker(
 
     raw_values = _parse_marker_values(marker_line=marker_line, marker_prefix=_READINESS_MARKER)
     values = {key: raw_value == "1" for key, raw_value in raw_values.items()}
+    container_mode = raw_values.get("container", "").strip() == "1"
+    container_reason = raw_values.get("missing", "").strip()
 
     home_ok = values.get("home", False)
     runtime_path_ok = values.get("runtime", False)
@@ -319,6 +349,9 @@ def _parse_readiness_marker(
     elif ready:
         status = "READY"
         reason = "ok"
+    elif container_mode:
+        status = "DISABLED_FOR_DISPATCH"
+        reason = container_reason or ",".join(failed_checks)
     elif bootstrap_needed and not hard_blocked:
         status = "BOOTSTRAP_REQUIRED"
         reason = ",".join(failed_checks)
@@ -412,13 +445,13 @@ def _run_windows_ssh_script(
     ssh_connect_timeout_seconds: int,
     command_timeout_seconds: int,
     stage: str,
+    ssh_config_path: str = "",
 ) -> tuple[int, str, str]:
     command = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        f"ConnectTimeout={ssh_connect_timeout_seconds}",
+        *_ssh_base_command(
+            ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+            ssh_config_path=ssh_config_path,
+        ),
         account.host_alias,
         f"powershell -NoProfile -NonInteractive -Command {shlex.quote(script)}",
     ]
@@ -448,6 +481,7 @@ def _query_windows_account_readiness(
     command_timeout_seconds: int,
     remote_storage_inode_block_percent: int,
     remote_storage_min_free_mb: int,
+    ssh_config_path: str = "",
 ) -> AccountReadinessSnapshot:
     return_code, stdout, stderr = _run_windows_ssh_script(
         account=account,
@@ -456,6 +490,7 @@ def _query_windows_account_readiness(
         ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
         command_timeout_seconds=command_timeout_seconds,
         stage="windows readiness check",
+        ssh_config_path=ssh_config_path,
     )
     combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
     if combined_output:
@@ -483,6 +518,7 @@ def _query_windows_account_preflight(
     command_timeout_seconds: int,
     remote_storage_inode_block_percent: int,
     remote_storage_min_free_mb: int,
+    ssh_config_path: str = "",
 ) -> AccountReadinessSnapshot:
     return_code, stdout, stderr = _run_windows_ssh_script(
         account=account,
@@ -491,6 +527,7 @@ def _query_windows_account_preflight(
         ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
         command_timeout_seconds=command_timeout_seconds,
         stage="windows preflight check",
+        ssh_config_path=ssh_config_path,
     )
     combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
     if combined_output:
@@ -510,6 +547,100 @@ def _query_windows_account_preflight(
     raise RuntimeError(f"preflight check failed account={account.account_id}: {details}")
 
 
+def _build_enroot_readiness_script(*, remote_container_image: str, remote_container_ansys_root: str) -> str:
+    image_path = _remote_shell_path(remote_container_image)
+    ansys_root = _remote_shell_path(remote_container_ansys_root)
+    return f"""
+set +e
+HOME_OK=0
+RUNTIME_OK=0
+VENV_OK=1
+PYTHON_OK=1
+MODULE_OK=1
+BINARIES_OK=0
+ANSYS_OK=0
+STORAGE_OK=1
+MISSING=()
+REMOTE_CONTAINER_IMAGE={_double_quoted_shell_value(image_path)}
+REMOTE_CONTAINER_ANSYS_ROOT={_double_quoted_shell_value(ansys_root)}
+if [ -n "${{HOME:-}}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
+  HOME_OK=1
+fi
+if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+  BINARIES_OK=1
+else
+  MISSING+=("binaries")
+fi
+IMAGE_OK=0
+if [ -n "$REMOTE_CONTAINER_IMAGE" ] && [ -f "$REMOTE_CONTAINER_IMAGE" ] && [ -r "$REMOTE_CONTAINER_IMAGE" ]; then
+  IMAGE_OK=1
+else
+  MISSING+=("image")
+fi
+if [ "$IMAGE_OK" -eq 1 ]; then
+  RUNTIME_OK=1
+fi
+if [ -n "$REMOTE_CONTAINER_ANSYS_ROOT" ] && [ -d "$REMOTE_CONTAINER_ANSYS_ROOT" ]; then
+  ANSYS_OK=1
+else
+  MISSING+=("ansys_root")
+fi
+INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {{gsub(/%/, "", $5); print $5+0}}' || echo 0)
+FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {{print $4+0}}' || echo 0)
+FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
+MISSING_TEXT=$(IFS=,; printf '%s' "${{MISSING[*]}}")
+printf '__PEETSFEA_READY__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT"
+"""
+
+
+def _build_enroot_preflight_script(*, remote_container_image: str, remote_container_ansys_root: str) -> str:
+    image_path = _remote_shell_path(remote_container_image)
+    ansys_root = _remote_shell_path(remote_container_ansys_root)
+    return f"""
+set +e
+HOME_OK=0
+RUNTIME_OK=0
+VENV_OK=1
+PYTHON_OK=1
+MODULE_OK=1
+BINARIES_OK=0
+ANSYS_OK=0
+UV_OK=1
+PYAEDT_OK=1
+STORAGE_OK=1
+MISSING=()
+REMOTE_CONTAINER_IMAGE={_double_quoted_shell_value(image_path)}
+REMOTE_CONTAINER_ANSYS_ROOT={_double_quoted_shell_value(ansys_root)}
+if [ -n "${{HOME:-}}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
+  HOME_OK=1
+fi
+if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+  BINARIES_OK=1
+else
+  MISSING+=("binaries")
+fi
+IMAGE_OK=0
+if [ -n "$REMOTE_CONTAINER_IMAGE" ] && [ -f "$REMOTE_CONTAINER_IMAGE" ] && [ -r "$REMOTE_CONTAINER_IMAGE" ]; then
+  IMAGE_OK=1
+else
+  MISSING+=("image")
+fi
+if [ "$IMAGE_OK" -eq 1 ]; then
+  RUNTIME_OK=1
+fi
+if [ -n "$REMOTE_CONTAINER_ANSYS_ROOT" ] && [ -d "$REMOTE_CONTAINER_ANSYS_ROOT" ]; then
+  ANSYS_OK=1
+else
+  MISSING+=("ansys_root")
+fi
+INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {{gsub(/%/, "", $5); print $5+0}}' || echo 0)
+FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {{print $4+0}}' || echo 0)
+FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
+MISSING_TEXT=$(IFS=,; printf '%s' "${{MISSING[*]}}")
+printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT"
+"""
+
+
 def query_account_readiness(
     *,
     account: AccountConfigLike,
@@ -518,7 +649,74 @@ def query_account_readiness(
     command_timeout_seconds: int = 12,
     remote_storage_inode_block_percent: int = 98,
     remote_storage_min_free_mb: int = 0,
+    remote_container_runtime: str = "none",
+    remote_container_image: str = "",
+    remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252",
+    remote_ansys_executable: str = "",
+    ssh_config_path: str = "",
 ) -> AccountReadinessSnapshot:
+    container_runtime = _container_runtime(remote_container_runtime)
+    if container_runtime == "enroot":
+        if (_account_platform(account), _account_scheduler(account)) != ("linux", "slurm"):
+            raise RuntimeError(
+                f"unsupported account provider account={account.account_id} "
+                f"platform={_account_platform(account)} scheduler={_account_scheduler(account)}"
+            )
+        if ssh_connect_timeout_seconds <= 0:
+            raise ValueError("ssh_connect_timeout_seconds must be > 0")
+        if command_timeout_seconds <= 0:
+            raise ValueError("command_timeout_seconds must be > 0")
+        remote_script = _build_enroot_readiness_script(
+            remote_container_image=remote_container_image,
+            remote_container_ansys_root=remote_container_ansys_root,
+        )
+        command = [
+            *_ssh_base_command(
+                ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+                ssh_config_path=ssh_config_path,
+            ),
+            account.host_alias,
+            f"bash -lc {shlex.quote(remote_script)}",
+        ]
+        if run_command is None:
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=command_timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    f"readiness check timed out account={account.account_id} host={account.host_alias} "
+                    f"timeout={command_timeout_seconds}s"
+                ) from exc
+            return_code = completed.returncode
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+        else:
+            return_code, stdout, stderr = run_command(command)
+
+        combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
+        if combined_output:
+            snapshot = _parse_readiness_marker(
+                account=account,
+                text=combined_output,
+                remote_storage_inode_block_percent=remote_storage_inode_block_percent,
+                remote_storage_min_free_mb=remote_storage_min_free_mb,
+            )
+            if return_code != 0 and snapshot.ready:
+                raise RuntimeError(
+                    f"readiness check failed account={account.account_id}: "
+                    f"{(stderr or stdout).strip() or f'return code={return_code}'}"
+                )
+            return snapshot
+
+        details = (stderr or stdout).strip()
+        if not details:
+            details = f"return code={return_code}"
+        raise RuntimeError(f"readiness check failed account={account.account_id}: {details}")
     if (_account_platform(account), _account_scheduler(account)) == ("windows", "none"):
         return _query_windows_account_readiness(
             account=account,
@@ -527,6 +725,7 @@ def query_account_readiness(
             command_timeout_seconds=command_timeout_seconds,
             remote_storage_inode_block_percent=remote_storage_inode_block_percent,
             remote_storage_min_free_mb=remote_storage_min_free_mb,
+            ssh_config_path=ssh_config_path,
         )
     if (_account_platform(account), _account_scheduler(account)) != ("linux", "slurm"):
         raise RuntimeError(
@@ -576,11 +775,10 @@ FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
 printf '__PEETSFEA_READY__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE"
 """
     command = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        f"ConnectTimeout={ssh_connect_timeout_seconds}",
+        *_ssh_base_command(
+            ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+            ssh_config_path=ssh_config_path,
+        ),
         account.host_alias,
         f"bash -lc {shlex.quote(remote_script)}",
     ]
@@ -638,6 +836,7 @@ def _parse_preflight_marker(
 
     raw_values = _parse_marker_values(marker_line=marker_line, marker_prefix=_PREFLIGHT_MARKER)
     values = {key: raw_value == "1" for key, raw_value in raw_values.items()}
+    container_reason = raw_values.get("missing", "").strip()
 
     home_ok = values.get("home", False)
     runtime_path_ok = values.get("runtime", False)
@@ -674,7 +873,7 @@ def _parse_preflight_marker(
         host_alias=account.host_alias,
         ready=ready,
         status="READY" if ready else ("BLOCKED_STORAGE" if not storage_ready else "PREFLIGHT_FAILED"),
-        reason="ok" if ready else (storage_reason if not storage_ready else ",".join(failed_checks)),
+        reason="ok" if ready else (storage_reason if not storage_ready else (container_reason or ",".join(failed_checks))),
         home_ok=home_ok,
         runtime_path_ok=runtime_path_ok,
         venv_ok=venv_ok,
@@ -699,7 +898,74 @@ def query_account_preflight(
     command_timeout_seconds: int = 20,
     remote_storage_inode_block_percent: int = 98,
     remote_storage_min_free_mb: int = 0,
+    remote_container_runtime: str = "none",
+    remote_container_image: str = "",
+    remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252",
+    remote_ansys_executable: str = "",
+    ssh_config_path: str = "",
 ) -> AccountReadinessSnapshot:
+    container_runtime = _container_runtime(remote_container_runtime)
+    if container_runtime == "enroot":
+        if (_account_platform(account), _account_scheduler(account)) != ("linux", "slurm"):
+            raise RuntimeError(
+                f"unsupported account provider account={account.account_id} "
+                f"platform={_account_platform(account)} scheduler={_account_scheduler(account)}"
+            )
+        if ssh_connect_timeout_seconds <= 0:
+            raise ValueError("ssh_connect_timeout_seconds must be > 0")
+        if command_timeout_seconds <= 0:
+            raise ValueError("command_timeout_seconds must be > 0")
+        remote_script = _build_enroot_preflight_script(
+            remote_container_image=remote_container_image,
+            remote_container_ansys_root=remote_container_ansys_root,
+        )
+        command = [
+            *_ssh_base_command(
+                ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+                ssh_config_path=ssh_config_path,
+            ),
+            account.host_alias,
+            f"bash -lc {shlex.quote(remote_script)}",
+        ]
+        if run_command is None:
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=command_timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    f"preflight check timed out account={account.account_id} host={account.host_alias} "
+                    f"timeout={command_timeout_seconds}s"
+                ) from exc
+            return_code = completed.returncode
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+        else:
+            return_code, stdout, stderr = run_command(command)
+
+        combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
+        if combined_output:
+            snapshot = _parse_preflight_marker(
+                account=account,
+                text=combined_output,
+                remote_storage_inode_block_percent=remote_storage_inode_block_percent,
+                remote_storage_min_free_mb=remote_storage_min_free_mb,
+            )
+            if return_code != 0 and snapshot.ready:
+                raise RuntimeError(
+                    f"preflight check failed account={account.account_id}: "
+                    f"{(stderr or stdout).strip() or f'return code={return_code}'}"
+                )
+            return snapshot
+
+        details = (stderr or stdout).strip()
+        if not details:
+            details = f"return code={return_code}"
+        raise RuntimeError(f"preflight check failed account={account.account_id}: {details}")
     if (_account_platform(account), _account_scheduler(account)) == ("windows", "none"):
         return _query_windows_account_preflight(
             account=account,
@@ -708,6 +974,7 @@ def query_account_preflight(
             command_timeout_seconds=command_timeout_seconds,
             remote_storage_inode_block_percent=remote_storage_inode_block_percent,
             remote_storage_min_free_mb=remote_storage_min_free_mb,
+            ssh_config_path=ssh_config_path,
         )
     if (_account_platform(account), _account_scheduler(account)) != ("linux", "slurm"):
         raise RuntimeError(
@@ -766,11 +1033,10 @@ FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
 printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE"
 """
     command = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        f"ConnectTimeout={ssh_connect_timeout_seconds}",
+        *_ssh_base_command(
+            ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+            ssh_config_path=ssh_config_path,
+        ),
         account.host_alias,
         f"bash -lc {shlex.quote(remote_script)}",
     ]
@@ -821,13 +1087,21 @@ def bootstrap_account_runtime(
     run_command: Callable[[list[str]], tuple[int, str, str]] | None = None,
     ssh_connect_timeout_seconds: int = 5,
     command_timeout_seconds: int = 900,
+    remote_container_runtime: str = "none",
+    remote_container_image: str = "",
+    remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252",
+    remote_ansys_executable: str = "",
+    ssh_config_path: str = "",
 ) -> str:
+    if _container_runtime(remote_container_runtime) == "enroot":
+        raise RuntimeError("bootstrap is not supported when remote_container_runtime='enroot'")
     if (_account_platform(account), _account_scheduler(account)) == ("windows", "none"):
         return _bootstrap_windows_account_runtime(
             account=account,
             run_command=run_command,
             ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
             command_timeout_seconds=command_timeout_seconds,
+            ssh_config_path=ssh_config_path,
         )
     if (_account_platform(account), _account_scheduler(account)) != ("linux", "slurm"):
         raise RuntimeError(
@@ -918,11 +1192,10 @@ touch "$DEPS_READY_MARKER"
 printf '__PEETSFEA_BOOTSTRAP__:ok\\n'
 """
     command = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        f"ConnectTimeout={ssh_connect_timeout_seconds}",
+        *_ssh_base_command(
+            ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+            ssh_config_path=ssh_config_path,
+        ),
         account.host_alias,
         f"bash -lc {shlex.quote(remote_script)}",
     ]
@@ -959,6 +1232,7 @@ def _bootstrap_windows_account_runtime(
     run_command: Callable[[list[str]], tuple[int, str, str]] | None,
     ssh_connect_timeout_seconds: int,
     command_timeout_seconds: int,
+    ssh_config_path: str = "",
 ) -> str:
     remote_script = r"""
 $ErrorActionPreference = 'Stop'
@@ -1012,6 +1286,7 @@ Write-Output '__PEETSFEA_BOOTSTRAP__:ok'
         ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
         command_timeout_seconds=command_timeout_seconds,
         stage="windows bootstrap",
+        ssh_config_path=ssh_config_path,
     )
     output = "\n".join(part for part in (stdout, stderr) if part).strip()
     if return_code != 0 or _BOOTSTRAP_MARKER not in output:

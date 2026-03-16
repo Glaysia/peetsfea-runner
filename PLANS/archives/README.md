@@ -37,9 +37,17 @@
 - `ops-stabilization-03c-night-operations-rollout-and-service-boundary.md`
 - `ops-stabilization-04-full-4x10x10-saturation.md`
 
+아래 문서는 enroot 도입 전 설계를 위한 archive 참고 문서다.
+
+- `enroot-canary-repo-ssh-handover.md`
+- `enroot-canary-01-ssh-and-account-topology.md`
+- `enroot-canary-02-worker-runtime-and-container-contract.md`
+- `enroot-canary-03-canary-rollout-and-270-slot-target.md`
+
 ## 구조
 
 - active tree: `1 + 4`
 - leaf docs: `11`
 - archive index: `1`
-- total planned docs: `17`
+- archive enroot docs: `4`
+- total tracked docs: `21`

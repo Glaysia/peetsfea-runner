@@ -36,7 +36,10 @@ class TestBuiltInService(unittest.TestCase):
         self.assertEqual(lane_by_id["preserve_results"].tasks_per_slot, 4)
         self.assertTrue(lane_by_id["preserve_results"].retain_aedtresults)
         self.assertTrue(lane_by_id["preserve_results"].rename_input_to_done_on_success)
-        self.assertEqual([account.host_alias for account in lane_by_id["preserve_results"].accounts], ["gate1-harry"])
+        self.assertEqual(
+            [account.host_alias for account in lane_by_id["preserve_results"].accounts],
+            ["gate1-wjddn5916"],
+        )
         self.assertEqual(lane_by_id["prune_results"].cpus_per_job, 20)
         self.assertEqual(lane_by_id["prune_results"].slots_per_job, 5)
         self.assertEqual(lane_by_id["prune_results"].cores_per_slot, 4)
@@ -45,8 +48,10 @@ class TestBuiltInService(unittest.TestCase):
         self.assertTrue(lane_by_id["prune_results"].rename_input_to_done_on_success)
         self.assertEqual(
             [account.host_alias for account in lane_by_id["prune_results"].accounts],
-            ["gate1-dhj02", "gate1-jji0930", "gate1-dw16"],
+            ["gate1-harry", "gate1-dhj02", "gate1-jji0930", "gate1-hmlee31", "gate1-dw16"],
         )
+        total_slots = sum(len(lane.accounts) * 10 * lane.slots_per_job for lane in profile.lanes)
+        self.assertEqual(total_slots, 260)
 
     def test_validate_service_layout_creates_required_output_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -97,6 +102,8 @@ class TestBuiltInService(unittest.TestCase):
             root = Path(tmpdir)
             (root / "input_queue" / "preserve_results").mkdir(parents=True, exist_ok=True)
             (root / "input_queue" / "prune_results").mkdir(parents=True, exist_ok=True)
+            (root / ".ssh").mkdir(parents=True, exist_ok=True)
+            (root / ".ssh" / "config").write_text("Host gate1-harry\n", encoding="utf-8")
             profile = build_service_profile(repo_root=root)
             lane_by_id = {lane.lane_id: lane for lane in profile.lanes}
 
@@ -109,11 +116,13 @@ class TestBuiltInService(unittest.TestCase):
             self.assertTrue(preserve_cfg.rename_input_to_done_on_success)
             self.assertEqual(preserve_cfg.input_source_policy, "allow_original")
             self.assertEqual(len(preserve_cfg.accounts_registry), 1)
+            self.assertEqual(preserve_cfg.ssh_config_path, str(root / ".ssh" / "config"))
             self.assertEqual(prune_cfg.run_namespace, "prune_results")
             self.assertEqual(prune_cfg.tasks_per_slot, 1)
             self.assertFalse(prune_cfg.retain_aedtresults)
             self.assertTrue(prune_cfg.rename_input_to_done_on_success)
-            self.assertEqual(len(prune_cfg.accounts_registry), 3)
+            self.assertEqual(len(prune_cfg.accounts_registry), 5)
+            self.assertEqual(prune_cfg.ssh_config_path, str(root / ".ssh" / "config"))
 
 
 if __name__ == "__main__":

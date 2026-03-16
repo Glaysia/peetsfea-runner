@@ -154,6 +154,39 @@ class TestPipelineApi(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "remote_execution_backend"):
                 config.validate()
 
+    def test_validate_rejects_enroot_outside_slurm_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            (input_dir / "sample.aedt").write_text("x", encoding="utf-8")
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                continuous_mode=False,
+                remote_execution_backend="foreground_ssh",
+                remote_container_runtime="enroot",
+                remote_container_image="~/runtime/enroot/aedt.sqsh",
+            )
+            with self.assertRaisesRegex(ValueError, "remote_container_runtime='enroot' requires remote_execution_backend='slurm_batch'"):
+                config.validate()
+
+    def test_validate_rejects_enroot_with_windows_account(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            (input_dir / "sample.aedt").write_text("x", encoding="utf-8")
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                continuous_mode=False,
+                remote_execution_backend="slurm_batch",
+                remote_container_runtime="enroot",
+                remote_container_image="~/runtime/enroot/aedt.sqsh",
+                accounts_registry=(
+                    AccountConfig(account_id="account_01", host_alias="gate1-dw16", max_jobs=1, platform="windows", scheduler="none"),
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "requires all accounts to be linux/slurm"):
+                config.validate()
+
     def test_auto_register_low_tmp_node_skips_control_plane_and_gate_hosts(self) -> None:
         accounts = (
             AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),
@@ -2071,7 +2104,7 @@ class TestPipelineApi(unittest.TestCase):
             self.assertFalse(result.success)
             conn = duckdb.connect(str(db_path))
             try:
-                rows = conn.execute("SELECT stage FROM events ORDER BY ts").fetchall()
+                rows = conn.execute("SELECT stage, message FROM events ORDER BY ts").fetchall()
             finally:
                 conn.close()
             stages = [str(row[0]) for row in rows]
@@ -2079,6 +2112,13 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIn("CUTOVER_BLOCKED", stages)
             self.assertIn("CANARY_FAILED", stages)
             self.assertIn("ROLLBACK_TRIGGERED", stages)
+            self.assertIn("canary_gate=readiness_blocked", result.summary)
+            self.assertTrue(
+                any(stage == "CANARY_FAILED" and "reason=readiness_blocked" in str(message) for stage, message in rows)
+            )
+            self.assertTrue(
+                any(stage == "ROLLBACK_TRIGGERED" and "reason=readiness_blocked" in str(message) for stage, message in rows)
+            )
 
     def test_validate_rejects_missing_directory(self) -> None:
         missing = Path(tempfile.gettempdir()) / "missing_input_queue"

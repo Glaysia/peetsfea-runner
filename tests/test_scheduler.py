@@ -122,6 +122,26 @@ class TestScheduler(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 query_account_capacity(account=account, pending_buffer_per_account=3)
 
+    def test_query_account_capacity_uses_repo_local_ssh_config_when_provided(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        seen_commands: list[list[str]] = []
+
+        def _run_command(command: list[str]) -> tuple[int, str, str]:
+            seen_commands.append(command)
+            return 0, "R\n", ""
+
+        query_account_capacity(
+            account=account,
+            pending_buffer_per_account=3,
+            run_command=_run_command,
+            ssh_config_path="/repo/.ssh/config",
+        )
+
+        self.assertEqual(
+            seen_commands[0][:8],
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-F", "/repo/.ssh/config", "host-1"],
+        )
+
     def test_query_account_readiness_reports_ready_snapshot(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
         snapshot = query_account_readiness(
@@ -212,6 +232,24 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(snapshot.status, "BOOTSTRAP_REQUIRED")
         self.assertEqual(snapshot.reason, "venv,python")
 
+    def test_query_account_readiness_in_enroot_mode_reports_missing_image_without_bootstrap(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_readiness(
+            account=account,
+            remote_container_runtime="enroot",
+            remote_container_image="~/runtime/enroot/aedt.sqsh",
+            remote_container_ansys_root="/opt/ohpc/pub/Electronics/v252",
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_READY__:home=1 runtime=0 venv=1 python=1 module=1 binaries=1 ansys=1 storage=1 inode_pct=10 free_mb=8192 fs_type=ext4 container=1 missing=image\n",
+                "",
+            ),
+        )
+
+        self.assertFalse(snapshot.ready)
+        self.assertEqual(snapshot.status, "DISABLED_FOR_DISPATCH")
+        self.assertEqual(snapshot.reason, "image")
+
     def test_query_account_preflight_reports_missing_uv_and_pyaedt(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
         snapshot = query_account_preflight(
@@ -227,6 +265,26 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(snapshot.reason, "uv,pyaedt")
         self.assertFalse(snapshot.uv_ok)
         self.assertFalse(snapshot.pyaedt_ok)
+
+    def test_query_account_preflight_in_enroot_mode_accepts_image_backed_runtime(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_preflight(
+            account=account,
+            remote_container_runtime="enroot",
+            remote_container_image="~/runtime/enroot/aedt.sqsh",
+            remote_container_ansys_root="/opt/ohpc/pub/Electronics/v252",
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1 uv=1 pyaedt=1 storage=1 inode_pct=10 free_mb=8192 fs_type=ext4 container=1 missing=\n",
+                "",
+            ),
+        )
+
+        self.assertTrue(snapshot.ready)
+        self.assertEqual(snapshot.status, "READY")
+        self.assertEqual(snapshot.reason, "ok")
+        self.assertTrue(snapshot.uv_ok)
+        self.assertTrue(snapshot.pyaedt_ok)
 
     def test_query_account_preflight_blocks_storage_when_free_mb_below_threshold(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
@@ -279,6 +337,15 @@ class TestScheduler(unittest.TestCase):
         self.assertTrue(seen)
         self.assertIn('if [ -e "$MINICONDA_DIR" ]; then', seen[0][-1])
         self.assertIn('rm -rf "$MINICONDA_DIR"', seen[0][-1])
+
+    def test_bootstrap_account_runtime_rejects_enroot_mode(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        with self.assertRaisesRegex(RuntimeError, "remote_container_runtime='enroot'"):
+            bootstrap_account_runtime(
+                account=account,
+                remote_container_runtime="enroot",
+                remote_container_image="~/runtime/enroot/aedt.sqsh",
+            )
 
     def test_query_windows_account_capacity_uses_local_max_jobs(self) -> None:
         account = _Account(account_id="w1", host_alias="win-1", max_jobs=2, platform="windows", scheduler="none")

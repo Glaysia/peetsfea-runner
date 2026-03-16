@@ -43,6 +43,11 @@ class RemoteJobConfig(Protocol):
     tunnel_heartbeat_timeout_seconds: int
     tunnel_recovery_grace_seconds: int
     remote_ssh_port: int
+    ssh_config_path: str
+    remote_container_runtime: str
+    remote_container_image: str
+    remote_container_ansys_root: str
+    remote_ansys_executable: str
     emit_output_variables_csv: bool
     slurm_exclude_nodes: tuple[str, ...]
 
@@ -154,8 +159,42 @@ def _remote_execution_backend(config: RemoteJobConfig) -> str:
     return getattr(config, "remote_execution_backend", "foreground_ssh").strip().lower()
 
 
+def _remote_container_runtime(config: RemoteJobConfig) -> str:
+    return str(getattr(config, "remote_container_runtime", "none")).strip().lower() or "none"
+
+
+def _remote_container_image(config: RemoteJobConfig) -> str:
+    return str(getattr(config, "remote_container_image", "")).strip()
+
+
+def _remote_container_ansys_root(config: RemoteJobConfig) -> str:
+    value = str(getattr(config, "remote_container_ansys_root", "")).strip()
+    return value or "/opt/ohpc/pub/Electronics/v252"
+
+
+def _remote_ansys_executable(config: RemoteJobConfig) -> str:
+    explicit = str(getattr(config, "remote_ansys_executable", "")).strip()
+    if explicit:
+        return explicit
+    if _remote_container_runtime(config) == "enroot":
+        return "/mnt/AnsysEM/ansysedt"
+    return "/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt"
+
+
+def _remote_ansysem_root(config: RemoteJobConfig) -> str:
+    executable = _remote_ansys_executable(config).strip()
+    if not executable:
+        return "/opt/ohpc/pub/Electronics/v252/AnsysEM"
+    parent = Path(executable).parent.as_posix()
+    return parent or "/opt/ohpc/pub/Electronics/v252/AnsysEM"
+
+
 def _remote_ssh_port(config: RemoteJobConfig) -> int:
     return int(getattr(config, "remote_ssh_port", 22))
+
+
+def _remote_ssh_config_path(config: RemoteJobConfig) -> str:
+    return str(getattr(config, "ssh_config_path", "")).strip()
 
 
 def _control_plane_return_host(config: RemoteJobConfig) -> str:
@@ -201,11 +240,21 @@ def _slurm_exclude_nodes(config: RemoteJobConfig) -> tuple[str, ...]:
 
 
 def _ssh_command(config: RemoteJobConfig, *args: str) -> list[str]:
-    return ["ssh", "-p", str(_remote_ssh_port(config)), *args]
+    command = ["ssh", "-p", str(_remote_ssh_port(config))]
+    ssh_config_path = _remote_ssh_config_path(config)
+    if ssh_config_path:
+        command.extend(["-F", ssh_config_path])
+    command.extend(args)
+    return command
 
 
 def _scp_command(config: RemoteJobConfig, *args: str) -> list[str]:
-    return ["scp", "-P", str(_remote_ssh_port(config)), *args]
+    command = ["scp", "-P", str(_remote_ssh_port(config))]
+    ssh_config_path = _remote_ssh_config_path(config)
+    if ssh_config_path:
+        command.extend(["-F", ssh_config_path])
+    command.extend(args)
+    return command
 
 
 _TRANSIENT_LAUNCH_PATTERNS = (
@@ -1329,6 +1378,10 @@ def _remote_path_for_shell(*, config: RemoteJobConfig, path: str) -> str:
     return path
 
 
+def _double_quoted_shell_value(value: str) -> str:
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) -> str:
     lines = [
         "#!/usr/bin/env bash",
@@ -1336,8 +1389,8 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "",
         "if [ ! -f .env_initialized ]; then",
         "  export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/AnsysEM",
-        "  export LANG=en_US.UTF-8",
-        "  export LC_ALL=en_US.UTF-8",
+        "  export LANG=C.UTF-8",
+        "  export LC_ALL=C.UTF-8",
         "  unset LANGUAGE",
         "  export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81",
         "  module load ansys-electronics/v252",
@@ -1474,10 +1527,34 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "",
         "def launch_ansys_grpc_server(port: int) -> subprocess.Popen:",
         "    cmd = [ANSYS_EXECUTABLE, '-ng', '-grpcsrv', str(port)]",
-        "    process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
-        "    time.sleep(6)",
-        "    if process.poll() is not None:",
-        "        raise RuntimeError(f'Failed to start ansysedt gRPC server on port {port}')",
+        "    stdout_path = Path('ansys_grpc.stdout.log')",
+        "    stderr_path = Path('ansys_grpc.stderr.log')",
+        "    stdout_handle = stdout_path.open('w', encoding='utf-8')",
+        "    stderr_handle = stderr_path.open('w', encoding='utf-8')",
+        "    process = subprocess.Popen(cmd, cwd='/tmp', stdout=stdout_handle, stderr=stderr_handle)",
+        "    deadline = time.time() + 180",
+        "    while time.time() < deadline:",
+        "        if process.poll() is not None:",
+        "            break",
+        "        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:",
+        "            probe.settimeout(1)",
+        "            if probe.connect_ex(('127.0.0.1', port)) == 0:",
+        "                stdout_handle.close()",
+        "                stderr_handle.close()",
+        "                return process",
+        "        time.sleep(2)",
+        "    stdout_handle.close()",
+        "    stderr_handle.close()",
+        "    stdout_tail = ''",
+        "    stderr_tail = ''",
+        "    if stdout_path.exists():",
+        "        stdout_tail = stdout_path.read_text(encoding='utf-8', errors='ignore')[-2000:]",
+        "    if stderr_path.exists():",
+        "        stderr_tail = stderr_path.read_text(encoding='utf-8', errors='ignore')[-2000:]",
+        "    raise RuntimeError(",
+        "        f'Failed to start ansysedt gRPC server on port {port}; '",
+        "        f'returncode={process.poll()} stdout_tail={stdout_tail!r} stderr_tail={stderr_tail!r}'",
+        "    )",
         "    return process",
         "",
         "",
@@ -1901,6 +1978,36 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
     return "\n".join(lines) + "\n"
 
 
+def _build_enroot_remote_job_script_content(*, config: RemoteJobConfig) -> str:
+    content = _build_remote_job_script_content(
+        emit_output_variables_csv=getattr(config, "emit_output_variables_csv", True),
+    )
+    marker = "cat > run_sim.py <<'PY'\n"
+    _prefix, remainder = content.split(marker, 1)
+    remainder = remainder.replace(
+        "ANSYS_EXECUTABLE: str = '/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt'",
+        f"ANSYS_EXECUTABLE: str = {_remote_ansys_executable(config)!r}",
+        1,
+    )
+    remainder = remainder.replace(
+        "\"$VENV_DIR/bin/python\" run_sim.py",
+        "/opt/peetsfea-venv/bin/python run_sim.py",
+        1,
+    )
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "",
+        "export LANG=C.UTF-8",
+        "export LC_ALL=C.UTF-8",
+        "unset LANGUAGE",
+        f"export ANSYSEM_ROOT252={shlex.quote(_remote_ansysem_root(config))}",
+        "export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81",
+        marker.rstrip("\n"),
+    ]
+    return "\n".join(lines) + "\n" + remainder
+
+
 def _build_windows_remote_job_script_content() -> str:
     lines = [
         "$ErrorActionPreference = 'Stop'",
@@ -1947,12 +2054,13 @@ def _build_windows_remote_job_script_content() -> str:
 
 def _write_remote_job_script(tmpdir: Path, *, config: RemoteJobConfig) -> Path:
     script = tmpdir / "remote_job.sh"
-    script.write_text(
-        _build_remote_job_script_content(
+    if _remote_container_runtime(config) == "enroot":
+        content = _build_enroot_remote_job_script_content(config=config)
+    else:
+        content = _build_remote_job_script_content(
             emit_output_variables_csv=getattr(config, "emit_output_variables_csv", True),
-        ),
-        encoding="utf-8",
-    )
+        )
+    script.write_text(content, encoding="utf-8")
     return script
 
 
@@ -2072,6 +2180,9 @@ def _build_worker_payload_script_content(
 ) -> str:
     max_parallel = max(1, int(getattr(config, "slots_per_job", case_count)))
     tasks_per_slot = int(getattr(config, "tasks_per_slot", 1))
+    container_runtime = _remote_container_runtime(config)
+    container_image = _remote_container_image(config)
+    container_ansys_root = _remote_container_ansys_root(config)
     total_allocated_mem_mb = _memory_to_mb(getattr(config, "mem", ""))
     slot_allocated_mem_mb = max(
         1,
@@ -2111,6 +2222,15 @@ def _build_worker_payload_script_content(
         "PEETS_TUNNEL_SOCKET=\"$workdir/control-plane.sock\"",
         "PEETS_TUNNEL_SESSION_ID=\"${SLURM_JOB_ID:-nojob}-${PEETS_CONTROL_WORKER_ID:-worker}-$$\"",
         "PEETS_CONTROL_API_URL=\"http://127.0.0.1:${PEETS_CONTROL_LOCAL_PORT}\"",
+        f"PEETS_REMOTE_CONTAINER_RUNTIME={shlex.quote(container_runtime)}",
+        (
+            "REMOTE_CONTAINER_IMAGE="
+            + _double_quoted_shell_value(_remote_path_for_shell(config=config, path=container_image))
+        ),
+        (
+            "REMOTE_CONTAINER_ANSYS_ROOT="
+            + _double_quoted_shell_value(_remote_path_for_shell(config=config, path=container_ansys_root))
+        ),
         "case_pids=()",
         "count_case_jobs() {",
         "  local pid",
@@ -2252,6 +2372,33 @@ def _build_worker_payload_script_content(
         "  stop_control_tunnel",
         "}",
         "trap teardown_control_plane EXIT",
+        "if [ \"$PEETS_REMOTE_CONTAINER_RUNTIME\" = \"enroot\" ]; then",
+        "  export ENROOT_RUNTIME_PATH=\"/tmp/$USER/enroot/runtime/${SLURM_JOB_ID:-nojob}\"",
+        "  export ENROOT_CACHE_PATH=\"/tmp/$USER/enroot/cache/${SLURM_JOB_ID:-nojob}\"",
+        "  export ENROOT_DATA_PATH=\"/tmp/$USER/enroot/data/${SLURM_JOB_ID:-nojob}\"",
+        "  export ENROOT_TEMP_PATH=\"/tmp/$USER/enroot/tmp/${SLURM_JOB_ID:-nojob}\"",
+        "  mkdir -p \"$ENROOT_RUNTIME_PATH\" \"$ENROOT_CACHE_PATH\" \"$ENROOT_DATA_PATH\" \"$ENROOT_TEMP_PATH\"",
+        "  chmod 700 \"$ENROOT_RUNTIME_PATH\" \"$ENROOT_CACHE_PATH\" \"$ENROOT_DATA_PATH\" \"$ENROOT_TEMP_PATH\"",
+        "fi",
+        "run_case_command() {",
+        "  case_dir=\"$1\"",
+        "  case_name=\"$(basename \"$case_dir\")\"",
+        "  export PEETS_SLOT_CORES PEETS_SLOT_TASKS",
+        "  if [ \"$PEETS_REMOTE_CONTAINER_RUNTIME\" = \"enroot\" ]; then",
+        "    (",
+        "      container_name=\"peets-${SLURM_JOB_ID:-nojob}-${case_name}-$$\"",
+        "      cd \"$REMOTE_CONTAINER_ANSYS_ROOT\"",
+        "      enroot create -f -n \"$container_name\" \"$REMOTE_CONTAINER_IMAGE\" >/dev/null",
+        "      trap 'enroot remove -f \"$container_name\" >/dev/null 2>&1 || true' EXIT",
+        "      enroot start --root --rw --mount .:/mnt --mount \"$case_dir:/work\" \"$container_name\" /bin/bash -lc 'cd /work && export ANS_IGNOREOS=1 && bash ./remote_job.sh'",
+        "    )",
+        "    return",
+        "  fi",
+        "  (",
+        "    cd \"$case_dir\"",
+        "    bash ./remote_job.sh",
+        "  )",
+        "}",
     ]
     for case_index in range(1, case_count + 1):
         case_name = f"case_{case_index:02d}"
@@ -2260,6 +2407,7 @@ def _build_worker_payload_script_content(
             [
                 f"mkdir -p {shlex.quote(case_name)}",
                 f"cp -f {shlex.quote(source_name)} {shlex.quote(case_name)}/project.aedt",
+                f"cp -f remote_job.sh {shlex.quote(case_name)}/remote_job.sh",
             ]
         )
     payload_lines.extend(
@@ -2273,10 +2421,11 @@ def _build_worker_payload_script_content(
             "    cd \"$case_dir\"",
             "    mkdir -p tmp",
             "    export TMPDIR=\"$PWD/tmp\"",
+            "    case_dir_path=\"$PWD\"",
             "    emit_slot_snapshot \"$case_dir\" \"RUNNING\" 0",
             (
                 f"    if PEETS_SLOT_CORES={config.cores_per_slot} "
-                f"PEETS_SLOT_TASKS={tasks_per_slot} bash ../remote_job.sh > run.log 2>&1; then"
+                f"PEETS_SLOT_TASKS={tasks_per_slot} run_case_command \"$case_dir_path\" > run.log 2>&1; then"
             ),
             "      rc=0",
             "    else",

@@ -33,6 +33,7 @@ from peetsfea_runner.remote_job import (
     SlotInput,
     WorkflowError,
     _classify_return_path_failure_stage,
+    _build_enroot_remote_job_script_content,
     _build_worker_payload_script_content,
     _build_remote_sbatch_script_content,
     _build_windows_remote_dispatch_script_content,
@@ -40,6 +41,8 @@ from peetsfea_runner.remote_job import (
     _parse_sbatch_job_id,
     _parse_squeue_state_line,
     _read_remote_optional_text_file,
+    _scp_command,
+    _ssh_command,
     _run_completed_process_capture_with_transport_retry,
     _run_remote_workflow_sbatch,
     _wait_for_remote_sbatch_completion,
@@ -52,8 +55,8 @@ class TestPlan03Workflow(unittest.TestCase):
     def test_remote_script_contains_required_environment_setup(self) -> None:
         content = _build_remote_job_script_content()
         self.assertIn("export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/AnsysEM", content)
-        self.assertIn("export LANG=en_US.UTF-8", content)
-        self.assertIn("export LC_ALL=en_US.UTF-8", content)
+        self.assertIn("export LANG=C.UTF-8", content)
+        self.assertIn("export LC_ALL=C.UTF-8", content)
         self.assertIn("unset LANGUAGE", content)
         self.assertIn("export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81", content)
         self.assertIn("module load ansys-electronics/v252", content)
@@ -132,7 +135,7 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("max_parallel=4", content)
         self.assertIn("export REMOTE_JOB_DIR", content)
         self.assertIn("wait -n \"${case_pids[@]}\" || true", content)
-        self.assertIn("if PEETS_SLOT_CORES=4 PEETS_SLOT_TASKS=1 bash ../remote_job.sh > run.log 2>&1; then", content)
+        self.assertIn('if PEETS_SLOT_CORES=4 PEETS_SLOT_TASKS=1 run_case_command "$case_dir_path" > run.log 2>&1; then', content)
         self.assertIn("echo \"$rc\" > exit.code", content)
         self.assertIn("archive_path=$(mktemp /tmp/peetsfea-results.", content)
         self.assertIn('tar -czf "$archive_path" case_* case_summary.txt failed.count', content)
@@ -182,6 +185,58 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("case_pids+=(\"$!\")", content)
         self.assertIn("wait -n \"${case_pids[@]}\" || true", content)
         self.assertNotIn("while [ \"$(jobs -pr | wc -l)\" -gt 0 ]; do", content)
+
+    def test_enroot_worker_payload_uses_cd_then_mount_contract(self) -> None:
+        class _Cfg:
+            slots_per_job = 4
+            cores_per_slot = 4
+            control_plane_host = "127.0.0.1"
+            control_plane_port = 8765
+            control_plane_ssh_target = "peetsmain@192.168.0.10"
+            control_plane_return_host = "192.168.0.10"
+            control_plane_return_port = 5722
+            control_plane_return_user = "peetsmain"
+            tunnel_recovery_grace_seconds = 30
+            remote_container_runtime = "enroot"
+            remote_container_image = "~/runtime/enroot/aedt-ubuntu2404-pyaedt.sqsh"
+            remote_container_ansys_root = "/opt/ohpc/pub/Electronics/v252"
+            remote_ansys_executable = "/mnt/AnsysEM/ansysedt"
+
+        content = _build_worker_payload_script_content(
+            config=_Cfg(),
+            case_count=3,
+            run_id="run_02",
+            worker_id="attempt_0002",
+        )
+
+        self.assertIn("PEETS_REMOTE_CONTAINER_RUNTIME=enroot", content)
+        self.assertIn('REMOTE_CONTAINER_ANSYS_ROOT="/opt/ohpc/pub/Electronics/v252"', content)
+        self.assertIn('export ENROOT_RUNTIME_PATH="/tmp/$USER/enroot/runtime/${SLURM_JOB_ID:-nojob}"', content)
+        self.assertIn('(\n      container_name="peets-${SLURM_JOB_ID:-nojob}-${case_name}-$$"', content)
+        self.assertIn('cd "$REMOTE_CONTAINER_ANSYS_ROOT"', content)
+        self.assertIn('container_name="peets-${SLURM_JOB_ID:-nojob}-${case_name}-$$"', content)
+        self.assertIn('enroot create -f -n "$container_name" "$REMOTE_CONTAINER_IMAGE" >/dev/null', content)
+        self.assertIn('enroot start --root --rw --mount .:/mnt --mount "$case_dir:/work"', content)
+        self.assertIn("export ANS_IGNOREOS=1", content)
+        self.assertIn('cp -f remote_job.sh case_01/remote_job.sh', content)
+        self.assertIn('run_case_command "$case_dir_path" > run.log 2>&1', content)
+        self.assertIn('(\n    cd "$case_dir"\n    bash ./remote_job.sh\n  )', content)
+
+    def test_enroot_remote_job_script_uses_image_python_and_mounted_ansys(self) -> None:
+        class _Cfg:
+            emit_output_variables_csv = True
+            remote_container_runtime = "enroot"
+            remote_ansys_executable = "/mnt/AnsysEM/ansysedt"
+
+        content = _build_enroot_remote_job_script_content(config=_Cfg())
+
+        self.assertIn("export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81", content)
+        self.assertIn("export ANSYSEM_ROOT252=/mnt/AnsysEM", content)
+        self.assertNotIn("module load ansys-electronics/v252", content)
+        self.assertNotIn("ensure_miniconda()", content)
+        self.assertNotIn("\"$VENV_DIR/bin/python\" -m uv pip install pyaedt==0.25.1", content)
+        self.assertIn("ANSYS_EXECUTABLE: str = '/mnt/AnsysEM/ansysedt'", content)
+        self.assertIn("/opt/peetsfea-venv/bin/python run_sim.py", content)
 
     def test_windows_remote_scripts_use_powershell_without_slurm(self) -> None:
         class _Cfg:
@@ -274,6 +329,24 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertEqual(payload, "ok")
         command = run_completed.call_args.args[0]
         self.assertEqual(command[:4], ["ssh", "-p", "2202", "gate1-harry"])
+
+    def test_remote_ssh_and_scp_commands_include_repo_local_config_when_present(self) -> None:
+        class _Cfg:
+            host = "gate1-harry"
+            remote_ssh_port = 2202
+            ssh_config_path = "/repo/.ssh/config"
+
+        ssh_command = _ssh_command(_Cfg(), "gate1-harry", "true")
+        scp_command = _scp_command(_Cfg(), "src.txt", "gate1-harry:/tmp/dst.txt")
+
+        self.assertEqual(
+            ssh_command,
+            ["ssh", "-p", "2202", "-F", "/repo/.ssh/config", "gate1-harry", "true"],
+        )
+        self.assertEqual(
+            scp_command,
+            ["scp", "-P", "2202", "-F", "/repo/.ssh/config", "src.txt", "gate1-harry:/tmp/dst.txt"],
+        )
 
     def test_classify_return_path_failure_stage(self) -> None:
         self.assertEqual(

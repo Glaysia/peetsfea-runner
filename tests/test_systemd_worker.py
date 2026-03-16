@@ -63,6 +63,47 @@ class TestSystemdWorker(unittest.TestCase):
         self.assertEqual(config.accounts_registry[1].platform, "windows")
         self.assertEqual(config.accounts_registry[1].scheduler, "none")
 
+    def test_build_config_reads_repo_local_ssh_config_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ssh_config_path = Path(tmpdir) / ".ssh-config"
+            ssh_config_path.write_text("Host gate1-harry\n", encoding="utf-8")
+            with patch.dict(
+                environ,
+                {
+                    "PEETSFEA_INPUT_QUEUE_DIR": str(Path(tmpdir) / "in"),
+                    "PEETSFEA_OUTPUT_ROOT_DIR": str(Path(tmpdir) / "out"),
+                    "PEETSFEA_DB_PATH": str(Path(tmpdir) / "state.duckdb"),
+                    "PEETSFEA_SSH_CONFIG_PATH": str(ssh_config_path),
+                },
+                clear=False,
+            ):
+                config = _build_config()
+
+        self.assertEqual(config.ssh_config_path, str(ssh_config_path))
+
+    def test_build_config_reads_enroot_runtime_fields_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                environ,
+                {
+                    "PEETSFEA_INPUT_QUEUE_DIR": str(Path(tmpdir) / "in"),
+                    "PEETSFEA_OUTPUT_ROOT_DIR": str(Path(tmpdir) / "out"),
+                    "PEETSFEA_DB_PATH": str(Path(tmpdir) / "state.duckdb"),
+                    "PEETSFEA_REMOTE_EXECUTION_BACKEND": "slurm_batch",
+                    "PEETSFEA_REMOTE_CONTAINER_RUNTIME": "enroot",
+                    "PEETSFEA_REMOTE_CONTAINER_IMAGE": "~/runtime/enroot/aedt.sqsh",
+                    "PEETSFEA_REMOTE_CONTAINER_ANSYS_ROOT": "/opt/ohpc/pub/Electronics/v252",
+                    "PEETSFEA_REMOTE_ANSYS_EXECUTABLE": "/mnt/AnsysEM/ansysedt",
+                },
+                clear=False,
+            ):
+                config = _build_config()
+
+        self.assertEqual(config.remote_container_runtime, "enroot")
+        self.assertEqual(config.remote_container_image, "~/runtime/enroot/aedt.sqsh")
+        self.assertEqual(config.remote_container_ansys_root, "/opt/ohpc/pub/Electronics/v252")
+        self.assertEqual(config.remote_ansys_executable, "/mnt/AnsysEM/ansysedt")
+
     def test_normalize_control_plane_ssh_target_prefixes_local_user(self) -> None:
         with patch.dict(environ, {"USER": "peetsmain"}, clear=False):
             self.assertEqual(_normalize_control_plane_ssh_target("harrypc"), "peetsmain@harrypc")

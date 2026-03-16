@@ -312,6 +312,13 @@ def _parse_accounts_from_env() -> tuple[AccountConfig, ...]:
     return tuple(accounts)
 
 
+def _default_repo_ssh_config_path(repo_root: Path) -> str:
+    candidate = repo_root / ".ssh" / "config"
+    if candidate.is_file():
+        return str(candidate)
+    return ""
+
+
 def _build_config() -> PipelineConfig:
     repo_root = Path(__file__).resolve().parent.parent
     input_queue_dir = os.getenv("PEETSFEA_INPUT_QUEUE_DIR", str(repo_root / "input_queue"))
@@ -366,6 +373,14 @@ def _build_config() -> PipelineConfig:
         tunnel_heartbeat_timeout_seconds=int(os.getenv("PEETSFEA_TUNNEL_HEARTBEAT_TIMEOUT_SECONDS", "90")),
         tunnel_recovery_grace_seconds=int(os.getenv("PEETSFEA_TUNNEL_RECOVERY_GRACE_SECONDS", "30")),
         remote_ssh_port=int(os.getenv("PEETSFEA_REMOTE_SSH_PORT", "22")),
+        ssh_config_path=os.getenv("PEETSFEA_SSH_CONFIG_PATH", _default_repo_ssh_config_path(repo_root)),
+        remote_container_runtime=os.getenv("PEETSFEA_REMOTE_CONTAINER_RUNTIME", "none"),
+        remote_container_image=os.getenv("PEETSFEA_REMOTE_CONTAINER_IMAGE", ""),
+        remote_container_ansys_root=os.getenv(
+            "PEETSFEA_REMOTE_CONTAINER_ANSYS_ROOT",
+            "/opt/ohpc/pub/Electronics/v252",
+        ),
+        remote_ansys_executable=os.getenv("PEETSFEA_REMOTE_ANSYS_EXECUTABLE", ""),
         continuous_mode=_env_bool("PEETSFEA_CONTINUOUS_MODE", True),
         ingest_poll_seconds=int(os.getenv("PEETSFEA_INGEST_POLL_SECONDS", "30")),
         ready_sidecar_suffix=os.getenv("PEETSFEA_READY_SIDECAR_SUFFIX", ".ready"),
