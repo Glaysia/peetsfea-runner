@@ -260,7 +260,7 @@ def _parse_accounts_from_env() -> tuple[AccountConfig, ...]:
       - account_id@host_alias:max_jobs:platform:scheduler
       - account_id@host_alias
     Example:
-      account_01@gate1-harry:10,account_02@gate1-dhj02:10,account_03@gate1-jji0930:10,account_04@gate1-dw16:2:windows:none
+      account_01@gate1-harry261:10,account_02@gate1-dhj02:10,account_03@gate1-jji0930:10,account_04@gate1-dw16:2:windows:none
     """
     raw = os.getenv("PEETSFEA_ACCOUNTS", "").strip()
     if not raw:
@@ -329,7 +329,7 @@ def _build_config() -> PipelineConfig:
     accounts_registry = _parse_accounts_from_env()
     if not accounts_registry:
         account_id = os.getenv("PEETSFEA_ACCOUNT_ID", "account_01")
-        host_alias = os.getenv("PEETSFEA_HOST_ALIAS", "gate1-harry")
+        host_alias = os.getenv("PEETSFEA_HOST_ALIAS", "gate1-harry261")
         max_jobs = int(os.getenv("PEETSFEA_MAX_JOBS_PER_ACCOUNT", "10"))
         accounts_registry = (AccountConfig(account_id=account_id, host_alias=host_alias, max_jobs=max_jobs),)
 
@@ -358,12 +358,12 @@ def _build_config() -> PipelineConfig:
         metadata_db_path=metadata_db_path,
         accounts_registry=accounts_registry,
         execute_remote=_env_bool("PEETSFEA_EXECUTE_REMOTE", True),
-        remote_execution_backend=os.getenv("PEETSFEA_REMOTE_EXECUTION_BACKEND", "foreground_ssh"),
+        remote_execution_backend=os.getenv("PEETSFEA_REMOTE_EXECUTION_BACKEND", "slurm_batch"),
         partition=os.getenv("PEETSFEA_PARTITION", "cpu2"),
         cpus_per_job=int(os.getenv("PEETSFEA_CPUS_PER_JOB", "16")),
         mem=os.getenv("PEETSFEA_MEM", "960G"),
         time_limit=os.getenv("PEETSFEA_TIME_LIMIT", "05:00:00"),
-        remote_root=os.getenv("PEETSFEA_REMOTE_ROOT", "~/aedt_runs"),
+        remote_root=os.getenv("PEETSFEA_REMOTE_ROOT", "/tmp/$USER/aedt_runs"),
         control_plane_host=os.getenv("PEETSFEA_CONTROL_PLANE_HOST", "127.0.0.1"),
         control_plane_port=int(os.getenv("PEETSFEA_CONTROL_PLANE_PORT", os.getenv("PEETSFEA_WEB_PORT", "8765"))),
         control_plane_ssh_target=control_plane_ssh_target,
@@ -374,13 +374,13 @@ def _build_config() -> PipelineConfig:
         tunnel_recovery_grace_seconds=int(os.getenv("PEETSFEA_TUNNEL_RECOVERY_GRACE_SECONDS", "30")),
         remote_ssh_port=int(os.getenv("PEETSFEA_REMOTE_SSH_PORT", "22")),
         ssh_config_path=os.getenv("PEETSFEA_SSH_CONFIG_PATH", _default_repo_ssh_config_path(repo_root)),
-        remote_container_runtime=os.getenv("PEETSFEA_REMOTE_CONTAINER_RUNTIME", "none"),
-        remote_container_image=os.getenv("PEETSFEA_REMOTE_CONTAINER_IMAGE", ""),
+        remote_container_runtime=os.getenv("PEETSFEA_REMOTE_CONTAINER_RUNTIME", "enroot"),
+        remote_container_image=os.getenv("PEETSFEA_REMOTE_CONTAINER_IMAGE", "~/runtime/enroot/aedt.sqsh"),
         remote_container_ansys_root=os.getenv(
             "PEETSFEA_REMOTE_CONTAINER_ANSYS_ROOT",
             "/opt/ohpc/pub/Electronics/v252",
         ),
-        remote_ansys_executable=os.getenv("PEETSFEA_REMOTE_ANSYS_EXECUTABLE", ""),
+        remote_ansys_executable=os.getenv("PEETSFEA_REMOTE_ANSYS_EXECUTABLE", "/mnt/AnsysEM/ansysedt"),
         continuous_mode=_env_bool("PEETSFEA_CONTINUOUS_MODE", True),
         ingest_poll_seconds=int(os.getenv("PEETSFEA_INGEST_POLL_SECONDS", "30")),
         ready_sidecar_suffix=os.getenv("PEETSFEA_READY_SIDECAR_SUFFIX", ".ready"),
@@ -395,10 +395,12 @@ def _build_config() -> PipelineConfig:
         pending_buffer_per_account=int(os.getenv("PEETSFEA_PENDING_BUFFER_PER_ACCOUNT", "3")),
         capacity_scope=os.getenv("PEETSFEA_CAPACITY_SCOPE", "all_user_jobs"),
         balance_metric=os.getenv("PEETSFEA_BALANCE_METRIC", "slot_throughput"),
-        input_source_policy=os.getenv("PEETSFEA_INPUT_SOURCE_POLICY", "sample_only"),
+        input_source_policy=os.getenv("PEETSFEA_INPUT_SOURCE_POLICY", "input_queue_only"),
         public_storage_mode=os.getenv("PEETSFEA_PUBLIC_STORAGE_MODE", "disabled"),
         remote_storage_inode_block_percent=int(os.getenv("PEETSFEA_REMOTE_STORAGE_INODE_BLOCK_PERCENT", "98")),
-        remote_storage_min_free_mb=int(os.getenv("PEETSFEA_REMOTE_STORAGE_MIN_FREE_MB", "0")),
+        remote_storage_min_free_mb=int(os.getenv("PEETSFEA_REMOTE_STORAGE_MIN_FREE_MB", "20480")),
+        readiness_probe_timeout_seconds=int(os.getenv("PEETSFEA_READINESS_PROBE_TIMEOUT_SECONDS", "180")),
+        preflight_probe_timeout_seconds=int(os.getenv("PEETSFEA_PREFLIGHT_PROBE_TIMEOUT_SECONDS", "180")),
     )
 
 

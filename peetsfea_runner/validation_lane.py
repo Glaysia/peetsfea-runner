@@ -7,7 +7,6 @@ from .pipeline import AccountConfig, PipelineConfig
 
 
 _PRUNE_ACCOUNTS = (
-    AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),
     AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
     AccountConfig(account_id="account_03", host_alias="gate1-jji0930", max_jobs=10),
     AccountConfig(account_id="account_04", host_alias="gate1-hmlee31", max_jobs=10),
@@ -15,7 +14,7 @@ _PRUNE_ACCOUNTS = (
 )
 
 _PRESERVE_ACCOUNTS = (
-    AccountConfig(account_id="account_07", host_alias="gate1-wjddn5916", max_jobs=10),
+    AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
 )
 
 
@@ -32,7 +31,7 @@ def build_enroot_validation_lane_config(
     lane: str,
     window: str,
     remote_container_image: str,
-    remote_root: str = "~/aedt_runs",
+    remote_root: str = "/tmp/$USER/aedt_runs",
     partition: str = "cpu2",
     mem: str = "960G",
     time_limit: str = "05:00:00",
@@ -101,8 +100,10 @@ def build_enroot_validation_lane_config(
         worker_bundle_multiplier=1,
         cores_per_slot=cores_per_slot,
         tasks_per_slot=tasks_per_slot,
-        input_source_policy="sample_only",
+        input_source_policy="input_queue_only",
         public_storage_mode="disabled",
+        readiness_probe_timeout_seconds=180,
+        preflight_probe_timeout_seconds=180,
         ssh_config_path=resolved_ssh_config_path,
         remote_container_runtime="enroot",
         remote_container_image=remote_container_image,

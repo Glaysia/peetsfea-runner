@@ -53,7 +53,7 @@ class TestSystemdWorker(unittest.TestCase):
                     "PEETSFEA_INPUT_QUEUE_DIR": str(Path(tmpdir) / "in"),
                     "PEETSFEA_OUTPUT_ROOT_DIR": str(Path(tmpdir) / "out"),
                     "PEETSFEA_DB_PATH": str(Path(tmpdir) / "state.duckdb"),
-                    "PEETSFEA_ACCOUNTS": "account_01@gate1-harry:10,account_04@gate1-dw16:2:windows:none",
+                    "PEETSFEA_ACCOUNTS": "account_01@gate1-harry261:10,account_04@gate1-dw16:2:windows:none",
                 },
                 clear=False,
             ):
@@ -66,7 +66,7 @@ class TestSystemdWorker(unittest.TestCase):
     def test_build_config_reads_repo_local_ssh_config_from_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             ssh_config_path = Path(tmpdir) / ".ssh-config"
-            ssh_config_path.write_text("Host gate1-harry\n", encoding="utf-8")
+            ssh_config_path.write_text("Host gate1-harry261\n", encoding="utf-8")
             with patch.dict(
                 environ,
                 {

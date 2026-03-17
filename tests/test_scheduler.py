@@ -65,7 +65,7 @@ class TestScheduler(unittest.TestCase):
                     relative_path=Path(f"file_{idx}.aedt"),
                     output_dir=base / f"out_{idx}.aedt_all",
                     account_id="account_01",
-                    host_alias="gate1-harry",
+                    host_alias="gate1-harry261",
                 )
                 for idx in range(1, 81)
             ]
@@ -148,7 +148,7 @@ class TestScheduler(unittest.TestCase):
             account=account,
             run_command=lambda _cmd: (
                 0,
-                "__PEETSFEA_READY__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1\n",
+                "__PEETSFEA_READY__:home=1 runtime=1 env=1 python=1 module=1 binaries=1 ansys=1\n",
                 "",
             ),
         )
@@ -162,7 +162,7 @@ class TestScheduler(unittest.TestCase):
                 reason="ok",
                 home_ok=True,
                 runtime_path_ok=True,
-                venv_ok=True,
+                env_ok=True,
                 python_ok=True,
                 module_ok=True,
                 binaries_ok=True,
@@ -176,13 +176,13 @@ class TestScheduler(unittest.TestCase):
             account=account,
             run_command=lambda _cmd: (
                 0,
-                "__PEETSFEA_READY__:home=1 runtime=1 venv=0 python=0 module=1 binaries=1 ansys=0\n",
+                "__PEETSFEA_READY__:home=1 runtime=1 env=0 python=0 module=1 binaries=1 ansys=0\n",
                 "",
             ),
         )
         self.assertFalse(snapshot.ready)
-        self.assertEqual(snapshot.status, "DISABLED_FOR_DISPATCH")
-        self.assertEqual(snapshot.reason, "venv,python,ansys")
+        self.assertEqual(snapshot.status, "BLOCKED")
+        self.assertEqual(snapshot.reason, "env,python,ansys")
 
     def test_query_account_readiness_blocks_storage_when_inode_full(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
@@ -190,24 +190,24 @@ class TestScheduler(unittest.TestCase):
             account=account,
             run_command=lambda _cmd: (
                 0,
-                "__PEETSFEA_READY__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1 storage=1 inode_pct=100 free_mb=12345\n",
+                "__PEETSFEA_READY__:home=1 runtime=1 env=1 python=1 module=1 binaries=1 ansys=1 storage=1 inode_pct=100 free_mb=12345\n",
                 "",
             ),
         )
         self.assertFalse(snapshot.ready)
-        self.assertEqual(snapshot.status, "BLOCKED_STORAGE")
-        self.assertEqual(snapshot.reason, "inode_pct=100")
+        self.assertEqual(snapshot.status, "BLOCKED")
+        self.assertEqual(snapshot.reason, "home_inode_exhausted inode_pct=100 threshold_pct=98")
         self.assertFalse(snapshot.storage_ready)
         self.assertEqual(snapshot.inode_use_percent, 100)
         self.assertEqual(snapshot.free_mb, 12345)
 
-    def test_query_account_readiness_ignores_gpfs_inode_pressure(self) -> None:
+    def test_query_account_readiness_blocks_gpfs_inode_pressure(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
         snapshot = query_account_readiness(
             account=account,
             run_command=lambda _cmd: (
                 0,
-                "__PEETSFEA_READY__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1 storage=1 inode_pct=100 free_mb=12345 fs_type=gpfs\n",
+                "__PEETSFEA_READY__:home=1 runtime=1 env=1 python=1 module=1 binaries=1 ansys=1 storage=1 inode_pct=100 free_mb=12345 fs_type=gpfs\n",
                 "",
             ),
         )
@@ -224,13 +224,13 @@ class TestScheduler(unittest.TestCase):
             account=account,
             run_command=lambda _cmd: (
                 0,
-                "__PEETSFEA_READY__:home=1 runtime=1 venv=0 python=0 module=1 binaries=1 ansys=1\n",
+                "__PEETSFEA_READY__:home=1 runtime=1 env=0 python=0 module=1 binaries=1 ansys=1\n",
                 "",
             ),
         )
         self.assertFalse(snapshot.ready)
         self.assertEqual(snapshot.status, "BOOTSTRAP_REQUIRED")
-        self.assertEqual(snapshot.reason, "venv,python")
+        self.assertEqual(snapshot.reason, "env,python")
 
     def test_query_account_readiness_in_enroot_mode_reports_missing_image_without_bootstrap(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
@@ -241,14 +241,14 @@ class TestScheduler(unittest.TestCase):
             remote_container_ansys_root="/opt/ohpc/pub/Electronics/v252",
             run_command=lambda _cmd: (
                 0,
-                "__PEETSFEA_READY__:home=1 runtime=0 venv=1 python=1 module=1 binaries=1 ansys=1 storage=1 inode_pct=10 free_mb=8192 fs_type=ext4 container=1 missing=image\n",
+                "__PEETSFEA_READY__:home=1 runtime=0 env=1 python=1 module=1 binaries=1 ansys=1 storage=1 inode_pct=10 free_mb=8192 fs_type=ext4 container=1 missing=image_missing image_path=$HOME/runtime/enroot/aedt.sqsh\n",
                 "",
             ),
         )
 
         self.assertFalse(snapshot.ready)
-        self.assertEqual(snapshot.status, "DISABLED_FOR_DISPATCH")
-        self.assertEqual(snapshot.reason, "image")
+        self.assertEqual(snapshot.status, "BLOCKED")
+        self.assertEqual(snapshot.reason, "image_missing path=$HOME/runtime/enroot/aedt.sqsh")
 
     def test_query_account_preflight_reports_missing_uv_and_pyaedt(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
@@ -256,13 +256,13 @@ class TestScheduler(unittest.TestCase):
             account=account,
             run_command=lambda _cmd: (
                 0,
-                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1 uv=0 pyaedt=0\n",
+                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 env=1 python=1 module=1 binaries=1 ansys=1 uv=0 pyaedt=0 pandas=0 pyvista=0\n",
                 "",
             ),
         )
         self.assertFalse(snapshot.ready)
         self.assertEqual(snapshot.status, "PREFLIGHT_FAILED")
-        self.assertEqual(snapshot.reason, "uv,pyaedt")
+        self.assertEqual(snapshot.reason, "uv,pyaedt,pandas,pyvista")
         self.assertFalse(snapshot.uv_ok)
         self.assertFalse(snapshot.pyaedt_ok)
 
@@ -275,7 +275,7 @@ class TestScheduler(unittest.TestCase):
             remote_container_ansys_root="/opt/ohpc/pub/Electronics/v252",
             run_command=lambda _cmd: (
                 0,
-                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1 uv=1 pyaedt=1 storage=1 inode_pct=10 free_mb=8192 fs_type=ext4 container=1 missing=\n",
+                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 env=1 python=1 module=1 binaries=1 ansys=1 uv=1 pyaedt=1 pandas=1 pyvista=1 storage=1 inode_pct=10 free_mb=8192 fs_type=ext4 container=1 missing=\n",
                 "",
             ),
         )
@@ -293,22 +293,22 @@ class TestScheduler(unittest.TestCase):
             remote_storage_min_free_mb=2048,
             run_command=lambda _cmd: (
                 0,
-                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1 uv=1 pyaedt=1 storage=1 inode_pct=10 free_mb=1024\n",
+                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 env=1 python=1 module=1 binaries=1 ansys=1 uv=1 pyaedt=1 storage=1 inode_pct=10 free_mb=1024\n",
                 "",
             ),
         )
         self.assertFalse(snapshot.ready)
-        self.assertEqual(snapshot.status, "BLOCKED_STORAGE")
-        self.assertEqual(snapshot.reason, "free_mb=1024")
+        self.assertEqual(snapshot.status, "BLOCKED")
+        self.assertEqual(snapshot.reason, "home_storage_insufficient free_mb=1024 threshold_mb=2048")
         self.assertFalse(snapshot.storage_ready)
 
-    def test_query_account_preflight_ignores_gpfs_inode_pressure(self) -> None:
+    def test_query_account_preflight_blocks_gpfs_inode_pressure(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
         snapshot = query_account_preflight(
             account=account,
             run_command=lambda _cmd: (
                 0,
-                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1 uv=1 pyaedt=1 storage=1 inode_pct=100 free_mb=20480 fs_type=gpfs\n",
+                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 env=1 python=1 module=1 binaries=1 ansys=1 uv=1 pyaedt=1 pandas=1 pyvista=1 storage=1 inode_pct=100 free_mb=20480 fs_type=gpfs\n",
                 "",
             ),
         )
@@ -316,6 +316,22 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(snapshot.status, "READY")
         self.assertEqual(snapshot.reason, "ok")
         self.assertTrue(snapshot.storage_ready)
+
+    def test_query_account_preflight_gpfs_still_blocks_when_free_mb_below_threshold(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_preflight(
+            account=account,
+            remote_storage_min_free_mb=2048,
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 env=1 python=1 module=1 binaries=1 ansys=1 uv=1 pyaedt=1 pandas=1 pyvista=1 storage=1 inode_pct=100 free_mb=1024 fs_type=gpfs\n",
+                "",
+            ),
+        )
+        self.assertFalse(snapshot.ready)
+        self.assertEqual(snapshot.status, "BLOCKED")
+        self.assertEqual(snapshot.reason, "home_storage_insufficient free_mb=1024 threshold_mb=2048")
+        self.assertFalse(snapshot.storage_ready)
 
     def test_bootstrap_account_runtime_requires_success_marker(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
@@ -338,14 +354,23 @@ class TestScheduler(unittest.TestCase):
         self.assertIn('if [ -e "$MINICONDA_DIR" ]; then', seen[0][-1])
         self.assertIn('rm -rf "$MINICONDA_DIR"', seen[0][-1])
 
-    def test_bootstrap_account_runtime_rejects_enroot_mode(self) -> None:
+    def test_bootstrap_account_runtime_supports_enroot_mode(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
-        with self.assertRaisesRegex(RuntimeError, "remote_container_runtime='enroot'"):
-            bootstrap_account_runtime(
-                account=account,
-                remote_container_runtime="enroot",
-                remote_container_image="~/runtime/enroot/aedt.sqsh",
-            )
+        seen: list[list[str]] = []
+
+        def _runner(cmd: list[str]) -> tuple[int, str, str]:
+            seen.append(cmd)
+            return 0, "__PEETSFEA_BOOTSTRAP__:ok\n", ""
+
+        output = bootstrap_account_runtime(
+            account=account,
+            remote_container_runtime="enroot",
+            remote_container_image="~/runtime/enroot/aedt.sqsh",
+            run_command=_runner,
+        )
+        self.assertIn("__PEETSFEA_BOOTSTRAP__:ok", output)
+        self.assertTrue(seen)
+        self.assertIn("srun -p cpu2 -N1 -n1", seen[0][-1])
 
     def test_query_windows_account_capacity_uses_local_max_jobs(self) -> None:
         account = _Account(account_id="w1", host_alias="win-1", max_jobs=2, platform="windows", scheduler="none")
@@ -362,7 +387,7 @@ class TestScheduler(unittest.TestCase):
             seen.append(cmd)
             return (
                 0,
-                "__PEETSFEA_READY__:home=1 runtime=1 venv=1 python=1 module=1 binaries=1 ansys=1\n",
+                "__PEETSFEA_READY__:home=1 runtime=1 env=1 python=1 module=1 binaries=1 ansys=1\n",
                 "",
             )
 

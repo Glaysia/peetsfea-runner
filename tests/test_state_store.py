@@ -57,7 +57,7 @@ class TestStateStore(unittest.TestCase):
                 output_path="/tmp/out/a.aedt_all",
                 account_id="account_01",
             )
-            attempt_id = store.start_attempt(run_id="run_01", job_id="job_0001", attempt_no=1, node="gate1-harry")
+            attempt_id = store.start_attempt(run_id="run_01", job_id="job_0001", attempt_no=1, node="gate1-harry261")
             store.finish_attempt(run_id="run_01", attempt_id=attempt_id, exit_code=13, error="mock fail")
             store.update_job_status(
                 run_id="run_01",
@@ -155,6 +155,7 @@ class TestStateStore(unittest.TestCase):
                 ready_present=True,
                 ready_mode="SIDECAR",
                 ready_error=None,
+                ready_mtime_ns=200,
                 file_size=100,
                 file_mtime_ns=12345,
             )
@@ -164,6 +165,7 @@ class TestStateStore(unittest.TestCase):
                 ready_present=True,
                 ready_mode="SIDECAR",
                 ready_error=None,
+                ready_mtime_ns=200,
                 file_size=100,
                 file_mtime_ns=12345,
             )
@@ -173,6 +175,7 @@ class TestStateStore(unittest.TestCase):
                 ready_present=True,
                 ready_mode="SIDECAR",
                 ready_error=None,
+                ready_mtime_ns=201,
                 file_size=101,
                 file_mtime_ns=12346,
             )
@@ -193,6 +196,7 @@ class TestStateStore(unittest.TestCase):
                 ready_present=False,
                 ready_mode="INTERNAL_ONLY",
                 ready_error="read-only",
+                ready_mtime_ns=None,
                 file_size=100,
                 file_mtime_ns=12345,
             )
@@ -202,6 +206,7 @@ class TestStateStore(unittest.TestCase):
                 ready_present=True,
                 ready_mode="SIDECAR",
                 ready_error=None,
+                ready_mtime_ns=200,
                 file_size=100,
                 file_mtime_ns=12345,
             )
@@ -221,6 +226,113 @@ class TestStateStore(unittest.TestCase):
             self.assertTrue(first)
             self.assertFalse(second)
             self.assertEqual((bool(row[0]), row[1], row[2], row[3]), (True, "SIDECAR", None, "READY"))
+
+    def test_register_ingest_candidate_rearms_quarantined_input_on_newer_ready_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+
+            self.assertTrue(
+                store.register_ingest_candidate(
+                    input_path="/in/a.aedt",
+                    ready_path="/in/a.aedt.ready",
+                    ready_present=True,
+                    ready_mode="SIDECAR",
+                    ready_error=None,
+                    ready_mtime_ns=100,
+                    file_size=100,
+                    file_mtime_ns=12345,
+                )
+            )
+            store.mark_ingest_state(input_path="/in/a.aedt", state="QUARANTINED")
+
+            unchanged = store.register_ingest_candidate(
+                input_path="/in/a.aedt",
+                ready_path="/in/a.aedt.ready",
+                ready_present=True,
+                ready_mode="SIDECAR",
+                ready_error=None,
+                ready_mtime_ns=100,
+                file_size=100,
+                file_mtime_ns=12345,
+            )
+            rearmed = store.register_ingest_candidate(
+                input_path="/in/a.aedt",
+                ready_path="/in/a.aedt.ready",
+                ready_present=True,
+                ready_mode="SIDECAR",
+                ready_error=None,
+                ready_mtime_ns=200,
+                file_size=100,
+                file_mtime_ns=12345,
+            )
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT state, ready_mtime_ns, last_rearmed_at
+                    FROM ingest_index
+                    WHERE input_path = '/in/a.aedt'
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertFalse(unchanged)
+            self.assertTrue(rearmed)
+            self.assertEqual(row[0], "READY")
+            self.assertEqual(int(row[1]), 200)
+            self.assertTrue(row[2])
+
+    def test_register_ingest_candidate_does_not_rearm_succeeded_input_on_newer_ready_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+
+            self.assertTrue(
+                store.register_ingest_candidate(
+                    input_path="/in/a.aedt",
+                    ready_path="/in/a.aedt.ready",
+                    ready_present=True,
+                    ready_mode="SIDECAR",
+                    ready_error=None,
+                    ready_mtime_ns=100,
+                    file_size=100,
+                    file_mtime_ns=12345,
+                )
+            )
+            store.mark_ingest_state(input_path="/in/a.aedt", state="SUCCEEDED")
+
+            rearmed = store.register_ingest_candidate(
+                input_path="/in/a.aedt",
+                ready_path="/in/a.aedt.ready",
+                ready_present=True,
+                ready_mode="SIDECAR",
+                ready_error=None,
+                ready_mtime_ns=200,
+                file_size=100,
+                file_mtime_ns=12345,
+            )
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT state, ready_mtime_ns, last_rearmed_at
+                    FROM ingest_index
+                    WHERE input_path = '/in/a.aedt'
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertFalse(rearmed)
+            self.assertEqual(row[0], "SUCCEEDED")
+            self.assertEqual(int(row[1]), 200)
+            self.assertIsNone(row[2])
 
     def test_ensure_continuous_run_reuses_active_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -302,7 +414,7 @@ class TestStateStore(unittest.TestCase):
 
             store.record_account_capacity_snapshot(
                 account_id="account_01",
-                host="gate1-harry",
+                host="gate1-harry261",
                 running_count=2,
                 pending_count=1,
                 allowed_submit=10,
@@ -369,7 +481,7 @@ class TestStateStore(unittest.TestCase):
                 job_id="job_0001",
                 attempt_no=1,
                 account_id="account_01",
-                host_alias="gate1-harry",
+                host_alias="gate1-harry261",
                 slurm_job_id="552740",
                 worker_state="SUBMITTED",
                 observed_node=None,
@@ -382,7 +494,7 @@ class TestStateStore(unittest.TestCase):
                 job_id="job_0001",
                 attempt_no=1,
                 account_id="account_01",
-                host_alias="gate1-harry",
+                host_alias="gate1-harry261",
                 slurm_job_id="552740",
                 worker_state="RUNNING",
                 observed_node="n115",
@@ -397,7 +509,7 @@ class TestStateStore(unittest.TestCase):
                 job_id="job_0002",
                 attempt_no=1,
                 account_id="account_01",
-                host_alias="gate1-harry",
+                host_alias="gate1-harry261",
                 slurm_job_id="552741",
                 worker_state="COMPLETED",
                 observed_node="n108",
@@ -446,7 +558,7 @@ class TestStateStore(unittest.TestCase):
                 job_id="job_0001",
                 attempt_no=1,
                 account_id="account_01",
-                host_alias="gate1-harry",
+                host_alias="gate1-harry261",
                 slurm_job_id="552740",
                 worker_state="RUNNING",
                 observed_node="n115",

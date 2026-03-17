@@ -17,16 +17,14 @@ class TestPlan04BootstrapScript(unittest.TestCase):
         self.assertIn("MINICONDA_DIR=\"$HOME/miniconda3\"", content)
         self.assertIn("Miniconda3-latest-Linux-x86_64.sh", content)
         self.assertIn("bash \"${installer_path}\" -b -p \"${MINICONDA_DIR}\"", content)
-        self.assertIn("\"${conda_bin}\" create -y -n \"${CONDA_ENV_NAME}\" python=3.12", content)
+        self.assertIn("\"${conda_bin}\" install -y python=3.12 pip", content)
 
-    def test_contains_fixed_venv_policy(self) -> None:
+    def test_contains_base_env_policy(self) -> None:
         content = SCRIPT_PATH.read_text(encoding="utf-8")
-        self.assertIn("VENV_DIR=\"$HOME/.peetsfea-runner-venv\"", content)
-        self.assertIn("CONDA_ENV_NAME=\"peetsfea-runner-py312\"", content)
         self.assertIn("CONDA_PYTHON_PATH", content)
-        self.assertIn("major_minor", content)
-        self.assertIn("!= \"3.12\"", content)
-        self.assertIn("\"${CONDA_PYTHON_PATH}\" -m venv \"${VENV_DIR}\"", content)
+        self.assertNotIn("VENV_DIR=", content)
+        self.assertNotIn("CONDA_ENV_NAME=", content)
+        self.assertNotIn("-m venv", content)
 
     def test_contains_tag_install_and_verification(self) -> None:
         content = SCRIPT_PATH.read_text(encoding="utf-8")

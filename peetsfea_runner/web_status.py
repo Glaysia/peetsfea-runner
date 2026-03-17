@@ -326,7 +326,7 @@ def _latest_account_readiness(db_path: Path) -> dict[str, dict[str, object]]:
             reason,
             home_ok,
             runtime_path_ok,
-            venv_ok,
+            env_ok,
             python_ok,
             module_ok,
             binaries_ok,
@@ -347,7 +347,7 @@ def _latest_account_readiness(db_path: Path) -> dict[str, dict[str, object]]:
                 reason,
                 home_ok,
                 runtime_path_ok,
-                venv_ok,
+                env_ok,
                 python_ok,
                 module_ok,
                 binaries_ok,
@@ -377,7 +377,7 @@ def _latest_account_readiness(db_path: Path) -> dict[str, dict[str, object]]:
             "checks": {
                 "home_ok": bool(row[5]),
                 "runtime_path_ok": bool(row[6]),
-                "venv_ok": bool(row[7]),
+                "env_ok": bool(row[7]),
                 "python_ok": bool(row[8]),
                 "module_ok": bool(row[9]),
                 "binaries_ok": bool(row[10]),
@@ -763,11 +763,11 @@ def _alertable_event_summary(
         add_alert(
             {
                 "alert_key": "REAL_CUTOVER_DRIFT",
-                "severity": "ERROR" if actual_input_source_policy == "allow_original" and decision != "GO" else "WARN",
+                "severity": "WARN",
                 "category": "lifecycle",
                 "account_id": None,
                 "message": (
-                    f"{real_cutover.get('alignment_reason') or 'real cutover drift'} "
+                    f"{real_cutover.get('alignment_reason') or 'input queue mode drift'} "
                     f"decision={decision} action={real_cutover.get('action') or 'unknown'}"
                 ),
             }
@@ -779,7 +779,7 @@ def _alertable_event_summary(
                 "severity": "WARN",
                 "category": "lifecycle",
                 "account_id": None,
-                "message": str(real_input_flow.get("reason") or "real input flow absent"),
+                "message": str(real_input_flow.get("reason") or "input queue flow absent"),
             }
         )
     if real_input_flow and str(real_input_flow.get("status") or "") == "RECENT_FAILED_ONLY":
@@ -789,7 +789,7 @@ def _alertable_event_summary(
                 "severity": "WARN",
                 "category": "lifecycle",
                 "account_id": None,
-                "message": str(real_input_flow.get("reason") or "real input flow failed only"),
+                "message": str(real_input_flow.get("reason") or "input queue flow failed only"),
             }
         )
 
@@ -1034,11 +1034,11 @@ def _ops_triage_with_real_cutover(
     decision = str(real_cutover.get("decision") or "UNKNOWN")
     action = str(real_cutover.get("action") or "unknown")
     actual_input_source_policy = str(real_cutover.get("actual_input_source_policy") or "")
-    alignment_reason = str(real_cutover.get("alignment_reason") or real_cutover.get("reason") or "real cutover drift")
+    alignment_reason = str(real_cutover.get("alignment_reason") or real_cutover.get("reason") or "input queue mode drift")
     payload["priority"] = "cutover"
-    payload["headline"] = "real cutover drift"
+    payload["headline"] = "input queue mode drift"
     payload["reason"] = f"{alignment_reason} decision={decision} action={action}"
-    payload["status"] = "NO_GO" if actual_input_source_policy == "allow_original" and decision != "GO" else "ADJUST"
+    payload["status"] = "ADJUST"
     return payload
 
 
@@ -1060,13 +1060,13 @@ def _ops_triage_with_real_input_flow(
     if flow_absent:
         payload["priority"] = "flow"
         payload["status"] = "ADJUST"
-        payload["headline"] = "real input flow absent"
-        payload["reason"] = str(real_input_flow.get("reason") or "real input flow absent")
+        payload["headline"] = "input queue flow absent"
+        payload["reason"] = str(real_input_flow.get("reason") or "input queue flow absent")
     elif flow_failed_only:
         payload["priority"] = "flow"
         payload["status"] = "ADJUST"
-        payload["headline"] = "real input flow failed only"
-        payload["reason"] = str(real_input_flow.get("reason") or "real input flow failed only")
+        payload["headline"] = "input queue flow failed only"
+        payload["reason"] = str(real_input_flow.get("reason") or "input queue flow failed only")
     return payload
 
 
@@ -1078,67 +1078,28 @@ def _real_input_flow_signal_payload(
     real_cutover = real_cutover or {}
     slot_source_mix = slot_source_mix or {}
     decision = str(real_cutover.get("decision") or "UNKNOWN")
-    sample_active_slots = int(slot_source_mix.get("sample_active_slots") or 0)
-    sample_queued_slots = int(slot_source_mix.get("sample_queued_slots") or 0)
-    original_active_slots = int(slot_source_mix.get("original_active_slots") or 0)
-    original_queued_slots = int(slot_source_mix.get("original_queued_slots") or 0)
-    original_completed_slots = int(slot_source_mix.get("original_completed_slots") or 0)
-    original_recent_completed_slots = int(slot_source_mix.get("original_recent_completed_slots") or 0)
-    original_recent_succeeded_slots = int(slot_source_mix.get("original_recent_succeeded_slots") or 0)
-    original_recent_failed_slots = int(slot_source_mix.get("original_recent_failed_slots") or 0)
+    queued_slots = int(slot_source_mix.get("sample_queued_slots") or 0) + int(slot_source_mix.get("other_queued_slots") or 0)
+    active_slots = int(slot_source_mix.get("sample_active_slots") or 0) + int(slot_source_mix.get("other_active_slots") or 0)
+    completed_slots = int(slot_source_mix.get("sample_completed_slots") or 0) + int(slot_source_mix.get("other_completed_slots") or 0)
+    recent_failed_slots = int(slot_source_mix.get("sample_recent_failed_slots") or 0) + int(slot_source_mix.get("other_recent_failed_slots") or 0)
     if decision != "GO":
-        return {
-            "status": "INACTIVE",
-            "flow_absent": False,
-            "reason": f"decision={decision}",
-        }
-    if original_active_slots > 0 or original_queued_slots > 0:
+        return {"status": "INACTIVE", "flow_absent": False, "reason": f"decision={decision}"}
+    if active_slots > 0 or queued_slots > 0:
         return {
             "status": "PRESENT",
             "flow_absent": False,
-            "reason": f"original_active_slots={original_active_slots} original_queued_slots={original_queued_slots}",
+            "reason": f"input_queue_active_slots={active_slots} input_queue_queued_slots={queued_slots}",
         }
-    if original_recent_succeeded_slots > 0:
-        return {
-            "status": "RECENT",
-            "flow_absent": False,
-            "reason": (
-                f"decision={decision} original_recent_succeeded_slots={original_recent_succeeded_slots} "
-                f"original_recent_failed_slots={original_recent_failed_slots} "
-                f"original_recent_completed_slots={original_recent_completed_slots} "
-                f"original_completed_slots={original_completed_slots} "
-                f"original_active_slots={original_active_slots} original_queued_slots={original_queued_slots}"
-            ),
-        }
-    if original_recent_failed_slots > 0:
+    if recent_failed_slots > 0:
         return {
             "status": "RECENT_FAILED_ONLY",
             "flow_absent": False,
-            "reason": (
-                f"decision={decision} original_recent_succeeded_slots={original_recent_succeeded_slots} "
-                f"original_recent_failed_slots={original_recent_failed_slots} "
-                f"original_recent_completed_slots={original_recent_completed_slots} "
-                f"original_completed_slots={original_completed_slots} "
-                f"original_active_slots={original_active_slots} original_queued_slots={original_queued_slots}"
-            ),
-        }
-    if sample_active_slots > 0 or sample_queued_slots > 0:
-        return {
-            "status": "ABSENT",
-            "flow_absent": True,
-            "reason": (
-                f"decision={decision} original_active_slots={original_active_slots} "
-                f"original_queued_slots={original_queued_slots} original_completed_slots={original_completed_slots} "
-                f"original_recent_succeeded_slots={original_recent_succeeded_slots} "
-                f"original_recent_failed_slots={original_recent_failed_slots} "
-                f"sample_active_slots={sample_active_slots} "
-                f"sample_queued_slots={sample_queued_slots}"
-            ),
+            "reason": f"decision={decision} recent_failed_slots={recent_failed_slots} completed_slots={completed_slots}",
         }
     return {
         "status": "IDLE",
         "flow_absent": False,
-        "reason": f"decision={decision} no queued_or_active_slots",
+        "reason": f"decision={decision} input_queue_active_slots={active_slots} input_queue_queued_slots={queued_slots}",
     }
 
 
@@ -1168,7 +1129,7 @@ def _real_cutover_decision_payload(
     bad_node_active = bool(rollout_status.get("bad_node_active"))
     actual_input_source_policy = str(service_boundary.get("input_source_policy") or "") or None
     real_input_flow_status = str(real_input_flow.get("status") or "UNKNOWN")
-    real_input_flow_reason = str(real_input_flow.get("reason") or "real input flow unavailable")
+    real_input_flow_reason = str(real_input_flow.get("reason") or "input queue flow unavailable")
     dispatch_mode = str(ops_controls.get("dispatch_mode") or "run")
     dispatch_mode_ready = bool(ops_controls.get("dispatch_mode_ready"))
     stop_gate_state = str(ops_controls.get("stop_gate_state") or "UNKNOWN")
@@ -1240,17 +1201,13 @@ def _real_cutover_decision_payload(
     canary_blocking_reasons = csv_blocking_reasons | {"materialized_output_missing", "submit_missing"}
 
     def with_alignment(payload: dict[str, object]) -> dict[str, object]:
-        desired_input_source_policy = "allow_original" if payload["decision"] == "GO" else "sample_only"
-        if actual_input_source_policy is None:
-            alignment_status = "UNKNOWN"
-        elif actual_input_source_policy == desired_input_source_policy:
-            alignment_status = "ALIGNED"
-        else:
-            alignment_status = "DRIFT"
+        desired_input_source_policy = "input_queue_only"
+        effective_input_source_policy = actual_input_source_policy or "input_queue_only"
+        alignment_status = "ALIGNED" if effective_input_source_policy == desired_input_source_policy else "DRIFT"
         return {
             **payload,
             "desired_input_source_policy": desired_input_source_policy,
-            "actual_input_source_policy": actual_input_source_policy,
+            "actual_input_source_policy": effective_input_source_policy,
             "alignment_status": alignment_status,
             "drift_active": alignment_status == "DRIFT",
             "drain_gate_state": drain_gate_state,
@@ -1261,49 +1218,49 @@ def _real_cutover_decision_payload(
             "canary_sla_reason": canary_sla_reason,
             "alignment_reason": (
                 f"desired_input_source_policy={desired_input_source_policy} "
-                f"actual_input_source_policy={actual_input_source_policy or 'unknown'}"
+                f"actual_input_source_policy={effective_input_source_policy}"
             ),
         }
 
     if csv_state == "RED" or canary_gate in csv_blocking_reasons or canary_reason in csv_blocking_reasons:
         return with_alignment({
             "decision": "NO_GO",
-            "action": "block_real_aedt",
+            "action": "hold_dispatch",
             "workstream": "04",
             "reason": f"csv_gate={canary_gate} canary_reason={canary_reason}",
         })
     if canary_sla_state == "RED":
         return with_alignment({
             "decision": "NO_GO",
-            "action": "block_real_aedt",
+            "action": "hold_dispatch",
             "workstream": "01",
             "reason": f"canary_sla_state={canary_sla_state} {canary_sla_reason}",
         })
     if drain_gate_state == "RED":
         return with_alignment({
             "decision": "NO_GO",
-            "action": "block_real_aedt",
+            "action": "hold_dispatch",
             "workstream": "01",
             "reason": f"drain_gate_state={drain_gate_state} {drain_gate_reason}",
         })
     if restart_state == "RED" or rediscovery_status == "RED":
         return with_alignment({
             "decision": "NO_GO",
-            "action": "block_real_aedt",
+            "action": "hold_dispatch",
             "workstream": "01",
             "reason": f"restart_state={restart_state} rediscovery_status={rediscovery_status}",
         })
     if restart_bundle_state == "RED":
         return with_alignment({
             "decision": "NO_GO",
-            "action": "block_real_aedt",
+            "action": "hold_dispatch",
             "workstream": "01",
             "reason": f"restart_bundle_state={restart_bundle_state} {restart_bundle_reason}",
         })
     if canary_status == "FAILED" or canary_gate in canary_blocking_reasons or canary_reason in canary_blocking_reasons:
         return with_alignment({
             "decision": "NO_GO",
-            "action": "block_real_aedt",
+            "action": "hold_dispatch",
             "workstream": "01",
             "reason": f"canary_status={canary_status} canary_reason={canary_reason}",
         })
@@ -2966,7 +2923,7 @@ def _ops_window_guardrails_payload(
     bad_node_count = int(rollout_status.get("bad_node_count") or 0)
     real_input_flow_status = str(real_input_flow.get("status") or "INACTIVE")
     real_input_flow_absent = bool(real_input_flow.get("flow_absent"))
-    real_input_flow_reason = str(real_input_flow.get("reason") or "real input flow unavailable")
+    real_input_flow_reason = str(real_input_flow.get("reason") or "input queue flow unavailable")
     real_cutover = rollout_status.get("real_cutover") or {}
     cutover_decision = str(real_cutover.get("decision") or "UNKNOWN")
     cutover_action = str(real_cutover.get("action") or "unknown")
@@ -3698,7 +3655,7 @@ def _rollout_status_payload(db_path: Path, *, run_id: str | None) -> dict[str, o
         real_cutover = _real_cutover_decision_payload(
             ops_triage={},
             rollout_status={},
-            service_boundary={"input_source_policy": os.getenv("PEETSFEA_INPUT_SOURCE_POLICY", "sample_only")},
+            service_boundary={"input_source_policy": os.getenv("PEETSFEA_INPUT_SOURCE_POLICY", "input_queue_only")},
         )
         return {
             "run_id": None,
@@ -3757,7 +3714,7 @@ def _rollout_status_payload(db_path: Path, *, run_id: str | None) -> dict[str, o
             "tunnel_degraded_workers": 0,
             "tunnel_stale_workers": 0,
             "service_boundary": {
-                "input_source_policy": os.getenv("PEETSFEA_INPUT_SOURCE_POLICY", "sample_only"),
+                "input_source_policy": os.getenv("PEETSFEA_INPUT_SOURCE_POLICY", "input_queue_only"),
                 "public_storage_mode": os.getenv("PEETSFEA_PUBLIC_STORAGE_MODE", "disabled"),
                 "runner_scope": "control_plane_orchestration",
                 "storage_scope": "separate_service_boundary",
@@ -3794,7 +3751,7 @@ def _rollout_status_payload(db_path: Path, *, run_id: str | None) -> dict[str, o
     tunnel_stale_workers = sum(1 for worker in workers if worker.get("is_tunnel_stale"))
     seen_stages = [str(row[0]) for row in rows]
     service_boundary = {
-        "input_source_policy": os.getenv("PEETSFEA_INPUT_SOURCE_POLICY", "sample_only"),
+        "input_source_policy": os.getenv("PEETSFEA_INPUT_SOURCE_POLICY", "input_queue_only"),
         "public_storage_mode": os.getenv("PEETSFEA_PUBLIC_STORAGE_MODE", "disabled"),
         "runner_scope": "control_plane_orchestration",
         "storage_scope": "separate_service_boundary",
@@ -5288,6 +5245,9 @@ def _dashboard_html(*, version: str) -> str:
     .badge-DEGRADED { background: #78350f; color: #fcd34d; }
     .badge-STALE { background: #7f1d1d; color: #fca5a5; }
     .badge-BLOCKED { background: #7c2d12; color: #fdba74; }
+    .danger-text { color: #fca5a5; font-weight: 700; }
+    .readiness-detail { margin-top: 4px; font-size: 11px; color: #9ca3af; }
+    .readiness-detail-danger { color: #fca5a5; }
     .section-grid { display:grid; grid-template-columns: 1.5fr 1fr; gap:12px; }
     .resource-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:10px; }
     table { width: 100%; border-collapse: collapse; background: #111a2e; border: 1px solid #25324a; border-radius: 10px; overflow: hidden; }
@@ -5351,7 +5311,7 @@ def _dashboard_html(*, version: str) -> str:
         <div class="muted">real cutover: <code id="real-cutover-decision">-</code></div>
         <div class="muted">real cutover alignment: <code id="real-cutover-alignment">-</code></div>
         <div class="muted">real cutover reason: <code id="real-cutover-reason">-</code></div>
-        <div class="muted">real input flow: <code id="real-input-flow">-</code></div>
+        <div class="muted">input queue flow: <code id="real-input-flow">-</code></div>
         <div class="muted">slot sources: <code id="slot-source-mix">-</code></div>
         <div class="muted">decision: <code id="triage-status">-</code></div>
         <div class="muted">priority: <code id="triage-priority">-</code></div>
@@ -5650,6 +5610,17 @@ def _dashboard_html(*, version: str) -> str:
       const accountsBody = document.getElementById('accounts-body');
       accountsBody.innerHTML = '';
       for (const account of (overview.accounts || [])) {
+        const readinessReason = (account.storage_reason && account.storage_reason !== 'ok')
+          ? account.storage_reason
+          : (account.readiness_reason || '-');
+        const blockedReadiness = account.storage_ready === false
+          || ['BLOCKED', 'BOOTSTRAP_FAILED'].includes(account.readiness_status || '')
+          || ['image_missing', 'home_storage_insufficient', 'home_inode_exhausted'].some(
+            marker => String(readinessReason || '').includes(marker)
+          );
+        const readinessHtml = blockedReadiness
+          ? `<div class="danger-text">${esc(account.readiness_status || '-')}</div><div class="readiness-detail readiness-detail-danger">${esc(readinessReason)}</div>`
+          : `<div>${esc(account.readiness_status || '-')}</div><div class="readiness-detail">${esc(readinessReason)}</div>`;
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td>${esc(account.account_id)}</td>
@@ -5660,7 +5631,7 @@ def _dashboard_html(*, version: str) -> str:
           <td>${esc(account.allowed_submit)}</td>
           <td>${esc(account.active_slots)}</td>
           <td>${esc(account.live_status)}</td>
-          <td>${esc(account.readiness_status || '-')}</td>
+          <td>${readinessHtml}</td>
         `;
         accountsBody.appendChild(tr);
       }

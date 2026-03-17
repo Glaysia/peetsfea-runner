@@ -17,6 +17,7 @@ from peetsfea_runner.pipeline import (
     EXIT_CODE_SUCCESS,
     PipelineResult,
     _BundleRuntimeOutcome,
+    _ensure_ready_artifact,
     _is_stale_worker_heartbeat,
     _record_launch_transient_failure,
     _reconcile_slurm_truth,
@@ -39,11 +40,34 @@ def _valid_canary_output_csv() -> str:
     return f"{header}\n{row}\n"
 
 
+def _ready_account_snapshot(
+    *,
+    account_id: str = "account_01",
+    host_alias: str = "gate1-harry261",
+) -> AccountReadinessSnapshot:
+    return AccountReadinessSnapshot(
+        account_id=account_id,
+        host_alias=host_alias,
+        ready=True,
+        status="READY",
+        reason="ok",
+        home_ok=True,
+        runtime_path_ok=True,
+        env_ok=True,
+        python_ok=True,
+        module_ok=True,
+        binaries_ok=True,
+        ansys_ok=True,
+        uv_ok=True,
+        pyaedt_ok=True,
+    )
+
+
 class TestPipelineApi(unittest.TestCase):
     def test_reconcile_slurm_truth_escalates_transient_lag_to_capacity_mismatch(self) -> None:
         snapshot = AccountCapacitySnapshot(
             account_id="account_01",
-            host_alias="gate1-harry",
+            host_alias="gate1-harry261",
             running_count=1,
             pending_count=0,
             allowed_submit=0,
@@ -67,7 +91,7 @@ class TestPipelineApi(unittest.TestCase):
         state3, events3 = _reconcile_slurm_truth(
             snapshot=AccountCapacitySnapshot(
                 account_id="account_01",
-                host_alias="gate1-harry",
+                host_alias="gate1-harry261",
                 running_count=2,
                 pending_count=0,
                 allowed_submit=0,
@@ -97,8 +121,63 @@ class TestPipelineApi(unittest.TestCase):
             self.assertEqual(config.run_rotation_hours, 24)
             self.assertEqual(config.tasks_per_slot, 1)
             self.assertTrue(config.retain_aedtresults)
+            self.assertEqual(config.remote_root, "/tmp/$USER/aedt_runs")
             self.assertEqual(config.run_namespace, "")
             self.assertFalse((input_dir / "sample.aedt.ready").exists())
+
+    def test_ensure_ready_artifact_does_not_retouch_existing_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "sample.aedt"
+            input_path.write_text("x", encoding="utf-8")
+            ready_path = input_path.with_name("sample.aedt.ready")
+            ready_path.write_text("", encoding="utf-8")
+            before = ready_path.stat().st_mtime_ns
+
+            state = _ensure_ready_artifact(input_path, ".ready")
+
+            self.assertTrue(state.ready_present)
+            self.assertEqual(state.ready_path, ready_path)
+            self.assertEqual(ready_path.stat().st_mtime_ns, before)
+
+    def test_continuous_idle_run_refreshes_remote_readiness_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            input_dir = root / "in"
+            output_dir = root / "out"
+            delete_failed_dir = root / "delete_failed"
+            db_path = root / "state.duckdb"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            delete_failed_dir.mkdir(parents=True, exist_ok=True)
+            readiness_ready = _ready_account_snapshot()
+
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_dir),
+                delete_failed_quarantine_dir=str(delete_failed_dir),
+                metadata_db_path=str(db_path),
+                execute_remote=True,
+                continuous_mode=True,
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
+            )
+
+            with (
+                patch("peetsfea_runner.pipeline.query_account_readiness", return_value=readiness_ready) as readiness_mock,
+                patch("peetsfea_runner.pipeline.query_account_preflight", return_value=readiness_ready) as preflight_mock,
+            ):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.total_slots, 0)
+            self.assertEqual(readiness_mock.call_count, 1)
+            self.assertEqual(preflight_mock.call_count, 1)
+
+            with duckdb.connect(str(db_path)) as conn:
+                rows = conn.execute(
+                    "SELECT account_id, status, reason FROM account_readiness_snapshots ORDER BY ts DESC"
+                ).fetchall()
+            self.assertTrue(rows)
+            self.assertEqual(rows[0], ("account_01", "READY", "ok"))
 
     def test_record_launch_transient_failure_triggers_cooldown_after_threshold(self) -> None:
         history: dict[str, deque[float]] = {}
@@ -189,7 +268,7 @@ class TestPipelineApi(unittest.TestCase):
 
     def test_auto_register_low_tmp_node_skips_control_plane_and_gate_hosts(self) -> None:
         accounts = (
-            AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),
+            AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
             AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
         )
         with (
@@ -198,7 +277,7 @@ class TestPipelineApi(unittest.TestCase):
         ):
             self.assertFalse(_should_auto_register_low_tmp_node(host="5950xlinux", accounts=accounts))
             self.assertFalse(_should_auto_register_low_tmp_node(host="5950xlinux.local", accounts=accounts))
-            self.assertFalse(_should_auto_register_low_tmp_node(host="gate1-harry", accounts=accounts))
+            self.assertFalse(_should_auto_register_low_tmp_node(host="gate1-harry261", accounts=accounts))
             self.assertTrue(_should_auto_register_low_tmp_node(host="n108", accounts=accounts))
 
     def test_slurm_batch_backend_records_worker_lifecycle(self) -> None:
@@ -217,7 +296,7 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=False,
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(
@@ -260,13 +339,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -279,13 +358,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -298,7 +377,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -377,7 +456,7 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=False,
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(
@@ -424,13 +503,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -443,13 +522,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -462,7 +541,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -487,7 +566,7 @@ class TestPipelineApi(unittest.TestCase):
                 conn.close()
 
             self.assertIn(
-                ("BAD_NODE_EXCLUDE_ACTIVE", "account=account_01 host=gate1-harry nodes=n108,n109"),
+                ("BAD_NODE_EXCLUDE_ACTIVE", "account=account_01 host=gate1-harry261 nodes=n108,n109"),
                 rows,
             )
 
@@ -527,7 +606,7 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=False,
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(
@@ -574,13 +653,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -593,13 +672,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -612,7 +691,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -644,7 +723,7 @@ class TestPipelineApi(unittest.TestCase):
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
                 job_retry_count=0,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(
@@ -687,13 +766,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -706,13 +785,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -725,7 +804,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -755,7 +834,7 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=False,
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(
@@ -797,13 +876,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -816,13 +895,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -835,7 +914,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -882,7 +961,7 @@ class TestPipelineApi(unittest.TestCase):
                 job_id="job_0001",
                 attempt_no=1,
                 account_id="account_01",
-                host_alias="gate1-harry",
+                host_alias="gate1-harry261",
                 slurm_job_id="552740",
                 worker_state="SUBMITTED",
                 observed_node=None,
@@ -896,7 +975,7 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=True,
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             with (
@@ -946,7 +1025,7 @@ class TestPipelineApi(unittest.TestCase):
                 job_id="job_0001",
                 attempt_no=1,
                 account_id="account_01",
-                host_alias="gate1-harry",
+                host_alias="gate1-harry261",
                 slurm_job_id="552740",
                 worker_state="RUNNING",
                 observed_node="n115",
@@ -964,7 +1043,7 @@ class TestPipelineApi(unittest.TestCase):
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
                 tunnel_heartbeat_timeout_seconds=30,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             with (
@@ -1016,7 +1095,7 @@ class TestPipelineApi(unittest.TestCase):
                 job_id="job_0001",
                 attempt_no=1,
                 account_id="account_01",
-                host_alias="gate1-harry",
+                host_alias="gate1-harry261",
                 slurm_job_id="552740",
                 worker_state="PENDING",
                 observed_node=None,
@@ -1033,7 +1112,7 @@ class TestPipelineApi(unittest.TestCase):
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
                 tunnel_heartbeat_timeout_seconds=30,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             with (
@@ -1096,7 +1175,7 @@ class TestPipelineApi(unittest.TestCase):
                 remote_execution_backend="slurm_batch",
                 job_retry_count=0,
                 worker_requeue_limit=1,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
             attempt_counter = {"count": 0}
 
@@ -1163,13 +1242,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -1182,13 +1261,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -1201,7 +1280,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -1252,7 +1331,7 @@ class TestPipelineApi(unittest.TestCase):
                 job_retry_count=1,
                 worker_requeue_limit=1,
                 accounts_registry=(
-                    AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),
+                    AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),
                     AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=1),
                 ),
             )
@@ -1264,7 +1343,7 @@ class TestPipelineApi(unittest.TestCase):
                 seen_hosts.append(config.host)
                 if on_upload_success is not None:
                     on_upload_success()
-                if config.host == "gate1-harry":
+                if config.host == "gate1-harry261":
                     return RemoteJobAttemptResult(
                         success=False,
                         exit_code=13,
@@ -1291,13 +1370,13 @@ class TestPipelineApi(unittest.TestCase):
 
             readiness_ready = AccountReadinessSnapshot(
                 account_id="account_01",
-                host_alias="gate1-harry",
+                host_alias="gate1-harry261",
                 ready=True,
                 status="READY",
                 reason="ok",
                 home_ok=True,
                 runtime_path_ok=True,
-                venv_ok=True,
+                env_ok=True,
                 python_ok=True,
                 module_ok=True,
                 binaries_ok=True,
@@ -1328,7 +1407,7 @@ class TestPipelineApi(unittest.TestCase):
                 result = run_pipeline(config)
 
             self.assertTrue(result.success)
-            self.assertEqual(seen_hosts, ["gate1-harry", "gate1-dhj02"])
+            self.assertEqual(seen_hosts, ["gate1-harry261", "gate1-dhj02"])
 
             conn = duckdb.connect(str(db_path))
             try:
@@ -1360,7 +1439,7 @@ class TestPipelineApi(unittest.TestCase):
                 job_retry_count=0,
                 worker_requeue_limit=1,
                 accounts_registry=(
-                    AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),
+                    AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),
                     AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=1),
                 ),
             )
@@ -1373,7 +1452,7 @@ class TestPipelineApi(unittest.TestCase):
                 seen_hosts.append(config.host)
                 if on_upload_success is not None:
                     on_upload_success()
-                if config.host == "gate1-harry" and transient_attempts["count"] < 2:
+                if config.host == "gate1-harry261" and transient_attempts["count"] < 2:
                     transient_attempts["count"] += 1
                     return RemoteJobAttemptResult(
                         success=False,
@@ -1401,13 +1480,13 @@ class TestPipelineApi(unittest.TestCase):
 
             readiness_ready = AccountReadinessSnapshot(
                 account_id="account_01",
-                host_alias="gate1-harry",
+                host_alias="gate1-harry261",
                 ready=True,
                 status="READY",
                 reason="ok",
                 home_ok=True,
                 runtime_path_ok=True,
-                venv_ok=True,
+                env_ok=True,
                 python_ok=True,
                 module_ok=True,
                 binaries_ok=True,
@@ -1438,7 +1517,7 @@ class TestPipelineApi(unittest.TestCase):
                 result = run_pipeline(config)
 
             self.assertTrue(result.success)
-            self.assertEqual(seen_hosts, ["gate1-harry", "gate1-harry", "gate1-dhj02"])
+            self.assertEqual(seen_hosts, ["gate1-harry261", "gate1-harry261", "gate1-dhj02"])
 
             conn = duckdb.connect(str(db_path))
             try:
@@ -1469,7 +1548,7 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=False,
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(
@@ -1509,13 +1588,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -1528,13 +1607,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -1547,7 +1626,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -1588,7 +1667,7 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=False,
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(
@@ -1645,13 +1724,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -1664,13 +1743,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -1683,7 +1762,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -1712,7 +1791,7 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIn("output_root=", started_message)
             self.assertIn("db_path=", started_message)
             self.assertIn("delete_failed_dir=", started_message)
-            self.assertTrue(any("input_source_policy=sample_only" in message for message in messages))
+            self.assertTrue(any("input_source_policy=input_queue_only" in message for message in messages))
 
     def test_sample_canary_allows_full_rollout_when_output_materializes_without_live_return_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1730,7 +1809,7 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=False,
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(*, local_job_dir=None, on_upload_success=None, on_worker_submitted=None, on_worker_state_change=None, **kwargs):
@@ -1770,13 +1849,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -1789,13 +1868,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -1808,7 +1887,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -1846,7 +1925,7 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=False,
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(
@@ -1903,13 +1982,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -1922,13 +2001,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -1941,7 +2020,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -1977,7 +2056,7 @@ class TestPipelineApi(unittest.TestCase):
                 metadata_db_path=str(db_path),
                 continuous_mode=False,
                 execute_remote=True,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(*, local_job_dir=None, on_upload_success=None, **kwargs):
@@ -2002,13 +2081,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -2021,13 +2100,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -2040,7 +2119,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -2073,7 +2152,7 @@ class TestPipelineApi(unittest.TestCase):
                 metadata_db_path=str(db_path),
                 continuous_mode=False,
                 execute_remote=True,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             with (
@@ -2083,13 +2162,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=False,
                         status="DISABLED_FOR_DISPATCH",
                         reason="ansys",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -2749,7 +2828,7 @@ class TestPipelineApi(unittest.TestCase):
                 output_root_dir=str(output_root),
                 metadata_db_path=str(db_path),
                 execute_remote=True,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(*, local_job_dir=None, on_upload_success=None, **kwargs):
@@ -2779,13 +2858,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -2798,13 +2877,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -2817,7 +2896,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=10,
@@ -2857,7 +2936,7 @@ class TestPipelineApi(unittest.TestCase):
                 metadata_db_path=str(db_path),
                 execute_remote=True,
                 delete_input_after_upload=False,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(*, local_job_dir=None, on_upload_success=None, **kwargs):
@@ -2887,13 +2966,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -2906,13 +2985,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -2925,7 +3004,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=10,
@@ -2961,7 +3040,7 @@ class TestPipelineApi(unittest.TestCase):
                 execute_remote=True,
                 delete_input_after_upload=False,
                 rename_input_to_done_on_success=True,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(*, local_job_dir=None, on_upload_success=None, **kwargs):
@@ -2991,13 +3070,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -3010,13 +3089,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -3029,7 +3108,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=10,
@@ -3064,7 +3143,7 @@ class TestPipelineApi(unittest.TestCase):
                 output_root_dir=str(output_root),
                 metadata_db_path=str(db_path),
                 execute_remote=True,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(*, on_upload_success=None, **kwargs):
@@ -3098,7 +3177,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=10,
@@ -3229,8 +3308,9 @@ class TestPipelineApi(unittest.TestCase):
                 execute_remote=True,
                 continuous_mode=False,
                 job_retry_count=0,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
+            readiness_ready = _ready_account_snapshot()
 
             def _mock_attempt(*, local_job_dir=None, on_upload_success=None, **kwargs):
                 if on_upload_success is not None:
@@ -3264,11 +3344,13 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline.query_account_readiness", return_value=readiness_ready),
+                patch("peetsfea_runner.pipeline.query_account_preflight", return_value=readiness_ready),
                 patch(
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=10,
@@ -3305,8 +3387,9 @@ class TestPipelineApi(unittest.TestCase):
                 execute_remote=True,
                 continuous_mode=False,
                 job_retry_count=0,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
+            readiness_ready = _ready_account_snapshot()
 
             def _mock_attempt(*, on_upload_success=None, **kwargs):
                 if on_upload_success is not None:
@@ -3324,11 +3407,13 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline.query_account_readiness", return_value=readiness_ready),
+                patch("peetsfea_runner.pipeline.query_account_preflight", return_value=readiness_ready),
                 patch(
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=10,
@@ -3356,8 +3441,9 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=False,
                 job_retry_count=0,
                 worker_requeue_limit=0,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
+            readiness_ready = _ready_account_snapshot()
 
             def _mock_attempt(*, local_job_dir=None, on_upload_success=None, **kwargs):
                 if on_upload_success is not None:
@@ -3384,11 +3470,13 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline.query_account_readiness", return_value=readiness_ready),
+                patch("peetsfea_runner.pipeline.query_account_preflight", return_value=readiness_ready),
                 patch(
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=10,
@@ -3432,18 +3520,18 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=False,
                 job_retry_count=0,
                 worker_requeue_limit=1,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
             attempt_counter = {"count": 0}
             readiness_ready = AccountReadinessSnapshot(
                 account_id="account_01",
-                host_alias="gate1-harry",
+                host_alias="gate1-harry261",
                 ready=True,
                 status="READY",
                 reason="ok",
                 home_ok=True,
                 runtime_path_ok=True,
-                venv_ok=True,
+                env_ok=True,
                 python_ok=True,
                 module_ok=True,
                 binaries_ok=True,
@@ -3491,7 +3579,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -3529,17 +3617,17 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=False,
                 job_retry_count=0,
                 worker_requeue_limit=1,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
             readiness_ready = AccountReadinessSnapshot(
                 account_id="account_01",
-                host_alias="gate1-harry",
+                host_alias="gate1-harry261",
                 ready=True,
                 status="READY",
                 reason="ok",
                 home_ok=True,
                 runtime_path_ok=True,
-                venv_ok=True,
+                env_ok=True,
                 python_ok=True,
                 module_ok=True,
                 binaries_ok=True,
@@ -3571,7 +3659,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -3621,7 +3709,7 @@ class TestPipelineApi(unittest.TestCase):
                 remote_execution_backend="slurm_batch",
                 slots_per_job=4,
                 worker_bundle_multiplier=2,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             submitted_slot_counts: list[int] = []
@@ -3679,13 +3767,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -3698,13 +3786,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -3717,7 +3805,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=1,
@@ -3773,7 +3861,7 @@ class TestPipelineApi(unittest.TestCase):
                 delete_failed_quarantine_dir=str(quarantine_root),
                 metadata_db_path=str(db_path),
                 execute_remote=True,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             def _mock_attempt(*, local_job_dir=None, on_upload_success=None, **kwargs):
@@ -3803,13 +3891,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -3822,13 +3910,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -3841,7 +3929,7 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=10,
@@ -3865,7 +3953,7 @@ class TestPipelineApi(unittest.TestCase):
                 metadata_db_path=str(db_path),
                 execute_remote=True,
                 continuous_mode=False,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             with (
@@ -3873,13 +3961,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=False,
                         status="DISABLED_FOR_DISPATCH",
-                        reason="venv,python",
+                        reason="env,python",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=False,
+                        env_ok=False,
                         python_ok=False,
                         module_ok=True,
                         binaries_ok=True,
@@ -3911,7 +3999,7 @@ class TestPipelineApi(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(slot_state, "QUEUED")
-            self.assertEqual((bool(readiness_row[0]), readiness_row[1], readiness_row[2]), (False, "DISABLED_FOR_DISPATCH", "venv,python"))
+            self.assertEqual((bool(readiness_row[0]), readiness_row[1], readiness_row[2]), (False, "DISABLED_FOR_DISPATCH", "env,python"))
 
     def test_remote_pipeline_bootstraps_account_before_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3925,7 +4013,7 @@ class TestPipelineApi(unittest.TestCase):
                 metadata_db_path=str(db_path),
                 execute_remote=True,
                 continuous_mode=False,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             with (
@@ -3933,13 +4021,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=False,
                         status="BOOTSTRAP_REQUIRED",
-                        reason="venv,python",
+                        reason="env,python",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=False,
+                        env_ok=False,
                         python_ok=False,
                         module_ok=True,
                         binaries_ok=True,
@@ -3951,13 +4039,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -4035,7 +4123,7 @@ class TestPipelineApi(unittest.TestCase):
                 metadata_db_path=str(db_path),
                 execute_remote=True,
                 continuous_mode=False,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=1),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
             )
 
             with (
@@ -4043,13 +4131,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=True,
                         status="READY",
                         reason="ok",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -4060,13 +4148,13 @@ class TestPipelineApi(unittest.TestCase):
                     "peetsfea_runner.pipeline.query_account_preflight",
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         ready=False,
                         status="PREFLIGHT_FAILED",
                         reason="uv,pyaedt",
                         home_ok=True,
                         runtime_path_ok=True,
-                        venv_ok=True,
+                        env_ok=True,
                         python_ok=True,
                         module_ok=True,
                         binaries_ok=True,
@@ -4115,8 +4203,9 @@ class TestPipelineApi(unittest.TestCase):
                 execute_remote=True,
                 continuous_mode=False,
                 job_retry_count=0,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),),
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),),
             )
+            readiness_ready = _ready_account_snapshot()
 
             def _mock_attempt(*, slot_inputs=None, local_job_dir=None, on_upload_success=None, **kwargs):
                 if on_upload_success is not None:
@@ -4142,11 +4231,13 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline.query_account_readiness", return_value=readiness_ready),
+                patch("peetsfea_runner.pipeline.query_account_preflight", return_value=readiness_ready),
                 patch(
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
                         account_id="account_01",
-                        host_alias="gate1-harry",
+                        host_alias="gate1-harry261",
                         running_count=0,
                         pending_count=0,
                         allowed_submit=10,

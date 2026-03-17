@@ -172,6 +172,13 @@ def _remote_container_ansys_root(config: RemoteJobConfig) -> str:
     return value or "/opt/ohpc/pub/Electronics/v252"
 
 
+def _remote_host_ansys_mount_root(config: RemoteJobConfig) -> str:
+    value = _remote_container_ansys_root(config).rstrip("/")
+    if value.endswith("/AnsysEM"):
+        return value
+    return f"{value}/AnsysEM"
+
+
 def _remote_ansys_executable(config: RemoteJobConfig) -> str:
     explicit = str(getattr(config, "remote_ansys_executable", "")).strip()
     if explicit:
@@ -405,7 +412,12 @@ def run_remote_job_attempt(
         _extract_local_results_archive(local_job_dir=local_job_dir, archive_name=local_archive.name)
         _cleanup_remote_workspace(config, remote_job_dir=resolved_remote_job_dir)
     except WorkflowError as exc:
-        _cleanup_remote_workspace_best_effort(config, remote_job_dir=resolved_remote_job_dir)
+        _download_remote_debug_artifacts(
+            config,
+            remote_job_dir=resolved_remote_job_dir,
+            local_job_dir=local_job_dir,
+            slurm_job_id=exc.slurm_job_id or slurm_job_id,
+        )
         worker_terminal_state = exc.worker_terminal_state or worker_terminal_state
         collect_probe_state = exc.collect_probe_state or collect_probe_state
         marker_present = exc.marker_present if exc.marker_present is not None else marker_present
@@ -538,13 +550,12 @@ def _resolve_remote_path(*, config: RemoteJobConfig, path: str) -> str:
         if path == "~":
             return home
         return f"{home}/{path[2:]}"
+    if path == "/tmp/$USER" or path.startswith("/tmp/$USER/"):
+        remote_user = _get_remote_user(config=config)
+        if path == "/tmp/$USER":
+            return f"/tmp/{remote_user}"
+        return f"/tmp/{remote_user}{path[len('/tmp/$USER'):]}"
     if path == "/tmp/peetsfea-runner" or path.startswith("/tmp/peetsfea-runner/"):
-        if _remote_scheduler(config) == "slurm" and _remote_execution_backend(config) == "slurm_batch":
-            home = _get_remote_home(config=config)
-            shared_root = f"{home}/aedt_runs"
-            if path == "/tmp/peetsfea-runner":
-                return shared_root
-            return f"{shared_root}{path[len('/tmp/peetsfea-runner'):]}"
         remote_user = _get_remote_user(config=config)
         scoped_root = f"/tmp/{remote_user}/peetsfea-runner"
         if path == "/tmp/peetsfea-runner":
@@ -702,6 +713,51 @@ def _cleanup_remote_workspace_best_effort(config: RemoteJobConfig, *, remote_job
         _cleanup_remote_workspace(config, remote_job_dir=remote_job_dir)
     except WorkflowError as exc:
         _log_stage(f"cleanup remote workspace skipped path={remote_job_dir} reason={exc}")
+
+
+def _download_remote_debug_artifacts(
+    config: RemoteJobConfig,
+    *,
+    remote_job_dir: str,
+    local_job_dir: Path,
+    slurm_job_id: str | None = None,
+) -> None:
+    if _remote_platform(config) != "linux":
+        return
+    remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
+    local_archive = local_job_dir / "remote_debug.tgz"
+    slurm_targets = [f"slurm-{slurm_job_id}.out", f"slurm-{slurm_job_id}.err"] if slurm_job_id else []
+    script_lines = [
+        "set +e",
+        "shopt -s nullglob",
+        f"cd {shlex.quote(remote_path)} || exit 0",
+        "files=()",
+    ]
+    for name in ("launch_probe.txt", "worker.stdout", "worker.stderr", "control_tunnel_bootstrap.err", *slurm_targets):
+        script_lines.append(f"[ -f {shlex.quote(name)} ] && files+=({shlex.quote(name)})")
+    script_lines.extend(
+        [
+            "for path in case_*/run.log case_*/exit.code case_*/ansys_grpc.stdout.log case_*/ansys_grpc.stderr.log; do",
+            '  [ -f "$path" ] && files+=("$path")',
+            "done",
+            'if [ "${#files[@]}" -eq 0 ]; then exit 0; fi',
+            'tar -czf - "${files[@]}"',
+        ]
+    )
+    completed = subprocess.run(
+        _ssh_command(config, config.host, "bash -lc " + shlex.quote("\n".join(script_lines))),
+        check=False,
+        capture_output=True,
+        timeout=30,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        return
+    local_job_dir.mkdir(parents=True, exist_ok=True)
+    local_archive.write_bytes(completed.stdout)
+    try:
+        _extract_local_results_archive(local_job_dir=local_job_dir, archive_name=local_archive.name)
+    except WorkflowError:
+        return
 
 
 def _run_remote_workflow_noninteractive(
@@ -1387,107 +1443,29 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "",
-        "if [ ! -f .env_initialized ]; then",
-        "  export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/AnsysEM",
-        "  export LANG=C.UTF-8",
-        "  export LC_ALL=C.UTF-8",
-        "  unset LANGUAGE",
-        "  export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81",
-        "  source /opt/ohpc/admin/lmod/lmod/init/bash",
-        "  touch .env_initialized",
-        "fi",
+        "export LANG=C.UTF-8",
+        "export LC_ALL=C.UTF-8",
+        "unset LANGUAGE",
+        "export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81",
+        "export ANSYSEM_ROOT252=/mnt/AnsysEM",
         "",
-        "VENV_DIR=\"$HOME/.peetsfea-runner-venv\"",
-        "MINICONDA_DIR=\"$HOME/miniconda3\"",
-        "CONDA_ENV_NAME=\"peetsfea-runner-py312\"",
-        "CONDA_PYTHON_PATH=\"$MINICONDA_DIR/envs/$CONDA_ENV_NAME/bin/python\"",
-        "download_miniconda_installer() {",
-        "  installer_path=\"$1\"",
-        "  url=\"https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh\"",
-        "  if command -v curl >/dev/null 2>&1; then",
-        "    curl -fsSL \"$url\" -o \"$installer_path\"",
-        "    return 0",
-        "  fi",
-        "  if command -v wget >/dev/null 2>&1; then",
-        "    wget -qO \"$installer_path\" \"$url\"",
-        "    return 0",
-        "  fi",
-        "  echo \"[ERROR] curl or wget is required to install Miniconda3\" >&2",
+        "TMP_SHARED_ROOT=\"/tmp/$USER/peetsfea-runner\"",
+        "mkdir -p \"$TMP_SHARED_ROOT\"",
+        "IMAGE_PYTHON=\"/opt/miniconda3/bin/python\"",
+        "if [ ! -x \"$IMAGE_PYTHON\" ]; then",
+        "  echo \"[ERROR] image python is missing: $IMAGE_PYTHON\" >&2",
         "  exit 1",
-        "}",
-        "ensure_miniconda() {",
-        "  if [ -x \"$MINICONDA_DIR/bin/conda\" ]; then",
-        "    return 0",
-        "  fi",
-        "  if [ -e \"$MINICONDA_DIR\" ]; then",
-        "    rm -rf \"$MINICONDA_DIR\"",
-        "  fi",
-        "  installer_path=$(mktemp /tmp/miniconda_installer.XXXXXX.sh)",
-        "  download_miniconda_installer \"$installer_path\"",
-        "  bash \"$installer_path\" -b -p \"$MINICONDA_DIR\"",
-        "  rm -f \"$installer_path\"",
-        "}",
-        "ensure_conda_python312() {",
-        "  if \"$MINICONDA_DIR/bin/conda\" tos --help >/dev/null 2>&1; then",
-        "    \"$MINICONDA_DIR/bin/conda\" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true",
-        "    \"$MINICONDA_DIR/bin/conda\" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true",
-        "  fi",
-        "  if [ -x \"$CONDA_PYTHON_PATH\" ]; then",
-        "    major_minor=\"$($CONDA_PYTHON_PATH -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")')\"",
-        "    if [ \"$major_minor\" = \"3.12\" ]; then",
-        "      return 0",
-        "    fi",
-        "  fi",
-        "  \"$MINICONDA_DIR/bin/conda\" create -y -n \"$CONDA_ENV_NAME\" python=3.12",
-        "}",
-        "ensure_runner_venv() {",
-        "  recreate=0",
-        "  if [ -d \"$VENV_DIR\" ]; then",
-        "    if [ ! -x \"$VENV_DIR/bin/python\" ]; then",
-        "      recreate=1",
-        "    else",
-        "      major_minor=\"$($VENV_DIR/bin/python -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")')\"",
-        "      if [ \"$major_minor\" != \"3.12\" ]; then",
-        "        recreate=1",
-        "      fi",
-        "    fi",
-        "  else",
-        "    recreate=1",
-        "  fi",
-        "  if [ \"$recreate\" -eq 1 ]; then",
-        "    rm -rf \"$VENV_DIR\"",
-        "    \"$CONDA_PYTHON_PATH\" -m venv \"$VENV_DIR\"",
-        "  fi",
-        "}",
-        "if [ ! -x \"$VENV_DIR/bin/python\" ]; then",
-        "  ensure_miniconda",
-        "  ensure_conda_python312",
-        "  ensure_runner_venv",
         "fi",
-        "BASE_PREFIX=\"$($VENV_DIR/bin/python -c 'import sys; print(sys.base_prefix)')\"",
-        "export LD_LIBRARY_PATH=\"$BASE_PREFIX/lib:$HOME/miniconda3/lib:${LD_LIBRARY_PATH:-}\"",
-        "DEPS_READY_MARKER=\"$VENV_DIR/.peets_deps_ready\"",
-        "DEPS_LOCK_DIR=\"$VENV_DIR/.peets_deps_lock\"",
-        "while ! mkdir \"$DEPS_LOCK_DIR\" 2>/dev/null; do",
-        "  sleep 1",
-        "done",
-        "cleanup_deps_lock() {",
-        "  rmdir \"$DEPS_LOCK_DIR\" 2>/dev/null || true",
-        "}",
-        "trap cleanup_deps_lock EXIT",
-        "if [ ! -f \"$DEPS_READY_MARKER\" ]; then",
-        "  \"$VENV_DIR/bin/python\" -m ensurepip --upgrade || true",
-        "  \"$VENV_DIR/bin/python\" -m pip install --upgrade pip",
-        "  \"$VENV_DIR/bin/python\" -m pip install uv",
-        "  if ! \"$VENV_DIR/bin/python\" -m uv --version >/dev/null 2>&1; then",
-        "    echo \"[ERROR] uv is not available in shared venv: $VENV_DIR\" >&2",
-        "    exit 1",
-        "  fi",
-        "  \"$VENV_DIR/bin/python\" -m uv pip install pyaedt==0.25.1",
-        "  touch \"$DEPS_READY_MARKER\"",
+        "BASE_PREFIX=\"$($IMAGE_PYTHON -c 'import sys; print(sys.base_prefix)')\"",
+        "export LD_LIBRARY_PATH=\"$BASE_PREFIX/lib:${LD_LIBRARY_PATH:-}\"",
+        "if ! \"$IMAGE_PYTHON\" -m uv --version >/dev/null 2>&1; then",
+        "  echo \"[ERROR] uv is not available in image python: $IMAGE_PYTHON\" >&2",
+        "  exit 1",
         "fi",
-        "trap - EXIT",
-        "cleanup_deps_lock",
+        "if ! \"$IMAGE_PYTHON\" -c \"import ansys.aedt.core, pandas, pyvista\" >/dev/null 2>&1; then",
+        "  echo \"[ERROR] required Python modules are missing from image python: $IMAGE_PYTHON\" >&2",
+        "  exit 1",
+        "fi",
         "cat > run_sim.py <<'PY'",
         "from __future__ import annotations",
         "",
@@ -1507,7 +1485,7 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "OUTPUT_VARIABLES_CSV_NAME: str = 'output_variables.csv'",
         "OUTPUT_VARIABLES_ERROR_LOG_NAME: str = 'output_variables.error.log'",
         "USE_GRAPHIC: bool = False",
-        "ANSYS_EXECUTABLE: str = '/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt'",
+        "ANSYS_EXECUTABLE: str = '/mnt/AnsysEM/ansysedt'",
         "",
         "",
         "def remove_lock_files(workdir: Path) -> None:",
@@ -1973,7 +1951,7 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "if __name__ == '__main__':",
         "    main()",
         "PY",
-        "\"$VENV_DIR/bin/python\" run_sim.py",
+        "\"$IMAGE_PYTHON\" run_sim.py",
     ]
     return "\n".join(lines) + "\n"
 
@@ -1982,37 +1960,18 @@ def _build_enroot_remote_job_script_content(*, config: RemoteJobConfig) -> str:
     content = _build_remote_job_script_content(
         emit_output_variables_csv=getattr(config, "emit_output_variables_csv", True),
     )
-    marker = "cat > run_sim.py <<'PY'\n"
-    _prefix, remainder = content.split(marker, 1)
-    remainder = remainder.replace(
-        "ANSYS_EXECUTABLE: str = '/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt'",
+    content = content.replace(
+        "ANSYS_EXECUTABLE: str = '/mnt/AnsysEM/ansysedt'",
         f"ANSYS_EXECUTABLE: str = {_remote_ansys_executable(config)!r}",
         1,
     )
-    remainder = remainder.replace(
-        "\"$VENV_DIR/bin/python\" run_sim.py",
-        "/opt/peetsfea-venv/bin/python run_sim.py",
-        1,
-    )
-    lines = [
-        "#!/usr/bin/env bash",
-        "set -euo pipefail",
-        "",
-        "export LANG=C.UTF-8",
-        "export LC_ALL=C.UTF-8",
-        "unset LANGUAGE",
-        f"export ANSYSEM_ROOT252={shlex.quote(_remote_ansysem_root(config))}",
-        "export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81",
-        "source /opt/ohpc/admin/lmod/lmod/init/bash",
-        marker.rstrip("\n"),
-    ]
-    return "\n".join(lines) + "\n" + remainder
+    return content
 
 
 def _build_windows_remote_job_script_content() -> str:
     lines = [
         "$ErrorActionPreference = 'Stop'",
-        "$VenvDir = Join-Path $HOME '.peetsfea-runner-venv'",
+        "$CondaPython = Join-Path (Join-Path $HOME 'miniconda3') 'python.exe'",
         "$RunSim = @'",
         "from __future__ import annotations",
         "",
@@ -2048,19 +2007,18 @@ def _build_windows_remote_job_script_content() -> str:
         "    main()",
         "'@",
         "Set-Content -Path run_sim.py -Value $RunSim",
-        "& (Join-Path $VenvDir 'Scripts\\python.exe') run_sim.py",
+        "& $CondaPython run_sim.py",
     ]
     return "\n".join(lines) + "\n"
 
 
 def _write_remote_job_script(tmpdir: Path, *, config: RemoteJobConfig) -> Path:
     script = tmpdir / "remote_job.sh"
-    if _remote_container_runtime(config) == "enroot":
-        content = _build_enroot_remote_job_script_content(config=config)
-    else:
-        content = _build_remote_job_script_content(
-            emit_output_variables_csv=getattr(config, "emit_output_variables_csv", True),
-        )
+    if _remote_platform(config) == "windows":
+        raise ValueError("windows remote jobs must use _write_windows_remote_job_script")
+    if _remote_container_runtime(config) != "enroot":
+        raise ValueError("linux remote job generation requires remote_container_runtime='enroot'")
+    content = _build_enroot_remote_job_script_content(config=config)
     script.write_text(content, encoding="utf-8")
     return script
 
@@ -2183,7 +2141,7 @@ def _build_worker_payload_script_content(
     tasks_per_slot = int(getattr(config, "tasks_per_slot", 1))
     container_runtime = _remote_container_runtime(config)
     container_image = _remote_container_image(config)
-    container_ansys_root = _remote_container_ansys_root(config)
+    host_ansys_root = _remote_host_ansys_mount_root(config)
     total_allocated_mem_mb = _memory_to_mb(getattr(config, "mem", ""))
     slot_allocated_mem_mb = max(
         1,
@@ -2199,17 +2157,29 @@ def _build_worker_payload_script_content(
     payload_lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
-        "workdir=$(mktemp -d /tmp/peetsfea-slot.XXXXXX)",
+        "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}",
+        "mkdir -p \"/tmp/$USER\"",
+        "workdir=$(mktemp -d \"/tmp/$USER/peetsfea-slot.XXXXXX\")",
         "cleanup() {",
         "  rc=$?",
         "  cd /tmp >/dev/null 2>&1 || true",
         "  rm -rf \"$workdir\"",
-        "  if [ -n \"${REMOTE_JOB_DIR:-}\" ]; then",
-        "    rm -rf \"$REMOTE_JOB_DIR\" >/dev/null 2>&1 || true",
-        "  fi",
         "  exit \"$rc\"",
         "}",
         "trap cleanup EXIT",
+        "launch_probe_file=\"${REMOTE_JOB_DIR:-$workdir}/launch_probe.txt\"",
+        "{",
+        "  printf 'hostname=%s\\n' \"$(hostname 2>/dev/null || true)\"",
+        "  printf 'pwd=%s\\n' \"$PWD\"",
+        "  printf 'path=%s\\n' \"$PATH\"",
+        "  for tool in bash tar seq cp base64 ssh enroot python3 python; do",
+        "    resolved_tool=\"$(command -v \"$tool\" 2>/dev/null || true)\"",
+        "    printf 'tool.%s=%s\\n' \"$tool\" \"${resolved_tool:-MISSING}\"",
+        "  done",
+        "  if command -v enroot >/dev/null 2>&1; then",
+        "    printf 'enroot.version=%s\\n' \"$(enroot version 2>/dev/null | tr '\\n' ' ' | sed 's/[[:space:]]\\+/ /g' | sed 's/^ //;s/ $//')\"",
+        "  fi",
+        "} > \"$launch_probe_file\" 2>&1 || true",
         "cd \"$workdir\"",
         "tar -xzf -",
         f"PEETS_CONTROL_RUN_ID={shlex.quote(run_id or '')}",
@@ -2229,8 +2199,8 @@ def _build_worker_payload_script_content(
             + _double_quoted_shell_value(_remote_path_for_shell(config=config, path=container_image))
         ),
         (
-            "REMOTE_CONTAINER_ANSYS_ROOT="
-            + _double_quoted_shell_value(_remote_path_for_shell(config=config, path=container_ansys_root))
+            "REMOTE_HOST_ANSYS_ROOT="
+            + _double_quoted_shell_value(_remote_path_for_shell(config=config, path=host_ansys_root))
         ),
         "case_pids=()",
         "count_case_jobs() {",
@@ -2373,31 +2343,26 @@ def _build_worker_payload_script_content(
         "  stop_control_tunnel",
         "}",
         "trap teardown_control_plane EXIT",
-        "if [ \"$PEETS_REMOTE_CONTAINER_RUNTIME\" = \"enroot\" ]; then",
-        "  export ENROOT_RUNTIME_PATH=\"/tmp/$USER/enroot/runtime/${SLURM_JOB_ID:-nojob}\"",
-        "  export ENROOT_CACHE_PATH=\"/tmp/$USER/enroot/cache/${SLURM_JOB_ID:-nojob}\"",
-        "  export ENROOT_DATA_PATH=\"/tmp/$USER/enroot/data/${SLURM_JOB_ID:-nojob}\"",
-        "  export ENROOT_TEMP_PATH=\"/tmp/$USER/enroot/tmp/${SLURM_JOB_ID:-nojob}\"",
-        "  mkdir -p \"$ENROOT_RUNTIME_PATH\" \"$ENROOT_CACHE_PATH\" \"$ENROOT_DATA_PATH\" \"$ENROOT_TEMP_PATH\"",
-        "  chmod 700 \"$ENROOT_RUNTIME_PATH\" \"$ENROOT_CACHE_PATH\" \"$ENROOT_DATA_PATH\" \"$ENROOT_TEMP_PATH\"",
-        "fi",
         "run_case_command() {",
         "  case_dir=\"$1\"",
         "  case_name=\"$(basename \"$case_dir\")\"",
         "  export PEETS_SLOT_CORES PEETS_SLOT_TASKS",
-        "  if [ \"$PEETS_REMOTE_CONTAINER_RUNTIME\" = \"enroot\" ]; then",
-        "    (",
-        "      container_name=\"peets-${SLURM_JOB_ID:-nojob}-${case_name}-$$\"",
-        "      cd \"$REMOTE_CONTAINER_ANSYS_ROOT\"",
-        "      enroot create -f -n \"$container_name\" \"$REMOTE_CONTAINER_IMAGE\" >/dev/null",
-        "      trap 'enroot remove -f \"$container_name\" >/dev/null 2>&1 || true' EXIT",
-        "      enroot start --root --rw --mount .:/mnt --mount \"$case_dir:/work\" \"$container_name\" /bin/bash -lc 'cd /work && export ANS_IGNOREOS=1 && bash ./remote_job.sh'",
-        "    )",
-        "    return",
+        "  if [ \"$PEETS_REMOTE_CONTAINER_RUNTIME\" != \"enroot\" ]; then",
+        "    echo \"[ERROR] linux worker payload requires enroot\" >&2",
+        "    return 1",
         "  fi",
         "  (",
-        "    cd \"$case_dir\"",
-        "    bash ./remote_job.sh",
+        "    container_name=\"peets-${SLURM_JOB_ID:-nojob}-${case_name}-$$\"",
+        "    enroot_base=\"/tmp/$USER/enroot/${SLURM_JOB_ID:-nojob}/${case_name}-$$\"",
+        "    export ENROOT_RUNTIME_PATH=\"$enroot_base/runtime\"",
+        "    export ENROOT_CACHE_PATH=\"$enroot_base/cache\"",
+        "    export ENROOT_DATA_PATH=\"$enroot_base/data\"",
+        "    export ENROOT_TEMP_PATH=\"$enroot_base/tmp\"",
+        "    mkdir -p \"$ENROOT_RUNTIME_PATH\" \"$ENROOT_CACHE_PATH\" \"$ENROOT_DATA_PATH\" \"$ENROOT_TEMP_PATH\"",
+        "    chmod 700 \"$ENROOT_RUNTIME_PATH\" \"$ENROOT_CACHE_PATH\" \"$ENROOT_DATA_PATH\" \"$ENROOT_TEMP_PATH\"",
+        "    enroot create -f -n \"$container_name\" \"$REMOTE_CONTAINER_IMAGE\" >/dev/null",
+        "    trap 'enroot remove -f \"$container_name\" >/dev/null 2>&1 || true; rm -rf \"$enroot_base\" >/dev/null 2>&1 || true' EXIT",
+        "    enroot start --root --rw --mount \"$HOME:$HOME\" --mount \"$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM\" --mount \"$case_dir:/work\" \"$container_name\" /bin/bash -lc \"export HOME=$HOME; cd /work && export ANS_IGNOREOS=1 && bash ./remote_job.sh\"",
         "  )",
         "}",
     ]
@@ -2456,7 +2421,8 @@ def _build_worker_payload_script_content(
     payload_lines.extend(
         [
             _build_case_aggregation_command(case_count),
-            "archive_path=$(mktemp /tmp/peetsfea-results.XXXXXX.tgz)",
+            "mkdir -p \"/tmp/$USER\"",
+            "archive_path=$(mktemp \"/tmp/$USER/peetsfea-results.XXXXXX.tgz\")",
             "cleanup_archive() { rm -f \"$archive_path\"; }",
             "trap cleanup_archive EXIT",
             "tar -czf \"$archive_path\" case_* case_summary.txt failed.count",
@@ -2531,6 +2497,7 @@ def _build_remote_sbatch_script_content(
     control_plane_return_port = _control_plane_return_port(config)
     exclude_nodes = _slurm_exclude_nodes(config)
     exclude_lines = [f"#SBATCH --exclude={','.join(exclude_nodes)}"] if exclude_nodes else []
+    submit_spool_dir = shlex.quote(remote_path)
     return "\n".join(
         [
             "#!/bin/bash",
@@ -2541,10 +2508,12 @@ def _build_remote_sbatch_script_content(
             f"#SBATCH --mem={config.mem}",
             f"#SBATCH --time={config.time_limit}",
             *exclude_lines,
+            "#SBATCH -D /tmp",
             "#SBATCH -o slurm-%j.out",
             "#SBATCH -e slurm-%j.err",
             "set -euo pipefail",
-            f"REMOTE_JOB_DIR={shlex.quote(remote_path)}",
+            "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}",
+            f"SUBMIT_SPOOL_DIR={submit_spool_dir}",
             f"export PEETS_CONTROL_RUN_ID={shlex.quote(run_id or '')}",
             f"export PEETS_CONTROL_WORKER_ID={shlex.quote(worker_id or '')}",
             f"export PEETS_CONTROL_HOST={shlex.quote(getattr(config, 'control_plane_host', '127.0.0.1'))}",
@@ -2554,8 +2523,60 @@ def _build_remote_sbatch_script_content(
             f"export PEETS_CONTROL_RETURN_USER={shlex.quote(control_plane_return_user)}",
             f"export PEETS_CONTROL_RETURN_PORT={control_plane_return_port}",
             f"export PEETS_CONTROL_HEARTBEAT_INTERVAL={max(5, int(getattr(config, 'tunnel_recovery_grace_seconds', 30)))}",
-            "export REMOTE_JOB_DIR",
-            "cd \"$REMOTE_JOB_DIR\"",
+            "SUBMIT_HOST=\"${SLURM_SUBMIT_HOST:-}\"",
+            "SUBMIT_USER=\"${USER:-$(id -un)}\"",
+            "SSH_REMOTE=\"${SUBMIT_USER}@${SUBMIT_HOST}\"",
+            "SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)",
+            "mkdir -p \"/tmp/$USER\"",
+            "EXEC_DIR=$(mktemp -d \"/tmp/$USER/peetsfea-sbatch.${SLURM_JOB_ID:-nojob}.XXXXXX\")",
+            "upload_back() {",
+            "  if [ -z \"$SUBMIT_HOST\" ] || [ ! -d \"$EXEC_DIR\" ]; then",
+            "    return 0",
+            "  fi",
+            "  shopt -s nullglob",
+            "  files=()",
+            "  for path in launch_probe.txt worker.stdout worker.stderr control_tunnel_bootstrap.err results.tgz.ready results.tgz case_summary.txt failed.count case_*/run.log case_*/exit.code case_*/ansys_grpc.stdout.log case_*/ansys_grpc.stderr.log; do",
+            "    [ -e \"$path\" ] && files+=(\"$path\")",
+            "  done",
+            "  if [ \"${#files[@]}\" -eq 0 ]; then",
+            "    return 0",
+            "  fi",
+            "  tar -czf - \"${files[@]}\" | ssh \"${SSH_OPTS[@]}\" \"$SSH_REMOTE\" \"bash -lc 'mkdir -p "
+            + submit_spool_dir
+            + " && cd "
+            + submit_spool_dir
+            + " && tar -xzf -'\" >/dev/null 2>&1 || true",
+            "}",
+            "cleanup_exec() {",
+            "  rc=$?",
+            "  if [ -d \"$EXEC_DIR\" ]; then",
+            "    cd \"$EXEC_DIR\" >/dev/null 2>&1 || true",
+            "    upload_back",
+            "    cd /tmp >/dev/null 2>&1 || true",
+            "    rm -rf \"$EXEC_DIR\" >/dev/null 2>&1 || true",
+            "  fi",
+            "  exit \"$rc\"",
+            "}",
+            "trap cleanup_exec EXIT",
+            "if [ -z \"$SUBMIT_HOST\" ]; then",
+            "  echo \"[ERROR] SLURM_SUBMIT_HOST is empty\" >&2",
+            "  exit 127",
+            "fi",
+            "cd \"$EXEC_DIR\"",
+            "printf 'hostname=%s\\n' \"$(hostname 2>/dev/null || true)\" > launch_probe.txt",
+            "printf 'pwd=%s\\n' \"$PWD\" >> launch_probe.txt",
+            "printf 'path=%s\\n' \"$PATH\" >> launch_probe.txt",
+            "printf 'submit_host=%s\\n' \"$SUBMIT_HOST\" >> launch_probe.txt",
+            "printf 'submit_spool_dir=%s\\n' \"$SUBMIT_SPOOL_DIR\" >> launch_probe.txt",
+            "for tool in bash tar seq cp base64 ssh enroot python3 python; do",
+            "  resolved_tool=\"$(command -v \"$tool\" 2>/dev/null || true)\"",
+            "  printf 'tool.%s=%s\\n' \"$tool\" \"${resolved_tool:-MISSING}\" >> launch_probe.txt",
+            "done",
+            "ssh \"${SSH_OPTS[@]}\" \"$SSH_REMOTE\" \"bash -lc 'set -euo pipefail; shopt -s nullglob; cd "
+            + submit_spool_dir
+            + " && tar -czf - remote_job.sh remote_worker_payload.sh project_*.aedt'\" | tar -xzf -",
+            "chmod 700 remote_job.sh remote_worker_payload.sh >/dev/null 2>&1 || true",
+            "export REMOTE_JOB_DIR=\"$EXEC_DIR\"",
             "tar -czf - remote_job.sh project_*.aedt | /bin/bash ./remote_worker_payload.sh > worker.stdout 2> worker.stderr",
         ]
     ) + "\n"

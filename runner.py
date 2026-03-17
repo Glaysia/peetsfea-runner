@@ -42,7 +42,7 @@ def _build_config(workspace_root: Path) -> PipelineConfig:
         capacity_scope=os.getenv("PEETSFEA_CAPACITY_SCOPE", "all_user_jobs"),
         balance_metric=os.getenv("PEETSFEA_BALANCE_METRIC", "slot_throughput"),
         accounts_registry=(
-            AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),
+            AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
             AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
             AccountConfig(account_id="account_03", host_alias="gate1-jji0930", max_jobs=10),
         ),

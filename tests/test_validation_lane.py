@@ -8,13 +8,13 @@ from peetsfea_runner import build_enroot_validation_lane_config
 
 
 class TestValidationLane(unittest.TestCase):
-    def test_build_enroot_validation_lane_config_for_prune_creates_sample_only_canary_layout(self) -> None:
+    def test_build_enroot_validation_lane_config_for_prune_creates_input_queue_only_canary_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             (repo_root / "examples").mkdir(parents=True, exist_ok=True)
             (repo_root / "examples" / "sample.aedt").write_text("sample", encoding="utf-8")
             (repo_root / ".ssh").mkdir(parents=True, exist_ok=True)
-            (repo_root / ".ssh" / "config").write_text("Host gate1-harry\n", encoding="utf-8")
+            (repo_root / ".ssh" / "config").write_text("Host gate1-harry261\n", encoding="utf-8")
 
             config = build_enroot_validation_lane_config(
                 repo_root=repo_root,
@@ -30,16 +30,17 @@ class TestValidationLane(unittest.TestCase):
             self.assertEqual(config.metadata_db_path, str(root / "state.duckdb"))
             self.assertTrue((root / "input" / "sample.aedt").is_file())
             self.assertTrue((root / "input" / "sample.aedt.ready").is_file())
-            self.assertEqual(config.input_source_policy, "sample_only")
+            self.assertEqual(config.input_source_policy, "input_queue_only")
             self.assertFalse(config.continuous_mode)
             self.assertEqual(config.remote_container_runtime, "enroot")
             self.assertEqual(config.ssh_config_path, str(repo_root / ".ssh" / "config"))
-            self.assertEqual(config.host, "gate1-harry")
+            self.assertEqual(config.host, "gate1-dhj02")
+            self.assertEqual(config.remote_root, "/tmp/$USER/aedt_runs")
             self.assertEqual(config.slots_per_job, 5)
             self.assertEqual(config.cpus_per_job, 20)
             self.assertEqual(config.cores_per_slot, 4)
             self.assertEqual(config.tasks_per_slot, 1)
-            self.assertEqual(len(config.accounts_registry), 5)
+            self.assertEqual(len(config.accounts_registry), 4)
 
     def test_build_enroot_validation_lane_config_for_preserve_uses_single_account_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -55,8 +56,9 @@ class TestValidationLane(unittest.TestCase):
             )
 
             self.assertEqual(config.run_namespace, "")
-            self.assertEqual(config.host, "gate1-wjddn5916")
-            self.assertEqual([account.host_alias for account in config.accounts_registry], ["gate1-wjddn5916"])
+            self.assertEqual(config.host, "gate1-harry261")
+            self.assertEqual(config.remote_root, "/tmp/$USER/aedt_runs")
+            self.assertEqual([account.host_alias for account in config.accounts_registry], ["gate1-harry261"])
             self.assertEqual(config.slots_per_job, 1)
             self.assertEqual(config.cpus_per_job, 32)
             self.assertEqual(config.cores_per_slot, 32)

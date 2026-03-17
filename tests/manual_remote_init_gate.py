@@ -8,10 +8,8 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class RemoteInitConfig:
-    host: str = os.environ.get("PEETS_GATE_HOST", "gate1-harry")
+    host: str = os.environ.get("PEETS_GATE_HOST", "gate1-harry261")
     miniconda_dir: str = os.environ.get("PEETS_MINICONDA_DIR", "$HOME/miniconda3")
-    conda_env_name: str = os.environ.get("PEETS_CONDA_ENV_NAME", "peetsfea-runner-py312")
-    venv_dir: str = os.environ.get("PEETS_REMOTE_VENV_DIR", "$HOME/.peetsfea-runner-venv")
 
 
 def _remote_script(cfg: RemoteInitConfig) -> str:
@@ -19,9 +17,7 @@ def _remote_script(cfg: RemoteInitConfig) -> str:
 set -euo pipefail
 
 MINICONDA_DIR="{cfg.miniconda_dir}"
-CONDA_ENV_NAME="{cfg.conda_env_name}"
-VENV_DIR="{cfg.venv_dir}"
-CONDA_PYTHON_PATH="$MINICONDA_DIR/envs/$CONDA_ENV_NAME/bin/python"
+CONDA_PYTHON_PATH="$MINICONDA_DIR/bin/python"
 
 download_miniconda_installer() {{
   local installer_path="$1"
@@ -52,52 +48,20 @@ ensure_miniconda() {{
   rm -f "$installer_path"
 }}
 
-ensure_conda_py312() {{
+ensure_conda_base_python() {{
   local conda_bin="$MINICONDA_DIR/bin/conda"
-  if [[ -x "$CONDA_PYTHON_PATH" ]]; then
-    local mm
-    mm="$("$CONDA_PYTHON_PATH" -c 'import sys; print(f"{{sys.version_info.major}}.{{sys.version_info.minor}}")')"
-    if [[ "$mm" == "3.12" ]]; then
-      echo "[INFO] conda py312 exists: $CONDA_PYTHON_PATH"
-      return 0
-    fi
-  fi
-  echo "[INFO] Creating conda env $CONDA_ENV_NAME (python=3.12)"
-  "$conda_bin" create -y -n "$CONDA_ENV_NAME" python=3.12
-}}
-
-ensure_venv_py312() {{
-  local recreate=0
-  if [[ -d "$VENV_DIR" ]]; then
-    if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-      recreate=1
-    else
-      local mm
-      mm="$("$VENV_DIR/bin/python" -c 'import sys; print(f"{{sys.version_info.major}}.{{sys.version_info.minor}}")')"
-      if [[ "$mm" != "3.12" ]]; then
-        recreate=1
-      fi
-    fi
-  else
-    recreate=1
-  fi
-  if [[ "$recreate" -eq 1 ]]; then
-    echo "[INFO] Recreating venv with conda python: $VENV_DIR"
-    rm -rf "$VENV_DIR"
-    "$CONDA_PYTHON_PATH" -m venv "$VENV_DIR"
-  fi
+  echo "[INFO] Updating base env to Python 3.12"
+  "$conda_bin" install -y python=3.12 pip
 }}
 
 verify() {{
   echo "[INFO] Verify versions"
   "$MINICONDA_DIR/bin/conda" --version
   "$CONDA_PYTHON_PATH" -V
-  "$VENV_DIR/bin/python" -V
 }}
 
 ensure_miniconda
-ensure_conda_py312
-ensure_venv_py312
+ensure_conda_base_python
 verify
 echo "[INFO] Remote init test done"
 """

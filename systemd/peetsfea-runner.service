@@ -7,7 +7,6 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/mnt/8tb/peetsfea-runner
 ExecStart=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -c "from peetsfea_runner.built_in_service import run_built_in_service; run_built_in_service()"
-ExecStopPost=/bin/sh -lc 'rm -f %h/mnt/8tb/peetsfea-runner/peetsfea_runner.duckdb %h/mnt/8tb/peetsfea-runner/peetsfea_runner.duckdb.wal'
 Restart=always
 RestartSec=5
 

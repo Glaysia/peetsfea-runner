@@ -168,9 +168,11 @@ class StateStore:
                         ready_present BOOLEAN NOT NULL DEFAULT FALSE,
                         ready_mode TEXT NOT NULL DEFAULT 'SIDECAR',
                         ready_error TEXT,
+                        ready_mtime_ns BIGINT,
                         file_size BIGINT NOT NULL,
                         file_mtime_ns BIGINT NOT NULL,
                         discovered_at TEXT NOT NULL,
+                        last_rearmed_at TEXT,
                         state TEXT NOT NULL
                     )
                     """
@@ -197,7 +199,7 @@ class StateStore:
                         reason TEXT NOT NULL,
                         home_ok BOOLEAN NOT NULL,
                         runtime_path_ok BOOLEAN NOT NULL,
-                        venv_ok BOOLEAN NOT NULL,
+                        env_ok BOOLEAN NOT NULL,
                         python_ok BOOLEAN NOT NULL,
                         module_ok BOOLEAN NOT NULL,
                         binaries_ok BOOLEAN NOT NULL,
@@ -342,6 +344,16 @@ class StateStore:
                     )
                     """
                 )
+                readiness_columns = {
+                    str(row[1]).strip().lower()
+                    for row in conn.execute("PRAGMA table_info('account_readiness_snapshots')").fetchall()
+                }
+                if "venv_ok" in readiness_columns and "env_ok" not in readiness_columns:
+                    conn.execute("ALTER TABLE account_readiness_snapshots RENAME COLUMN venv_ok TO env_ok")
+                    readiness_columns.remove("venv_ok")
+                    readiness_columns.add("env_ok")
+                if "env_ok" not in readiness_columns:
+                    conn.execute("ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS env_ok BOOLEAN DEFAULT FALSE")
                 conn.execute("ALTER TABLE file_lifecycle ADD COLUMN IF NOT EXISTS slot_id TEXT")
                 conn.execute("ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS uv_ok BOOLEAN DEFAULT FALSE")
                 conn.execute(
@@ -360,6 +372,8 @@ class StateStore:
                 conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_present BOOLEAN DEFAULT FALSE")
                 conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_mode TEXT DEFAULT 'SIDECAR'")
                 conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_error TEXT")
+                conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_mtime_ns BIGINT")
+                conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS last_rearmed_at TEXT")
                 conn.execute("ALTER TABLE slurm_workers ADD COLUMN IF NOT EXISTS tunnel_session_id TEXT")
                 conn.execute("ALTER TABLE slurm_workers ADD COLUMN IF NOT EXISTS tunnel_state TEXT DEFAULT 'PENDING'")
                 conn.execute("ALTER TABLE slurm_workers ADD COLUMN IF NOT EXISTS heartbeat_ts TEXT")
@@ -934,6 +948,7 @@ class StateStore:
         ready_present: bool,
         ready_mode: str,
         ready_error: str | None,
+        ready_mtime_ns: int | None,
         file_size: int,
         file_mtime_ns: int,
     ) -> bool:
@@ -943,7 +958,14 @@ class StateStore:
             try:
                 row = conn.execute(
                     """
-                    SELECT file_size, file_mtime_ns, ready_present, ready_mode, COALESCE(ready_error, '')
+                    SELECT
+                        file_size,
+                        file_mtime_ns,
+                        ready_present,
+                        ready_mode,
+                        COALESCE(ready_error, ''),
+                        state,
+                        COALESCE(ready_mtime_ns, 0)
                     FROM ingest_index
                     WHERE input_path = ?
                     """,
@@ -955,26 +977,58 @@ class StateStore:
                     prev_ready_present = bool(row[2])
                     prev_ready_mode = str(row[3])
                     prev_ready_error = str(row[4]) or None
+                    prev_state = str(row[5]).strip().upper()
+                    prev_ready_mtime_ns = int(row[6] or 0)
                     if prev_size == file_size and prev_mtime == file_mtime_ns:
+                        should_rearm = (
+                            ready_present
+                            and ready_mtime_ns is not None
+                            and ready_mtime_ns > prev_ready_mtime_ns
+                            and prev_state in {"FAILED", "QUARANTINED", "DELETE_QUARANTINED"}
+                        )
+                        if should_rearm:
+                            conn.execute(
+                                """
+                                UPDATE ingest_index
+                                SET ready_path = ?, ready_present = ?, ready_mode = ?, ready_error = ?,
+                                    ready_mtime_ns = ?, discovered_at = ?, last_rearmed_at = ?, state = ?
+                                WHERE input_path = ?
+                                """,
+                                [
+                                    ready_path,
+                                    ready_present,
+                                    ready_mode,
+                                    ready_error,
+                                    ready_mtime_ns,
+                                    now,
+                                    now,
+                                    "READY",
+                                    input_path,
+                                ],
+                            )
+                            return True
                         if (
                             prev_ready_present != ready_present
                             or prev_ready_mode != ready_mode
                             or prev_ready_error != ready_error
+                            or prev_ready_mtime_ns != int(ready_mtime_ns or 0)
                         ):
                             conn.execute(
                                 """
                                 UPDATE ingest_index
-                                SET ready_path = ?, ready_present = ?, ready_mode = ?, ready_error = ?, discovered_at = ?
+                                SET ready_path = ?, ready_present = ?, ready_mode = ?, ready_error = ?,
+                                    ready_mtime_ns = ?, discovered_at = ?
                                 WHERE input_path = ?
                                 """,
-                                [ready_path, ready_present, ready_mode, ready_error, now, input_path],
+                                [ready_path, ready_present, ready_mode, ready_error, ready_mtime_ns, now, input_path],
                             )
                         return False
                     conn.execute(
                         """
                         UPDATE ingest_index
                         SET ready_path = ?, ready_present = ?, ready_mode = ?, ready_error = ?,
-                            file_size = ?, file_mtime_ns = ?, discovered_at = ?, state = ?
+                            ready_mtime_ns = ?, file_size = ?, file_mtime_ns = ?, discovered_at = ?,
+                            last_rearmed_at = NULL, state = ?
                         WHERE input_path = ?
                         """,
                         [
@@ -982,6 +1036,7 @@ class StateStore:
                             ready_present,
                             ready_mode,
                             ready_error,
+                            ready_mtime_ns,
                             file_size,
                             file_mtime_ns,
                             now,
@@ -995,9 +1050,9 @@ class StateStore:
                     """
                     INSERT INTO ingest_index (
                         input_path, ready_path, ready_present, ready_mode, ready_error,
-                        file_size, file_mtime_ns, discovered_at, state
+                        ready_mtime_ns, file_size, file_mtime_ns, discovered_at, last_rearmed_at, state
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         input_path,
@@ -1005,9 +1060,11 @@ class StateStore:
                         ready_present,
                         ready_mode,
                         ready_error,
+                        ready_mtime_ns,
                         file_size,
                         file_mtime_ns,
                         now,
+                        None,
                         "READY",
                     ],
                 )
@@ -1355,7 +1412,7 @@ class StateStore:
         reason: str,
         home_ok: bool,
         runtime_path_ok: bool,
-        venv_ok: bool,
+        env_ok: bool,
         python_ok: bool,
         module_ok: bool,
         binaries_ok: bool,
@@ -1380,7 +1437,7 @@ class StateStore:
                         reason,
                         home_ok,
                         runtime_path_ok,
-                        venv_ok,
+                        env_ok,
                         python_ok,
                         module_ok,
                         binaries_ok,
@@ -1402,7 +1459,7 @@ class StateStore:
                         reason,
                         home_ok,
                         runtime_path_ok,
-                        venv_ok,
+                        env_ok,
                         python_ok,
                         module_ok,
                         binaries_ok,

@@ -280,7 +280,7 @@ class AccountConfig:
     enabled: bool = True
     platform: str = "linux"
     scheduler: str = "slurm"
-    remote_execution_backend: str = "foreground_ssh"
+    remote_execution_backend: str = "slurm_batch"
 
 
 @dataclass(slots=True, frozen=True)
@@ -308,7 +308,7 @@ class PipelineConfig:
     delete_failed_quarantine_dir: str = "./output/_delete_failed"
     metadata_db_path: str = "./peetsfea_runner.duckdb"
     accounts_registry: tuple[AccountConfig, ...] = field(
-        default_factory=lambda: (AccountConfig(account_id="account_01", host_alias="gate1-harry", max_jobs=10),)
+        default_factory=lambda: (AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),)
     )
     # Execution/runtime settings
     partition: str = "cpu2"
@@ -317,9 +317,9 @@ class PipelineConfig:
     cpus_per_job: int = 16
     mem: str = "960G"
     time_limit: str = "05:00:00"
-    remote_root: str = "~/aedt_runs"
+    remote_root: str = "/tmp/$USER/aedt_runs"
     execute_remote: bool = False
-    remote_execution_backend: str = "foreground_ssh"
+    remote_execution_backend: str = "slurm_batch"
     control_plane_host: str = "127.0.0.1"
     control_plane_port: int = 8765
     control_plane_ssh_target: str = ""
@@ -330,10 +330,10 @@ class PipelineConfig:
     tunnel_recovery_grace_seconds: int = 30
     remote_ssh_port: int = 22
     ssh_config_path: str = ""
-    remote_container_runtime: str = "none"
-    remote_container_image: str = ""
+    remote_container_runtime: str = "enroot"
+    remote_container_image: str = "~/runtime/enroot/aedt.sqsh"
     remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252"
-    remote_ansys_executable: str = ""
+    remote_ansys_executable: str = "/mnt/AnsysEM/ansysedt"
     slots_per_job: int = 4
     worker_bundle_multiplier: int = 1
     cores_per_slot: int = 4
@@ -348,7 +348,7 @@ class PipelineConfig:
     max_jobs_per_account: int = 10
     local_artifacts_dir: str = "./output"
     emit_output_variables_csv: bool = True
-    host: str = "gate1-harry"
+    host: str = "gate1-harry261"
     # 11-01 continuous ingest settings
     continuous_mode: bool = True
     ingest_poll_seconds: int = 30
@@ -358,10 +358,12 @@ class PipelineConfig:
     pending_buffer_per_account: int = 3
     capacity_scope: str = "all_user_jobs"
     balance_metric: str = "slot_throughput"
-    input_source_policy: str = "sample_only"
+    input_source_policy: str = "input_queue_only"
     public_storage_mode: str = "disabled"
     remote_storage_inode_block_percent: int = 98
-    remote_storage_min_free_mb: int = 0
+    remote_storage_min_free_mb: int = 20480
+    readiness_probe_timeout_seconds: int = 180
+    preflight_probe_timeout_seconds: int = 180
     launch_transient_same_account_retries: int = 1
     launch_transient_cooldown_threshold: int = 3
     launch_transient_cooldown_window_seconds: int = 300
@@ -403,14 +405,16 @@ class PipelineConfig:
             raise ValueError("capacity_scope must be 'all_user_jobs'")
         if self.balance_metric != "slot_throughput":
             raise ValueError("balance_metric must be 'slot_throughput'")
-        if self.input_source_policy not in {"sample_only", "allow_original"}:
-            raise ValueError("input_source_policy must be 'sample_only' or 'allow_original'")
+        if self.input_source_policy != "input_queue_only":
+            raise ValueError("input_source_policy must be 'input_queue_only'")
         if self.public_storage_mode not in {"disabled", "private_only", "public_nas"}:
             raise ValueError("public_storage_mode must be 'disabled', 'private_only', or 'public_nas'")
         if self.remote_storage_inode_block_percent < 0 or self.remote_storage_inode_block_percent > 100:
             raise ValueError("remote_storage_inode_block_percent must be in 0..100")
         if self.remote_storage_min_free_mb < 0:
             raise ValueError("remote_storage_min_free_mb must be >= 0")
+        _ensure_positive("readiness_probe_timeout_seconds", self.readiness_probe_timeout_seconds)
+        _ensure_positive("preflight_probe_timeout_seconds", self.preflight_probe_timeout_seconds)
         if self.launch_transient_same_account_retries < 0:
             raise ValueError("launch_transient_same_account_retries must be >= 0")
         if self.launch_transient_cooldown_threshold < 1:
@@ -460,6 +464,14 @@ class PipelineConfig:
             scheduler = account.scheduler.strip().lower()
             if (platform, scheduler) not in {("linux", "slurm"), ("windows", "none")}:
                 raise ValueError("account platform/scheduler must be linux/slurm or windows/none")
+        if self.execute_remote and any(
+            (account.platform.strip().lower(), account.scheduler.strip().lower()) == ("linux", "slurm")
+            for account in accounts
+        ):
+            if self.remote_execution_backend != "slurm_batch":
+                raise ValueError("linux/slurm remote execution requires remote_execution_backend='slurm_batch'")
+            if self.remote_container_runtime != "enroot":
+                raise ValueError("linux/slurm remote execution requires remote_container_runtime='enroot'")
         if self.remote_container_runtime == "enroot":
             if self.remote_execution_backend != "slurm_batch":
                 raise ValueError("remote_container_runtime='enroot' requires remote_execution_backend='slurm_batch'")
@@ -566,10 +578,10 @@ class _RemoteExecutionConfig:
     tunnel_recovery_grace_seconds: int = 30
     remote_ssh_port: int = 22
     ssh_config_path: str = ""
-    remote_container_runtime: str = "none"
-    remote_container_image: str = ""
+    remote_container_runtime: str = "enroot"
+    remote_container_image: str = "~/runtime/enroot/aedt.sqsh"
     remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252"
-    remote_ansys_executable: str = ""
+    remote_ansys_executable: str = "/mnt/AnsysEM/ansysedt"
     slurm_exclude_nodes: tuple[str, ...] = ()
 
 
@@ -702,11 +714,11 @@ def _blocked_readiness_snapshot(*, account: AccountConfig, reason: str) -> Accou
         account_id=account.account_id,
         host_alias=account.host_alias,
         ready=False,
-        status="DISABLED_FOR_DISPATCH",
+        status="BLOCKED",
         reason=reason,
         home_ok=False,
         runtime_path_ok=False,
-        venv_ok=False,
+        env_ok=False,
         python_ok=False,
         module_ok=False,
         binaries_ok=False,
@@ -1151,7 +1163,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             reason=snapshot.reason,
             home_ok=snapshot.home_ok,
             runtime_path_ok=snapshot.runtime_path_ok,
-            venv_ok=snapshot.venv_ok,
+            env_ok=snapshot.env_ok,
             python_ok=snapshot.python_ok,
             module_ok=snapshot.module_ok,
             binaries_ok=snapshot.binaries_ok,
@@ -1197,6 +1209,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             try:
                 snapshot = query_account_readiness(
                     account=account,
+                    command_timeout_seconds=config.readiness_probe_timeout_seconds,
                     remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
                     remote_storage_min_free_mb=config.remote_storage_min_free_mb,
                     **_container_runtime_kwargs(),
@@ -1248,6 +1261,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 try:
                     snapshot = query_account_preflight(
                         account=account,
+                        command_timeout_seconds=config.preflight_probe_timeout_seconds,
                         remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
                         remote_storage_min_free_mb=config.remote_storage_min_free_mb,
                         **_container_runtime_kwargs(),
@@ -1264,6 +1278,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 try:
                     snapshot = query_account_preflight(
                         account=account,
+                        command_timeout_seconds=config.preflight_probe_timeout_seconds,
                         remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
                         remote_storage_min_free_mb=config.remote_storage_min_free_mb,
                         **_container_runtime_kwargs(),
@@ -1294,6 +1309,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             )
             cutover_ready_emitted = True
         return ready_accounts
+
+    if config.continuous_mode and config.execute_remote and not queued_slots:
+        _resolve_dispatch_accounts()
 
     def _run_slot_batch(slot_batch: list[SlotTaskRef]) -> bool:
         nonlocal max_inflight_jobs, next_job_index, terminal_jobs, replacement_jobs, readiness_blocked_slots, cutover_blocked_emitted
@@ -1888,6 +1906,12 @@ def _ingest_slot_queue(
             discovered_count += 1
             continue
         file_stat = input_file.stat()
+        ready_mtime_ns = None
+        if ready_state.ready_present and ready_state.ready_path.exists():
+            try:
+                ready_mtime_ns = ready_state.ready_path.stat().st_mtime_ns
+            except OSError:
+                ready_mtime_ns = None
         discovered_count += 1
 
         if config.continuous_mode:
@@ -1897,13 +1921,18 @@ def _ingest_slot_queue(
                 ready_present=ready_state.ready_present,
                 ready_mode=ready_state.ready_mode,
                 ready_error=ready_state.ready_error,
+                ready_mtime_ns=ready_mtime_ns,
                 file_size=file_stat.st_size,
                 file_mtime_ns=file_stat.st_mtime_ns,
             )
             if not inserted:
                 continue
 
-        slot_id = _build_slot_id(relative_path=relative_path, mtime_ns=file_stat.st_mtime_ns)
+        slot_id = _build_slot_id(
+            relative_path=relative_path,
+            mtime_ns=file_stat.st_mtime_ns,
+            ready_mtime_ns=ready_mtime_ns,
+        )
         state_store.create_slot_task(
             run_id=run_id,
             slot_id=slot_id,
@@ -3110,8 +3139,9 @@ def _ensure_ready_artifact(input_path: Path, ready_suffix: str) -> _ReadyArtifac
             locked=True,
         )
     try:
-        ready_path.parent.mkdir(parents=True, exist_ok=True)
-        ready_path.touch(exist_ok=True)
+        if not ready_path.exists():
+            ready_path.parent.mkdir(parents=True, exist_ok=True)
+            ready_path.touch(exist_ok=False)
         return _ReadyArtifactState(
             ready_path=ready_path,
             ready_present=True,
@@ -3128,6 +3158,6 @@ def _ensure_ready_artifact(input_path: Path, ready_suffix: str) -> _ReadyArtifac
         )
 
 
-def _build_slot_id(*, relative_path: Path, mtime_ns: int) -> str:
-    digest = sha1(f"{relative_path.as_posix()}:{mtime_ns}".encode("utf-8")).hexdigest()[:16]
+def _build_slot_id(*, relative_path: Path, mtime_ns: int, ready_mtime_ns: int | None = None) -> str:
+    digest = sha1(f"{relative_path.as_posix()}:{mtime_ns}:{int(ready_mtime_ns or 0)}".encode("utf-8")).hexdigest()[:16]
     return f"w_{digest}"

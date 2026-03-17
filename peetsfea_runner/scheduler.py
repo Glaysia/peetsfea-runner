@@ -82,7 +82,7 @@ class AccountReadinessSnapshot:
     reason: str
     home_ok: bool
     runtime_path_ok: bool
-    venv_ok: bool
+    env_ok: bool
     python_ok: bool
     module_ok: bool
     binaries_ok: bool
@@ -119,6 +119,8 @@ PENDING_STATES = frozenset({"PD", "PENDING"})
 _READINESS_MARKER = "__PEETSFEA_READY__:"
 _PREFLIGHT_MARKER = "__PEETSFEA_PREFLIGHT__:"
 _BOOTSTRAP_MARKER = "__PEETSFEA_BOOTSTRAP__:ok"
+_DEFAULT_SLURM_PROBE_PARTITION = "cpu2"
+_ENROOT_IMAGE_PYTHON = "/opt/miniconda3/bin/python"
 
 
 def _parse_marker_values(*, marker_line: str, marker_prefix: str) -> dict[str, str]:
@@ -150,13 +152,15 @@ def _storage_snapshot_from_values(
         free_mb = None
 
     reasons: list[str] = []
-    inode_guard_enabled = fs_type not in {"gpfs"}
-    if inode_guard_enabled and remote_storage_inode_block_percent > 0 and inode_use_percent is not None:
+    inode_enforceable = fs_type not in {"gpfs"}
+    if inode_enforceable and remote_storage_inode_block_percent > 0 and inode_use_percent is not None:
         if inode_use_percent >= remote_storage_inode_block_percent:
-            reasons.append(f"inode_pct={inode_use_percent}")
+            reasons.append(
+                f"home_inode_exhausted inode_pct={inode_use_percent} threshold_pct={remote_storage_inode_block_percent}"
+            )
     if remote_storage_min_free_mb > 0 and free_mb is not None:
         if free_mb < remote_storage_min_free_mb:
-            reasons.append(f"free_mb={free_mb}")
+            reasons.append(f"home_storage_insufficient free_mb={free_mb} threshold_mb={remote_storage_min_free_mb}")
 
     if reasons:
         return False, ",".join(reasons), inode_use_percent, free_mb
@@ -184,6 +188,22 @@ def _remote_shell_path(path: str) -> str:
     if normalized.startswith("~/"):
         return f"$HOME/{normalized[2:]}"
     return normalized
+
+
+def _host_ansys_mount_root(path: str) -> str:
+    normalized = _remote_shell_path(path).rstrip("/")
+    if normalized.endswith("/AnsysEM"):
+        return normalized
+    return f"{normalized}/AnsysEM"
+
+
+def _wrap_with_slurm_probe(script: str, *, partition: str = _DEFAULT_SLURM_PROBE_PARTITION) -> str:
+    return "\n".join(
+        [
+            "set -euo pipefail",
+            f"srun -p {shlex.quote(partition)} -N1 -n1 bash -lc {shlex.quote(script)}",
+        ]
+    )
 
 
 def _double_quoted_shell_value(value: str) -> str:
@@ -305,6 +325,7 @@ def _parse_readiness_marker(
     text: str,
     remote_storage_inode_block_percent: int = 98,
     remote_storage_min_free_mb: int = 0,
+    remote_container_image: str = "",
 ) -> AccountReadinessSnapshot:
     marker_line = next((line.strip() for line in text.splitlines() if line.strip().startswith(_READINESS_MARKER)), None)
     if marker_line is None:
@@ -314,10 +335,11 @@ def _parse_readiness_marker(
     values = {key: raw_value == "1" for key, raw_value in raw_values.items()}
     container_mode = raw_values.get("container", "").strip() == "1"
     container_reason = raw_values.get("missing", "").strip()
+    image_path = raw_values.get("image_path", "").strip() or _remote_shell_path(remote_container_image)
 
     home_ok = values.get("home", False)
     runtime_path_ok = values.get("runtime", False)
-    venv_ok = values.get("venv", False)
+    env_ok = values.get("env", values.get("venv", False))
     python_ok = values.get("python", False)
     module_ok = values.get("module", False)
     binaries_ok = values.get("binaries", False)
@@ -327,14 +349,14 @@ def _parse_readiness_marker(
         remote_storage_inode_block_percent=remote_storage_inode_block_percent,
         remote_storage_min_free_mb=remote_storage_min_free_mb,
     )
-    bootstrap_needed = not runtime_path_ok or not venv_ok or not python_ok or not binaries_ok
+    bootstrap_needed = not runtime_path_ok or not env_ok or not python_ok or not binaries_ok
     hard_blocked = not home_ok or not module_ok or not ansys_ok
     failed_checks = [
         check_name
         for check_name, check_ok in (
             ("home", home_ok),
             ("runtime_path", runtime_path_ok),
-            ("venv", venv_ok),
+            ("env", env_ok),
             ("python", python_ok),
             ("module", module_ok),
             ("binaries", binaries_ok),
@@ -344,19 +366,22 @@ def _parse_readiness_marker(
     ]
     ready = not failed_checks and storage_ready
     if not storage_ready:
-        status = "BLOCKED_STORAGE"
+        status = "BLOCKED"
         reason = storage_reason
     elif ready:
         status = "READY"
         reason = "ok"
     elif container_mode:
-        status = "DISABLED_FOR_DISPATCH"
-        reason = container_reason or ",".join(failed_checks)
+        status = "BLOCKED"
+        if "image_missing" in container_reason:
+            reason = f"image_missing path={image_path}"
+        else:
+            reason = container_reason or ",".join(failed_checks)
     elif bootstrap_needed and not hard_blocked:
         status = "BOOTSTRAP_REQUIRED"
         reason = ",".join(failed_checks)
     else:
-        status = "DISABLED_FOR_DISPATCH"
+        status = "BLOCKED"
         reason = ",".join(failed_checks)
     return AccountReadinessSnapshot(
         account_id=account.account_id,
@@ -366,7 +391,7 @@ def _parse_readiness_marker(
         reason=reason,
         home_ok=home_ok,
         runtime_path_ok=runtime_path_ok,
-        venv_ok=venv_ok,
+        env_ok=env_ok,
         python_ok=python_ok,
         module_ok=module_ok,
         binaries_ok=binaries_ok,
@@ -384,13 +409,11 @@ $ErrorActionPreference = 'Stop'
 $HomeOk = 1
 $ModuleOk = 1
 $MinicondaDir = Join-Path $HOME 'miniconda3'
-$VenvDir = Join-Path $HOME '.peetsfea-runner-venv'
-$CondaEnvName = 'peetsfea-runner-py312'
-$CondaPython = Join-Path $MinicondaDir ('envs\' + $CondaEnvName + '\python.exe')
+$CondaPython = Join-Path $MinicondaDir 'python.exe'
 $RuntimeOk = [int](Test-Path $MinicondaDir)
-$VenvOk = [int](Test-Path (Join-Path $VenvDir 'Scripts\python.exe'))
+$EnvOk = [int](Test-Path $CondaPython)
 $PythonOk = [int](Test-Path $CondaPython)
-$BinariesOk = [int]($RuntimeOk -and $VenvOk -and $PythonOk)
+$BinariesOk = [int]($RuntimeOk -and $PythonOk)
 $AnsysOk = 0
 $StorageOk = 1
 $InodePct = 0
@@ -398,7 +421,7 @@ $FreeMb = 0
 $FsType = 'windows'
 if (Get-Command ansysedt.exe -ErrorAction SilentlyContinue) { $AnsysOk = 1 }
 elseif (Test-Path 'C:\Program Files\ANSYS Inc') { $AnsysOk = 1 }
-Write-Output ('__PEETSFEA_READY__:home={0} runtime={1} venv={2} python={3} module={4} binaries={5} ansys={6} storage={7} inode_pct={8} free_mb={9} fs_type={10}' -f $HomeOk,$RuntimeOk,$VenvOk,$PythonOk,$ModuleOk,$BinariesOk,$AnsysOk,$StorageOk,$InodePct,$FreeMb,$FsType)
+Write-Output ('__PEETSFEA_READY__:home={0} runtime={1} env={2} python={3} module={4} binaries={5} ansys={6} storage={7} inode_pct={8} free_mb={9} fs_type={10}' -f $HomeOk,$RuntimeOk,$EnvOk,$PythonOk,$ModuleOk,$BinariesOk,$AnsysOk,$StorageOk,$InodePct,$FreeMb,$FsType)
 """
 
 
@@ -408,14 +431,11 @@ $ErrorActionPreference = 'Stop'
 $HomeOk = 1
 $ModuleOk = 1
 $MinicondaDir = Join-Path $HOME 'miniconda3'
-$VenvDir = Join-Path $HOME '.peetsfea-runner-venv'
-$CondaEnvName = 'peetsfea-runner-py312'
-$CondaPython = Join-Path $MinicondaDir ('envs\' + $CondaEnvName + '\python.exe')
+$CondaPython = Join-Path $MinicondaDir 'python.exe'
 $RuntimeOk = [int](Test-Path $MinicondaDir)
-$VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
-$VenvOk = [int](Test-Path $VenvPython)
+$EnvOk = [int](Test-Path $CondaPython)
 $PythonOk = [int](Test-Path $CondaPython)
-$BinariesOk = [int]($RuntimeOk -and $VenvOk -and $PythonOk)
+$BinariesOk = [int]($RuntimeOk -and $PythonOk)
 $AnsysOk = 0
 $StorageOk = 1
 $InodePct = 0
@@ -424,16 +444,16 @@ $FsType = 'windows'
 if (Get-Command ansysedt.exe -ErrorAction SilentlyContinue) { $AnsysOk = 1 }
 elseif (Test-Path 'C:\Program Files\ANSYS Inc') { $AnsysOk = 1 }
 $UvOk = 0
-if ($VenvOk) {
-  & $VenvPython -m uv --version *> $null
+if ($EnvOk) {
+  & $CondaPython -m uv --version *> $null
   if ($LASTEXITCODE -eq 0) { $UvOk = 1 }
 }
 $PyaedtOk = 0
-if ($VenvOk) {
-  & $VenvPython -c "import ansys.aedt.core" *> $null
+if ($EnvOk) {
+  & $CondaPython -c "import ansys.aedt.core" *> $null
   if ($LASTEXITCODE -eq 0) { $PyaedtOk = 1 }
 }
-Write-Output ('__PEETSFEA_PREFLIGHT__:home={0} runtime={1} venv={2} python={3} module={4} binaries={5} ansys={6} uv={7} pyaedt={8} storage={9} inode_pct={10} free_mb={11} fs_type={12}' -f $HomeOk,$RuntimeOk,$VenvOk,$PythonOk,$ModuleOk,$BinariesOk,$AnsysOk,$UvOk,$PyaedtOk,$StorageOk,$InodePct,$FreeMb,$FsType)
+Write-Output ('__PEETSFEA_PREFLIGHT__:home={0} runtime={1} env={2} python={3} module={4} binaries={5} ansys={6} uv={7} pyaedt={8} storage={9} inode_pct={10} free_mb={11} fs_type={12}' -f $HomeOk,$RuntimeOk,$EnvOk,$PythonOk,$ModuleOk,$BinariesOk,$AnsysOk,$UvOk,$PyaedtOk,$StorageOk,$InodePct,$FreeMb,$FsType)
 """
 
 
@@ -549,25 +569,29 @@ def _query_windows_account_preflight(
 
 def _build_enroot_readiness_script(*, remote_container_image: str, remote_container_ansys_root: str) -> str:
     image_path = _remote_shell_path(remote_container_image)
-    ansys_root = _remote_shell_path(remote_container_ansys_root)
+    ansys_root = _host_ansys_mount_root(remote_container_ansys_root)
     return f"""
 set +e
 HOME_OK=0
 RUNTIME_OK=0
-VENV_OK=1
-PYTHON_OK=1
-MODULE_OK=1
+ENV_OK=0
+PYTHON_OK=0
+MODULE_OK=0
 BINARIES_OK=0
 ANSYS_OK=0
 STORAGE_OK=1
 MISSING=()
 REMOTE_CONTAINER_IMAGE={_double_quoted_shell_value(image_path)}
 REMOTE_CONTAINER_ANSYS_ROOT={_double_quoted_shell_value(ansys_root)}
+IMAGE_PYTHON={_double_quoted_shell_value(_ENROOT_IMAGE_PYTHON)}
+BASE_DIR="/tmp/$USER/peetsfea-ready-${{SLURM_JOB_ID:-nojob}}-$$"
+CONTAINER_NAME="peetsfea-ready-${{SLURM_JOB_ID:-nojob}}-$$"
 if [ -n "${{HOME:-}}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
   HOME_OK=1
 fi
-if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 && command -v enroot >/dev/null 2>&1; then
   BINARIES_OK=1
+  MODULE_OK=1
 else
   MISSING+=("binaries")
 fi
@@ -575,47 +599,75 @@ IMAGE_OK=0
 if [ -n "$REMOTE_CONTAINER_IMAGE" ] && [ -f "$REMOTE_CONTAINER_IMAGE" ] && [ -r "$REMOTE_CONTAINER_IMAGE" ]; then
   IMAGE_OK=1
 else
-  MISSING+=("image")
+  MISSING+=("image_missing")
 fi
-if [ "$IMAGE_OK" -eq 1 ]; then
+if [ "$IMAGE_OK" -eq 1 ] && [ "$MODULE_OK" -eq 1 ]; then
   RUNTIME_OK=1
 fi
-if [ -n "$REMOTE_CONTAINER_ANSYS_ROOT" ] && [ -d "$REMOTE_CONTAINER_ANSYS_ROOT" ]; then
+if [ -n "$REMOTE_CONTAINER_ANSYS_ROOT" ] && [ -x "$REMOTE_CONTAINER_ANSYS_ROOT/ansysedt" ]; then
   ANSYS_OK=1
 else
-  MISSING+=("ansys_root")
+  MISSING+=("ansys_root_missing")
+fi
+cleanup() {{
+  enroot remove -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  rm -rf "$BASE_DIR" >/dev/null 2>&1 || true
+}}
+trap cleanup EXIT
+if [ "$RUNTIME_OK" -eq 1 ]; then
+  mkdir -p "$BASE_DIR/runtime" "$BASE_DIR/cache" "$BASE_DIR/data" "$BASE_DIR/tmp"
+  export ENROOT_RUNTIME_PATH="$BASE_DIR/runtime"
+  export ENROOT_CACHE_PATH="$BASE_DIR/cache"
+  export ENROOT_DATA_PATH="$BASE_DIR/data"
+  export ENROOT_TEMP_PATH="$BASE_DIR/tmp"
+  if enroot create -f -n "$CONTAINER_NAME" "$REMOTE_CONTAINER_IMAGE" >/dev/null 2>&1; then
+    if enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "test -x \"$IMAGE_PYTHON\"" >/dev/null 2>&1; then
+      ENV_OK=1
+      PYTHON_OK=1
+    else
+      MISSING+=("env")
+    fi
+  else
+    MISSING+=("env")
+  fi
 fi
 INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {{gsub(/%/, "", $5); print $5+0}}' || echo 0)
 FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {{print $4+0}}' || echo 0)
 FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
 MISSING_TEXT=$(IFS=,; printf '%s' "${{MISSING[*]}}")
-printf '__PEETSFEA_READY__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT"
+printf '__PEETSFEA_READY__:home=%s runtime=%s env=%s python=%s module=%s binaries=%s ansys=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s image_path=%s env_path=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$ENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT" "$REMOTE_CONTAINER_IMAGE" "$IMAGE_PYTHON"
 """
 
 
 def _build_enroot_preflight_script(*, remote_container_image: str, remote_container_ansys_root: str) -> str:
     image_path = _remote_shell_path(remote_container_image)
-    ansys_root = _remote_shell_path(remote_container_ansys_root)
+    ansys_root = _host_ansys_mount_root(remote_container_ansys_root)
     return f"""
 set +e
 HOME_OK=0
 RUNTIME_OK=0
-VENV_OK=1
-PYTHON_OK=1
-MODULE_OK=1
+ENV_OK=0
+PYTHON_OK=0
+MODULE_OK=0
 BINARIES_OK=0
 ANSYS_OK=0
-UV_OK=1
-PYAEDT_OK=1
+UV_OK=0
+PYAEDT_OK=0
+PANDAS_OK=0
+PYVISTA_OK=0
 STORAGE_OK=1
 MISSING=()
 REMOTE_CONTAINER_IMAGE={_double_quoted_shell_value(image_path)}
 REMOTE_CONTAINER_ANSYS_ROOT={_double_quoted_shell_value(ansys_root)}
+IMAGE_PYTHON={_double_quoted_shell_value(_ENROOT_IMAGE_PYTHON)}
+BASE_DIR="/tmp/$USER/peetsfea-preflight-${{SLURM_JOB_ID:-nojob}}-$$"
+CONTAINER_NAME="peetsfea-preflight-${{SLURM_JOB_ID:-nojob}}-$$"
 if [ -n "${{HOME:-}}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
   HOME_OK=1
 fi
-if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 && command -v enroot >/dev/null 2>&1; then
   BINARIES_OK=1
+  MODULE_OK=1
 else
   MISSING+=("binaries")
 fi
@@ -623,21 +675,55 @@ IMAGE_OK=0
 if [ -n "$REMOTE_CONTAINER_IMAGE" ] && [ -f "$REMOTE_CONTAINER_IMAGE" ] && [ -r "$REMOTE_CONTAINER_IMAGE" ]; then
   IMAGE_OK=1
 else
-  MISSING+=("image")
+  MISSING+=("image_missing")
 fi
-if [ "$IMAGE_OK" -eq 1 ]; then
+if [ "$IMAGE_OK" -eq 1 ] && [ "$MODULE_OK" -eq 1 ]; then
   RUNTIME_OK=1
 fi
-if [ -n "$REMOTE_CONTAINER_ANSYS_ROOT" ] && [ -d "$REMOTE_CONTAINER_ANSYS_ROOT" ]; then
+if [ -n "$REMOTE_CONTAINER_ANSYS_ROOT" ] && [ -x "$REMOTE_CONTAINER_ANSYS_ROOT/ansysedt" ]; then
   ANSYS_OK=1
 else
-  MISSING+=("ansys_root")
+  MISSING+=("ansys_root_missing")
+fi
+cleanup() {{
+  enroot remove -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  rm -rf "$BASE_DIR" >/dev/null 2>&1 || true
+}}
+trap cleanup EXIT
+if [ "$RUNTIME_OK" -eq 1 ]; then
+  mkdir -p "$BASE_DIR/runtime" "$BASE_DIR/cache" "$BASE_DIR/data" "$BASE_DIR/tmp"
+  export ENROOT_RUNTIME_PATH="$BASE_DIR/runtime"
+  export ENROOT_CACHE_PATH="$BASE_DIR/cache"
+  export ENROOT_DATA_PATH="$BASE_DIR/data"
+  export ENROOT_TEMP_PATH="$BASE_DIR/tmp"
+  if enroot create -f -n "$CONTAINER_NAME" "$REMOTE_CONTAINER_IMAGE" >/dev/null 2>&1; then
+    if enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "test -x \"$IMAGE_PYTHON\"" >/dev/null 2>&1; then
+      ENV_OK=1
+      PYTHON_OK=1
+    else
+      MISSING+=("env")
+    fi
+    if [ "$PYTHON_OK" -eq 1 ] && enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "\"$IMAGE_PYTHON\" -m uv --version >/dev/null 2>&1"; then
+      UV_OK=1
+    fi
+    if [ "$PYTHON_OK" -eq 1 ] && enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "\"$IMAGE_PYTHON\" -c 'import ansys.aedt.core'" >/dev/null 2>&1; then
+      PYAEDT_OK=1
+    fi
+    if [ "$PYTHON_OK" -eq 1 ] && enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "\"$IMAGE_PYTHON\" -c 'import pandas'" >/dev/null 2>&1; then
+      PANDAS_OK=1
+    fi
+    if [ "$PYTHON_OK" -eq 1 ] && enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "\"$IMAGE_PYTHON\" -c 'import pyvista'" >/dev/null 2>&1; then
+      PYVISTA_OK=1
+    fi
+  else
+    MISSING+=("env")
+  fi
 fi
 INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {{gsub(/%/, "", $5); print $5+0}}' || echo 0)
 FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {{print $4+0}}' || echo 0)
 FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
 MISSING_TEXT=$(IFS=,; printf '%s' "${{MISSING[*]}}")
-printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT"
+printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s env=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s pandas=%s pyvista=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s image_path=%s env_path=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$ENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK" "$PANDAS_OK" "$PYVISTA_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT" "$REMOTE_CONTAINER_IMAGE" "$IMAGE_PYTHON"
 """
 
 
@@ -646,7 +732,7 @@ def query_account_readiness(
     account: AccountConfigLike,
     run_command: Callable[[list[str]], tuple[int, str, str]] | None = None,
     ssh_connect_timeout_seconds: int = 5,
-    command_timeout_seconds: int = 12,
+    command_timeout_seconds: int = 60,
     remote_storage_inode_block_percent: int = 98,
     remote_storage_min_free_mb: int = 0,
     remote_container_runtime: str = "none",
@@ -676,7 +762,7 @@ def query_account_readiness(
                 ssh_config_path=ssh_config_path,
             ),
             account.host_alias,
-            f"bash -lc {shlex.quote(remote_script)}",
+            f"bash -lc {shlex.quote(_wrap_with_slurm_probe(remote_script))}",
         ]
         if run_command is None:
             try:
@@ -705,6 +791,7 @@ def query_account_readiness(
                 text=combined_output,
                 remote_storage_inode_block_percent=remote_storage_inode_block_percent,
                 remote_storage_min_free_mb=remote_storage_min_free_mb,
+                remote_container_image=remote_container_image,
             )
             if return_code != 0 and snapshot.ready:
                 raise RuntimeError(
@@ -741,19 +828,21 @@ def query_account_readiness(
 set +e
 HOME_OK=0
 RUNTIME_OK=0
-VENV_OK=0
+ENV_OK=0
 PYTHON_OK=0
 MODULE_OK=0
 BINARIES_OK=0
 ANSYS_OK=0
 if [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
   HOME_OK=1
+fi
+MINICONDA_DIR="$HOME/miniconda3"
+CONDA_PYTHON="$MINICONDA_DIR/bin/python"
+if [ -d "$MINICONDA_DIR" ]; then
   RUNTIME_OK=1
 fi
-if [ -d "$HOME/.peetsfea-runner-venv" ]; then
-  VENV_OK=1
-fi
-if [ -x "$HOME/.peetsfea-runner-venv/bin/python" ]; then
+if [ -x "$CONDA_PYTHON" ]; then
+  ENV_OK=1
   PYTHON_OK=1
 fi
 if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
@@ -772,7 +861,7 @@ STORAGE_OK=1
 INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5+0}' || echo 0)
 FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {print $4+0}' || echo 0)
 FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
-printf '__PEETSFEA_READY__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE"
+printf '__PEETSFEA_READY__:home=%s runtime=%s env=%s python=%s module=%s binaries=%s ansys=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$ENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE"
 """
     command = [
         *_ssh_base_command(
@@ -829,6 +918,7 @@ def _parse_preflight_marker(
     text: str,
     remote_storage_inode_block_percent: int = 98,
     remote_storage_min_free_mb: int = 0,
+    remote_container_image: str = "",
 ) -> AccountReadinessSnapshot:
     marker_line = next((line.strip() for line in text.splitlines() if line.strip().startswith(_PREFLIGHT_MARKER)), None)
     if marker_line is None:
@@ -837,16 +927,19 @@ def _parse_preflight_marker(
     raw_values = _parse_marker_values(marker_line=marker_line, marker_prefix=_PREFLIGHT_MARKER)
     values = {key: raw_value == "1" for key, raw_value in raw_values.items()}
     container_reason = raw_values.get("missing", "").strip()
+    image_path = raw_values.get("image_path", "").strip() or _remote_shell_path(remote_container_image)
 
     home_ok = values.get("home", False)
     runtime_path_ok = values.get("runtime", False)
-    venv_ok = values.get("venv", False)
+    env_ok = values.get("env", values.get("venv", False))
     python_ok = values.get("python", False)
     module_ok = values.get("module", False)
     binaries_ok = values.get("binaries", False)
     ansys_ok = values.get("ansys", False)
     uv_ok = values.get("uv", False)
     pyaedt_ok = values.get("pyaedt", False)
+    pandas_ok = values.get("pandas", False)
+    pyvista_ok = values.get("pyvista", False)
     storage_ready, storage_reason, inode_use_percent, free_mb = _storage_snapshot_from_values(
         values=raw_values,
         remote_storage_inode_block_percent=remote_storage_inode_block_percent,
@@ -857,13 +950,15 @@ def _parse_preflight_marker(
         for check_name, check_ok in (
             ("home", home_ok),
             ("runtime_path", runtime_path_ok),
-            ("venv", venv_ok),
+            ("env", env_ok),
             ("python", python_ok),
             ("module", module_ok),
             ("binaries", binaries_ok),
             ("ansys", ansys_ok),
             ("uv", uv_ok),
             ("pyaedt", pyaedt_ok),
+            ("pandas", pandas_ok),
+            ("pyvista", pyvista_ok),
         )
         if not check_ok
     ]
@@ -872,11 +967,19 @@ def _parse_preflight_marker(
         account_id=account.account_id,
         host_alias=account.host_alias,
         ready=ready,
-        status="READY" if ready else ("BLOCKED_STORAGE" if not storage_ready else "PREFLIGHT_FAILED"),
-        reason="ok" if ready else (storage_reason if not storage_ready else (container_reason or ",".join(failed_checks))),
+        status="READY" if ready else ("BLOCKED" if not storage_ready or container_reason else "PREFLIGHT_FAILED"),
+        reason=(
+            "ok"
+            if ready
+            else (
+                storage_reason
+                if not storage_ready
+                else (f"image_missing path={image_path}" if "image_missing" in container_reason else (container_reason or ",".join(failed_checks)))
+            )
+        ),
         home_ok=home_ok,
         runtime_path_ok=runtime_path_ok,
-        venv_ok=venv_ok,
+        env_ok=env_ok,
         python_ok=python_ok,
         module_ok=module_ok,
         binaries_ok=binaries_ok,
@@ -895,7 +998,7 @@ def query_account_preflight(
     account: AccountConfigLike,
     run_command: Callable[[list[str]], tuple[int, str, str]] | None = None,
     ssh_connect_timeout_seconds: int = 5,
-    command_timeout_seconds: int = 20,
+    command_timeout_seconds: int = 60,
     remote_storage_inode_block_percent: int = 98,
     remote_storage_min_free_mb: int = 0,
     remote_container_runtime: str = "none",
@@ -925,7 +1028,7 @@ def query_account_preflight(
                 ssh_config_path=ssh_config_path,
             ),
             account.host_alias,
-            f"bash -lc {shlex.quote(remote_script)}",
+            f"bash -lc {shlex.quote(_wrap_with_slurm_probe(remote_script))}",
         ]
         if run_command is None:
             try:
@@ -954,6 +1057,7 @@ def query_account_preflight(
                 text=combined_output,
                 remote_storage_inode_block_percent=remote_storage_inode_block_percent,
                 remote_storage_min_free_mb=remote_storage_min_free_mb,
+                remote_container_image=remote_container_image,
             )
             if return_code != 0 and snapshot.ready:
                 raise RuntimeError(
@@ -990,22 +1094,23 @@ def query_account_preflight(
 set +e
 HOME_OK=0
 RUNTIME_OK=0
-VENV_OK=0
+ENV_OK=0
 PYTHON_OK=0
 MODULE_OK=0
 BINARIES_OK=0
 ANSYS_OK=0
 UV_OK=0
 PYAEDT_OK=0
-VENV_DIR="$HOME/.peetsfea-runner-venv"
+MINICONDA_DIR="$HOME/miniconda3"
+CONDA_PYTHON="$MINICONDA_DIR/bin/python"
 if [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
   HOME_OK=1
+fi
+if [ -d "$MINICONDA_DIR" ]; then
   RUNTIME_OK=1
 fi
-if [ -d "$VENV_DIR" ]; then
-  VENV_OK=1
-fi
-if [ -x "$VENV_DIR/bin/python" ]; then
+if [ -x "$CONDA_PYTHON" ]; then
+  ENV_OK=1
   PYTHON_OK=1
 fi
 if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
@@ -1020,17 +1125,17 @@ fi
 if command -v ansysedt >/dev/null 2>&1 || command -v ansysedtsv >/dev/null 2>&1 || [ -x /opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt ]; then
   ANSYS_OK=1
 fi
-if [ "$PYTHON_OK" -eq 1 ] && "$VENV_DIR/bin/python" -m uv --version >/dev/null 2>&1; then
+if [ "$PYTHON_OK" -eq 1 ] && "$CONDA_PYTHON" -m uv --version >/dev/null 2>&1; then
   UV_OK=1
 fi
-if [ "$PYTHON_OK" -eq 1 ] && "$VENV_DIR/bin/python" -c "import ansys.aedt.core" >/dev/null 2>&1; then
+if [ "$PYTHON_OK" -eq 1 ] && "$CONDA_PYTHON" -c "import ansys.aedt.core" >/dev/null 2>&1; then
   PYAEDT_OK=1
 fi
 STORAGE_OK=1
 INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5+0}' || echo 0)
 FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {print $4+0}' || echo 0)
 FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
-printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s venv=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$VENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE"
+printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s env=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$ENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE"
 """
     command = [
         *_ssh_base_command(
@@ -1094,7 +1199,83 @@ def bootstrap_account_runtime(
     ssh_config_path: str = "",
 ) -> str:
     if _container_runtime(remote_container_runtime) == "enroot":
-        raise RuntimeError("bootstrap is not supported when remote_container_runtime='enroot'")
+        image_path = _remote_shell_path(remote_container_image)
+        host_ansys_root = _host_ansys_mount_root(remote_container_ansys_root)
+        remote_script = f"""
+set -euo pipefail
+if [ ! -f {shlex.quote(image_path)} ]; then
+  echo "image_missing path={image_path}" >&2
+  exit 1
+fi
+if [ ! -x {shlex.quote(host_ansys_root + "/ansysedt")} ]; then
+  echo "ansys_root_missing path={host_ansys_root}" >&2
+  exit 1
+fi
+BASE_DIR="/tmp/$USER/peetsfea-bootstrap-${{SLURM_JOB_ID:-nojob}}-$$"
+mkdir -p "$BASE_DIR"
+export ENROOT_RUNTIME_PATH="$BASE_DIR/runtime"
+export ENROOT_CACHE_PATH="$BASE_DIR/cache"
+export ENROOT_DATA_PATH="$BASE_DIR/data"
+export ENROOT_TEMP_PATH="$BASE_DIR/tmp"
+mkdir -p "$ENROOT_RUNTIME_PATH" "$ENROOT_CACHE_PATH" "$ENROOT_DATA_PATH" "$ENROOT_TEMP_PATH"
+cleanup() {{
+  rc=$?
+  enroot remove -f peetsfea-bootstrap >/dev/null 2>&1 || true
+  rm -rf "$BASE_DIR"
+  exit "$rc"
+}}
+trap cleanup EXIT
+enroot create -f -n peetsfea-bootstrap {shlex.quote(image_path)} >/dev/null
+BOOTSTRAP_SCRIPT=$(cat <<'INNER'
+set -euo pipefail
+IMAGE_PYTHON="/opt/miniconda3/bin/python"
+if [ ! -x "$IMAGE_PYTHON" ]; then
+  echo "python_missing" >&2
+  exit 1
+fi
+if ! "$IMAGE_PYTHON" -m uv --version >/dev/null 2>&1; then
+  echo "uv_missing" >&2
+  exit 1
+fi
+"$IMAGE_PYTHON" -c "import ansys.aedt.core, pandas, pyvista" >/dev/null 2>&1
+printf '__PEETSFEA_BOOTSTRAP__:ok\\n'
+INNER
+)
+enroot start --root --rw --mount "$HOME:$HOME" --mount {shlex.quote(host_ansys_root)}:/mnt/AnsysEM peetsfea-bootstrap /bin/bash -lc "$BOOTSTRAP_SCRIPT"
+"""
+        command = [
+            *_ssh_base_command(
+                ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
+                ssh_config_path=ssh_config_path,
+            ),
+            account.host_alias,
+            f"bash -lc {shlex.quote(_wrap_with_slurm_probe(remote_script))}",
+        ]
+        if run_command is None:
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=command_timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    f"bootstrap timed out account={account.account_id} host={account.host_alias} "
+                    f"timeout={command_timeout_seconds}s"
+                ) from exc
+            return_code = completed.returncode
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+        else:
+            return_code, stdout, stderr = run_command(command)
+
+        output = "\n".join(part for part in (stdout, stderr) if part).strip()
+        if return_code != 0 or _BOOTSTRAP_MARKER not in output:
+            details = output or f"return code={return_code}"
+            raise RuntimeError(f"bootstrap failed account={account.account_id}: {details}")
+        return output
     if (_account_platform(account), _account_scheduler(account)) == ("windows", "none"):
         return _bootstrap_windows_account_runtime(
             account=account,
@@ -1115,11 +1296,8 @@ def bootstrap_account_runtime(
 
     remote_script = """
 set -euo pipefail
-VENV_DIR="$HOME/.peetsfea-runner-venv"
 MINICONDA_DIR="$HOME/miniconda3"
-CONDA_ENV_NAME="peetsfea-runner-py312"
-CONDA_PYTHON_PATH="$MINICONDA_DIR/envs/$CONDA_ENV_NAME/bin/python"
-DEPS_READY_MARKER="$VENV_DIR/.peets_deps_ready"
+CONDA_PYTHON_PATH="$MINICONDA_DIR/bin/python"
 if [ -r /etc/profile.d/modules.sh ]; then
   . /etc/profile.d/modules.sh >/dev/null 2>&1 || true
 fi
@@ -1149,46 +1327,18 @@ ensure_miniconda() {
   bash "$installer_path" -b -p "$MINICONDA_DIR"
   rm -f "$installer_path"
 }
-ensure_conda_python312() {
+ensure_conda_base_python() {
   if "$MINICONDA_DIR/bin/conda" tos --help >/dev/null 2>&1; then
     "$MINICONDA_DIR/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
     "$MINICONDA_DIR/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
   fi
-  if [ -x "$CONDA_PYTHON_PATH" ]; then
-    major_minor="$($CONDA_PYTHON_PATH -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-    if [ "$major_minor" = "3.12" ]; then
-      return 0
-    fi
-  fi
-  "$MINICONDA_DIR/bin/conda" create -y -n "$CONDA_ENV_NAME" python=3.12
-}
-ensure_runner_venv() {
-  recreate=0
-  if [ -d "$VENV_DIR" ]; then
-    if [ ! -x "$VENV_DIR/bin/python" ]; then
-      recreate=1
-    else
-      major_minor="$($VENV_DIR/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-      if [ "$major_minor" != "3.12" ]; then
-        recreate=1
-      fi
-    fi
-  else
-    recreate=1
-  fi
-  if [ "$recreate" -eq 1 ]; then
-    rm -rf "$VENV_DIR"
-    "$CONDA_PYTHON_PATH" -m venv "$VENV_DIR"
-  fi
+  "$MINICONDA_DIR/bin/conda" install -y python=3.12 pip
 }
 ensure_miniconda
-ensure_conda_python312
-ensure_runner_venv
-"$VENV_DIR/bin/python" -m ensurepip --upgrade || true
-"$VENV_DIR/bin/python" -m pip install --upgrade pip
-"$VENV_DIR/bin/python" -m pip install uv
-"$VENV_DIR/bin/python" -m uv pip install pyaedt==0.25.1
-touch "$DEPS_READY_MARKER"
+ensure_conda_base_python
+"$CONDA_PYTHON_PATH" -m pip install --upgrade pip
+"$CONDA_PYTHON_PATH" -m pip install uv
+"$CONDA_PYTHON_PATH" -m uv pip install pyaedt==0.25.1 'pandas<2.4' pyvista
 printf '__PEETSFEA_BOOTSTRAP__:ok\\n'
 """
     command = [
@@ -1236,10 +1386,8 @@ def _bootstrap_windows_account_runtime(
 ) -> str:
     remote_script = r"""
 $ErrorActionPreference = 'Stop'
-$VenvDir = Join-Path $HOME '.peetsfea-runner-venv'
 $MinicondaDir = Join-Path $HOME 'miniconda3'
-$CondaEnvName = 'peetsfea-runner-py312'
-$CondaPythonPath = Join-Path $MinicondaDir ('envs\' + $CondaEnvName + '\python.exe')
+$CondaPythonPath = Join-Path $MinicondaDir 'python.exe'
 $CondaExe = Join-Path $MinicondaDir 'Scripts\conda.exe'
 $InstallerPath = Join-Path $env:TEMP 'Miniconda3-latest-Windows-x86_64.exe'
 function Ensure-Miniconda {
@@ -1249,34 +1397,16 @@ function Ensure-Miniconda {
   Start-Process -FilePath $InstallerPath -ArgumentList '/InstallationType=JustMe','/RegisterPython=0','/S',('/D=' + $MinicondaDir) -Wait
   Remove-Item -Force $InstallerPath
 }
-function Ensure-CondaPython312 {
+function Ensure-CondaBasePython {
   & $CondaExe tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main *> $null
   & $CondaExe tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r *> $null
-  if (Test-Path $CondaPythonPath) {
-    $ver = & $CondaPythonPath -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-    if ($ver -eq '3.12') { return }
-  }
-  & $CondaExe create -y -n $CondaEnvName python=3.12
-}
-function Ensure-RunnerVenv {
-  $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
-  $recreate = $true
-  if (Test-Path $VenvPython) {
-    $ver = & $VenvPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-    if ($ver -eq '3.12') { $recreate = $false }
-  }
-  if ($recreate) {
-    if (Test-Path $VenvDir) { Remove-Item -Recurse -Force $VenvDir }
-    & $CondaPythonPath -m venv $VenvDir
-  }
+  & $CondaExe install -y python=3.12 pip
 }
 Ensure-Miniconda
-Ensure-CondaPython312
-Ensure-RunnerVenv
-$VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
-& $VenvPython -m pip install --upgrade pip
-& $VenvPython -m pip install uv
-& $VenvPython -m uv pip install pyaedt==0.25.1
+Ensure-CondaBasePython
+& $CondaPythonPath -m pip install --upgrade pip
+& $CondaPythonPath -m pip install uv
+& $CondaPythonPath -m uv pip install pyaedt==0.25.1 "pandas<2.4" pyvista
 Write-Output '__PEETSFEA_BOOTSTRAP__:ok'
 """
     return_code, stdout, stderr = _run_windows_ssh_script(

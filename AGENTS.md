@@ -44,9 +44,9 @@
 
 ## Input Source Rule
 
-1. `/home/peetsmain/peetsfea-runner/original` 아래 파일은 실제로 최종 돌려야 하는 무거운 `.aedt` 원본으로 취급한다.
-2. active `PLANS`가 명시적으로 real input 사용을 허용하기 전까지는 `/home/peetsmain/peetsfea-runner/examples/sample.aedt`를 여러 개 복사해서 테스트, 재현, sample canary, validation lane 검증에 사용한다.
-3. `original` 아래의 무거운 `.aedt` 파일은 active `PLANS`가 final validation 또는 real cutover를 허용한 단계에서만 사용한다.
+1. 입력 소스는 항상 `/home/peetsmain/peetsfea-runner/input_queue` 아래 경로만 사용한다.
+2. 테스트나 검증이 필요하면 필요한 `.aedt`를 `input_queue` 아래 적절한 lane으로 복사해서 사용한다.
+3. `original` 같은 별도 입력 루트는 특수 취급하지 않는다.
 
 ## Canary Rule
 
@@ -54,6 +54,17 @@
 2. canary는 항상 `run_pipeline(config)` 함수 호출 경로에서 `continuous_mode=False`인 별도 validation lane으로 수행한다.
 3. canary 산출물은 live continuous service output과 섞지 않는다.
 4. canary 판정은 `output_variables.csv` 존재 여부만이 아니라 active `PLANS`의 CSV schema gate 기준을 따라야 한다.
+
+## Live Service Acceptance Rule
+
+1. built-in service 복구나 ingest 복구를 주장하려면, 실제 `input_queue/<lane>/.../sample.aedt`가 서비스에 의해 소비되어야 한다.
+2. acceptance 최소 기준은 다음 4가지를 모두 만족하는 것이다.
+   - `input_queue` 아래 sample이 service ingest 대상이 된다.
+   - `output/<lane>/.../sample.aedt.out` 아래 실제 산출물이 materialize 된다.
+   - service 정책에 따라 입력이 active queue에서 빠진다. 현재 built-in service는 성공 시 `.done`으로 나가야 한다.
+   - `/api/events/recent` 또는 DB 상태에서 `QUEUED -> submit/worker -> terminal` 진행이 확인된다.
+3. unit test, direct `run_pipeline(config)` validation lane, 원격 수동 probe는 보조 검증일 뿐이며, 이 규칙을 대체하지 못한다.
+4. 위 round-trip이 끝나지 않았으면 복구 완료로 간주하지 말고 계속 수정과 재검증을 반복한다.
 
 ## Codex Resume Helper Rule
 
