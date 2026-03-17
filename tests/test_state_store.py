@@ -143,6 +143,77 @@ class TestStateStore(unittest.TestCase):
             self.assertEqual(rows[0][3], "run_02")
             self.assertEqual(rows[0][4], "DEGRADED")
 
+    def test_fail_active_job_from_rediscovered_worker_marks_job_slots_and_ingest_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            input_path = "/tmp/sample.aedt"
+            output_path = "/tmp/out/sample.aedt.out"
+
+            store.register_ingest_candidate(
+                input_path=input_path,
+                ready_path=f"{input_path}.ready",
+                ready_present=True,
+                ready_mode="SIDECAR",
+                ready_error=None,
+                ready_mtime_ns=200,
+                file_size=10,
+                file_mtime_ns=100,
+            )
+            store.create_slot_task(
+                run_id="run_01",
+                slot_id="slot_01",
+                input_path=input_path,
+                output_path=output_path,
+                account_id="account_01",
+                state="RUNNING",
+            )
+            store.update_slot_task(
+                run_id="run_01",
+                slot_id="slot_01",
+                state="RUNNING",
+                attempt_no=1,
+                job_id="job_0001",
+                account_id="account_01",
+            )
+            store.create_job(
+                run_id="run_01",
+                job_id="job_0001",
+                input_path=input_path,
+                output_path=output_path,
+                account_id="account_01",
+            )
+            store.update_job_status(run_id="run_01", job_id="job_0001", status="RUNNING", attempt_no=1)
+
+            affected = store.fail_active_job_from_rediscovered_worker(
+                run_id="run_01",
+                job_id="job_0001",
+                attempt_no=2,
+                failure_reason="rediscovered worker terminal state=FAILED",
+            )
+
+            self.assertEqual(affected, [("slot_01", input_path)])
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                job_row = conn.execute(
+                    "SELECT status, last_attempt_no, failure_reason FROM jobs WHERE run_id = 'run_01' AND job_id = 'job_0001'"
+                ).fetchone()
+                slot_row = conn.execute(
+                    "SELECT state, attempt_no, failure_reason FROM slot_tasks WHERE run_id = 'run_01' AND slot_id = 'slot_01'"
+                ).fetchone()
+                ingest_row = conn.execute(
+                    "SELECT state FROM ingest_index WHERE input_path = ?",
+                    [input_path],
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(job_row, ("FAILED", 2, "rediscovered worker terminal state=FAILED"))
+            self.assertEqual(slot_row, ("FAILED", 2, "rediscovered worker terminal state=FAILED"))
+            self.assertEqual(ingest_row, ("FAILED",))
+
     def test_register_ingest_candidate_deduplicates_same_stat(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "state.duckdb"

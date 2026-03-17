@@ -39,7 +39,7 @@ class TestBuiltInService(unittest.TestCase):
         self.assertTrue(lane_by_id["preserve_results"].rename_input_to_done_on_success)
         self.assertEqual(
             [account.host_alias for account in lane_by_id["preserve_results"].accounts],
-            ["gate1-harry261"],
+            ["gate1-harry261", "gate1-dhj02"],
         )
         self.assertEqual(lane_by_id["prune_results"].cpus_per_job, 20)
         self.assertEqual(lane_by_id["prune_results"].slots_per_job, 5)
@@ -52,7 +52,7 @@ class TestBuiltInService(unittest.TestCase):
             ["gate1-dhj02", "gate1-jji0930", "gate1-hmlee31", "gate1-dw16"],
         )
         total_slots = sum(len(lane.accounts) * 10 * lane.slots_per_job for lane in profile.lanes)
-        self.assertEqual(total_slots, 210)
+        self.assertEqual(total_slots, 220)
 
     def test_validate_service_layout_creates_required_output_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -116,7 +116,7 @@ class TestBuiltInService(unittest.TestCase):
             self.assertTrue(preserve_cfg.retain_aedtresults)
             self.assertTrue(preserve_cfg.rename_input_to_done_on_success)
             self.assertEqual(preserve_cfg.input_source_policy, "input_queue_only")
-            self.assertEqual(len(preserve_cfg.accounts_registry), 1)
+            self.assertEqual(len(preserve_cfg.accounts_registry), 2)
             self.assertEqual(preserve_cfg.ssh_config_path, str(root / ".ssh" / "config"))
             self.assertEqual(preserve_cfg.remote_root, "/tmp/$USER/aedt_runs")
             self.assertEqual(prune_cfg.run_namespace, "prune_results")

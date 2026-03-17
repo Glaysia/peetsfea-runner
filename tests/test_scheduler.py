@@ -250,6 +250,31 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(snapshot.status, "BLOCKED")
         self.assertEqual(snapshot.reason, "image_missing path=$HOME/runtime/enroot/aedt.sqsh")
 
+    def test_query_account_readiness_in_enroot_mode_uses_direct_probe(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        seen_commands: list[list[str]] = []
+
+        def _run_command(command: list[str]) -> tuple[int, str, str]:
+            seen_commands.append(command)
+            return (
+                0,
+                "__PEETSFEA_READY__:home=1 runtime=1 env=1 python=1 module=1 binaries=1 ansys=1 storage=1 inode_pct=10 free_mb=8192 fs_type=ext4 container=1 missing= image_path=$HOME/runtime/enroot/aedt.sqsh\n",
+                "",
+            )
+
+        snapshot = query_account_readiness(
+            account=account,
+            remote_container_runtime="enroot",
+            remote_container_image="~/runtime/enroot/aedt.sqsh",
+            remote_container_ansys_root="/opt/ohpc/pub/Electronics/v252",
+            run_command=_run_command,
+        )
+
+        self.assertTrue(snapshot.ready)
+        self.assertEqual(snapshot.status, "READY")
+        self.assertEqual(snapshot.reason, "ok")
+        self.assertNotIn("srun -p", seen_commands[0][-1])
+
     def test_query_account_preflight_reports_missing_uv_and_pyaedt(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
         snapshot = query_account_preflight(
@@ -265,6 +290,29 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(snapshot.reason, "uv,pyaedt,pandas,pyvista")
         self.assertFalse(snapshot.uv_ok)
         self.assertFalse(snapshot.pyaedt_ok)
+
+    def test_query_account_preflight_in_enroot_mode_accepts_scheduler_queue_delay(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        seen_commands: list[list[str]] = []
+
+        def _run_command(command: list[str]) -> tuple[int, str, str]:
+            seen_commands.append(command)
+            return 1, "", "srun: Unable to allocate resources: Requested nodes are busy\n"
+
+        snapshot = query_account_preflight(
+            account=account,
+            remote_container_runtime="enroot",
+            remote_container_image="~/runtime/enroot/aedt.sqsh",
+            remote_container_ansys_root="/opt/ohpc/pub/Electronics/v252",
+            run_command=_run_command,
+        )
+
+        self.assertTrue(snapshot.ready)
+        self.assertEqual(snapshot.status, "READY")
+        self.assertEqual(snapshot.reason, "scheduler_queue_delay")
+        self.assertTrue(snapshot.uv_ok)
+        self.assertTrue(snapshot.pyaedt_ok)
+        self.assertIn("--immediate=15", seen_commands[0][-1])
 
     def test_query_account_preflight_in_enroot_mode_accepts_image_backed_runtime(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)

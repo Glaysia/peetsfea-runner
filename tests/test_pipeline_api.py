@@ -25,7 +25,7 @@ from peetsfea_runner.pipeline import (
     _should_auto_register_low_tmp_node,
 )
 from peetsfea_runner.remote_job import CaseExecutionSummary, RemoteJobAttemptResult
-from peetsfea_runner.scheduler import AccountCapacitySnapshot, AccountReadinessSnapshot
+from peetsfea_runner.scheduler import AccountCapacitySnapshot, AccountReadinessSnapshot, BalancedBatchResult
 from peetsfea_runner.state_store import StateStore
 
 
@@ -158,7 +158,15 @@ class TestPipelineApi(unittest.TestCase):
                 metadata_db_path=str(db_path),
                 execute_remote=True,
                 continuous_mode=True,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
+                accounts_registry=(
+                    AccountConfig(
+                        account_id="account_01",
+                        host_alias="gate1-harry261",
+                        max_jobs=1,
+                        platform="windows",
+                        scheduler="none",
+                    ),
+                ),
             )
 
             with (
@@ -296,7 +304,15 @@ class TestPipelineApi(unittest.TestCase):
                 continuous_mode=False,
                 execute_remote=True,
                 remote_execution_backend="slurm_batch",
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
+                accounts_registry=(
+                    AccountConfig(
+                        account_id="account_01",
+                        host_alias="gate1-harry261",
+                        max_jobs=1,
+                        platform="windows",
+                        scheduler="none",
+                    ),
+                ),
             )
 
             def _mock_attempt(
@@ -1009,6 +1025,251 @@ class TestPipelineApi(unittest.TestCase):
 
             self.assertEqual(worker_row, ("RUNNING", "n115"))
             self.assertIn("SLURM_WORKERS_REDISCOVERED", [str(row[0]) for row in event_rows])
+
+    def test_slurm_batch_restart_rediscovery_marks_failed_worker_job_and_slot_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            sample_path = input_dir / "sample.aedt"
+            ready_path = sample_path.with_suffix(sample_path.suffix + ".ready")
+            sample_path.write_text("mock", encoding="utf-8")
+            ready_path.write_text("", encoding="utf-8")
+
+            store = StateStore(db_path)
+            store.initialize()
+            run_id = store.ensure_continuous_run(rotation_hours=24)
+            store.register_ingest_candidate(
+                input_path=str(sample_path),
+                ready_path=str(ready_path),
+                ready_present=True,
+                ready_mode="SIDECAR",
+                ready_error=None,
+                ready_mtime_ns=ready_path.stat().st_mtime_ns,
+                file_size=sample_path.stat().st_size,
+                file_mtime_ns=sample_path.stat().st_mtime_ns,
+            )
+            store.create_slot_task(
+                run_id=run_id,
+                slot_id="slot_0001",
+                input_path=str(sample_path),
+                output_path=str(output_root / "sample.aedt.out"),
+                account_id="account_01",
+                state="RUNNING",
+            )
+            store.update_slot_task(
+                run_id=run_id,
+                slot_id="slot_0001",
+                state="RUNNING",
+                attempt_no=1,
+                job_id="job_0001",
+                account_id="account_01",
+            )
+            store.create_job(
+                run_id=run_id,
+                job_id="job_0001",
+                input_path=str(sample_path),
+                output_path=str(output_root / "sample.aedt.out"),
+                account_id="account_01",
+            )
+            store.update_job_status(run_id=run_id, job_id="job_0001", status="RUNNING", attempt_no=1)
+            store.upsert_slurm_worker(
+                run_id=run_id,
+                worker_id="attempt_0001",
+                job_id="job_0001",
+                attempt_no=1,
+                account_id="account_01",
+                host_alias="gate1-harry261",
+                slurm_job_id="552740",
+                worker_state="RUNNING",
+                observed_node="n115",
+                slots_configured=4,
+                backend="slurm_batch",
+            )
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                continuous_mode=True,
+                execute_remote=True,
+                remote_execution_backend="slurm_batch",
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
+            )
+
+            with (
+                patch("peetsfea_runner.pipeline.query_slurm_job_state", return_value=("FAILED", "n115")),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+            ):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            conn = duckdb.connect(str(db_path))
+            try:
+                worker_row = conn.execute(
+                    """
+                    SELECT worker_state, observed_node
+                    FROM slurm_workers
+                    WHERE run_id = ? AND worker_id = 'attempt_0001'
+                    """,
+                    [run_id],
+                ).fetchone()
+                job_row = conn.execute(
+                    """
+                    SELECT status, failure_reason
+                    FROM jobs
+                    WHERE run_id = ? AND job_id = 'job_0001'
+                    """,
+                    [run_id],
+                ).fetchone()
+                slot_row = conn.execute(
+                    """
+                    SELECT state, failure_reason
+                    FROM slot_tasks
+                    WHERE run_id = ? AND slot_id = 'slot_0001'
+                    """,
+                    [run_id],
+                ).fetchone()
+                ingest_row = conn.execute(
+                    """
+                    SELECT state
+                    FROM ingest_index
+                    WHERE input_path = ?
+                    """,
+                    [str(sample_path)],
+                ).fetchone()
+                stages = [
+                    row[0]
+                    for row in conn.execute(
+                        """
+                        SELECT stage
+                        FROM events
+                        WHERE run_id = ?
+                        ORDER BY ts
+                        """,
+                        [run_id],
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+
+            self.assertEqual(worker_row, ("FAILED", "n115"))
+            self.assertEqual(job_row[0], "FAILED")
+            self.assertIn("rediscovered worker terminal state=FAILED", str(job_row[1]))
+            self.assertEqual(slot_row[0], "FAILED")
+            self.assertIn("rediscovered worker terminal state=FAILED", str(slot_row[1]))
+            self.assertEqual(ingest_row, ("FAILED",))
+            self.assertIn("WORKER_TERMINAL_REDISCOVERED", stages)
+
+    def test_slurm_batch_restart_reconciles_preexisting_terminal_worker_to_failed_job_and_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            sample_path = input_dir / "sample.aedt"
+            ready_path = sample_path.with_suffix(sample_path.suffix + ".ready")
+            sample_path.write_text("mock", encoding="utf-8")
+            ready_path.write_text("", encoding="utf-8")
+
+            store = StateStore(db_path)
+            store.initialize()
+            run_id = store.ensure_continuous_run(rotation_hours=24)
+            store.register_ingest_candidate(
+                input_path=str(sample_path),
+                ready_path=str(ready_path),
+                ready_present=True,
+                ready_mode="SIDECAR",
+                ready_error=None,
+                ready_mtime_ns=ready_path.stat().st_mtime_ns,
+                file_size=sample_path.stat().st_size,
+                file_mtime_ns=sample_path.stat().st_mtime_ns,
+            )
+            store.create_slot_task(
+                run_id=run_id,
+                slot_id="slot_0001",
+                input_path=str(sample_path),
+                output_path=str(output_root / "sample.aedt.out"),
+                account_id="account_01",
+                state="RUNNING",
+            )
+            store.update_slot_task(
+                run_id=run_id,
+                slot_id="slot_0001",
+                state="RUNNING",
+                attempt_no=1,
+                job_id="job_0001",
+                account_id="account_01",
+            )
+            store.create_job(
+                run_id=run_id,
+                job_id="job_0001",
+                input_path=str(sample_path),
+                output_path=str(output_root / "sample.aedt.out"),
+                account_id="account_01",
+            )
+            store.update_job_status(run_id=run_id, job_id="job_0001", status="RUNNING", attempt_no=1)
+            store.upsert_slurm_worker(
+                run_id=run_id,
+                worker_id="attempt_0001",
+                job_id="job_0001",
+                attempt_no=1,
+                account_id="account_01",
+                host_alias="gate1-harry261",
+                slurm_job_id="552740",
+                worker_state="FAILED",
+                observed_node="n115",
+                slots_configured=4,
+                backend="slurm_batch",
+            )
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                continuous_mode=True,
+                execute_remote=True,
+                remote_execution_backend="slurm_batch",
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
+            )
+
+            with patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            conn = duckdb.connect(str(db_path))
+            try:
+                job_row = conn.execute(
+                    """
+                    SELECT status, failure_reason
+                    FROM jobs
+                    WHERE run_id = ? AND job_id = 'job_0001'
+                    """,
+                    [run_id],
+                ).fetchone()
+                slot_row = conn.execute(
+                    """
+                    SELECT state, failure_reason
+                    FROM slot_tasks
+                    WHERE run_id = ? AND slot_id = 'slot_0001'
+                    """,
+                    [run_id],
+                ).fetchone()
+                ingest_row = conn.execute(
+                    """
+                    SELECT state
+                    FROM ingest_index
+                    WHERE input_path = ?
+                    """,
+                    [str(sample_path)],
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(job_row[0], "FAILED")
+            self.assertIn("rediscovered worker terminal state=FAILED", str(job_row[1]))
+            self.assertEqual(slot_row[0], "FAILED")
+            self.assertIn("rediscovered worker terminal state=FAILED", str(slot_row[1]))
+            self.assertEqual(ingest_row, ("FAILED",))
 
     def test_slurm_batch_restart_rediscovery_marks_stale_tunnel_as_degraded(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4013,7 +4274,16 @@ class TestPipelineApi(unittest.TestCase):
                 metadata_db_path=str(db_path),
                 execute_remote=True,
                 continuous_mode=False,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
+                remote_container_runtime="none",
+                accounts_registry=(
+                    AccountConfig(
+                        account_id="account_01",
+                        host_alias="gate1-harry261",
+                        max_jobs=1,
+                        platform="windows",
+                        scheduler="none",
+                    ),
+                ),
             )
 
             with (
@@ -4123,7 +4393,16 @@ class TestPipelineApi(unittest.TestCase):
                 metadata_db_path=str(db_path),
                 execute_remote=True,
                 continuous_mode=False,
-                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
+                remote_container_runtime="none",
+                accounts_registry=(
+                    AccountConfig(
+                        account_id="account_01",
+                        host_alias="gate1-harry261",
+                        max_jobs=1,
+                        platform="windows",
+                        scheduler="none",
+                    ),
+                ),
             )
 
             with (
@@ -4185,6 +4464,52 @@ class TestPipelineApi(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual((row[0], row[1], bool(row[2]), bool(row[3])), ("PREFLIGHT_FAILED", "uv,pyaedt", False, False))
+
+    def test_remote_pipeline_skips_service_preflight_for_enroot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / "foo.aedt"
+            input_file.write_text("placeholder", encoding="utf-8")
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                metadata_db_path=str(db_path),
+                execute_remote=True,
+                continuous_mode=False,
+                remote_execution_backend="slurm_batch",
+                remote_container_runtime="enroot",
+                remote_container_image="~/runtime/enroot/aedt.sqsh",
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
+            )
+
+            with (
+                patch(
+                    "peetsfea_runner.pipeline.query_account_readiness",
+                    return_value=AccountReadinessSnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry261",
+                        ready=True,
+                        status="READY",
+                        reason="ok",
+                        home_ok=True,
+                        runtime_path_ok=True,
+                        env_ok=True,
+                        python_ok=True,
+                        module_ok=True,
+                        binaries_ok=True,
+                        ansys_ok=True,
+                    ),
+                ),
+                patch("peetsfea_runner.pipeline.query_account_preflight") as preflight_mock,
+                patch("peetsfea_runner.pipeline.run_slot_workers") as run_workers_mock,
+            ):
+                run_workers_mock.return_value = BalancedBatchResult(results=[], max_inflight_jobs=0, submitted_jobs=0)
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            preflight_mock.assert_not_called()
+            run_workers_mock.assert_called_once()
 
     def test_remote_pipeline_caps_worker_jobs_at_account_max(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

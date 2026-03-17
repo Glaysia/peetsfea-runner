@@ -932,6 +932,41 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             continue
         _register_bad_node(node=host, reason=f"tmp_free_mb={tmp_free_mb}")
 
+    def _reconcile_terminal_worker_failure(
+        *,
+        job_id: str,
+        attempt_no: int,
+        slurm_job_id: str,
+        worker_state: str,
+        observed_node: str | None,
+    ) -> None:
+        failure_message = (
+            "rediscovered worker terminal state="
+            f"{worker_state} slurm_job_id={slurm_job_id} observed_node={observed_node or 'unknown'}"
+        )
+        failed_slots = state_store.fail_active_job_from_rediscovered_worker(
+            run_id=run_id,
+            job_id=job_id,
+            attempt_no=attempt_no,
+            failure_reason=failure_message,
+        )
+        if failed_slots:
+            state_store.append_event(
+                run_id=run_id,
+                job_id=job_id,
+                level="ERROR" if worker_state == "FAILED" else "WARN",
+                stage="WORKER_TERMINAL_REDISCOVERED",
+                message=failure_message,
+            )
+            for slot_id, _ in failed_slots:
+                state_store.append_slot_event(
+                    run_id=run_id,
+                    slot_id=slot_id,
+                    level="ERROR" if worker_state == "FAILED" else "WARN",
+                    stage="FAILED",
+                    message=failure_message,
+                )
+
     if config.execute_remote and config.remote_execution_backend == "slurm_batch":
         active_workers = state_store.list_active_slurm_workers(run_id=run_id)
         if active_workers:
@@ -994,6 +1029,14 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     heartbeat_ts=str(worker["heartbeat_ts"]) if worker.get("heartbeat_ts") else None,
                     degraded_reason=str(worker["degraded_reason"]) if worker.get("degraded_reason") else None,
                 )
+                if worker_state in {"FAILED", "LOST"}:
+                    _reconcile_terminal_worker_failure(
+                        job_id=str(worker["job_id"]),
+                        attempt_no=int(worker["attempt_no"]),
+                        slurm_job_id=str(worker["slurm_job_id"]),
+                        worker_state=worker_state,
+                        observed_node=observed_node,
+                    )
                 if worker_state in {"RUNNING", "IDLE_DRAINING"} and _is_stale_worker_heartbeat(
                     heartbeat_ts=worker.get("heartbeat_ts"),
                     timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
@@ -1020,6 +1063,14 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     stage="SLURM_WORKERS_REDISCOVERED",
                     message=f"run_id={run_id} count={refreshed}",
                 )
+        for worker in state_store.list_jobs_with_terminal_slurm_workers(run_id=run_id):
+            _reconcile_terminal_worker_failure(
+                job_id=str(worker["job_id"]),
+                attempt_no=int(worker["attempt_no"]),
+                slurm_job_id=str(worker["slurm_job_id"]),
+                worker_state=str(worker["worker_state"]),
+                observed_node=worker.get("observed_node"),
+            )
 
     def _capacity_log(snapshot: AccountCapacitySnapshot) -> None:
         state_store.record_account_capacity_snapshot(
@@ -1201,6 +1252,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             bootstrapping_account_ids = []
             return list(accounts)
 
+        skip_remote_preflight = str(config.remote_container_runtime).strip().lower() == "enroot"
         ready_accounts: list[AccountConfig] = []
         ready_account_ids = []
         blocked_account_ids = []
@@ -1258,39 +1310,41 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     stage="ACCOUNT_BOOTSTRAP_OK",
                     message=f"account={account.account_id} host={account.host_alias}",
                 )
-                try:
-                    snapshot = query_account_preflight(
-                        account=account,
-                        command_timeout_seconds=config.preflight_probe_timeout_seconds,
-                        remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
-                        remote_storage_min_free_mb=config.remote_storage_min_free_mb,
-                        **_container_runtime_kwargs(),
-                        **_ssh_config_kwargs(),
-                    )
-                except Exception as exc:
-                    snapshot = _update_readiness_snapshot(
-                        snapshot,
-                        status="PREFLIGHT_FAILED",
-                        reason=str(exc),
-                        ready=False,
-                    )
+                if not skip_remote_preflight:
+                    try:
+                        snapshot = query_account_preflight(
+                            account=account,
+                            command_timeout_seconds=config.preflight_probe_timeout_seconds,
+                            remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
+                            remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                            **_container_runtime_kwargs(),
+                            **_ssh_config_kwargs(),
+                        )
+                    except Exception as exc:
+                        snapshot = _update_readiness_snapshot(
+                            snapshot,
+                            status="PREFLIGHT_FAILED",
+                            reason=str(exc),
+                            ready=False,
+                        )
             elif snapshot.ready:
-                try:
-                    snapshot = query_account_preflight(
-                        account=account,
-                        command_timeout_seconds=config.preflight_probe_timeout_seconds,
-                        remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
-                        remote_storage_min_free_mb=config.remote_storage_min_free_mb,
-                        **_container_runtime_kwargs(),
-                        **_ssh_config_kwargs(),
-                    )
-                except Exception as exc:
-                    snapshot = _update_readiness_snapshot(
-                        snapshot,
-                        status="PREFLIGHT_FAILED",
-                        reason=str(exc),
-                        ready=False,
-                    )
+                if not skip_remote_preflight:
+                    try:
+                        snapshot = query_account_preflight(
+                            account=account,
+                            command_timeout_seconds=config.preflight_probe_timeout_seconds,
+                            remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
+                            remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                            **_container_runtime_kwargs(),
+                            **_ssh_config_kwargs(),
+                        )
+                    except Exception as exc:
+                        snapshot = _update_readiness_snapshot(
+                            snapshot,
+                            status="PREFLIGHT_FAILED",
+                            reason=str(exc),
+                            ready=False,
+                        )
 
             _record_readiness(snapshot)
             if snapshot.ready:
@@ -1378,7 +1432,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 terminal_bundle_lookup=lambda _bundle, outcome: False,
             )
         _record_batch(batch)
-        return True
+        return bool(
+            int(getattr(batch, "submitted_jobs", 0))
+            or int(getattr(batch, "terminal_jobs", 0))
+            or int(getattr(batch, "replacement_jobs", 0))
+            or getattr(batch, "results", ())
+        )
 
     def _dispatch_queued_slots(*, max_slots: int | None = None) -> None:
         nonlocal queued_slots

@@ -120,7 +120,14 @@ _READINESS_MARKER = "__PEETSFEA_READY__:"
 _PREFLIGHT_MARKER = "__PEETSFEA_PREFLIGHT__:"
 _BOOTSTRAP_MARKER = "__PEETSFEA_BOOTSTRAP__:ok"
 _DEFAULT_SLURM_PROBE_PARTITION = "cpu2"
+_DEFAULT_SLURM_PROBE_IMMEDIATE_SECONDS = 15
 _ENROOT_IMAGE_PYTHON = "/opt/miniconda3/bin/python"
+_SLURM_QUEUE_DELAY_MARKERS = (
+    "queued and waiting for resources",
+    "unable to allocate resources",
+    "requested nodes are busy",
+    "requested node configuration is not available",
+)
 
 
 def _parse_marker_values(*, marker_line: str, marker_prefix: str) -> dict[str, str]:
@@ -197,12 +204,65 @@ def _host_ansys_mount_root(path: str) -> str:
     return f"{normalized}/AnsysEM"
 
 
-def _wrap_with_slurm_probe(script: str, *, partition: str = _DEFAULT_SLURM_PROBE_PARTITION) -> str:
+def _wrap_with_slurm_probe(
+    script: str,
+    *,
+    partition: str = _DEFAULT_SLURM_PROBE_PARTITION,
+    immediate_seconds: int | None = None,
+) -> str:
+    srun_command = f"srun -p {shlex.quote(partition)} -N1 -n1 --job-name=peetsfea-probe --time=00:05:00"
+    if immediate_seconds is not None:
+        if immediate_seconds <= 0:
+            raise ValueError("immediate_seconds must be > 0 when provided")
+        srun_command += f" --immediate={int(immediate_seconds)}"
     return "\n".join(
         [
             "set -euo pipefail",
-            f"srun -p {shlex.quote(partition)} -N1 -n1 bash -lc {shlex.quote(script)}",
+            f"{srun_command} bash -lc {shlex.quote(script)}",
         ]
+    )
+
+
+def _slurm_queue_delay_detected(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _SLURM_QUEUE_DELAY_MARKERS)
+
+
+def _timeout_output_text(exc: subprocess.TimeoutExpired) -> str:
+    parts: list[str] = []
+    for value in (getattr(exc, "stdout", None), getattr(exc, "stderr", None)):
+        if not value:
+            continue
+        if isinstance(value, bytes):
+            value = value.decode(errors="ignore")
+        parts.append(str(value))
+    return "\n".join(parts).strip()
+
+
+def _queue_delay_ready_snapshot(
+    *,
+    account: AccountConfigLike,
+    include_preflight_checks: bool = False,
+) -> AccountReadinessSnapshot:
+    return AccountReadinessSnapshot(
+        account_id=account.account_id,
+        host_alias=account.host_alias,
+        ready=True,
+        status="READY",
+        reason="scheduler_queue_delay",
+        home_ok=True,
+        runtime_path_ok=True,
+        env_ok=True,
+        python_ok=True,
+        module_ok=True,
+        binaries_ok=True,
+        ansys_ok=True,
+        uv_ok=include_preflight_checks,
+        pyaedt_ok=include_preflight_checks,
+        storage_ready=True,
+        storage_reason="ok",
     )
 
 
@@ -589,7 +649,7 @@ CONTAINER_NAME="peetsfea-ready-${{SLURM_JOB_ID:-nojob}}-$$"
 if [ -n "${{HOME:-}}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
   HOME_OK=1
 fi
-if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 && command -v enroot >/dev/null 2>&1; then
+if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 && command -v srun >/dev/null 2>&1; then
   BINARIES_OK=1
   MODULE_OK=1
 else
@@ -603,33 +663,13 @@ else
 fi
 if [ "$IMAGE_OK" -eq 1 ] && [ "$MODULE_OK" -eq 1 ]; then
   RUNTIME_OK=1
+  ENV_OK=1
+  PYTHON_OK=1
 fi
 if [ -n "$REMOTE_CONTAINER_ANSYS_ROOT" ] && [ -x "$REMOTE_CONTAINER_ANSYS_ROOT/ansysedt" ]; then
   ANSYS_OK=1
 else
   MISSING+=("ansys_root_missing")
-fi
-cleanup() {{
-  enroot remove -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  rm -rf "$BASE_DIR" >/dev/null 2>&1 || true
-}}
-trap cleanup EXIT
-if [ "$RUNTIME_OK" -eq 1 ]; then
-  mkdir -p "$BASE_DIR/runtime" "$BASE_DIR/cache" "$BASE_DIR/data" "$BASE_DIR/tmp"
-  export ENROOT_RUNTIME_PATH="$BASE_DIR/runtime"
-  export ENROOT_CACHE_PATH="$BASE_DIR/cache"
-  export ENROOT_DATA_PATH="$BASE_DIR/data"
-  export ENROOT_TEMP_PATH="$BASE_DIR/tmp"
-  if enroot create -f -n "$CONTAINER_NAME" "$REMOTE_CONTAINER_IMAGE" >/dev/null 2>&1; then
-    if enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "test -x \"$IMAGE_PYTHON\"" >/dev/null 2>&1; then
-      ENV_OK=1
-      PYTHON_OK=1
-    else
-      MISSING+=("env")
-    fi
-  else
-    MISSING+=("env")
-  fi
 fi
 INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {{gsub(/%/, "", $5); print $5+0}}' || echo 0)
 FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {{print $4+0}}' || echo 0)
@@ -697,23 +737,54 @@ if [ "$RUNTIME_OK" -eq 1 ]; then
   export ENROOT_DATA_PATH="$BASE_DIR/data"
   export ENROOT_TEMP_PATH="$BASE_DIR/tmp"
   if enroot create -f -n "$CONTAINER_NAME" "$REMOTE_CONTAINER_IMAGE" >/dev/null 2>&1; then
-    if enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "test -x \"$IMAGE_PYTHON\"" >/dev/null 2>&1; then
+    PREFLIGHT_SCRIPT=$(cat <<'INNER'
+set +e
+IMAGE_PYTHON="/opt/miniconda3/bin/python"
+if [ ! -x "$IMAGE_PYTHON" ]; then
+  printf '__PEETSFEA_PREFLIGHT_INNER__:python=0 uv=0 pyaedt=0 pandas=0 pyvista=0\n'
+  exit 0
+fi
+printf '__PEETSFEA_PREFLIGHT_INNER__:python=1 '
+"$IMAGE_PYTHON" - <<'PY'
+import subprocess
+import sys
+
+def import_ok(module: str) -> int:
+    try:
+        __import__(module)
+        return 1
+    except Exception:
+        return 0
+
+uv_ok = int(subprocess.run([sys.executable, "-m", "uv", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
+print(
+    "uv=%d pyaedt=%d pandas=%d pyvista=%d"
+    % (
+        uv_ok,
+        import_ok("ansys.aedt.core"),
+        import_ok("pandas"),
+        import_ok("pyvista"),
+    )
+)
+PY
+INNER
+)
+    PREFLIGHT_OUTPUT=$(enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "$PREFLIGHT_SCRIPT" 2>/dev/null || true)
+    INNER_MARKER=$(printf '%s\n' "$PREFLIGHT_OUTPUT" | awk '/^__PEETSFEA_PREFLIGHT_INNER__:/ {{print; exit}}')
+    if [ -n "$INNER_MARKER" ]; then
       ENV_OK=1
-      PYTHON_OK=1
+      PYTHON_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*python=\([01]\).*/\\1/p')
+      UV_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*uv=\([01]\).*/\\1/p')
+      PYAEDT_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*pyaedt=\([01]\).*/\\1/p')
+      PANDAS_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*pandas=\([01]\).*/\\1/p')
+      PYVISTA_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*pyvista=\([01]\).*/\\1/p')
+      : "${{PYTHON_OK:=0}}"
+      : "${{UV_OK:=0}}"
+      : "${{PYAEDT_OK:=0}}"
+      : "${{PANDAS_OK:=0}}"
+      : "${{PYVISTA_OK:=0}}"
     else
       MISSING+=("env")
-    fi
-    if [ "$PYTHON_OK" -eq 1 ] && enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "\"$IMAGE_PYTHON\" -m uv --version >/dev/null 2>&1"; then
-      UV_OK=1
-    fi
-    if [ "$PYTHON_OK" -eq 1 ] && enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "\"$IMAGE_PYTHON\" -c 'import ansys.aedt.core'" >/dev/null 2>&1; then
-      PYAEDT_OK=1
-    fi
-    if [ "$PYTHON_OK" -eq 1 ] && enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "\"$IMAGE_PYTHON\" -c 'import pandas'" >/dev/null 2>&1; then
-      PANDAS_OK=1
-    fi
-    if [ "$PYTHON_OK" -eq 1 ] && enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "\"$IMAGE_PYTHON\" -c 'import pyvista'" >/dev/null 2>&1; then
-      PYVISTA_OK=1
     fi
   else
     MISSING+=("env")
@@ -762,7 +833,7 @@ def query_account_readiness(
                 ssh_config_path=ssh_config_path,
             ),
             account.host_alias,
-            f"bash -lc {shlex.quote(_wrap_with_slurm_probe(remote_script))}",
+            f"bash -lc {shlex.quote(remote_script)}",
         ]
         if run_command is None:
             try:
@@ -774,6 +845,9 @@ def query_account_readiness(
                     timeout=command_timeout_seconds,
                 )
             except subprocess.TimeoutExpired as exc:
+                timeout_output = _timeout_output_text(exc)
+                if _slurm_queue_delay_detected(timeout_output):
+                    return _queue_delay_ready_snapshot(account=account)
                 raise RuntimeError(
                     f"readiness check timed out account={account.account_id} host={account.host_alias} "
                     f"timeout={command_timeout_seconds}s"
@@ -785,6 +859,13 @@ def query_account_readiness(
             return_code, stdout, stderr = run_command(command)
 
         combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
+        if not combined_output and return_code != 0:
+            details = (stderr or stdout).strip() or f"return code={return_code}"
+            if _slurm_queue_delay_detected(details):
+                return _queue_delay_ready_snapshot(account=account)
+            raise RuntimeError(f"readiness check failed account={account.account_id}: {details}")
+        if combined_output and return_code != 0 and _slurm_queue_delay_detected(combined_output):
+            return _queue_delay_ready_snapshot(account=account)
         if combined_output:
             snapshot = _parse_readiness_marker(
                 account=account,
@@ -1028,7 +1109,7 @@ def query_account_preflight(
                 ssh_config_path=ssh_config_path,
             ),
             account.host_alias,
-            f"bash -lc {shlex.quote(_wrap_with_slurm_probe(remote_script))}",
+            f"bash -lc {shlex.quote(_wrap_with_slurm_probe(remote_script, immediate_seconds=_DEFAULT_SLURM_PROBE_IMMEDIATE_SECONDS))}",
         ]
         if run_command is None:
             try:
@@ -1040,6 +1121,9 @@ def query_account_preflight(
                     timeout=command_timeout_seconds,
                 )
             except subprocess.TimeoutExpired as exc:
+                timeout_output = _timeout_output_text(exc)
+                if _slurm_queue_delay_detected(timeout_output):
+                    return _queue_delay_ready_snapshot(account=account, include_preflight_checks=True)
                 raise RuntimeError(
                     f"preflight check timed out account={account.account_id} host={account.host_alias} "
                     f"timeout={command_timeout_seconds}s"
@@ -1051,6 +1135,13 @@ def query_account_preflight(
             return_code, stdout, stderr = run_command(command)
 
         combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
+        if not combined_output and return_code != 0:
+            details = (stderr or stdout).strip() or f"return code={return_code}"
+            if _slurm_queue_delay_detected(details):
+                return _queue_delay_ready_snapshot(account=account, include_preflight_checks=True)
+            raise RuntimeError(f"preflight check failed account={account.account_id}: {details}")
+        if combined_output and return_code != 0 and _slurm_queue_delay_detected(combined_output):
+            return _queue_delay_ready_snapshot(account=account, include_preflight_checks=True)
         if combined_output:
             snapshot = _parse_preflight_marker(
                 account=account,

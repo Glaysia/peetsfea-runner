@@ -882,6 +882,58 @@ class StateStore:
                 conn.close()
         return [(str(row[0]), str(row[1]), str(row[2]), int(row[3] or 0)) for row in rows]
 
+    def list_jobs_with_terminal_slurm_workers(self, *, run_id: str) -> list[dict[str, object]]:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    WITH latest_workers AS (
+                        SELECT
+                            job_id,
+                            attempt_no,
+                            slurm_job_id,
+                            worker_state,
+                            observed_node,
+                            last_seen_ts,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY job_id
+                                ORDER BY attempt_no DESC, last_seen_ts DESC, worker_id DESC
+                            ) AS row_no
+                        FROM slurm_workers
+                        WHERE run_id = ?
+                    )
+                    SELECT
+                        j.job_id,
+                        lw.attempt_no,
+                        lw.slurm_job_id,
+                        lw.worker_state,
+                        lw.observed_node,
+                        lw.last_seen_ts
+                    FROM jobs AS j
+                    JOIN latest_workers AS lw
+                      ON lw.job_id = j.job_id AND lw.row_no = 1
+                    WHERE j.run_id = ?
+                      AND j.status IN ('PENDING', 'SUBMITTED', 'RUNNING')
+                      AND lw.worker_state IN ('FAILED', 'LOST')
+                    ORDER BY lw.last_seen_ts DESC, j.job_id
+                    """,
+                    [run_id, run_id],
+                ).fetchall()
+            finally:
+                conn.close()
+        return [
+            {
+                "job_id": str(row[0]),
+                "attempt_no": int(row[1]),
+                "slurm_job_id": str(row[2]),
+                "worker_state": str(row[3]),
+                "observed_node": row[4],
+                "last_seen_ts": row[5],
+            }
+            for row in rows
+        ]
+
     def get_next_job_index(self, *, run_id: str) -> int:
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
@@ -1105,6 +1157,59 @@ class StateStore:
                     )
             finally:
                 conn.close()
+
+    def fail_active_job_from_rediscovered_worker(
+        self,
+        *,
+        run_id: str,
+        job_id: str,
+        attempt_no: int,
+        failure_reason: str,
+    ) -> list[tuple[str, str]]:
+        now = _utc_now_iso()
+        active_slot_states = ("ASSIGNED", "LEASED", "DOWNLOADING", "UPLOADING", "RUNNING", "COLLECTING")
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                active_slots = conn.execute(
+                    f"""
+                    SELECT slot_id, input_path
+                    FROM slot_tasks
+                    WHERE run_id = ? AND job_id = ? AND state IN ({", ".join(["?"] * len(active_slot_states))})
+                    ORDER BY slot_id
+                    """,
+                    [run_id, job_id, *active_slot_states],
+                ).fetchall()
+                if not active_slots:
+                    return []
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'FAILED', updated_at = ?, last_attempt_no = ?, failure_reason = ?
+                    WHERE run_id = ? AND job_id = ? AND status IN ('PENDING', 'SUBMITTED', 'RUNNING')
+                    """,
+                    [now, attempt_no, failure_reason, run_id, job_id],
+                )
+                conn.execute(
+                    f"""
+                    UPDATE slot_tasks
+                    SET state = 'FAILED', updated_at = ?, attempt_no = ?, failure_reason = ?
+                    WHERE run_id = ? AND job_id = ? AND state IN ({", ".join(["?"] * len(active_slot_states))})
+                    """,
+                    [now, attempt_no, failure_reason, run_id, job_id, *active_slot_states],
+                )
+                for _, input_path in active_slots:
+                    conn.execute(
+                        """
+                        UPDATE ingest_index
+                        SET state = 'FAILED'
+                        WHERE input_path = ? AND state IN ('READY', 'QUEUED', 'UPLOADED', 'RETRY_QUEUED')
+                        """,
+                        [input_path],
+                    )
+            finally:
+                conn.close()
+        return [(str(row[0]), str(row[1])) for row in active_slots]
 
     def start_attempt(self, *, run_id: str, job_id: str, attempt_no: int, node: str | None = None) -> str:
         attempt_id = f"{job_id}_a{attempt_no}"
