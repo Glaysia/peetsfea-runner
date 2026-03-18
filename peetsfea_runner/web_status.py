@@ -31,6 +31,9 @@ _OUTPUT_VARIABLES_REQUIRED_COLUMNS = frozenset(
         "Lrx_uH",
     }
 )
+_DESIGN_OUTPUTS_DIR_NAME = "design_outputs"
+_DESIGN_OUTPUTS_INDEX_NAME = "index.csv"
+_DESIGN_OUTPUTS_REQUIRED_COLUMNS = frozenset({"design_name", "reports_dir"})
 _THROUGHPUT_BASELINE_SLOTS_PER_HOUR = 50.0
 _THROUGHPUT_TARGET_SLOTS_PER_HOUR = 200.0
 _BAD_NODE_TMP_FREE_THRESHOLD_MB = 65536
@@ -144,13 +147,17 @@ def _classify_slot_input_source(input_path: str | None) -> str:
         return "other"
     repo_root = Path(__file__).resolve().parent.parent
     original_root = (repo_root / "original").resolve()
-    sample_path = (repo_root / "examples" / "sample.aedt").resolve()
+    sample_path = (repo_root / "examples" / "sample_0318.aedt").resolve()
     path = Path(str(input_path)).expanduser()
     try:
         resolved = path.resolve()
     except OSError:
         resolved = path
-    if resolved == sample_path or resolved.name == "sample.aedt" or "tonight-canary" in resolved.parts:
+    if (
+        resolved == sample_path
+        or resolved.name in {"sample.aedt", "sample_0318.aedt"}
+        or "tonight-canary" in resolved.parts
+    ):
         return "sample"
     if resolved == original_root or original_root in resolved.parents:
         return "original"
@@ -478,20 +485,62 @@ def _throughput_kpi_payload(
     }
 
 
-def _output_variables_csv_gate_reason(*, output_root: Path) -> str:
-    csv_paths = _artifact_file_candidates(output_root, "output_variables.csv")
-    if not csv_paths:
-        return "output_variables_csv_missing"
-    for csv_path in csv_paths:
-        try:
-            with csv_path.open("r", encoding="utf-8", newline="") as handle:
-                header = next(csv.reader(handle), [])
-        except (OSError, csv.Error):
-            header = []
-        normalized_header = {column.strip() for column in header if column.strip()}
-        if _OUTPUT_VARIABLES_REQUIRED_COLUMNS.issubset(normalized_header):
-            return "ok"
-    return "output_variables_csv_schema_invalid"
+def _design_outputs_manifest_path(output_root: Path) -> Path:
+    return output_root / _DESIGN_OUTPUTS_DIR_NAME / _DESIGN_OUTPUTS_INDEX_NAME
+
+
+def _design_outputs_report_csv_paths(output_root: Path) -> list[Path]:
+    manifest_path = _design_outputs_manifest_path(output_root)
+    if not manifest_path.is_file():
+        return []
+    try:
+        with manifest_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+    except (OSError, csv.Error):
+        return []
+    report_paths: list[Path] = []
+    for row in rows:
+        reports_dir_raw = str(row.get("reports_dir") or "").strip()
+        if not reports_dir_raw:
+            continue
+        reports_dir = Path(reports_dir_raw).expanduser()
+        if not reports_dir.is_absolute():
+            reports_dir = output_root / reports_dir
+        if not reports_dir.exists():
+            continue
+        report_paths.extend(sorted(path for path in reports_dir.glob("*.csv") if path.is_file()))
+    return report_paths
+
+
+def _design_outputs_manifest_gate_reason(*, output_root: Path) -> str:
+    manifest_path = _design_outputs_manifest_path(output_root)
+    if not manifest_path.is_file():
+        return "design_outputs_manifest_missing"
+    try:
+        with manifest_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames or []
+            normalized_header = {column.strip() for column in fieldnames if column and column.strip()}
+            if not _DESIGN_OUTPUTS_REQUIRED_COLUMNS.issubset(normalized_header):
+                return "design_outputs_manifest_schema_invalid"
+            rows = list(reader)
+    except (OSError, csv.Error):
+        return "design_outputs_manifest_schema_invalid"
+    if not rows:
+        return "design_outputs_manifest_schema_invalid"
+    for row in rows:
+        reports_dir_raw = str(row.get("reports_dir") or "").strip()
+        if not reports_dir_raw:
+            return "design_outputs_manifest_schema_invalid"
+        reports_dir = Path(reports_dir_raw).expanduser()
+        if not reports_dir.is_absolute():
+            reports_dir = output_root / reports_dir
+        if not reports_dir.is_dir():
+            return "design_outputs_reports_missing"
+        if not any(path.is_file() and path.suffix == ".csv" for path in reports_dir.glob("*.csv")):
+            return "design_outputs_reports_missing"
+    return "ok"
 
 
 def _artifact_file_candidates(output_root: Path, filename: str) -> list[Path]:
@@ -514,29 +563,33 @@ def _canary_artifact_status_payload(output_root: str | None) -> dict[str, object
         return {
             "canary_output_root_exists": None,
             "canary_materialized_output_present": None,
-            "canary_output_variables_csv_gate": None,
-            "canary_output_variables_csv_path": None,
+            "canary_design_outputs_manifest_gate": None,
+            "canary_design_outputs_manifest_path": None,
+            "canary_design_outputs_report_csv_path": None,
             "canary_run_log_path": None,
             "canary_exit_code_path": None,
         }
     root = Path(output_root).expanduser()
     output_root_exists = root.exists()
     materialized_output_present = False
-    csv_gate = "output_variables_csv_missing"
-    csv_paths: list[Path] = []
+    manifest_gate = "design_outputs_manifest_missing"
+    manifest_paths: list[Path] = []
+    report_csv_paths: list[Path] = []
     run_log_paths: list[Path] = []
     exit_code_paths: list[Path] = []
     if output_root_exists:
-        csv_paths = _artifact_file_candidates(root, "output_variables.csv")
+        manifest_paths = _artifact_file_candidates(root / _DESIGN_OUTPUTS_DIR_NAME, _DESIGN_OUTPUTS_INDEX_NAME)
+        report_csv_paths = _design_outputs_report_csv_paths(root)
         run_log_paths = _artifact_file_candidates(root, "run.log")
         exit_code_paths = _artifact_file_candidates(root, "exit.code")
-        materialized_output_present = bool(run_log_paths) and bool(exit_code_paths)
-        csv_gate = _output_variables_csv_gate_reason(output_root=root)
+        materialized_output_present = bool(manifest_paths) and bool(report_csv_paths) and bool(run_log_paths) and bool(exit_code_paths)
+        manifest_gate = _design_outputs_manifest_gate_reason(output_root=root)
     return {
         "canary_output_root_exists": output_root_exists,
         "canary_materialized_output_present": materialized_output_present,
-        "canary_output_variables_csv_gate": csv_gate,
-        "canary_output_variables_csv_path": _first_resolved_path(csv_paths),
+        "canary_design_outputs_manifest_gate": manifest_gate,
+        "canary_design_outputs_manifest_path": _first_resolved_path(manifest_paths),
+        "canary_design_outputs_report_csv_path": _first_resolved_path(report_csv_paths),
         "canary_run_log_path": _first_resolved_path(run_log_paths),
         "canary_exit_code_path": _first_resolved_path(exit_code_paths),
     }
@@ -555,7 +608,7 @@ def _rolling_valid_csv_throughput_payload(
         "rolling_60m_throughput": 0.0,
         "throughput_baseline_slots_per_hour": _THROUGHPUT_BASELINE_SLOTS_PER_HOUR,
         "throughput_target_slots_per_hour": _THROUGHPUT_TARGET_SLOTS_PER_HOUR,
-        "throughput_measurement_basis": "valid_output_variables_csv",
+        "throughput_measurement_basis": "valid_design_outputs_reports",
     }
     if run_id is None:
         return payload
@@ -586,7 +639,7 @@ def _rolling_valid_csv_throughput_payload(
         age_seconds = max(0.0, (reference_now - parsed_updated_at).total_seconds())
         if age_seconds > 3600:
             continue
-        if _output_variables_csv_gate_reason(output_root=Path(str(output_path)).expanduser()) != "ok":
+        if _design_outputs_manifest_gate_reason(output_root=Path(str(output_path)).expanduser()) != "ok":
             continue
         valid_succeeded_slots_60m += 1
         if age_seconds <= 1800:
@@ -1197,8 +1250,12 @@ def _real_cutover_decision_payload(
                 f"canary_progress_within_10m={canary_progress_within_10m}"
             )
 
-    csv_blocking_reasons = {"output_variables_csv_schema_invalid", "output_variables_csv_missing"}
-    canary_blocking_reasons = csv_blocking_reasons | {"materialized_output_missing", "submit_missing"}
+    manifest_blocking_reasons = {
+        "design_outputs_manifest_schema_invalid",
+        "design_outputs_manifest_missing",
+        "design_outputs_reports_missing",
+    }
+    canary_blocking_reasons = manifest_blocking_reasons | {"materialized_output_missing", "submit_missing"}
 
     def with_alignment(payload: dict[str, object]) -> dict[str, object]:
         desired_input_source_policy = "input_queue_only"
@@ -1222,12 +1279,12 @@ def _real_cutover_decision_payload(
             ),
         }
 
-    if csv_state == "RED" or canary_gate in csv_blocking_reasons or canary_reason in csv_blocking_reasons:
+    if csv_state == "RED" or canary_gate in manifest_blocking_reasons or canary_reason in manifest_blocking_reasons:
         return with_alignment({
             "decision": "NO_GO",
             "action": "hold_dispatch",
             "workstream": "04",
-            "reason": f"csv_gate={canary_gate} canary_reason={canary_reason}",
+            "reason": f"manifest_gate={canary_gate} canary_reason={canary_reason}",
         })
     if canary_sla_state == "RED":
         return with_alignment({
@@ -1291,7 +1348,7 @@ def _real_cutover_decision_payload(
             "action": "resume_real_aedt",
             "workstream": "-",
             "reason": (
-                f"canary_status={canary_status} csv_gate={canary_gate} "
+                f"canary_status={canary_status} manifest_gate={canary_gate} "
                 f"rediscovery_status={rediscovery_status} full_rollout_ready={full_rollout_ready}"
             ),
         })
@@ -1300,7 +1357,7 @@ def _real_cutover_decision_payload(
         "action": "wait_validation_lane",
         "workstream": "01",
         "reason": (
-            f"canary_status={canary_status} csv_gate={canary_gate} "
+            f"canary_status={canary_status} manifest_gate={canary_gate} "
             f"rediscovery_status={rediscovery_status} full_rollout_ready={full_rollout_ready}"
         ),
     })
@@ -2463,7 +2520,7 @@ def _count_valid_succeeded_slots_between(
     )
     valid_count = 0
     for output_path, in rows:
-        if _output_variables_csv_gate_reason(output_root=Path(str(output_path)).expanduser()) != "ok":
+        if _design_outputs_manifest_gate_reason(output_root=Path(str(output_path)).expanduser()) != "ok":
             continue
         valid_count += 1
     return valid_count
@@ -3679,8 +3736,9 @@ def _rollout_status_payload(db_path: Path, *, run_id: str | None) -> dict[str, o
             "canary_delete_failed_dir": None,
             "canary_output_root_exists": None,
             "canary_materialized_output_present": None,
-            "canary_output_variables_csv_gate": None,
-            "canary_output_variables_csv_path": None,
+            "canary_design_outputs_manifest_gate": None,
+            "canary_design_outputs_manifest_path": None,
+            "canary_design_outputs_report_csv_path": None,
             "canary_run_log_path": None,
             "canary_exit_code_path": None,
             "canary_duration_seconds": None,
@@ -4054,8 +4112,9 @@ def _rollout_status_payload(db_path: Path, *, run_id: str | None) -> dict[str, o
         "canary_delete_failed_dir": canary_delete_failed_dir,
         "canary_output_root_exists": canary_artifact_status["canary_output_root_exists"],
         "canary_materialized_output_present": canary_artifact_status["canary_materialized_output_present"],
-        "canary_output_variables_csv_gate": canary_artifact_status["canary_output_variables_csv_gate"],
-        "canary_output_variables_csv_path": canary_artifact_status["canary_output_variables_csv_path"],
+        "canary_design_outputs_manifest_gate": canary_artifact_status["canary_design_outputs_manifest_gate"],
+        "canary_design_outputs_manifest_path": canary_artifact_status["canary_design_outputs_manifest_path"],
+        "canary_design_outputs_report_csv_path": canary_artifact_status["canary_design_outputs_report_csv_path"],
         "canary_run_log_path": canary_artifact_status["canary_run_log_path"],
         "canary_exit_code_path": canary_artifact_status["canary_exit_code_path"],
         "canary_duration_seconds": canary_duration_seconds,
@@ -5491,10 +5550,10 @@ def _dashboard_html(*, version: str) -> str:
       document.getElementById('rollout-canary-artifacts').textContent =
         rollout.canary_output_root_exists == null
           ? '-'
-          : `root=${rollout.canary_output_root_exists ? 'present' : 'missing'} / materialized=${rollout.canary_materialized_output_present ? 'yes' : 'no'} / csv=${rollout.canary_output_variables_csv_gate || '-'}`;
+          : `root=${rollout.canary_output_root_exists ? 'present' : 'missing'} / materialized=${rollout.canary_materialized_output_present ? 'yes' : 'no'} / manifest=${rollout.canary_design_outputs_manifest_gate || '-'}`;
       document.getElementById('rollout-canary-files').textContent =
-        (rollout.canary_output_variables_csv_path || rollout.canary_run_log_path || rollout.canary_exit_code_path)
-          ? `csv=${rollout.canary_output_variables_csv_path || '-'} / run.log=${rollout.canary_run_log_path || '-'} / exit.code=${rollout.canary_exit_code_path || '-'}`
+        (rollout.canary_design_outputs_manifest_path || rollout.canary_design_outputs_report_csv_path || rollout.canary_run_log_path || rollout.canary_exit_code_path)
+          ? `manifest=${rollout.canary_design_outputs_manifest_path || '-'} / report_csv=${rollout.canary_design_outputs_report_csv_path || '-'} / run.log=${rollout.canary_run_log_path || '-'} / exit.code=${rollout.canary_exit_code_path || '-'}`
           : '-';
       document.getElementById('rollout-restart-status').textContent = rollout.restart_status || '-';
       document.getElementById('rollout-truth-status').textContent = rollout.rediscovery_status || '-';

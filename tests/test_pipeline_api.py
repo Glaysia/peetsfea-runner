@@ -29,15 +29,43 @@ from peetsfea_runner.scheduler import AccountCapacitySnapshot, AccountReadinessS
 from peetsfea_runner.state_store import StateStore
 
 
-def _valid_canary_output_csv() -> str:
-    header = (
-        "source_aedt_path,source_case_dir,source_aedt_name,"
-        "coil_groups_0__count_mode,coil_shape_inner_margin_x,"
-        "coil_spacing_tx_vertical_center_gap_mm,ferrite_present,"
-        "tx_region_z_parts_dd_z_mm,k_ratio,Lrx_uH"
+_SAMPLE_CANARY_NAME = "sample_0318.aedt"
+
+
+def _isolated_dispatch_mode_path(root: Path) -> Path:
+    return root / "dispatch.mode"
+
+
+def _write_valid_canary_design_outputs(case_dir: Path) -> None:
+    reports_dir = case_dir / "design_outputs" / "HFSSDesign1" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "coupling.csv").write_text("k_ratio,Lrx_uH\n0.91,12.5\n", encoding="utf-8")
+    (case_dir / "design_outputs" / "index.csv").write_text(
+        "design_name,reports_dir,report_count,native_report_count,synthetic_report_count,status,error_log\n"
+        "HFSSDesign1,design_outputs/HFSSDesign1/reports,1,1,0,native_reports_present,\n",
+        encoding="utf-8",
     )
-    row = "/path,/case,sample.aedt,tx,1.0mm,2.0mm,true,3.0mm,0.91,12.5"
-    return f"{header}\n{row}\n"
+
+
+def _write_invalid_canary_design_outputs(case_dir: Path) -> None:
+    design_outputs_dir = case_dir / "design_outputs"
+    design_outputs_dir.mkdir(parents=True, exist_ok=True)
+    (design_outputs_dir / "index.csv").write_text(
+        "design_name,report_count,error_log\n"
+        "HFSSDesign1,1,\n",
+        encoding="utf-8",
+    )
+
+
+def _write_incomplete_canary_design_outputs(case_dir: Path) -> None:
+    reports_dir = case_dir / "design_outputs" / "HFSSDesign1" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "peetsfea_input_parameters.csv").write_text("w,h\n1,2\n", encoding="utf-8")
+    (case_dir / "design_outputs" / "index.csv").write_text(
+        "design_name,reports_dir,report_count,native_report_count,synthetic_report_count,status,error_log\n"
+        "HFSSDesign1,design_outputs/HFSSDesign1/reports,1,0,1,synthetic_only_fallback,design_outputs/HFSSDesign1/report_export.error.log\n",
+        encoding="utf-8",
+    )
 
 
 def _ready_account_snapshot(
@@ -351,6 +379,7 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline._dispatch_mode_control_path", return_value=_isolated_dispatch_mode_path(Path(tmpdir))),
                 patch(
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
@@ -888,6 +917,7 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline._dispatch_mode_control_path", return_value=_isolated_dispatch_mode_path(Path(tmpdir))),
                 patch(
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
@@ -1269,6 +1299,125 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIn("rediscovered worker terminal state=FAILED", str(job_row[1]))
             self.assertEqual(slot_row[0], "FAILED")
             self.assertIn("rediscovered worker terminal state=FAILED", str(slot_row[1]))
+            self.assertEqual(ingest_row, ("FAILED",))
+
+    def test_slurm_batch_restart_reconciles_preexisting_unknown_worker_to_lost_job_and_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            sample_path = input_dir / "sample.aedt"
+            ready_path = sample_path.with_suffix(sample_path.suffix + ".ready")
+            sample_path.write_text("mock", encoding="utf-8")
+            ready_path.write_text("", encoding="utf-8")
+
+            store = StateStore(db_path)
+            store.initialize()
+            run_id = store.ensure_continuous_run(rotation_hours=24)
+            store.register_ingest_candidate(
+                input_path=str(sample_path),
+                ready_path=str(ready_path),
+                ready_present=True,
+                ready_mode="SIDECAR",
+                ready_error=None,
+                ready_mtime_ns=ready_path.stat().st_mtime_ns,
+                file_size=sample_path.stat().st_size,
+                file_mtime_ns=sample_path.stat().st_mtime_ns,
+            )
+            store.create_slot_task(
+                run_id=run_id,
+                slot_id="slot_0001",
+                input_path=str(sample_path),
+                output_path=str(output_root / "sample.aedt.out"),
+                account_id="account_01",
+                state="RUNNING",
+            )
+            store.update_slot_task(
+                run_id=run_id,
+                slot_id="slot_0001",
+                state="RUNNING",
+                attempt_no=1,
+                job_id="job_0001",
+                account_id="account_01",
+            )
+            store.create_job(
+                run_id=run_id,
+                job_id="job_0001",
+                input_path=str(sample_path),
+                output_path=str(output_root / "sample.aedt.out"),
+                account_id="account_01",
+            )
+            store.update_job_status(run_id=run_id, job_id="job_0001", status="RUNNING", attempt_no=1)
+            store.upsert_slurm_worker(
+                run_id=run_id,
+                worker_id="attempt_0001",
+                job_id="job_0001",
+                attempt_no=1,
+                account_id="account_01",
+                host_alias="gate1-harry261",
+                slurm_job_id="552740",
+                worker_state="UNKNOWN",
+                observed_node=None,
+                slots_configured=4,
+                backend="slurm_batch",
+            )
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                continuous_mode=True,
+                execute_remote=True,
+                remote_execution_backend="slurm_batch",
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
+            )
+
+            with patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"):
+                result = run_pipeline(config)
+
+            self.assertTrue(result.success)
+            conn = duckdb.connect(str(db_path))
+            try:
+                worker_row = conn.execute(
+                    """
+                    SELECT worker_state
+                    FROM slurm_workers
+                    WHERE run_id = ? AND worker_id = 'attempt_0001'
+                    """,
+                    [run_id],
+                ).fetchone()
+                job_row = conn.execute(
+                    """
+                    SELECT status, failure_reason
+                    FROM jobs
+                    WHERE run_id = ? AND job_id = 'job_0001'
+                    """,
+                    [run_id],
+                ).fetchone()
+                slot_row = conn.execute(
+                    """
+                    SELECT state, failure_reason
+                    FROM slot_tasks
+                    WHERE run_id = ? AND slot_id = 'slot_0001'
+                    """,
+                    [run_id],
+                ).fetchone()
+                ingest_row = conn.execute(
+                    """
+                    SELECT state
+                    FROM ingest_index
+                    WHERE input_path = ?
+                    """,
+                    [str(sample_path)],
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(worker_row, ("UNKNOWN",))
+            self.assertEqual(job_row[0], "FAILED")
+            self.assertIn("rediscovered worker terminal state=LOST", str(job_row[1]))
+            self.assertEqual(slot_row[0], "FAILED")
+            self.assertIn("rediscovered worker terminal state=LOST", str(slot_row[1]))
             self.assertEqual(ingest_row, ("FAILED",))
 
     def test_slurm_batch_restart_rediscovery_marks_stale_tunnel_as_degraded(self) -> None:
@@ -1845,6 +1994,7 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline._dispatch_mode_control_path", return_value=_isolated_dispatch_mode_path(Path(tmpdir))),
                 patch(
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
@@ -1916,9 +2066,9 @@ class TestPipelineApi(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            input_file = input_dir / "sample.aedt"
+            input_file = input_dir / _SAMPLE_CANARY_NAME
             input_file.write_text("placeholder", encoding="utf-8")
-            (input_dir / "sample.aedt.ready").write_text("", encoding="utf-8")
+            (input_dir / f"{_SAMPLE_CANARY_NAME}.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
             config = PipelineConfig(
@@ -1953,10 +2103,7 @@ class TestPipelineApi(unittest.TestCase):
                 (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
                 (case_dir / "run.log").write_text("log", encoding="utf-8")
                 (case_dir / "exit.code").write_text("0", encoding="utf-8")
-                (case_dir / "output_variables.csv").write_text(
-                    _valid_canary_output_csv(),
-                    encoding="utf-8",
-                )
+                _write_valid_canary_design_outputs(case_dir)
                 StateStore(db_path).update_slurm_worker_control_plane(
                     run_id=str(run_id),
                     worker_id=str(worker_id),
@@ -1981,6 +2128,7 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline._dispatch_mode_control_path", return_value=_isolated_dispatch_mode_path(Path(tmpdir))),
                 patch(
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
@@ -2058,9 +2206,9 @@ class TestPipelineApi(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            input_file = input_dir / "sample.aedt"
+            input_file = input_dir / _SAMPLE_CANARY_NAME
             input_file.write_text("placeholder", encoding="utf-8")
-            (input_dir / "sample.aedt.ready").write_text("", encoding="utf-8")
+            (input_dir / f"{_SAMPLE_CANARY_NAME}.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
             config = PipelineConfig(
@@ -2086,10 +2234,7 @@ class TestPipelineApi(unittest.TestCase):
                 (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
                 (case_dir / "run.log").write_text("log", encoding="utf-8")
                 (case_dir / "exit.code").write_text("0", encoding="utf-8")
-                (case_dir / "output_variables.csv").write_text(
-                    _valid_canary_output_csv(),
-                    encoding="utf-8",
-                )
+                _write_valid_canary_design_outputs(case_dir)
                 return RemoteJobAttemptResult(
                     success=True,
                     exit_code=0,
@@ -2106,6 +2251,7 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline._dispatch_mode_control_path", return_value=_isolated_dispatch_mode_path(Path(tmpdir))),
                 patch(
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
@@ -2170,13 +2316,13 @@ class TestPipelineApi(unittest.TestCase):
             self.assertIn("FULL_ROLLOUT_READY", stages)
             self.assertFalse(any("reason=tunnel_not_connected" in message for message in messages if "CANARY_FAILED" in message))
 
-    def test_sample_canary_rejects_schema_invalid_output_csv(self) -> None:
+    def test_sample_canary_rejects_schema_invalid_design_outputs_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            input_file = input_dir / "sample.aedt"
+            input_file = input_dir / _SAMPLE_CANARY_NAME
             input_file.write_text("placeholder", encoding="utf-8")
-            (input_dir / "sample.aedt.ready").write_text("", encoding="utf-8")
+            (input_dir / f"{_SAMPLE_CANARY_NAME}.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
             config = PipelineConfig(
@@ -2211,10 +2357,7 @@ class TestPipelineApi(unittest.TestCase):
                 (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
                 (case_dir / "run.log").write_text("log", encoding="utf-8")
                 (case_dir / "exit.code").write_text("0", encoding="utf-8")
-                (case_dir / "output_variables.csv").write_text(
-                    "source_aedt_path,source_case_dir,source_aedt_name\n/path,/case,sample.aedt\n",
-                    encoding="utf-8",
-                )
+                _write_invalid_canary_design_outputs(case_dir)
                 StateStore(db_path).update_slurm_worker_control_plane(
                     run_id=str(run_id),
                     worker_id=str(worker_id),
@@ -2239,6 +2382,7 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline._dispatch_mode_control_path", return_value=_isolated_dispatch_mode_path(Path(tmpdir))),
                 patch(
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
@@ -2300,15 +2444,109 @@ class TestPipelineApi(unittest.TestCase):
             messages = [str(row[1]) for row in rows]
             self.assertIn("CANARY_FAILED", stages)
             self.assertIn("ROLLBACK_TRIGGERED", stages)
-            self.assertTrue(any("reason=output_variables_csv_schema_invalid" in message for message in messages))
+            self.assertTrue(any("reason=design_outputs_manifest_schema_invalid" in message for message in messages))
+
+    def test_sample_canary_rejects_incomplete_design_outputs_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = Path(tmpdir) / "in"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_file = input_dir / _SAMPLE_CANARY_NAME
+            input_file.write_text("placeholder", encoding="utf-8")
+            (input_dir / f"{_SAMPLE_CANARY_NAME}.ready").write_text("", encoding="utf-8")
+            output_root = Path(tmpdir) / "out"
+            db_path = Path(tmpdir) / "state.duckdb"
+            config = PipelineConfig(
+                input_queue_dir=str(input_dir),
+                output_root_dir=str(output_root),
+                metadata_db_path=str(db_path),
+                continuous_mode=False,
+                execute_remote=True,
+                remote_execution_backend="slurm_batch",
+                accounts_registry=(AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=1),),
+            )
+
+            def _mock_attempt(
+                *,
+                local_job_dir=None,
+                on_upload_success=None,
+                on_worker_submitted=None,
+                on_worker_state_change=None,
+                run_id=None,
+                worker_id=None,
+                **kwargs,
+            ):
+                if on_upload_success is not None:
+                    on_upload_success()
+                if on_worker_submitted is not None:
+                    on_worker_submitted("552742", None)
+                if on_worker_state_change is not None:
+                    on_worker_state_change("RUNNING", "n115")
+                assert local_job_dir is not None
+                case_dir = Path(local_job_dir) / "case_01"
+                (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
+                (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
+                (case_dir / "run.log").write_text("log", encoding="utf-8")
+                (case_dir / "exit.code").write_text("0", encoding="utf-8")
+                _write_incomplete_canary_design_outputs(case_dir)
+                StateStore(db_path).update_slurm_worker_control_plane(
+                    run_id=str(run_id),
+                    worker_id=str(worker_id),
+                    tunnel_state="CONNECTED",
+                    tunnel_session_id="t_02",
+                    heartbeat_ts="2026-03-12T04:00:00+00:00",
+                    observed_node="n115",
+                )
+                return RemoteJobAttemptResult(
+                    success=True,
+                    exit_code=0,
+                    session_name="s",
+                    case_summary=CaseExecutionSummary(success_cases=1, failed_cases=0, case_lines=[]),
+                    message="ok",
+                    failed_case_lines=[],
+                    slurm_job_id="552742",
+                    observed_node="n115",
+                    worker_terminal_state="COMPLETED",
+                )
+
+            with (
+                patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
+                patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline._dispatch_mode_control_path", return_value=_isolated_dispatch_mode_path(Path(tmpdir))),
+                patch("peetsfea_runner.pipeline.query_account_readiness", return_value=_ready_account_snapshot()),
+                patch("peetsfea_runner.pipeline.query_account_preflight", return_value=_ready_account_snapshot()),
+                patch(
+                    "peetsfea_runner.pipeline.query_account_capacity",
+                    return_value=AccountCapacitySnapshot(
+                        account_id="account_01",
+                        host_alias="gate1-harry261",
+                        running_count=0,
+                        pending_count=0,
+                        allowed_submit=1,
+                    ),
+                ),
+            ):
+                result = run_pipeline(config)
+
+            self.assertFalse(result.success)
+            conn = duckdb.connect(str(db_path))
+            try:
+                rows = conn.execute("SELECT stage, message FROM events ORDER BY ts").fetchall()
+            finally:
+                conn.close()
+            stages = [str(row[0]) for row in rows]
+            messages = [str(row[1]) for row in rows]
+            self.assertIn("CANARY_FAILED", stages)
+            self.assertIn("ROLLBACK_TRIGGERED", stages)
+            self.assertTrue(any("reason=design_outputs_manifest_incomplete" in message for message in messages))
 
     def test_sample_canary_failure_records_canary_failed_and_rollback_triggered(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            input_file = input_dir / "sample.aedt"
+            input_file = input_dir / _SAMPLE_CANARY_NAME
             input_file.write_text("placeholder", encoding="utf-8")
-            (input_dir / "sample.aedt.ready").write_text("", encoding="utf-8")
+            (input_dir / f"{_SAMPLE_CANARY_NAME}.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
             config = PipelineConfig(
@@ -2338,6 +2576,7 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline._dispatch_mode_control_path", return_value=_isolated_dispatch_mode_path(Path(tmpdir))),
                 patch(
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(
@@ -2402,9 +2641,9 @@ class TestPipelineApi(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
-            input_file = input_dir / "sample.aedt"
+            input_file = input_dir / _SAMPLE_CANARY_NAME
             input_file.write_text("placeholder", encoding="utf-8")
-            (input_dir / "sample.aedt.ready").write_text("", encoding="utf-8")
+            (input_dir / f"{_SAMPLE_CANARY_NAME}.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
             config = PipelineConfig(
@@ -2419,6 +2658,7 @@ class TestPipelineApi(unittest.TestCase):
             with (
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
+                patch("peetsfea_runner.pipeline._dispatch_mode_control_path", return_value=_isolated_dispatch_mode_path(Path(tmpdir))),
                 patch(
                     "peetsfea_runner.pipeline.query_account_readiness",
                     return_value=AccountReadinessSnapshot(

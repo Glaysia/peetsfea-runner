@@ -206,12 +206,16 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("def design_dir_name(design_name: str) -> str:", content)
         self.assertIn("def reports_dir_for_design_name(workdir: Path, design_name: str) -> Path:", content)
         self.assertIn("def reports_dir_for_design(workdir: Path, app: Any) -> Path:", content)
-        self.assertIn("def export_all_reports(app: Any, workdir: Path, design_name: str) -> dict[str, Path]:", content)
+        self.assertIn("def export_all_reports(app: Any, workdir: Path, design_name: str) -> tuple[dict[str, Path], list[str]]:", content)
         self.assertIn("reports_dir = design_output_dir(workdir, design_name) / 'reports'", content)
         self.assertIn("app.post.export_report_to_csv", content)
         self.assertIn("def write_design_output_error_log(workdir: Path, design_name: str, errors: list[str]) -> Path:", content)
-        self.assertIn("def count_design_report_files(workdir: Path, design_name: str) -> int:", content)
+        self.assertIn("SYNTHETIC_REPORT_FILENAMES: set[str] = {'peetsfea_input_parameters.csv'}", content)
+        self.assertIn("def count_design_report_files(workdir: Path, design_name: str, *, include_synthetic: bool = True) -> int:", content)
+        self.assertIn("def count_synthetic_design_report_files(workdir: Path, design_name: str) -> int:", content)
+        self.assertIn("def classify_design_report_status(*, native_report_count: int, synthetic_report_count: int, errors: list[str]) -> str:", content)
         self.assertIn("def write_design_outputs_manifest(workdir: Path, rows: list[dict[str, object]]) -> None:", content)
+        self.assertIn("ordered_columns = ['design_name', 'reports_dir', 'report_count', 'native_report_count', 'synthetic_report_count', 'status', 'error_log']", content)
         self.assertIn("(workdir / DESIGN_OUTPUTS_DIR_NAME).mkdir(parents=True, exist_ok=True)", content)
         self.assertIn("write_design_outputs_manifest(workdir, design_output_manifest_rows)", content)
         self.assertIn("error_log_path.unlink()", content)
@@ -267,13 +271,16 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("if name == 'Freq':", content)
         self.assertIn("row[str(name)] = serialize_row_value(value)", content)
         self.assertIn("row.setdefault(key, value)", content)
-        self.assertIn("def write_synthetic_input_report(workdir: Path, app: Any) -> Path:", content)
-        self.assertIn("reports_dir = reports_dir_for_design(workdir, app)", content)
-        self.assertIn("canonical_input_path = write_synthetic_input_report(workdir, app)", content)
+        self.assertIn("def write_synthetic_input_report(workdir: Path, design_name: str, app: Any) -> Path:", content)
+        self.assertIn("reports_dir = reports_dir_for_design_name(workdir, design_name)", content)
+        self.assertIn("write_synthetic_input_report(workdir, design_name, app)", content)
+        self.assertIn("export_errors.append(f'report export failed report={report_name}: {exc}')", content)
+        self.assertIn("native_report_count = count_design_report_files(workdir, design_name, include_synthetic=False)", content)
+        self.assertIn("synthetic_report_count = count_synthetic_design_report_files(workdir, design_name)", content)
         self.assertIn("merge_report_rows(", content)
         self.assertLess(
             content.index("def build_output_variable_row_variations(app: Any) -> dict[str, object]:"),
-            content.index("def write_synthetic_input_report(workdir: Path, app: Any) -> Path:"),
+            content.index("def write_synthetic_input_report(workdir: Path, design_name: str, app: Any) -> Path:"),
         )
 
     def test_remote_dispatch_script_uses_noninteractive_srun_without_screen(self) -> None:
@@ -350,7 +357,7 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("sync_bundle_artifacts_back() {", content)
         self.assertIn("case_name=\"$(basename \"$case_dir\")\"", content)
         self.assertIn("mkdir -p \"$REMOTE_JOB_DIR/$case_name\"", content)
-        self.assertIn("output_variables.error.log license_diagnostics.txt runtime_logs.json", content)
+        self.assertIn("report_export.error.log license_diagnostics.txt runtime_logs.json", content)
         self.assertIn("design_outputs", content)
         self.assertIn("sync_case_artifacts_back \"$case_dir_path\"", content)
         self.assertIn("cp -f \"$archive_path\" results.tgz", content)
@@ -630,6 +637,24 @@ class TestPlan03Workflow(unittest.TestCase):
             ],
         ):
             self.assertEqual(query_slurm_job_state(_Cfg(), slurm_job_id="552740"), ("UNKNOWN", None))
+
+    def test_query_slurm_job_state_falls_back_when_squeue_reports_missing_job_id(self) -> None:
+        class _Cfg:
+            host = "gate1-harry261"
+
+        with patch(
+            "peetsfea_runner.remote_job._run_completed_process_capture_with_transport_retry",
+            side_effect=[
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=1,
+                    stdout="",
+                    stderr="slurm_load_jobs error: Invalid job id specified",
+                ),
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="552740|COMPLETED|n115\n", stderr=""),
+            ],
+        ):
+            self.assertEqual(query_slurm_job_state(_Cfg(), slurm_job_id="552740"), ("COMPLETED", "n115"))
 
     def test_sbatch_failure_keeps_submitted_slurm_job_id_in_attempt_result(self) -> None:
         class _Cfg:

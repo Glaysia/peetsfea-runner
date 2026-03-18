@@ -84,11 +84,10 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
         output_root=output_root / "preserve_results",
         accounts=(
             AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
-            AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
         ),
         cpus_per_job=32,
-        slots_per_job=1,
-        cores_per_slot=32,
+        slots_per_job=2,
+        cores_per_slot=16,
         tasks_per_slot=4,
         retain_aedtresults=True,
         delete_input_after_upload=False,

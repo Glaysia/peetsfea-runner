@@ -915,7 +915,7 @@ class StateStore:
                       ON lw.job_id = j.job_id AND lw.row_no = 1
                     WHERE j.run_id = ?
                       AND j.status IN ('PENDING', 'SUBMITTED', 'RUNNING')
-                      AND lw.worker_state IN ('FAILED', 'LOST')
+                      AND lw.worker_state IN ('FAILED', 'LOST', 'UNKNOWN')
                     ORDER BY lw.last_seen_ts DESC, j.job_id
                     """,
                     [run_id, run_id],

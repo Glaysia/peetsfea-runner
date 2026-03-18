@@ -49,7 +49,7 @@ def build_enroot_validation_lane_config(
     if not str(remote_container_image).strip():
         raise ValueError("remote_container_image must not be empty")
 
-    sample_src = resolved_repo_root / "examples" / "sample.aedt"
+    sample_src = resolved_repo_root / "examples" / "sample_0318.aedt"
     if not sample_src.is_file():
         raise FileNotFoundError(f"sample canary source not found: {sample_src}")
 
@@ -78,8 +78,8 @@ def build_enroot_validation_lane_config(
     else:
         accounts = _PRESERVE_ACCOUNTS
         cpus_per_job = 32
-        slots_per_job = 1
-        cores_per_slot = 32
+        slots_per_job = 2
+        cores_per_slot = 16
         tasks_per_slot = 4
 
     return PipelineConfig(

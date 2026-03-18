@@ -32,14 +32,14 @@ class TestBuiltInService(unittest.TestCase):
         lane_by_id = {lane.lane_id: lane for lane in profile.lanes}
         self.assertEqual(tuple(lane_by_id), EXPECTED_LANE_NAMES)
         self.assertEqual(lane_by_id["preserve_results"].cpus_per_job, 32)
-        self.assertEqual(lane_by_id["preserve_results"].slots_per_job, 1)
-        self.assertEqual(lane_by_id["preserve_results"].cores_per_slot, 32)
+        self.assertEqual(lane_by_id["preserve_results"].slots_per_job, 2)
+        self.assertEqual(lane_by_id["preserve_results"].cores_per_slot, 16)
         self.assertEqual(lane_by_id["preserve_results"].tasks_per_slot, 4)
         self.assertTrue(lane_by_id["preserve_results"].retain_aedtresults)
         self.assertTrue(lane_by_id["preserve_results"].rename_input_to_done_on_success)
         self.assertEqual(
             [account.host_alias for account in lane_by_id["preserve_results"].accounts],
-            ["gate1-harry261", "gate1-dhj02"],
+            ["gate1-harry261"],
         )
         self.assertEqual(lane_by_id["prune_results"].cpus_per_job, 20)
         self.assertEqual(lane_by_id["prune_results"].slots_per_job, 5)
@@ -116,7 +116,7 @@ class TestBuiltInService(unittest.TestCase):
             self.assertTrue(preserve_cfg.retain_aedtresults)
             self.assertTrue(preserve_cfg.rename_input_to_done_on_success)
             self.assertEqual(preserve_cfg.input_source_policy, "input_queue_only")
-            self.assertEqual(len(preserve_cfg.accounts_registry), 2)
+            self.assertEqual(len(preserve_cfg.accounts_registry), 1)
             self.assertEqual(preserve_cfg.ssh_config_path, str(root / ".ssh" / "config"))
             self.assertEqual(preserve_cfg.remote_root, "/tmp/$USER/aedt_runs")
             self.assertEqual(prune_cfg.run_namespace, "prune_results")

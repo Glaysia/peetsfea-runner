@@ -12,7 +12,7 @@ class TestValidationLane(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             (repo_root / "examples").mkdir(parents=True, exist_ok=True)
-            (repo_root / "examples" / "sample.aedt").write_text("sample", encoding="utf-8")
+            (repo_root / "examples" / "sample_0318.aedt").write_text("sample", encoding="utf-8")
             (repo_root / ".ssh").mkdir(parents=True, exist_ok=True)
             (repo_root / ".ssh" / "config").write_text("Host gate1-harry261\n", encoding="utf-8")
 
@@ -46,7 +46,7 @@ class TestValidationLane(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             (repo_root / "examples").mkdir(parents=True, exist_ok=True)
-            (repo_root / "examples" / "sample.aedt").write_text("sample", encoding="utf-8")
+            (repo_root / "examples" / "sample_0318.aedt").write_text("sample", encoding="utf-8")
 
             config = build_enroot_validation_lane_config(
                 repo_root=repo_root,
@@ -59,9 +59,9 @@ class TestValidationLane(unittest.TestCase):
             self.assertEqual(config.host, "gate1-harry261")
             self.assertEqual(config.remote_root, "/tmp/$USER/aedt_runs")
             self.assertEqual([account.host_alias for account in config.accounts_registry], ["gate1-harry261"])
-            self.assertEqual(config.slots_per_job, 1)
+            self.assertEqual(config.slots_per_job, 2)
             self.assertEqual(config.cpus_per_job, 32)
-            self.assertEqual(config.cores_per_slot, 32)
+            self.assertEqual(config.cores_per_slot, 16)
             self.assertEqual(config.tasks_per_slot, 4)
             self.assertEqual(config.ssh_config_path, "")
 
@@ -69,7 +69,7 @@ class TestValidationLane(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             (repo_root / "examples").mkdir(parents=True, exist_ok=True)
-            (repo_root / "examples" / "sample.aedt").write_text("sample", encoding="utf-8")
+            (repo_root / "examples" / "sample_0318.aedt").write_text("sample", encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "lane must be 'prune' or 'preserve'"):
                 build_enroot_validation_lane_config(

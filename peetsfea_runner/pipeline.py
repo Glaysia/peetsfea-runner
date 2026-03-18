@@ -63,24 +63,10 @@ from .version import get_version
 
 APP_VERSION = get_version()
 
-_CANARY_SOURCE_COLUMNS = frozenset(
-    {
-        "source_aedt_path",
-        "source_case_dir",
-        "source_aedt_name",
-    }
+_SAMPLE_CANARY_INPUT_NAMES = frozenset({"sample.aedt", "sample_0318.aedt"})
+_CANARY_REPORT_MANIFEST_COLUMNS = frozenset(
+    {"design_name", "reports_dir", "report_count", "native_report_count", "synthetic_report_count", "status", "error_log"}
 )
-_CANARY_INPUT_SENTINELS = frozenset(
-    {
-        "coil_groups_0__count_mode",
-        "coil_shape_inner_margin_x",
-        "coil_spacing_tx_vertical_center_gap_mm",
-        "ferrite_present",
-        "tx_region_z_parts_dd_z_mm",
-    }
-)
-_CANARY_OUTPUT_SENTINELS = frozenset({"k_ratio", "Lrx_uH"})
-_CANARY_REQUIRED_COLUMNS = _CANARY_SOURCE_COLUMNS | _CANARY_INPUT_SENTINELS | _CANARY_OUTPUT_SENTINELS
 _DISPATCH_MODE_ALLOWED = frozenset({"run", "drain"})
 _BAD_NODE_TMP_FREE_THRESHOLD_MB = 65536
 _BAD_NODE_COOLDOWN_HOURS = 8
@@ -269,7 +255,16 @@ def _register_bad_node_candidate(
 
 
 def _is_sample_canary_input(path: Path) -> bool:
-    return path.name == "sample.aedt"
+    return path.name in _SAMPLE_CANARY_INPUT_NAMES
+
+
+def _canary_input_label(paths: list[Path]) -> str:
+    names = [path.name for path in paths if path.name]
+    if not names:
+        return "sample_input"
+    if len(set(names)) == 1:
+        return names[0]
+    return "sample_input_batch"
 
 
 @dataclass(slots=True)
@@ -475,11 +470,6 @@ class PipelineConfig:
         if self.remote_container_runtime == "enroot":
             if self.remote_execution_backend != "slurm_batch":
                 raise ValueError("remote_container_runtime='enroot' requires remote_execution_backend='slurm_batch'")
-            for account in accounts:
-                platform = account.platform.strip().lower()
-                scheduler = account.scheduler.strip().lower()
-                if (platform, scheduler) != ("linux", "slurm"):
-                    raise ValueError("remote_container_runtime='enroot' requires all accounts to be linux/slurm")
             if not self.remote_container_image.strip():
                 raise ValueError("remote_container_image must not be empty when remote_container_runtime='enroot'")
 
@@ -598,20 +588,45 @@ def _storage_boundary_message(*, config: PipelineConfig) -> str:
     )
 
 
-def _canary_output_csv_gate_reason(*, output_root: Path) -> str:
-    csv_paths = sorted(output_root.rglob("output_variables.csv"))
-    if not csv_paths:
-        return "output_variables_csv_missing"
-    for csv_path in csv_paths:
+def _canary_design_reports_gate_reason(*, output_root: Path) -> str:
+    manifest_paths = sorted(output_root.rglob("design_outputs/index.csv"))
+    if not manifest_paths:
+        return "design_outputs_manifest_missing"
+    saw_valid_manifest = False
+    for manifest_path in manifest_paths:
         try:
-            with csv_path.open("r", encoding="utf-8", newline="") as handle:
-                header = next(csv.reader(handle), [])
+            with manifest_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                header = {column.strip() for column in (reader.fieldnames or []) if column and column.strip()}
+                if not _CANARY_REPORT_MANIFEST_COLUMNS.issubset(header):
+                    continue
+                saw_valid_manifest = True
+                workdir = manifest_path.parent.parent
+                saw_native_reports = False
+                saw_incomplete_design = False
+                for row in reader:
+                    reports_dir_value = str(row.get("reports_dir", "")).strip()
+                    if not reports_dir_value:
+                        continue
+                    design_status = str(row.get("status", "")).strip()
+                    try:
+                        native_report_count = int(str(row.get("native_report_count", "")).strip() or "0")
+                    except ValueError:
+                        continue
+                    reports_dir = workdir / reports_dir_value
+                    if not reports_dir.is_dir():
+                        continue
+                    if native_report_count > 0 and any(path.is_file() for path in reports_dir.glob("*.csv")):
+                        saw_native_reports = True
+                    if design_status in {"synthetic_only_fallback", "no_reports_exported"}:
+                        saw_incomplete_design = True
+                if saw_native_reports and not saw_incomplete_design:
+                    return "ok"
         except (OSError, csv.Error):
-            header = []
-        normalized_header = {column.strip() for column in header if column.strip()}
-        if _CANARY_REQUIRED_COLUMNS.issubset(normalized_header):
-            return "ok"
-    return "output_variables_csv_schema_invalid"
+            continue
+    if saw_valid_manifest:
+        return "design_outputs_manifest_incomplete"
+    return "design_outputs_manifest_schema_invalid"
 
 
 def _canary_materialized_output_present(*, output_root: Path) -> bool:
@@ -833,6 +848,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     canary_candidate = (not config.continuous_mode) and bool(aedt_files) and all(
         _is_sample_canary_input(path) for path in aedt_files
     )
+    canary_label = _canary_input_label(aedt_files) if canary_candidate else "sample_input"
     _log_stage(
         f"pipeline start version={APP_VERSION} run_id={run_id} "
         f"total_inputs={total_inputs_label} execute_remote={config.execute_remote}"
@@ -863,7 +879,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             level="INFO",
             stage="CANARY_STARTED",
             message=(
-                f"run_id={run_id} sample.aedt validation_lane=started "
+                f"run_id={run_id} {canary_label} validation_lane=started "
                 f"continuous_mode={config.continuous_mode} execute_remote={config.execute_remote} "
                 f"input_dir={config.input_queue_dir} output_root={config.output_root_dir} "
                 f"db_path={config.metadata_db_path} "
@@ -1012,6 +1028,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     )
                 except Exception:
                     continue
+                effective_worker_state = "LOST" if worker_state == "UNKNOWN" else worker_state
                 state_store.upsert_slurm_worker(
                     run_id=run_id,
                     worker_id=str(worker["worker_id"]),
@@ -1020,7 +1037,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     account_id=str(worker["account_id"]),
                     host_alias=str(worker["host_alias"]),
                     slurm_job_id=str(worker["slurm_job_id"]),
-                    worker_state=worker_state,
+                    worker_state=effective_worker_state,
                     observed_node=observed_node,
                     slots_configured=int(worker["slots_configured"]),
                     backend=str(worker["backend"]),
@@ -1029,15 +1046,15 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     heartbeat_ts=str(worker["heartbeat_ts"]) if worker.get("heartbeat_ts") else None,
                     degraded_reason=str(worker["degraded_reason"]) if worker.get("degraded_reason") else None,
                 )
-                if worker_state in {"FAILED", "LOST"}:
+                if effective_worker_state in {"FAILED", "LOST"}:
                     _reconcile_terminal_worker_failure(
                         job_id=str(worker["job_id"]),
                         attempt_no=int(worker["attempt_no"]),
                         slurm_job_id=str(worker["slurm_job_id"]),
-                        worker_state=worker_state,
+                        worker_state=effective_worker_state,
                         observed_node=observed_node,
                     )
-                if worker_state in {"RUNNING", "IDLE_DRAINING"} and _is_stale_worker_heartbeat(
+                if effective_worker_state in {"RUNNING", "IDLE_DRAINING"} and _is_stale_worker_heartbeat(
                     heartbeat_ts=worker.get("heartbeat_ts"),
                     timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
                 ):
@@ -1064,11 +1081,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     message=f"run_id={run_id} count={refreshed}",
                 )
         for worker in state_store.list_jobs_with_terminal_slurm_workers(run_id=run_id):
+            effective_worker_state = "LOST" if str(worker["worker_state"]) == "UNKNOWN" else str(worker["worker_state"])
             _reconcile_terminal_worker_failure(
                 job_id=str(worker["job_id"]),
                 attempt_no=int(worker["attempt_no"]),
                 slurm_job_id=str(worker["slurm_job_id"]),
-                worker_state=str(worker["worker_state"]),
+                worker_state=effective_worker_state,
                 observed_node=worker.get("observed_node"),
             )
 
@@ -1252,12 +1270,17 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             bootstrapping_account_ids = []
             return list(accounts)
 
-        skip_remote_preflight = str(config.remote_container_runtime).strip().lower() == "enroot"
         ready_accounts: list[AccountConfig] = []
         ready_account_ids = []
         blocked_account_ids = []
         bootstrapping_account_ids = []
         for account in accounts:
+            account_platform = account.platform.strip().lower()
+            account_scheduler = account.scheduler.strip().lower()
+            skip_remote_preflight = (
+                str(config.remote_container_runtime).strip().lower() == "enroot"
+                and (account_platform, account_scheduler) == ("linux", "slurm")
+            )
             try:
                 snapshot = query_account_readiness(
                     account=account,
@@ -1357,7 +1380,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 level="INFO",
                 stage="CUTOVER_READY",
                 message=(
-                    f"run_id={run_id} canary=sample.aedt ready_accounts={','.join(ready_account_ids)} "
+                    f"run_id={run_id} canary={canary_label} ready_accounts={','.join(ready_account_ids)} "
                     f"blocked_accounts={','.join(blocked_account_ids) or 'none'}"
                 ),
             )
@@ -1716,7 +1739,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             _append_worker_event(
                 level="ERROR",
                 stage="CANARY_FAILED",
-                message=f"run_id={run_id} sample.aedt canary failed reason={canary_gate_reason}",
+                message=f"run_id={run_id} {canary_label} canary failed reason={canary_gate_reason}",
             )
             _append_worker_event(
                 level="WARN",
@@ -1835,11 +1858,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             exit_code = EXIT_CODE_DOWNLOAD_FAILURE
             canary_gate_reason = "materialized_output_missing"
         else:
-            csv_gate_reason = _canary_output_csv_gate_reason(output_root=output_root)
-            if csv_gate_reason != "ok":
+            report_gate_reason = _canary_design_reports_gate_reason(output_root=output_root)
+            if report_gate_reason != "ok":
                 success = False
                 exit_code = EXIT_CODE_DOWNLOAD_FAILURE
-                canary_gate_reason = csv_gate_reason
+                canary_gate_reason = report_gate_reason
 
     summary = (
         f"version={APP_VERSION} total_jobs={total_jobs} success_jobs={success_jobs} failed_jobs={failed_jobs} "
@@ -1867,7 +1890,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             _append_worker_event(
                 level="INFO",
                 stage="CANARY_PASSED",
-                message=f"run_id={run_id} sample.aedt canary passed reason={canary_gate_reason}",
+                message=f"run_id={run_id} {canary_label} canary passed reason={canary_gate_reason}",
             )
             _append_worker_event(
                 level="INFO",
@@ -1881,7 +1904,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             _append_worker_event(
                 level="ERROR",
                 stage="CANARY_FAILED",
-                message=f"run_id={run_id} sample.aedt canary failed reason={canary_gate_reason}",
+                message=f"run_id={run_id} {canary_label} canary failed reason={canary_gate_reason}",
             )
             _append_worker_event(
                 level="WARN",
