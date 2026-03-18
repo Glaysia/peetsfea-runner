@@ -2381,9 +2381,34 @@ def _run_bundle_with_retry(
                         )
                         state_store.mark_ingest_state(input_path=str(slot.input_path), state="UPLOADED")
 
+            attempt_remote_cfg = remote_cfg
+            refreshed_excluded_nodes, refreshed_bad_node_warnings = _load_active_bad_nodes()
+            for warning in dict.fromkeys(refreshed_bad_node_warnings):
+                _log_stage(warning)
+                state_store.append_event(
+                    run_id=run_id,
+                    job_id="__worker__",
+                    level="WARN",
+                    stage="BAD_NODES_INVALID",
+                    message=warning,
+                )
+            if refreshed_excluded_nodes != attempt_remote_cfg.slurm_exclude_nodes:
+                attempt_remote_cfg = replace(attempt_remote_cfg, slurm_exclude_nodes=refreshed_excluded_nodes)
+            if refreshed_excluded_nodes:
+                state_store.append_event(
+                    run_id=run_id,
+                    job_id=bundle.job_id,
+                    level="INFO",
+                    stage="BAD_NODE_EXCLUDE_ACTIVE",
+                    message=(
+                        f"account={bundle.account_id} host={bundle.host_alias} "
+                        f"nodes={','.join(refreshed_excluded_nodes)} attempt={attempt}"
+                    ),
+                )
+
             try:
                 result = run_remote_job_attempt(
-                    config=remote_cfg,
+                    config=attempt_remote_cfg,
                     run_id=run_id,
                     worker_id=attempt_id,
                     slot_inputs=[
@@ -2481,7 +2506,7 @@ def _run_bundle_with_retry(
             )
 
             try:
-                cleanup_orphan_session(config=remote_cfg, session_name=session_name)
+                cleanup_orphan_session(config=attempt_remote_cfg, session_name=session_name)
             except _WorkflowError as cleanup_error:
                 state_store.append_event(
                     run_id=run_id,

@@ -247,8 +247,26 @@ class TestScheduler(unittest.TestCase):
         )
 
         self.assertFalse(snapshot.ready)
-        self.assertEqual(snapshot.status, "BLOCKED")
+        self.assertEqual(snapshot.status, "BOOTSTRAP_REQUIRED")
         self.assertEqual(snapshot.reason, "image_missing path=$HOME/runtime/enroot/aedt.sqsh")
+
+    def test_query_account_readiness_in_enroot_mode_marks_stale_image_for_bootstrap(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_readiness(
+            account=account,
+            remote_container_runtime="enroot",
+            remote_container_image="~/runtime/enroot/aedt.sqsh",
+            remote_container_ansys_root="/opt/ohpc/pub/Electronics/v252",
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_READY__:home=1 runtime=0 env=1 python=1 module=1 binaries=1 ansys=1 storage=1 inode_pct=10 free_mb=8192 fs_type=ext4 container=1 missing=image_stale image_path=$HOME/runtime/enroot/aedt.sqsh\n",
+                "",
+            ),
+        )
+
+        self.assertFalse(snapshot.ready)
+        self.assertEqual(snapshot.status, "BOOTSTRAP_REQUIRED")
+        self.assertEqual(snapshot.reason, "image_stale path=$HOME/runtime/enroot/aedt.sqsh")
 
     def test_query_account_readiness_in_enroot_mode_uses_direct_probe(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
@@ -419,6 +437,11 @@ class TestScheduler(unittest.TestCase):
         self.assertIn("__PEETSFEA_BOOTSTRAP__:ok", output)
         self.assertTrue(seen)
         self.assertIn("srun -p cpu2 -N1 -n1", seen[0][-1])
+        self.assertIn("--job-name=peetsfea-bootstrap", seen[0][-1])
+        self.assertIn("docker://ubuntu:24.04", seen[0][-1])
+        self.assertIn("aedt.sqsh.meta.json", seen[0][-1])
+        self.assertIn("/ansys_inc/v252", seen[0][-1])
+        self.assertIn("2026-03-18-aedt-sqsh-v2", seen[0][-1])
 
     def test_query_windows_account_capacity_uses_local_max_jobs(self) -> None:
         account = _Account(account_id="w1", host_alias="win-1", max_jobs=2, platform="windows", scheduler="none")

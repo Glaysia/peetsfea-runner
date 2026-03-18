@@ -17,6 +17,7 @@ input_queue*/*
 output/*
 
 examples/*
+!examples/sample_0318.aedt
 
 original/*
 build/*

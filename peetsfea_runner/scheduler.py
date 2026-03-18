@@ -122,6 +122,13 @@ _BOOTSTRAP_MARKER = "__PEETSFEA_BOOTSTRAP__:ok"
 _DEFAULT_SLURM_PROBE_PARTITION = "cpu2"
 _DEFAULT_SLURM_PROBE_IMMEDIATE_SECONDS = 15
 _ENROOT_IMAGE_PYTHON = "/opt/miniconda3/bin/python"
+_ENROOT_IMAGE_CONTRACT_VERSION = "2026-03-18-aedt-sqsh-v2"
+_ENROOT_IMAGE_METADATA_SUFFIX = ".meta.json"
+_ENROOT_IMAGE_BASE = "docker://ubuntu:24.04"
+_ENROOT_IMAGE_PYTHON_VERSION = "3.12"
+_ENROOT_IMAGE_PYAEDT_SPEC = "pyaedt==0.25.1"
+_ENROOT_IMAGE_PANDAS_SPEC = "pandas<2.4"
+_ENROOT_IMAGE_PYVISTA_SPEC = "pyvista"
 _SLURM_QUEUE_DELAY_MARKERS = (
     "queued and waiting for resources",
     "unable to allocate resources",
@@ -204,6 +211,24 @@ def _host_ansys_mount_root(path: str) -> str:
     return f"{normalized}/AnsysEM"
 
 
+def _host_ansys_base_root(path: str) -> str:
+    normalized = _remote_shell_path(path).rstrip("/")
+    if normalized.endswith("/AnsysEM"):
+        return str(Path(normalized).parent).rstrip("/")
+    return normalized
+
+
+def _image_metadata_path(image_path: str) -> str:
+    return f"{image_path}{_ENROOT_IMAGE_METADATA_SUFFIX}"
+
+
+def _load_remote_build_enroot_image_script() -> str:
+    script_path = Path(__file__).resolve().parent / "enroot_image_bootstrap.sh"
+    if not script_path.is_file():
+        raise RuntimeError(f"missing build script: {script_path}")
+    return script_path.read_text(encoding="utf-8")
+
+
 def _wrap_with_slurm_probe(
     script: str,
     *,
@@ -215,6 +240,23 @@ def _wrap_with_slurm_probe(
         if immediate_seconds <= 0:
             raise ValueError("immediate_seconds must be > 0 when provided")
         srun_command += f" --immediate={int(immediate_seconds)}"
+    return "\n".join(
+        [
+            "set -euo pipefail",
+            f"{srun_command} bash -lc {shlex.quote(script)}",
+        ]
+    )
+
+
+def _wrap_with_slurm_bootstrap(
+    script: str,
+    *,
+    partition: str = _DEFAULT_SLURM_PROBE_PARTITION,
+    time_limit: str = "01:30:00",
+) -> str:
+    srun_command = (
+        f"srun -p {shlex.quote(partition)} -N1 -n1 --job-name=peetsfea-bootstrap --time={shlex.quote(time_limit)}"
+    )
     return "\n".join(
         [
             "set -euo pipefail",
@@ -432,10 +474,14 @@ def _parse_readiness_marker(
         status = "READY"
         reason = "ok"
     elif container_mode:
-        status = "BLOCKED"
         if "image_missing" in container_reason:
+            status = "BOOTSTRAP_REQUIRED"
             reason = f"image_missing path={image_path}"
+        elif "image_stale" in container_reason:
+            status = "BOOTSTRAP_REQUIRED"
+            reason = f"image_stale path={image_path}"
         else:
+            status = "BLOCKED"
             reason = container_reason or ",".join(failed_checks)
     elif bootstrap_needed and not hard_blocked:
         status = "BOOTSTRAP_REQUIRED"
@@ -630,7 +676,9 @@ def _query_windows_account_preflight(
 def _build_enroot_readiness_script(*, remote_container_image: str, remote_container_ansys_root: str) -> str:
     image_path = _remote_shell_path(remote_container_image)
     ansys_root = _host_ansys_mount_root(remote_container_ansys_root)
-    return f"""
+    ansys_base = _host_ansys_base_root(remote_container_ansys_root)
+    metadata_path = _image_metadata_path(image_path)
+    return fr"""
 set +e
 HOME_OK=0
 RUNTIME_OK=0
@@ -642,14 +690,17 @@ ANSYS_OK=0
 STORAGE_OK=1
 MISSING=()
 REMOTE_CONTAINER_IMAGE={_double_quoted_shell_value(image_path)}
+REMOTE_CONTAINER_METADATA={_double_quoted_shell_value(metadata_path)}
 REMOTE_CONTAINER_ANSYS_ROOT={_double_quoted_shell_value(ansys_root)}
+REMOTE_CONTAINER_ANSYS_BASE={_double_quoted_shell_value(ansys_base)}
+IMAGE_CONTRACT_VERSION={_double_quoted_shell_value(_ENROOT_IMAGE_CONTRACT_VERSION)}
 IMAGE_PYTHON={_double_quoted_shell_value(_ENROOT_IMAGE_PYTHON)}
 BASE_DIR="/tmp/$USER/peetsfea-ready-${{SLURM_JOB_ID:-nojob}}-$$"
 CONTAINER_NAME="peetsfea-ready-${{SLURM_JOB_ID:-nojob}}-$$"
 if [ -n "${{HOME:-}}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
   HOME_OK=1
 fi
-if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 && command -v srun >/dev/null 2>&1; then
+if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 && command -v srun >/dev/null 2>&1 && command -v sbatch >/dev/null 2>&1; then
   BINARIES_OK=1
   MODULE_OK=1
 else
@@ -657,7 +708,11 @@ else
 fi
 IMAGE_OK=0
 if [ -n "$REMOTE_CONTAINER_IMAGE" ] && [ -f "$REMOTE_CONTAINER_IMAGE" ] && [ -r "$REMOTE_CONTAINER_IMAGE" ]; then
-  IMAGE_OK=1
+  if [ -f "$REMOTE_CONTAINER_METADATA" ] && [ -r "$REMOTE_CONTAINER_METADATA" ] && grep -Fq '"contract_version":"'"$IMAGE_CONTRACT_VERSION"'"' "$REMOTE_CONTAINER_METADATA"; then
+    IMAGE_OK=1
+  else
+    MISSING+=("image_stale")
+  fi
 else
   MISSING+=("image_missing")
 fi
@@ -666,7 +721,7 @@ if [ "$IMAGE_OK" -eq 1 ] && [ "$MODULE_OK" -eq 1 ]; then
   ENV_OK=1
   PYTHON_OK=1
 fi
-if [ -n "$REMOTE_CONTAINER_ANSYS_ROOT" ] && [ -x "$REMOTE_CONTAINER_ANSYS_ROOT/ansysedt" ]; then
+if [ -n "$REMOTE_CONTAINER_ANSYS_ROOT" ] && [ -x "$REMOTE_CONTAINER_ANSYS_ROOT/ansysedt" ] && [ -x "$REMOTE_CONTAINER_ANSYS_BASE/licensingclient/linx64/ansyscl" ]; then
   ANSYS_OK=1
 else
   MISSING+=("ansys_root_missing")
@@ -682,7 +737,9 @@ printf '__PEETSFEA_READY__:home=%s runtime=%s env=%s python=%s module=%s binarie
 def _build_enroot_preflight_script(*, remote_container_image: str, remote_container_ansys_root: str) -> str:
     image_path = _remote_shell_path(remote_container_image)
     ansys_root = _host_ansys_mount_root(remote_container_ansys_root)
-    return f"""
+    ansys_base = _host_ansys_base_root(remote_container_ansys_root)
+    metadata_path = _image_metadata_path(image_path)
+    return fr"""
 set +e
 HOME_OK=0
 RUNTIME_OK=0
@@ -698,14 +755,17 @@ PYVISTA_OK=0
 STORAGE_OK=1
 MISSING=()
 REMOTE_CONTAINER_IMAGE={_double_quoted_shell_value(image_path)}
+REMOTE_CONTAINER_METADATA={_double_quoted_shell_value(metadata_path)}
 REMOTE_CONTAINER_ANSYS_ROOT={_double_quoted_shell_value(ansys_root)}
+REMOTE_CONTAINER_ANSYS_BASE={_double_quoted_shell_value(ansys_base)}
+IMAGE_CONTRACT_VERSION={_double_quoted_shell_value(_ENROOT_IMAGE_CONTRACT_VERSION)}
 IMAGE_PYTHON={_double_quoted_shell_value(_ENROOT_IMAGE_PYTHON)}
 BASE_DIR="/tmp/$USER/peetsfea-preflight-${{SLURM_JOB_ID:-nojob}}-$$"
 CONTAINER_NAME="peetsfea-preflight-${{SLURM_JOB_ID:-nojob}}-$$"
 if [ -n "${{HOME:-}}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
   HOME_OK=1
 fi
-if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 && command -v enroot >/dev/null 2>&1; then
+if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 && command -v enroot >/dev/null 2>&1 && command -v srun >/dev/null 2>&1; then
   BINARIES_OK=1
   MODULE_OK=1
 else
@@ -713,14 +773,18 @@ else
 fi
 IMAGE_OK=0
 if [ -n "$REMOTE_CONTAINER_IMAGE" ] && [ -f "$REMOTE_CONTAINER_IMAGE" ] && [ -r "$REMOTE_CONTAINER_IMAGE" ]; then
-  IMAGE_OK=1
+  if [ -f "$REMOTE_CONTAINER_METADATA" ] && [ -r "$REMOTE_CONTAINER_METADATA" ] && grep -Fq '"contract_version":"'"$IMAGE_CONTRACT_VERSION"'"' "$REMOTE_CONTAINER_METADATA"; then
+    IMAGE_OK=1
+  else
+    MISSING+=("image_stale")
+  fi
 else
   MISSING+=("image_missing")
 fi
 if [ "$IMAGE_OK" -eq 1 ] && [ "$MODULE_OK" -eq 1 ]; then
   RUNTIME_OK=1
 fi
-if [ -n "$REMOTE_CONTAINER_ANSYS_ROOT" ] && [ -x "$REMOTE_CONTAINER_ANSYS_ROOT/ansysedt" ]; then
+if [ -n "$REMOTE_CONTAINER_ANSYS_ROOT" ] && [ -x "$REMOTE_CONTAINER_ANSYS_ROOT/ansysedt" ] && [ -x "$REMOTE_CONTAINER_ANSYS_BASE/licensingclient/linx64/ansyscl" ]; then
   ANSYS_OK=1
 else
   MISSING+=("ansys_root_missing")
@@ -769,7 +833,7 @@ print(
 PY
 INNER
 )
-    PREFLIGHT_OUTPUT=$(enroot start --root --rw --mount "$HOME:$HOME" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" "$CONTAINER_NAME" /bin/bash -lc "$PREFLIGHT_SCRIPT" 2>/dev/null || true)
+    PREFLIGHT_OUTPUT=$(enroot start --root --rw --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" --mount "$REMOTE_CONTAINER_ANSYS_BASE:/ansys_inc/v252" "$CONTAINER_NAME" /bin/bash -lc "mkdir -p /tmp/peetsfea-home /tmp/peetsfea-tmp && export HOME=/tmp/peetsfea-home && export TMPDIR=/tmp/peetsfea-tmp && export XDG_CONFIG_HOME=/tmp/peetsfea-home/.config && cd /tmp && $PREFLIGHT_SCRIPT" 2>/dev/null || true)
     INNER_MARKER=$(printf '%s\n' "$PREFLIGHT_OUTPUT" | awk '/^__PEETSFEA_PREFLIGHT_INNER__:/ {{print; exit}}')
     if [ -n "$INNER_MARKER" ]; then
       ENV_OK=1
@@ -1291,48 +1355,30 @@ def bootstrap_account_runtime(
 ) -> str:
     if _container_runtime(remote_container_runtime) == "enroot":
         image_path = _remote_shell_path(remote_container_image)
+        metadata_path = _image_metadata_path(image_path)
         host_ansys_root = _host_ansys_mount_root(remote_container_ansys_root)
+        host_ansys_base = _host_ansys_base_root(remote_container_ansys_root)
+        builder_script = _load_remote_build_enroot_image_script()
         remote_script = f"""
 set -euo pipefail
-if [ ! -f {shlex.quote(image_path)} ]; then
-  echo "image_missing path={image_path}" >&2
-  exit 1
-fi
-if [ ! -x {shlex.quote(host_ansys_root + "/ansysedt")} ]; then
-  echo "ansys_root_missing path={host_ansys_root}" >&2
-  exit 1
-fi
-BASE_DIR="/tmp/$USER/peetsfea-bootstrap-${{SLURM_JOB_ID:-nojob}}-$$"
-mkdir -p "$BASE_DIR"
-export ENROOT_RUNTIME_PATH="$BASE_DIR/runtime"
-export ENROOT_CACHE_PATH="$BASE_DIR/cache"
-export ENROOT_DATA_PATH="$BASE_DIR/data"
-export ENROOT_TEMP_PATH="$BASE_DIR/tmp"
-mkdir -p "$ENROOT_RUNTIME_PATH" "$ENROOT_CACHE_PATH" "$ENROOT_DATA_PATH" "$ENROOT_TEMP_PATH"
-cleanup() {{
-  rc=$?
-  enroot remove -f peetsfea-bootstrap >/dev/null 2>&1 || true
-  rm -rf "$BASE_DIR"
-  exit "$rc"
-}}
-trap cleanup EXIT
-enroot create -f -n peetsfea-bootstrap {shlex.quote(image_path)} >/dev/null
-BOOTSTRAP_SCRIPT=$(cat <<'INNER'
-set -euo pipefail
-IMAGE_PYTHON="/opt/miniconda3/bin/python"
-if [ ! -x "$IMAGE_PYTHON" ]; then
-  echo "python_missing" >&2
-  exit 1
-fi
-if ! "$IMAGE_PYTHON" -m uv --version >/dev/null 2>&1; then
-  echo "uv_missing" >&2
-  exit 1
-fi
-"$IMAGE_PYTHON" -c "import ansys.aedt.core, pandas, pyvista" >/dev/null 2>&1
-printf '__PEETSFEA_BOOTSTRAP__:ok\\n'
-INNER
-)
-enroot start --root --rw --mount "$HOME:$HOME" --mount {shlex.quote(host_ansys_root)}:/mnt/AnsysEM peetsfea-bootstrap /bin/bash -lc "$BOOTSTRAP_SCRIPT"
+SCRIPT_DIR="$HOME/runtime/enroot/bootstrap"
+SCRIPT_PATH="$SCRIPT_DIR/remote_build_enroot_image.sh"
+mkdir -p "$SCRIPT_DIR"
+cat > "$SCRIPT_PATH" <<'PEETSFEA_BUILD_SCRIPT'
+{builder_script}
+PEETSFEA_BUILD_SCRIPT
+chmod +x "$SCRIPT_PATH"
+TARGET_IMAGE={_double_quoted_shell_value(image_path)} \\
+METADATA_PATH={_double_quoted_shell_value(metadata_path)} \\
+CONTRACT_VERSION={_double_quoted_shell_value(_ENROOT_IMAGE_CONTRACT_VERSION)} \\
+BASE_IMAGE={_double_quoted_shell_value(_ENROOT_IMAGE_BASE)} \\
+PYTHON_VERSION={_double_quoted_shell_value(_ENROOT_IMAGE_PYTHON_VERSION)} \\
+PYAEDT_SPEC={_double_quoted_shell_value(_ENROOT_IMAGE_PYAEDT_SPEC)} \\
+PANDAS_SPEC={_double_quoted_shell_value(_ENROOT_IMAGE_PANDAS_SPEC)} \\
+PYVISTA_SPEC={_double_quoted_shell_value(_ENROOT_IMAGE_PYVISTA_SPEC)} \\
+HOST_ANSYS_ROOT={_double_quoted_shell_value(host_ansys_root)} \\
+HOST_ANSYS_BASE={_double_quoted_shell_value(host_ansys_base)} \\
+"$SCRIPT_PATH"
 """
         command = [
             *_ssh_base_command(
@@ -1340,8 +1386,9 @@ enroot start --root --rw --mount "$HOME:$HOME" --mount {shlex.quote(host_ansys_r
                 ssh_config_path=ssh_config_path,
             ),
             account.host_alias,
-            f"bash -lc {shlex.quote(_wrap_with_slurm_probe(remote_script))}",
+            f"bash -lc {shlex.quote(_wrap_with_slurm_bootstrap(remote_script))}",
         ]
+        bootstrap_timeout_seconds = max(command_timeout_seconds, 5400)
         if run_command is None:
             try:
                 completed = subprocess.run(
@@ -1349,12 +1396,12 @@ enroot start --root --rw --mount "$HOME:$HOME" --mount {shlex.quote(host_ansys_r
                     check=False,
                     capture_output=True,
                     text=True,
-                    timeout=command_timeout_seconds,
+                    timeout=bootstrap_timeout_seconds,
                 )
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError(
                     f"bootstrap timed out account={account.account_id} host={account.host_alias} "
-                    f"timeout={command_timeout_seconds}s"
+                    f"timeout={bootstrap_timeout_seconds}s"
                 ) from exc
             return_code = completed.returncode
             stdout = completed.stdout or ""
