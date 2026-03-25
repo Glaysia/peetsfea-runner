@@ -108,7 +108,7 @@ config = PipelineConfig(
     run_rotation_hours=24,
     pending_buffer_per_account=3,
     capacity_scope="all_user_jobs",
-    balance_metric="slot_throughput",
+    balance_metric="license_max_520",
     input_source_policy="sample_only",
     public_storage_mode="disabled",
 )
@@ -175,7 +175,7 @@ config = PipelineConfig(
     run_rotation_hours=24,
     pending_buffer_per_account=3,
     capacity_scope="all_user_jobs",
-    balance_metric="slot_throughput",
+    balance_metric="license_max_520",
     input_source_policy="sample_only",
     public_storage_mode="disabled",
 )

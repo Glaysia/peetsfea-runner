@@ -83,9 +83,7 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
         lane_id="preserve_results",
         input_root=input_queue_root / "preserve_results",
         output_root=output_root / "preserve_results",
-        accounts=(
-            AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
-        ),
+        accounts=(),
         cpus_per_job=32,
         slots_per_job=2,
         cores_per_slot=16,
@@ -99,6 +97,7 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
         input_root=input_queue_root / "prune_results",
         output_root=output_root / "prune_results",
         accounts=(
+            AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
             AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
             AccountConfig(account_id="account_03", host_alias="gate1-jji0930", max_jobs=10),
             AccountConfig(account_id="account_04", host_alias="gate1-hmlee31", max_jobs=10),
@@ -166,6 +165,8 @@ def validate_service_layout(*, profile: ServiceProfile) -> None:
 
 
 def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineConfig:
+    if not lane.accounts:
+        raise ValueError(f"lane has no assigned accounts: {lane.lane_id}")
     return PipelineConfig(
         input_queue_dir=str(lane.input_root),
         output_root_dir=str(lane.output_root),
@@ -210,10 +211,10 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
         run_namespace=lane.lane_id,
         pending_buffer_per_account=3,
         capacity_scope="all_user_jobs",
-        balance_metric="slot_throughput",
+        balance_metric="license_max_520",
         input_source_policy="input_queue_only",
         public_storage_mode="disabled",
-        remote_storage_min_free_mb=20480,
+        remote_storage_min_free_mb=0,
         readiness_probe_timeout_seconds=180,
         preflight_probe_timeout_seconds=180,
         host=lane.accounts[0].host_alias,
@@ -320,6 +321,7 @@ def run_built_in_service() -> None:
             name=f"peetsfea-{lane.lane_id}",
         )
         for lane in profile.lanes
+        if lane.accounts
     ]
     for thread in worker_threads:
         thread.start()

@@ -28,7 +28,7 @@ class TestRunnerConfig(unittest.TestCase):
                     "PEETSFEA_TIME_LIMIT": "02:30:00",
                     "PEETSFEA_SLOTS_PER_JOB": "6",
                     "PEETSFEA_CORES_PER_SLOT": "4",
-                    "PEETSFEA_BALANCE_METRIC": "slot_throughput",
+                    "PEETSFEA_BALANCE_METRIC": "license_max_520",
                 },
                 clear=False,
             ):
@@ -40,7 +40,7 @@ class TestRunnerConfig(unittest.TestCase):
             self.assertEqual(config.time_limit, "02:30:00")
             self.assertEqual(config.slots_per_job, 6)
             self.assertEqual(config.cores_per_slot, 4)
-            self.assertEqual(config.balance_metric, "slot_throughput")
+            self.assertEqual(config.balance_metric, "license_max_520")
 
     def test_package_version_uses_date_build_format(self) -> None:
         self.assertRegex(__version__, r"^\d{4}\.\d{2}\.\d{2}\.\d+$")

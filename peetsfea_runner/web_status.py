@@ -12,6 +12,12 @@ from urllib.parse import parse_qs, urlparse
 
 import duckdb
 
+from peetsfea_runner.license_policy import (
+    LICENSE_ACCOUNT_STATE_TTL_SECONDS,
+    LICENSE_CEILING,
+    compute_license_target_plan,
+    normalize_license_account_states,
+)
 from peetsfea_runner.runtime_policy import REMOTE_SCRATCH_HARD_LIMIT_MB, REMOTE_SCRATCH_SOFT_LIMIT_MB
 from peetsfea_runner.state_store import StateStore, _GLOBAL_DUCKDB_LOCK
 from peetsfea_runner.version import get_version
@@ -2098,11 +2104,120 @@ def _observed_node_summary_payload(db_path: Path, *, run_id: str | None) -> dict
     }
 
 
+def _license_summary_payload(db_path: Path) -> dict[str, object]:
+    snapshot_rows = _query(
+        db_path,
+        """
+        SELECT ts, source_host, level1_in_use, level2_in_use, effective_in_use, ceiling, status, error
+        FROM license_snapshots
+        ORDER BY ts DESC
+        LIMIT 1
+        """,
+    )
+    control_rows = _query(
+        db_path,
+        """
+        SELECT desired_total_active_slots, effective_in_use, ceiling, last_polled_ts, last_adjusted_ts, poll_source_host, status, error
+        FROM license_control_state
+        WHERE control_key = 'global'
+        LIMIT 1
+        """,
+    )
+    state_rows = _query(
+        db_path,
+        """
+        SELECT run_id, account_id, host, ready, queued_slots, active_slots, max_active_slots, ts
+        FROM license_account_states
+        WHERE ts >= ?
+        ORDER BY account_id, run_id
+        """,
+        [(datetime.now(tz=timezone.utc) - timedelta(seconds=LICENSE_ACCOUNT_STATE_TTL_SECONDS)).isoformat()],
+    )
+    account_states = normalize_license_account_states(
+        [
+            {
+                "run_id": str(row[0]),
+                "account_id": str(row[1]),
+                "host": str(row[2]),
+                "ready": bool(row[3]),
+                "queued_slots": int(row[4] or 0),
+                "active_slots": int(row[5] or 0),
+                "max_active_slots": int(row[6] or 0),
+                "ts": str(row[7]),
+            }
+            for row in state_rows
+        ]
+    )
+    if control_rows:
+        control_row = control_rows[0]
+        desired_total_active_slots = int(control_row[0] or 0)
+        effective_in_use = int(control_row[1]) if control_row[1] is not None else None
+        ceiling = int(control_row[2] or LICENSE_CEILING)
+        last_polled_ts = control_row[3]
+        last_adjusted_ts = control_row[4]
+        poll_source_host = str(control_row[5] or "")
+        control_status = str(control_row[6] or "UNKNOWN")
+        control_error = str(control_row[7]) if control_row[7] is not None else None
+    else:
+        desired_total_active_slots = 0
+        effective_in_use = None
+        ceiling = LICENSE_CEILING
+        last_polled_ts = None
+        last_adjusted_ts = None
+        poll_source_host = ""
+        control_status = "UNKNOWN"
+        control_error = None
+    plan = compute_license_target_plan(
+        account_states=account_states,
+        desired_total_active_slots=desired_total_active_slots,
+        effective_in_use=effective_in_use,
+        ceiling=ceiling,
+    )
+    aggregated_active_by_account: dict[str, int] = {}
+    for item in account_states:
+        aggregated_active_by_account[item.account_id] = aggregated_active_by_account.get(item.account_id, 0) + int(item.active_slots)
+    return {
+        "snapshot": (
+            {
+                "ts": str(snapshot_rows[0][0]),
+                "source_host": str(snapshot_rows[0][1]),
+                "level1_in_use": int(snapshot_rows[0][2]) if snapshot_rows[0][2] is not None else None,
+                "level2_in_use": int(snapshot_rows[0][3]) if snapshot_rows[0][3] is not None else None,
+                "effective_in_use": int(snapshot_rows[0][4]) if snapshot_rows[0][4] is not None else None,
+                "ceiling": int(snapshot_rows[0][5] or ceiling),
+                "status": str(snapshot_rows[0][6] or "UNKNOWN"),
+                "error": str(snapshot_rows[0][7]) if snapshot_rows[0][7] is not None else None,
+            }
+            if snapshot_rows
+            else None
+        ),
+        "desired_total_active_slots": desired_total_active_slots,
+        "effective_in_use": effective_in_use,
+        "ceiling": ceiling,
+        "last_polled_ts": last_polled_ts,
+        "last_adjusted_ts": last_adjusted_ts,
+        "poll_source_host": poll_source_host,
+        "status": control_status,
+        "error": control_error,
+        "dispatchable_accounts": list(plan.dispatchable_account_ids),
+        "dispatchable_account_count": len(plan.dispatchable_account_ids),
+        "target_slots_by_account": dict(plan.target_slots_by_account),
+        "slot_deficit_by_account": {
+            account_id: max(0, int(plan.target_slots_by_account.get(account_id, 0)) - aggregated_active_by_account.get(account_id, 0))
+            for account_id in set(plan.target_slots_by_account) | set(aggregated_active_by_account)
+        },
+    }
+
+
 def _overview_account_payloads(db_path: Path, *, run_id: str | None) -> list[dict[str, object]]:
     score_map = {item["account_id"]: item for item in _account_slot_scores(db_path, run_id=run_id)}
     live_slot_map = _account_slot_live_stats(db_path, run_id=run_id)
     target_worker_map = _configured_account_worker_targets()
     readiness_map = _latest_account_readiness(db_path)
+    license_summary = _license_summary_payload(db_path)
+    license_targets = dict(license_summary.get("target_slots_by_account") or {})
+    license_slot_deficits = dict(license_summary.get("slot_deficit_by_account") or {})
+    dispatchable_accounts = set(license_summary.get("dispatchable_accounts") or [])
     capacity_rows = _query(
         db_path,
         """
@@ -2142,7 +2257,7 @@ def _overview_account_payloads(db_path: Path, *, run_id: str | None) -> list[dic
     account_ids = sorted(set(capacity_map) | set(readiness_map) | set(target_worker_map) | set(score_map) | set(live_slot_map))
     payloads: list[dict[str, object]] = []
     for account_id in account_ids:
-        target = int(target_worker_map.get(account_id, _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10)))
+        target = int(license_targets.get(account_id, target_worker_map.get(account_id, _env_int("PEETSFEA_MAX_JOBS_PER_ACCOUNT", 10))))
         running = int(capacity_map.get(account_id, {}).get("running_count", 0))
         pending = int(capacity_map.get(account_id, {}).get("pending_count", 0))
         active_slots = int(live_slot_map.get(account_id, {}).get("active_slots", 0))
@@ -2171,7 +2286,8 @@ def _overview_account_payloads(db_path: Path, *, run_id: str | None) -> list[dic
                 "scratch_root": readiness_map.get(account_id, {}).get("scratch_root"),
                 "scratch_usage_mb": readiness_map.get(account_id, {}).get("scratch_usage_mb"),
                 "score": int(score_map.get(account_id, {}).get("score", 0)),
-                "slot_gap": max(target * _env_int("PEETSFEA_SLOTS_PER_JOB", 4) - active_slots, 0),
+                "slot_gap": int(license_slot_deficits.get(account_id, max(target - active_slots, 0))),
+                "dispatchable": account_id in dispatchable_accounts,
             }
         )
     return payloads
@@ -3627,6 +3743,7 @@ def _overview_payload(db_path: Path, *, run_id: str | None) -> dict[str, object]
     health = _worker_health_payload(db_path, stale_threshold=int(os.getenv("PEETSFEA_STALE_THRESHOLD_SECONDS", "90")))
     events, throughput_kpi = _recent_ops_events_payload(db_path, run_id=run_id, limit=24)
     workers = _slurm_worker_payloads(db_path, run_id=run_id)
+    license_summary = _license_summary_payload(db_path)
     resource_summary = _latest_resource_summary_payload(db_path, run_id=run_id)
     node_summary = _latest_node_resource_payload(db_path, run_id=run_id)
     scratch_summary = _scratch_summary_payload(db_path)
@@ -3729,6 +3846,7 @@ def _overview_payload(db_path: Path, *, run_id: str | None) -> dict[str, object]
         "ops_window_guardrails": ops_window_guardrails,
         "real_cutover": real_cutover,
         "real_input_flow": real_input_flow,
+        "license_summary": license_summary,
         "resource_summary": resource_summary,
         "node_summary": node_summary,
         "scratch_summary": scratch_summary,
@@ -4376,89 +4494,15 @@ def make_status_handler(*, db_path: Path):
                 return
 
             if parsed.path == "/internal/resources/node":
-                if not run_id:
-                    self._send_json({"error": "run_id_required"}, status=400)
-                    return
-                host = str(payload.get("host") or "unknown").strip() or "unknown"
-                state_store.record_node_resource_snapshot(
-                    run_id=run_id,
-                    host=host,
-                    allocated_mem_mb=int(payload["allocated_mem_mb"]) if payload.get("allocated_mem_mb") is not None else None,
-                    total_mem_mb=int(payload["total_mem_mb"]) if payload.get("total_mem_mb") is not None else None,
-                    used_mem_mb=int(payload["used_mem_mb"]) if payload.get("used_mem_mb") is not None else None,
-                    free_mem_mb=int(payload["free_mem_mb"]) if payload.get("free_mem_mb") is not None else None,
-                    load_1=float(payload["load_1"]) if payload.get("load_1") is not None else None,
-                    load_5=float(payload["load_5"]) if payload.get("load_5") is not None else None,
-                    load_15=float(payload["load_15"]) if payload.get("load_15") is not None else None,
-                    tmp_total_mb=int(payload["tmp_total_mb"]) if payload.get("tmp_total_mb") is not None else None,
-                    tmp_used_mb=int(payload["tmp_used_mb"]) if payload.get("tmp_used_mb") is not None else None,
-                    tmp_free_mb=int(payload["tmp_free_mb"]) if payload.get("tmp_free_mb") is not None else None,
-                    process_count=int(payload.get("process_count") or 0),
-                    running_worker_count=int(payload.get("running_worker_count") or 0),
-                    active_slot_count=int(payload.get("active_slot_count") or 0),
-                )
-                state_store.record_resource_summary_snapshot(
-                    run_id=run_id,
-                    host=host,
-                    allocated_mem_mb=int(payload["allocated_mem_mb"]) if payload.get("allocated_mem_mb") is not None else (
-                        int(payload["total_mem_mb"]) if payload.get("total_mem_mb") is not None else None
-                    ),
-                    used_mem_mb=int(payload["used_mem_mb"]) if payload.get("used_mem_mb") is not None else None,
-                    free_mem_mb=int(payload["free_mem_mb"]) if payload.get("free_mem_mb") is not None else None,
-                    load_1=float(payload["load_1"]) if payload.get("load_1") is not None else None,
-                    running_worker_count=int(payload.get("running_worker_count") or 0),
-                    active_slot_count=int(payload.get("active_slot_count") or 0),
-                    stale=bool(payload.get("stale") or False),
-                )
-                self._send_json({"ok": True})
+                self._send_json({"ok": True, "ignored": True})
                 return
 
             if parsed.path == "/internal/resources/worker":
-                if not run_id or not worker_id:
-                    self._send_json({"error": "run_id_and_worker_id_required"}, status=400)
-                    return
-                host = str(payload.get("host") or worker.get("observed_node") or worker.get("host_alias") or "unknown")
-                state_store.record_worker_resource_snapshot(
-                    run_id=run_id,
-                    worker_id=worker_id,
-                    host=host,
-                    slurm_job_id=str(payload.get("slurm_job_id") or worker.get("slurm_job_id") or "").strip() or None,
-                    configured_slots=int(payload.get("configured_slots") or 0),
-                    active_slots=int(payload.get("active_slots") or 0),
-                    idle_slots=int(payload.get("idle_slots") or 0),
-                    rss_mb=int(payload["rss_mb"]) if payload.get("rss_mb") is not None else None,
-                    cpu_pct=float(payload["cpu_pct"]) if payload.get("cpu_pct") is not None else None,
-                    tunnel_state=str(payload.get("tunnel_state") or worker.get("tunnel_state") or "").strip() or None,
-                    process_count=int(payload.get("process_count") or 0),
-                )
-                self._send_json({"ok": True})
+                self._send_json({"ok": True, "ignored": True})
                 return
 
             if parsed.path == "/internal/resources/slot":
-                if not run_id:
-                    self._send_json({"error": "run_id_required"}, status=400)
-                    return
-                slot_id = str(payload.get("slot_id") or "").strip()
-                if not slot_id:
-                    self._send_json({"error": "slot_id_required"}, status=400)
-                    return
-                state_store.record_slot_resource_snapshot(
-                    run_id=run_id,
-                    slot_id=slot_id,
-                    worker_id=worker_id or (str(payload.get("worker_id") or "").strip() or None),
-                    host=str(payload.get("host") or "").strip() or None,
-                    allocated_mem_mb=int(payload["allocated_mem_mb"]) if payload.get("allocated_mem_mb") is not None else None,
-                    used_mem_mb=int(payload["used_mem_mb"]) if payload.get("used_mem_mb") is not None else None,
-                    load_1=float(payload["load_1"]) if payload.get("load_1") is not None else None,
-                    rss_mb=int(payload["rss_mb"]) if payload.get("rss_mb") is not None else None,
-                    cpu_pct=float(payload["cpu_pct"]) if payload.get("cpu_pct") is not None else None,
-                    process_count=int(payload.get("process_count") or 0),
-                    active_process_count=int(payload.get("active_process_count") or 0),
-                    artifact_bytes=int(payload.get("artifact_bytes") or 0),
-                    progress_ts=str(payload.get("progress_ts") or "").strip() or None,
-                    state=str(payload.get("state") or "").strip() or None,
-                )
-                self._send_json({"ok": True})
+                self._send_json({"ok": True, "ignored": True})
                 return
 
             self._send_json({"error": "not_found"}, status=404)
@@ -4481,9 +4525,9 @@ def make_status_handler(*, db_path: Path):
                         "endpoints": [
                             "/api/worker/health",
                             "/api/overview",
+                            "/api/licenses/summary",
                             "/api/operations/rollout",
                             "/api/workers",
-                            "/api/resources/summary",
                             "/api/slots",
                             "/api/slots/{id}/timeline",
                             "/api/accounts/capacity",
@@ -4515,14 +4559,17 @@ def make_status_handler(*, db_path: Path):
                 self._send_json(_rollout_status_payload(db_path, run_id=run_id))
                 return
 
+            if parsed.path == "/api/licenses/summary":
+                self._send_json(_license_summary_payload(db_path))
+                return
+
             if parsed.path == "/api/workers":
                 run_id = _first_str_param(params, "run_id") or _latest_run_id(db_path)
                 self._send_json({"run_id": run_id, "workers": _slurm_worker_payloads(db_path, run_id=run_id)})
                 return
 
             if parsed.path == "/api/resources/summary":
-                run_id = _first_str_param(params, "run_id") or _latest_run_id(db_path)
-                self._send_json({"run_id": run_id, "summary": _latest_resource_summary_payload(db_path, run_id=run_id)})
+                self._send_json({"error": "not_found"}, status=404)
                 return
 
             if parsed.path == "/api/slots":
@@ -5475,28 +5522,28 @@ def _dashboard_html(*, version: str) -> str:
         <div id="bad-nodes-list" class="list" style="margin-top:8px;"></div>
         <div class="muted">1. health / alert 확인</div>
         <div class="muted">2. account target / running / pending 확인</div>
-        <div class="muted">3. memory / load / process count 확인</div>
-        <div class="muted">4. refill lag / tunnel 상태 확인</div>
+        <div class="muted">3. license ceiling / budget 확인</div>
+        <div class="muted">4. account target / dispatchable 확인</div>
         <div class="muted">5. 필요할 때만 detail 펼치기</div>
       </div>
     </div>
 
     <div class="section-grid">
       <div class="panel">
-        <h2>Resource Panel</h2>
+        <h2>License Panel</h2>
         <div class="resource-grid">
-          <div><div class="k">Allocated Memory</div><div class="v" id="res-alloc">-</div></div>
-          <div><div class="k">Used Memory</div><div class="v" id="res-used">-</div></div>
-          <div><div class="k">Free Memory</div><div class="v" id="res-free">-</div></div>
-          <div><div class="k">Scratch Usage</div><div class="v" id="res-tmp-free">-</div></div>
-          <div><div class="k">Scratch Gate</div><div class="v" id="res-tmp-status" style="font-size:15px;">-</div></div>
-          <div><div class="k">Load</div><div class="v" id="res-load">-</div></div>
-          <div><div class="k">Observed Node</div><div class="v" id="res-observed-node" style="font-size:15px;">-</div></div>
-          <div><div class="k">Process Count</div><div class="v" id="res-proc">-</div></div>
-          <div><div class="k">Worker Mix</div><div class="v" id="res-worker-mix" style="font-size:15px;">-</div></div>
-          <div><div class="k">Slot Mix</div><div class="v" id="res-slot-mix" style="font-size:15px;">-</div></div>
+          <div><div class="k">Level1 In Use</div><div class="v" id="res-alloc">-</div></div>
+          <div><div class="k">Level2 In Use</div><div class="v" id="res-used">-</div></div>
+          <div><div class="k">Effective In Use</div><div class="v" id="res-free">-</div></div>
+          <div><div class="k">Ceiling</div><div class="v" id="res-tmp-free">-</div></div>
+          <div><div class="k">Budget</div><div class="v" id="res-tmp-status" style="font-size:15px;">-</div></div>
+          <div><div class="k">Poll Status</div><div class="v" id="res-load">-</div></div>
+          <div><div class="k">Poll Source</div><div class="v" id="res-observed-node" style="font-size:15px;">-</div></div>
+          <div><div class="k">Dispatchable</div><div class="v" id="res-proc">-</div></div>
+          <div><div class="k">Budget Delta</div><div class="v" id="res-worker-mix" style="font-size:15px;">-</div></div>
+          <div><div class="k">Last Poll</div><div class="v" id="res-slot-mix" style="font-size:15px;">-</div></div>
         </div>
-        <div class="muted" style="margin-top:10px;">slow snapshot age: <code id="res-age">-</code>s</div>
+        <div class="muted" style="margin-top:10px;">license poll age: <code id="res-age">-</code>s</div>
       </div>
       <div class="panel">
         <h2>Alerts</h2>
@@ -5653,6 +5700,8 @@ def _dashboard_html(*, version: str) -> str:
       const overview = await fetchJson('/api/overview');
       const health = overview.health || {};
       const throughput = overview.throughput_kpi || {};
+      const license = overview.license_summary || {};
+      const licenseSnapshot = license.snapshot || {};
       const resource = overview.resource_summary || {};
       const node = overview.node_summary || {};
       const scratch = overview.scratch_summary || {};
@@ -5729,23 +5778,22 @@ def _dashboard_html(*, version: str) -> str:
       document.getElementById('triage-reason').textContent = triage.reason || triage.headline || '-';
       renderRolloutDetail(rollout, realCutover, realInputFlow, slotSourceMix);
 
-      document.getElementById('res-alloc').textContent = fmtMb(node.allocated_mem_mb ?? resource.allocated_mem_mb);
-      document.getElementById('res-used').textContent = fmtMb(node.used_mem_mb ?? resource.used_mem_mb);
-      document.getElementById('res-free').textContent = fmtMb(node.free_mem_mb ?? resource.free_mem_mb);
-      document.getElementById('res-tmp-free').textContent = fmtMb(scratch.total_usage_mb);
-      document.getElementById('res-tmp-status').textContent = scratch.status == null
-        ? '-'
-        : (Array.isArray(scratch.tmpfs_failed_accounts) && scratch.tmpfs_failed_accounts.length
-            ? `${scratch.status} / tmpfs=${scratch.tmpfs_failed_accounts.join(',')}`
-            : scratch.status);
-      document.getElementById('res-load').textContent = (node.load_1 ?? resource.load_1) == null ? '-' : (node.load_1 ?? resource.load_1).toFixed(2);
-      document.getElementById('res-observed-node').textContent = observed.primary_node == null
-        ? '-'
-        : (observed.node_count > 1 ? `${observed.primary_node} +${observed.node_count - 1}` : observed.primary_node);
-      document.getElementById('res-proc').textContent = node.process_count ?? '-';
-      document.getElementById('res-worker-mix').textContent = `${workerMix.busy_workers ?? 0} busy / ${workerMix.idle_workers ?? 0} idle`;
-      document.getElementById('res-slot-mix').textContent = `${workerMix.active_slots ?? 0} active / ${workerMix.idle_slots ?? 0} idle`;
-      document.getElementById('res-age').textContent = node.age_seconds ?? resource.age_seconds ?? '-';
+      document.getElementById('res-alloc').textContent = licenseSnapshot.level1_in_use ?? '-';
+      document.getElementById('res-used').textContent = licenseSnapshot.level2_in_use ?? '-';
+      document.getElementById('res-free').textContent = license.effective_in_use ?? licenseSnapshot.effective_in_use ?? '-';
+      document.getElementById('res-tmp-free').textContent = license.ceiling ?? licenseSnapshot.ceiling ?? '-';
+      document.getElementById('res-tmp-status').textContent = license.desired_total_active_slots ?? '-';
+      document.getElementById('res-load').textContent = license.status || licenseSnapshot.status || '-';
+      document.getElementById('res-observed-node').textContent = license.poll_source_host || licenseSnapshot.source_host || '-';
+      document.getElementById('res-proc').textContent = license.dispatchable_account_count ?? '-';
+      document.getElementById('res-worker-mix').textContent =
+        ((license.ceiling ?? 0) && (license.effective_in_use != null))
+          ? `${(license.ceiling - license.effective_in_use)} headroom`
+          : '-';
+      document.getElementById('res-slot-mix').textContent = license.last_polled_ts || '-';
+      document.getElementById('res-age').textContent = licenseSnapshot.ts ? (
+        Math.max(0, Math.round((Date.now() - Date.parse(licenseSnapshot.ts)) / 1000))
+      ) : '-';
 
       const accountsBody = document.getElementById('accounts-body');
       accountsBody.innerHTML = '';

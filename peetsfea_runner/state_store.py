@@ -321,6 +321,50 @@ class StateStore:
                     )
                     """
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS license_snapshots (
+                        ts TEXT NOT NULL,
+                        source_host TEXT NOT NULL,
+                        level1_in_use INTEGER,
+                        level2_in_use INTEGER,
+                        effective_in_use INTEGER,
+                        ceiling INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        error TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS license_control_state (
+                        control_key TEXT PRIMARY KEY,
+                        desired_total_active_slots INTEGER NOT NULL DEFAULT 0,
+                        effective_in_use INTEGER,
+                        ceiling INTEGER NOT NULL DEFAULT 520,
+                        last_polled_ts TEXT,
+                        last_adjusted_ts TEXT,
+                        poll_source_host TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'UNKNOWN',
+                        error TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS license_account_states (
+                        run_id TEXT NOT NULL,
+                        account_id TEXT NOT NULL,
+                        host TEXT NOT NULL,
+                        ready BOOLEAN NOT NULL,
+                        queued_slots INTEGER NOT NULL DEFAULT 0,
+                        active_slots INTEGER NOT NULL DEFAULT 0,
+                        max_active_slots INTEGER NOT NULL DEFAULT 0,
+                        ts TEXT NOT NULL,
+                        PRIMARY KEY (run_id, account_id)
+                    )
+                    """
+                )
                 # Backward-compatible tables retained for existing tooling/queries.
                 conn.execute(
                     """
@@ -1591,6 +1635,263 @@ class StateStore:
             finally:
                 conn.close()
 
+    def record_license_snapshot(
+        self,
+        *,
+        source_host: str,
+        level1_in_use: int | None,
+        level2_in_use: int | None,
+        effective_in_use: int | None,
+        ceiling: int,
+        status: str,
+        error: str | None = None,
+        ts: str | None = None,
+    ) -> None:
+        snapshot_ts = ts or _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO license_snapshots (
+                        ts, source_host, level1_in_use, level2_in_use,
+                        effective_in_use, ceiling, status, error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        snapshot_ts,
+                        source_host,
+                        level1_in_use,
+                        level2_in_use,
+                        effective_in_use,
+                        ceiling,
+                        status,
+                        error,
+                    ],
+                )
+            finally:
+                conn.close()
+
+    def get_latest_license_snapshot(self) -> dict[str, object] | None:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT
+                        ts,
+                        source_host,
+                        level1_in_use,
+                        level2_in_use,
+                        effective_in_use,
+                        ceiling,
+                        status,
+                        error
+                    FROM license_snapshots
+                    ORDER BY ts DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+        if row is None:
+            return None
+        return {
+            "ts": str(row[0]),
+            "source_host": str(row[1]),
+            "level1_in_use": int(row[2]) if row[2] is not None else None,
+            "level2_in_use": int(row[3]) if row[3] is not None else None,
+            "effective_in_use": int(row[4]) if row[4] is not None else None,
+            "ceiling": int(row[5] or 0),
+            "status": str(row[6] or "UNKNOWN"),
+            "error": str(row[7]) if row[7] is not None else None,
+        }
+
+    def upsert_license_control_state(
+        self,
+        *,
+        desired_total_active_slots: int,
+        effective_in_use: int | None,
+        ceiling: int,
+        last_polled_ts: str | None,
+        last_adjusted_ts: str | None,
+        poll_source_host: str,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO license_control_state (
+                        control_key,
+                        desired_total_active_slots,
+                        effective_in_use,
+                        ceiling,
+                        last_polled_ts,
+                        last_adjusted_ts,
+                        poll_source_host,
+                        status,
+                        error
+                    ) VALUES ('global', ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (control_key) DO UPDATE SET
+                        desired_total_active_slots = EXCLUDED.desired_total_active_slots,
+                        effective_in_use = EXCLUDED.effective_in_use,
+                        ceiling = EXCLUDED.ceiling,
+                        last_polled_ts = EXCLUDED.last_polled_ts,
+                        last_adjusted_ts = EXCLUDED.last_adjusted_ts,
+                        poll_source_host = EXCLUDED.poll_source_host,
+                        status = EXCLUDED.status,
+                        error = EXCLUDED.error
+                    """,
+                    [
+                        max(0, desired_total_active_slots),
+                        effective_in_use,
+                        ceiling,
+                        last_polled_ts,
+                        last_adjusted_ts,
+                        poll_source_host,
+                        status,
+                        error,
+                    ],
+                )
+            finally:
+                conn.close()
+
+    def get_license_control_state(self) -> dict[str, object]:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT
+                        desired_total_active_slots,
+                        effective_in_use,
+                        ceiling,
+                        last_polled_ts,
+                        last_adjusted_ts,
+                        poll_source_host,
+                        status,
+                        error
+                    FROM license_control_state
+                    WHERE control_key = 'global'
+                    LIMIT 1
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+        if row is None:
+            return {
+                "desired_total_active_slots": 0,
+                "effective_in_use": None,
+                "ceiling": 520,
+                "last_polled_ts": None,
+                "last_adjusted_ts": None,
+                "poll_source_host": "",
+                "status": "UNKNOWN",
+                "error": None,
+            }
+        return {
+            "desired_total_active_slots": int(row[0] or 0),
+            "effective_in_use": int(row[1]) if row[1] is not None else None,
+            "ceiling": int(row[2] or 520),
+            "last_polled_ts": str(row[3]) if row[3] is not None else None,
+            "last_adjusted_ts": str(row[4]) if row[4] is not None else None,
+            "poll_source_host": str(row[5] or ""),
+            "status": str(row[6] or "UNKNOWN"),
+            "error": str(row[7]) if row[7] is not None else None,
+        }
+
+    def upsert_license_account_state(
+        self,
+        *,
+        run_id: str,
+        account_id: str,
+        host: str,
+        ready: bool,
+        queued_slots: int,
+        active_slots: int,
+        max_active_slots: int,
+        ts: str | None = None,
+    ) -> None:
+        snapshot_ts = ts or _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO license_account_states (
+                        run_id, account_id, host, ready, queued_slots, active_slots, max_active_slots, ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (run_id, account_id) DO UPDATE SET
+                        host = EXCLUDED.host,
+                        ready = EXCLUDED.ready,
+                        queued_slots = EXCLUDED.queued_slots,
+                        active_slots = EXCLUDED.active_slots,
+                        max_active_slots = EXCLUDED.max_active_slots,
+                        ts = EXCLUDED.ts
+                    """,
+                    [
+                        run_id,
+                        account_id,
+                        host,
+                        ready,
+                        max(0, queued_slots),
+                        max(0, active_slots),
+                        max(0, max_active_slots),
+                        snapshot_ts,
+                    ],
+                )
+            finally:
+                conn.close()
+
+    def clear_license_account_states(self, *, run_id: str) -> None:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                conn.execute("DELETE FROM license_account_states WHERE run_id = ?", [run_id])
+            finally:
+                conn.close()
+
+    def list_license_account_states(self, *, max_age_seconds: int) -> list[dict[str, object]]:
+        cutoff = (datetime.now(tz=timezone.utc) - timedelta(seconds=max(1, max_age_seconds))).isoformat()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        run_id,
+                        account_id,
+                        host,
+                        ready,
+                        queued_slots,
+                        active_slots,
+                        max_active_slots,
+                        ts
+                    FROM license_account_states
+                    WHERE ts >= ?
+                    ORDER BY account_id, run_id
+                    """,
+                    [cutoff],
+                ).fetchall()
+            finally:
+                conn.close()
+        return [
+            {
+                "run_id": str(row[0]),
+                "account_id": str(row[1]),
+                "host": str(row[2]),
+                "ready": bool(row[3]),
+                "queued_slots": int(row[4] or 0),
+                "active_slots": int(row[5] or 0),
+                "max_active_slots": int(row[6] or 0),
+                "ts": str(row[7]),
+            }
+            for row in rows
+        ]
+
     def record_node_resource_snapshot(
         self,
         *,
@@ -1823,3 +2124,22 @@ class StateStore:
             finally:
                 conn.close()
         return int(row[0] or 0)
+
+    def count_active_slots_by_account(self, *, run_id: str) -> dict[str, int]:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT account_id, COUNT(*)
+                    FROM slot_tasks
+                    WHERE run_id = ? AND account_id IS NOT NULL
+                      AND state IN ('ASSIGNED', 'LEASED', 'DOWNLOADING', 'UPLOADING', 'RUNNING', 'COLLECTING')
+                    GROUP BY account_id
+                    ORDER BY account_id
+                    """,
+                    [run_id],
+                ).fetchall()
+            finally:
+                conn.close()
+        return {str(row[0]): int(row[1] or 0) for row in rows}

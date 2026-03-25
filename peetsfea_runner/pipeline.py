@@ -44,6 +44,16 @@ from .remote_job import (
     query_slurm_job_state,
     run_remote_job_attempt,
 )
+from .license_policy import (
+    LICENSE_ACCOUNT_STATE_TTL_SECONDS,
+    LICENSE_CEILING,
+    LICENSE_POLL_INTERVAL_SECONDS,
+    LicenseUsageSnapshot,
+    compute_license_target_plan,
+    next_desired_total_active_slots,
+    normalize_license_account_states,
+    query_license_usage,
+)
 from .scheduler import (
     AccountCapacitySnapshot,
     AccountReadinessSnapshot,
@@ -59,8 +69,6 @@ from .scheduler import (
 from .state_store import StateStore
 from .runtime_policy import (
     DEFAULT_REMOTE_ROOT,
-    REMOTE_SCRATCH_HARD_LIMIT_MB,
-    REMOTE_SCRATCH_SOFT_LIMIT_MB,
     join_remote_root,
 )
 from .version import get_version
@@ -75,6 +83,7 @@ _CANARY_REPORT_MANIFEST_COLUMNS = frozenset(
 _DISPATCH_MODE_ALLOWED = frozenset({"run", "drain"})
 _BAD_NODE_COOLDOWN_HOURS = 8
 _BAD_NODE_NO_SPACE_MARKER = "No space left on device"
+_LICENSE_BALANCE_METRIC = "license_max_520"
 
 
 def _log_stage(message: str) -> None:
@@ -342,7 +351,7 @@ class PipelineConfig:
     run_namespace: str = ""
     pending_buffer_per_account: int = 3
     capacity_scope: str = "all_user_jobs"
-    balance_metric: str = "slot_throughput"
+    balance_metric: str = _LICENSE_BALANCE_METRIC
     input_source_policy: str = "input_queue_only"
     public_storage_mode: str = "disabled"
     remote_storage_inode_block_percent: int = 98
@@ -388,8 +397,8 @@ class PipelineConfig:
             raise ValueError("pending_buffer_per_account must be >= 0")
         if self.capacity_scope != "all_user_jobs":
             raise ValueError("capacity_scope must be 'all_user_jobs'")
-        if self.balance_metric != "slot_throughput":
-            raise ValueError("balance_metric must be 'slot_throughput'")
+        if self.balance_metric != _LICENSE_BALANCE_METRIC:
+            raise ValueError(f"balance_metric must be '{_LICENSE_BALANCE_METRIC}'")
         if self.input_source_policy != "input_queue_only":
             raise ValueError("input_source_policy must be 'input_queue_only'")
         if self.public_storage_mode not in {"disabled", "private_only", "public_nas"}:
@@ -837,6 +846,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     else:
         run_id = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
         state_store.start_run(run_id)
+    state_store.clear_license_account_states(run_id=run_id)
     remote_run_dir = _join_remote_root(config.remote_root, run_id)
     total_inputs_label = "streaming" if config.continuous_mode else str(len(aedt_files))
     canary_candidate = (not config.continuous_mode) and bool(aedt_files) and all(
@@ -886,8 +896,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     dispatch_drain_emitted = False
     bad_node_policy_warnings: set[str] = set()
     bad_node_registrations: set[tuple[str, str]] = set()
-    scratch_guard_events: set[tuple[str, str]] = set()
-    runtime_probe_events: set[tuple[str, str]] = set()
+    license_target_slots_by_account: dict[str, int] = {}
+    license_slot_deficits_by_account: dict[str, int] = {}
+    license_dispatchable_account_ids: tuple[str, ...] = ()
+    license_event_markers: set[tuple[str, str]] = set()
 
     def _current_dispatch_mode() -> str:
         mode, warning = _read_dispatch_mode(control_path=dispatch_mode_path)
@@ -1161,6 +1173,183 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             "remote_root": config.remote_root,
         }
 
+    def _append_license_event_once(*, level: str, stage: str, message: str) -> None:
+        marker = (stage, message)
+        if marker in license_event_markers:
+            return
+        state_store.append_event(run_id=run_id, job_id="__worker__", level=level, stage=stage, message=message)
+        license_event_markers.add(marker)
+
+    def _publish_license_account_states(*, queued_slot_count: int) -> None:
+        active_slots_by_account = state_store.count_active_slots_by_account(run_id=run_id)
+        ready_accounts_set = set(ready_account_ids)
+        for account in accounts:
+            state_store.upsert_license_account_state(
+                run_id=run_id,
+                account_id=account.account_id,
+                host=account.host_alias,
+                ready=account.account_id in ready_accounts_set,
+                queued_slots=max(0, queued_slot_count),
+                active_slots=active_slots_by_account.get(account.account_id, 0),
+                max_active_slots=max(0, account.max_jobs * config.slots_per_job),
+            )
+
+    def _refresh_license_targets(*, queued_slot_count: int) -> dict[str, int]:
+        nonlocal license_target_slots_by_account, license_slot_deficits_by_account, license_dispatchable_account_ids
+        if not config.execute_remote:
+            license_target_slots_by_account = {}
+            license_dispatchable_account_ids = tuple(account.account_id for account in accounts)
+            license_slot_deficits_by_account = {
+                account.account_id: max(0, queued_slot_count) for account in accounts
+            }
+            return dict(license_slot_deficits_by_account)
+
+        _publish_license_account_states(queued_slot_count=queued_slot_count)
+        account_states = normalize_license_account_states(
+            state_store.list_license_account_states(max_age_seconds=LICENSE_ACCOUNT_STATE_TTL_SECONDS)
+        )
+        control_state = state_store.get_license_control_state()
+        current_desired_total = int(control_state.get("desired_total_active_slots") or 0)
+        effective_in_use = control_state.get("effective_in_use")
+        current_ceiling = int(control_state.get("ceiling") or LICENSE_CEILING)
+        now = datetime.now(tz=timezone.utc)
+        now_iso = now.isoformat()
+        last_polled_ts = _parse_optional_iso(control_state.get("last_polled_ts"))
+        should_poll = (
+            last_polled_ts is None
+            or (now - last_polled_ts).total_seconds() >= LICENSE_POLL_INTERVAL_SECONDS
+        )
+        if should_poll:
+            try:
+                snapshot = query_license_usage(ssh_config_path=config.ssh_config_path)
+            except Exception as exc:
+                snapshot = LicenseUsageSnapshot(
+                    source_host="gate1-harry261",
+                    level1_in_use=None,
+                    level2_in_use=None,
+                    effective_in_use=None,
+                    ceiling=current_ceiling,
+                    status="FAILED",
+                    error=str(exc),
+                )
+            state_store.record_license_snapshot(
+                source_host=snapshot.source_host,
+                level1_in_use=snapshot.level1_in_use,
+                level2_in_use=snapshot.level2_in_use,
+                effective_in_use=snapshot.effective_in_use,
+                ceiling=snapshot.ceiling,
+                status=snapshot.status,
+                error=snapshot.error,
+                ts=now_iso,
+            )
+            effective_in_use = snapshot.effective_in_use if snapshot.status == "OK" else effective_in_use
+            pre_adjust_plan = compute_license_target_plan(
+                account_states=account_states,
+                desired_total_active_slots=current_desired_total,
+                effective_in_use=effective_in_use,
+                ceiling=current_ceiling,
+            )
+            next_desired_total = next_desired_total_active_slots(
+                current_desired_total_active_slots=current_desired_total,
+                effective_in_use=snapshot.effective_in_use if snapshot.status == "OK" else None,
+                dispatchable_account_count=len(pre_adjust_plan.dispatchable_account_ids),
+                total_active_slots=pre_adjust_plan.total_active_slots,
+                total_queued_slots=pre_adjust_plan.total_queued_slots,
+                ceiling=current_ceiling,
+            )
+            state_store.upsert_license_control_state(
+                desired_total_active_slots=next_desired_total,
+                effective_in_use=effective_in_use,
+                ceiling=current_ceiling,
+                last_polled_ts=now_iso,
+                last_adjusted_ts=(
+                    now_iso
+                    if next_desired_total != current_desired_total
+                    else control_state.get("last_adjusted_ts")
+                ),
+                poll_source_host=snapshot.source_host,
+                status=snapshot.status,
+                error=snapshot.error,
+            )
+            current_desired_total = next_desired_total
+            if snapshot.status == "OK":
+                state_store.append_event(
+                    run_id=run_id,
+                    job_id="__worker__",
+                    level="INFO",
+                    stage="LICENSE_POLL_OK",
+                    message=(
+                        f"source_host={snapshot.source_host} level1_in_use={snapshot.level1_in_use} "
+                        f"level2_in_use={snapshot.level2_in_use} effective_in_use={snapshot.effective_in_use} "
+                        f"ceiling={snapshot.ceiling}"
+                    ),
+                )
+                if snapshot.effective_in_use is not None and snapshot.effective_in_use >= current_ceiling:
+                    _append_license_event_once(
+                        level="WARN",
+                        stage="LICENSE_CEILING_REACHED",
+                        message=(
+                            f"effective_in_use={snapshot.effective_in_use} ceiling={current_ceiling} "
+                            f"desired_total_active_slots={current_desired_total}"
+                        ),
+                    )
+                elif next_desired_total != int(control_state.get("desired_total_active_slots") or 0):
+                    state_store.append_event(
+                        run_id=run_id,
+                        job_id="__worker__",
+                        level="INFO",
+                        stage="LICENSE_SLOT_BUDGET_INCREASED",
+                        message=(
+                            f"desired_total_active_slots={current_desired_total} "
+                            f"dispatchable_accounts={len(pre_adjust_plan.dispatchable_account_ids)}"
+                        ),
+                    )
+                else:
+                    state_store.append_event(
+                        run_id=run_id,
+                        job_id="__worker__",
+                        level="INFO",
+                        stage="LICENSE_SLOT_BUDGET_FROZEN",
+                        message=(
+                            f"desired_total_active_slots={current_desired_total} "
+                            f"dispatchable_accounts={len(pre_adjust_plan.dispatchable_account_ids)}"
+                        ),
+                    )
+            else:
+                state_store.append_event(
+                    run_id=run_id,
+                    job_id="__worker__",
+                    level="WARN",
+                    stage="LICENSE_POLL_FAILED",
+                    message=(
+                        f"source_host={snapshot.source_host} error={snapshot.error or 'unknown'} "
+                        f"desired_total_active_slots={current_desired_total}"
+                    ),
+                )
+
+        final_plan = compute_license_target_plan(
+            account_states=account_states,
+            desired_total_active_slots=current_desired_total,
+            effective_in_use=effective_in_use,
+            ceiling=current_ceiling,
+        )
+        aggregated_active_slots_by_account: dict[str, int] = {}
+        for item in account_states:
+            aggregated_active_slots_by_account[item.account_id] = (
+                aggregated_active_slots_by_account.get(item.account_id, 0) + max(0, int(item.active_slots))
+            )
+        license_target_slots_by_account = dict(final_plan.target_slots_by_account)
+        license_dispatchable_account_ids = tuple(final_plan.dispatchable_account_ids)
+        license_slot_deficits_by_account = {
+            account_id: max(
+                0,
+                int(license_target_slots_by_account.get(account_id, 0))
+                - aggregated_active_slots_by_account.get(account_id, 0),
+            )
+            for account_id in {account.account_id for account in accounts}
+        }
+        return dict(license_slot_deficits_by_account)
+
     def _capacity_lookup_with_cooldown(*, account: AccountConfig, pending_buffer_per_account: int) -> AccountCapacitySnapshot:
         snapshot = query_account_capacity(
             account=account,
@@ -1222,9 +1411,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         )
 
     def _bundle_submitted(bundle: BundleSpec) -> None:
-        completed, inflight = state_store.get_slot_throughput_score(run_id=run_id, account_id=bundle.account_id)
+        target_slots = license_target_slots_by_account.get(bundle.account_id, 0)
+        remaining_deficit = license_slot_deficits_by_account.get(bundle.account_id, 0)
         _log_stage(
-            f"scheduler pick account={bundle.account_id} score={completed + inflight} slots={bundle.slot_count}"
+            f"scheduler pick account={bundle.account_id} target_slots={target_slots} "
+            f"remaining_deficit={remaining_deficit} slots={bundle.slot_count}"
         )
         _log_stage(
             f"bundle submitted job_id={bundle.job_id} account={bundle.account_id} slot_count={bundle.slot_count}"
@@ -1241,6 +1432,13 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     next_job_index = state_store.get_next_job_index(run_id=run_id)
     controller: SlotWorkerController[_BundleRuntimeOutcome] | None = None
 
+    def _current_license_backlog_slots() -> int:
+        backlog = len(queued_slots)
+        if controller is not None:
+            snapshot = controller.snapshot()
+            backlog += snapshot.queued_slots + snapshot.pending_slots
+        return backlog
+
     def _record_batch(batch: object) -> None:
         nonlocal max_inflight_jobs, next_job_index, terminal_jobs, replacement_jobs
         max_inflight_jobs = max(max_inflight_jobs, int(batch.max_inflight_jobs))
@@ -1250,10 +1448,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         outcomes.extend(batch.results)
 
     def _current_completed_slots() -> dict[str, int]:
-        return {
-            account.account_id: state_store.get_slot_throughput_score(run_id=run_id, account_id=account.account_id)[0]
-            for account in accounts
-        }
+        return {}
 
     def _record_readiness(snapshot: AccountReadinessSnapshot) -> None:
         state_store.record_account_readiness_snapshot(
@@ -1295,38 +1490,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 stage=snapshot.status,
                 message=f"account={snapshot.account_id} host={snapshot.host_alias} reason={snapshot.reason}",
             )
-        scratch_root = str(snapshot.scratch_root or config.remote_root)
-        if snapshot.scratch_usage_mb is not None and snapshot.scratch_usage_mb >= REMOTE_SCRATCH_SOFT_LIMIT_MB:
-            if snapshot.scratch_usage_mb >= REMOTE_SCRATCH_HARD_LIMIT_MB:
-                stage = "REMOTE_SCRATCH_HARD_LIMIT"
-                level = "ERROR"
-            else:
-                stage = "REMOTE_SCRATCH_SOFT_LIMIT"
-                level = "WARN"
-            event_key = (snapshot.account_id, stage)
-            if event_key not in scratch_guard_events:
-                state_store.append_event(
-                    run_id=run_id,
-                    job_id="__worker__",
-                    level=level,
-                    stage=stage,
-                    message=(
-                        f"account={snapshot.account_id} host={snapshot.host_alias} "
-                        f"scratch_root={scratch_root} usage_mb={snapshot.scratch_usage_mb}"
-                    ),
-                )
-                scratch_guard_events.add(event_key)
         if "tmpfs_mount_failed" in str(snapshot.reason):
-            event_key = (snapshot.account_id, "RUNTIME_TMPFS_PROBE_FAILED")
-            if event_key not in runtime_probe_events:
-                state_store.append_event(
-                    run_id=run_id,
-                    job_id="__worker__",
-                    level="WARN",
-                    stage="RUNTIME_TMPFS_PROBE_FAILED",
-                    message=f"account={snapshot.account_id} host={snapshot.host_alias} reason={snapshot.reason}",
-                )
-                runtime_probe_events.add(event_key)
+            _append_license_event_once(
+                level="WARN",
+                stage="RUNTIME_TMPFS_PROBE_FAILED",
+                message=f"account={snapshot.account_id} host={snapshot.host_alias} reason={snapshot.reason}",
+            )
 
     def _resolve_dispatch_accounts() -> list[AccountConfig]:
         nonlocal ready_account_ids, blocked_account_ids, bootstrapping_account_ids, cutover_ready_emitted
@@ -1345,8 +1514,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 snapshot = query_account_readiness(
                     account=account,
                     command_timeout_seconds=config.readiness_probe_timeout_seconds,
-                    remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
-                    remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                    remote_storage_inode_block_percent=0,
+                    remote_storage_min_free_mb=0,
                     **_runtime_probe_kwargs(),
                     **_ssh_config_kwargs(),
                 )
@@ -1397,8 +1566,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     snapshot = query_account_preflight(
                         account=account,
                         command_timeout_seconds=config.preflight_probe_timeout_seconds,
-                        remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
-                        remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                        remote_storage_inode_block_percent=0,
+                        remote_storage_min_free_mb=0,
                         **_runtime_probe_kwargs(),
                         **_ssh_config_kwargs(),
                     )
@@ -1414,8 +1583,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     snapshot = query_account_preflight(
                         account=account,
                         command_timeout_seconds=config.preflight_probe_timeout_seconds,
-                        remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
-                        remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                        remote_storage_inode_block_percent=0,
+                        remote_storage_min_free_mb=0,
                         **_runtime_probe_kwargs(),
                         **_ssh_config_kwargs(),
                     )
@@ -1443,6 +1612,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 ),
             )
             cutover_ready_emitted = True
+        _publish_license_account_states(queued_slot_count=len(queued_slots))
         return ready_accounts
 
     if config.continuous_mode and config.execute_remote and not queued_slots:
@@ -1468,6 +1638,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 )
                 cutover_blocked_emitted = True
             return False
+        _refresh_license_targets(queued_slot_count=len(slot_batch))
         completed_slots = _current_completed_slots()
         if config.execute_remote:
             batch = run_slot_workers(
@@ -1492,6 +1663,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 on_bundle_submitted=_bundle_submitted,
                 recovery_slots_lookup=lambda _bundle, outcome: outcome.requeue_slots,
                 terminal_bundle_lookup=lambda _bundle, outcome: outcome.terminal_worker,
+                slot_deficit_lookup=(lambda: _refresh_license_targets(queued_slot_count=len(slot_batch))),
             )
         else:
             batch = run_slot_workers(
@@ -1565,8 +1737,6 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 return True
             if not queued_slots:
                 return False
-            if not force and len(queued_slots) < config.slots_per_job:
-                return False
             if _dispatch_drained(queued_count=len(queued_slots)):
                 return False
             dispatch_accounts = _resolve_dispatch_accounts()
@@ -1583,6 +1753,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     )
                     cutover_blocked_emitted = True
                 return False
+            _refresh_license_targets(queued_slot_count=len(queued_slots))
             controller = SlotWorkerController(
                 accounts=dispatch_accounts,
                 slots_per_job=config.slots_per_job,
@@ -1621,6 +1792,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     (lambda _bundle, outcome: outcome.terminal_worker)
                     if config.execute_remote
                     else (lambda _bundle, outcome: False)
+                ),
+                slot_deficit_lookup=(
+                    (lambda: _refresh_license_targets(queued_slot_count=_current_license_backlog_slots()))
+                    if config.execute_remote
+                    else None
                 ),
             )
             controller.enqueue_slots(queued_slots, flush_partial=force)
@@ -1662,10 +1838,14 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 )
 
             if controller is None and queued_slots:
-                scan_backlog_empty = not pending_scan_files and not rescan_scan_files
-                forced_start = scan_backlog_empty or len(queued_slots) >= config.slots_per_job
-                if forced_start and _start_controller(force=scan_backlog_empty):
-                    continue
+                if config.execute_remote:
+                    if _start_controller(force=True):
+                        continue
+                else:
+                    scan_backlog_empty = not pending_scan_files and not rescan_scan_files
+                    forced_start = scan_backlog_empty or len(queued_slots) >= config.slots_per_job
+                    if forced_start and _start_controller(force=scan_backlog_empty):
+                        continue
 
             now = time.monotonic()
             if now >= next_scan_monotonic:
@@ -1707,7 +1887,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                         controller.step(wait_for_progress=False, flush_partial_bundles=allow_partial_flush)
                     else:
                         queued_slots.extend(slots)
-                        if len(queued_slots) >= config.slots_per_job:
+                        if config.execute_remote:
+                            _start_controller(force=True)
+                        elif len(queued_slots) >= config.slots_per_job:
                             _start_controller()
                 continue
 

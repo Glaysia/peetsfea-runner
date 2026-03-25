@@ -12,7 +12,6 @@ from typing import Callable, Generic, Protocol, Sequence, TypeVar
 
 from .runtime_policy import (
     DEFAULT_REMOTE_ROOT,
-    REMOTE_SCRATCH_HARD_LIMIT_MB,
     RUNTIME_PROBE_CACHE_TTL_SECONDS,
     SLOT_TMPFS_SIZE_GB,
     remote_runtime_root,
@@ -533,16 +532,6 @@ def _parse_readiness_marker(
         scratch_usage_mb = int(raw_scratch_usage_mb) if raw_scratch_usage_mb else None
     except ValueError:
         scratch_usage_mb = None
-    if scratch_usage_mb is not None and scratch_usage_mb >= REMOTE_SCRATCH_HARD_LIMIT_MB:
-        scratch_reason = (
-            f"remote_scratch_limit_exceeded usage_mb={scratch_usage_mb} "
-            f"limit_mb={REMOTE_SCRATCH_HARD_LIMIT_MB} root={scratch_root}"
-        )
-        if storage_ready:
-            storage_ready = False
-            storage_reason = scratch_reason
-        elif scratch_reason not in storage_reason:
-            storage_reason = f"{storage_reason},{scratch_reason}"
     bootstrap_needed = not runtime_path_ok or not env_ok or not python_ok or not binaries_ok
     hard_blocked = not home_ok or not module_ok or not ansys_ok
     failed_checks = [
@@ -1255,16 +1244,6 @@ def _parse_preflight_marker(
         scratch_usage_mb = int(raw_scratch_usage_mb) if raw_scratch_usage_mb else None
     except ValueError:
         scratch_usage_mb = None
-    if scratch_usage_mb is not None and scratch_usage_mb >= REMOTE_SCRATCH_HARD_LIMIT_MB:
-        scratch_reason = (
-            f"remote_scratch_limit_exceeded usage_mb={scratch_usage_mb} "
-            f"limit_mb={REMOTE_SCRATCH_HARD_LIMIT_MB} root={scratch_root}"
-        )
-        if storage_ready:
-            storage_ready = False
-            storage_reason = scratch_reason
-        elif scratch_reason not in storage_reason:
-            storage_reason = f"{storage_reason},{scratch_reason}"
     failed_checks = [
         check_name
         for check_name, check_ok in (
@@ -1939,6 +1918,7 @@ class SlotWorkerController(Generic[T]):
         on_capacity_error: Callable[[AccountConfigLike, Exception], None] | None = None,
         recovery_slots_lookup: Callable[[BundleSpec, T], Sequence[SlotTaskRef]] | None = None,
         terminal_bundle_lookup: Callable[[BundleSpec, T], bool] | None = None,
+        slot_deficit_lookup: Callable[[], dict[str, int]] | None = None,
     ) -> None:
         if slots_per_job <= 0:
             raise ValueError("slots_per_job must be > 0")
@@ -1969,6 +1949,7 @@ class SlotWorkerController(Generic[T]):
         self._on_capacity_error = on_capacity_error
         self._recovery_slots_lookup = recovery_slots_lookup
         self._terminal_bundle_lookup = terminal_bundle_lookup
+        self._slot_deficit_lookup = slot_deficit_lookup
 
         self._source_queue: deque[SlotTaskRef] = deque()
         self._pending_bundles: deque[list[SlotTaskRef]] = deque()
@@ -2098,11 +2079,24 @@ class SlotWorkerController(Generic[T]):
     def _submit_pending_bundles(self, snapshots: Sequence[AccountCapacitySnapshot]) -> bool:
         submitted_any = False
         step_submitted_workers: dict[str, int] = {}
+        step_submitted_slots: dict[str, int] = {}
+        slot_deficits_by_account = self._slot_deficit_lookup() if self._slot_deficit_lookup is not None else {}
         while self._pending_bundles and len(self._future_to_bundle) < self._max_workers:
             eligible: list[AccountCapacitySnapshot] = []
+            eligible_slot_limits: dict[str, int] = {}
             for snapshot in snapshots:
                 submitted_unobserved = step_submitted_workers.get(snapshot.account_id, 0)
                 effective_allowed = max(0, snapshot.allowed_submit - submitted_unobserved)
+                if self._slot_deficit_lookup is not None:
+                    effective_deficit = max(
+                        0,
+                        int(slot_deficits_by_account.get(snapshot.account_id, 0))
+                        - step_submitted_slots.get(snapshot.account_id, 0),
+                    )
+                    if effective_deficit <= 0:
+                        effective_allowed = 0
+                    else:
+                        eligible_slot_limits[snapshot.account_id] = min(self._bundle_slot_limit, effective_deficit)
                 eligible.append(
                     AccountCapacitySnapshot(
                         account_id=snapshot.account_id,
@@ -2113,11 +2107,28 @@ class SlotWorkerController(Generic[T]):
                     )
                 )
 
-            selected = pick_balanced_account(
-                capacities=eligible,
-                completed_slots_by_account=self._completed_slots,
-                inflight_slots_by_account=self._inflight_slots,
-            )
+            if self._slot_deficit_lookup is None:
+                selected = pick_balanced_account(
+                    capacities=eligible,
+                    completed_slots_by_account=self._completed_slots,
+                    inflight_slots_by_account=self._inflight_slots,
+                )
+            else:
+                slot_eligible = [
+                    snapshot
+                    for snapshot in eligible
+                    if snapshot.allowed_submit > 0 and eligible_slot_limits.get(snapshot.account_id, 0) > 0
+                ]
+                selected = None
+                if slot_eligible:
+                    selected = min(
+                        slot_eligible,
+                        key=lambda item: (
+                            -eligible_slot_limits.get(item.account_id, 0),
+                            item.running_count,
+                            item.account_id,
+                        ),
+                    )
             if selected is None:
                 for snapshot in snapshots:
                     inflight_workers = self._inflight_workers.get(snapshot.account_id, 0)
@@ -2131,6 +2142,12 @@ class SlotWorkerController(Generic[T]):
                 break
 
             bundle_slots = self._pending_bundles.popleft()
+            bundle_slot_limit = self._bundle_slot_limit
+            if self._slot_deficit_lookup is not None:
+                bundle_slot_limit = max(1, eligible_slot_limits.get(selected.account_id, 1))
+            if len(bundle_slots) > bundle_slot_limit:
+                self._pending_bundles.appendleft(bundle_slots[bundle_slot_limit:])
+                bundle_slots = bundle_slots[:bundle_slot_limit]
             self._job_counter += 1
             bundle = BundleSpec(
                 job_id=f"job_{self._job_counter:04d}",
@@ -2146,6 +2163,7 @@ class SlotWorkerController(Generic[T]):
             self._inflight_slots[bundle.account_id] = self._inflight_slots.get(bundle.account_id, 0) + bundle.slot_count
             self._inflight_workers[bundle.account_id] = self._inflight_workers.get(bundle.account_id, 0) + 1
             step_submitted_workers[bundle.account_id] = step_submitted_workers.get(bundle.account_id, 0) + 1
+            step_submitted_slots[bundle.account_id] = step_submitted_slots.get(bundle.account_id, 0) + bundle.slot_count
             self._submitted_jobs += 1
             self._max_inflight_jobs = max(self._max_inflight_jobs, len(self._future_to_bundle))
             submitted_any = True
@@ -2162,7 +2180,7 @@ class SlotWorkerController(Generic[T]):
 
     def _materialize_pending_bundles(self, *, flush_partial: bool = False) -> None:
         while self._source_queue:
-            if len(self._source_queue) < self._slots_per_job and not flush_partial:
+            if self._slot_deficit_lookup is None and len(self._source_queue) < self._slots_per_job and not flush_partial:
                 break
             assigned: list[SlotTaskRef] = []
             while self._source_queue and len(assigned) < self._bundle_slot_limit:
@@ -2203,6 +2221,7 @@ def run_slot_workers(
     on_capacity_error: Callable[[AccountConfigLike, Exception], None] | None = None,
     recovery_slots_lookup: Callable[[BundleSpec, T], Sequence[SlotTaskRef]] | None = None,
     terminal_bundle_lookup: Callable[[BundleSpec, T], bool] | None = None,
+    slot_deficit_lookup: Callable[[], dict[str, int]] | None = None,
 ) -> BalancedBatchResult[T]:
     if not slot_queue:
         return BalancedBatchResult(results=[], max_inflight_jobs=0, submitted_jobs=0)
@@ -2222,6 +2241,7 @@ def run_slot_workers(
         on_capacity_error=on_capacity_error,
         recovery_slots_lookup=recovery_slots_lookup,
         terminal_bundle_lookup=terminal_bundle_lookup,
+        slot_deficit_lookup=slot_deficit_lookup,
     )
     controller.enqueue_slots(slot_queue)
     return controller.finalize()

@@ -166,62 +166,7 @@ def _record_local_resource_snapshots(
     pid: int,
     runtime_state: _WorkerRuntimeState,
 ) -> None:
-    run_id, _status = runtime_state.snapshot()
-    if not run_id:
-        return
-    total_mem_mb, used_mem_mb, free_mem_mb = _read_meminfo_mb()
-    load_1, load_5, load_15 = _load_average()
-    tmp_total_mb, tmp_used_mb, tmp_free_mb = _tmp_usage_mb()
-    active_slot_count = store.count_active_slots(run_id=run_id)
-    running_worker_count = len(store.list_active_slurm_workers(run_id=run_id))
-    configured_mem_mb = _parse_mem_to_mb(config.mem)
-    worker_status = store.get_slurm_worker(run_id=run_id, worker_id=f"{service_name}:{host}:{pid}")
-    tunnel_state = None
-    if worker_status is not None:
-        tunnel_state = str(worker_status.get("tunnel_state") or "")
-    rss_mb = _read_self_rss_mb()
-    process_count = _system_process_count()
-    store.record_node_resource_snapshot(
-        run_id=run_id,
-        host=host,
-        allocated_mem_mb=configured_mem_mb,
-        total_mem_mb=total_mem_mb,
-        used_mem_mb=used_mem_mb,
-        free_mem_mb=free_mem_mb,
-        load_1=load_1,
-        load_5=load_5,
-        load_15=load_15,
-        tmp_total_mb=tmp_total_mb,
-        tmp_used_mb=tmp_used_mb,
-        tmp_free_mb=tmp_free_mb,
-        process_count=process_count,
-        running_worker_count=running_worker_count,
-        active_slot_count=active_slot_count,
-    )
-    store.record_worker_resource_snapshot(
-        run_id=run_id,
-        worker_id=f"{service_name}:{host}:{pid}",
-        host=host,
-        slurm_job_id=None,
-        configured_slots=config.slots_per_job,
-        active_slots=active_slot_count,
-        idle_slots=max(config.slots_per_job - active_slot_count, 0),
-        rss_mb=rss_mb,
-        cpu_pct=None,
-        tunnel_state=tunnel_state,
-        process_count=process_count,
-    )
-    store.record_resource_summary_snapshot(
-        run_id=run_id,
-        host=host,
-        allocated_mem_mb=configured_mem_mb,
-        used_mem_mb=used_mem_mb,
-        free_mem_mb=free_mem_mb,
-        load_1=load_1,
-        running_worker_count=running_worker_count,
-        active_slot_count=active_slot_count,
-        stale=False,
-    )
+    return
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -395,11 +340,11 @@ def _build_config() -> PipelineConfig:
         run_namespace=os.getenv("PEETSFEA_RUN_NAMESPACE", "").strip(),
         pending_buffer_per_account=int(os.getenv("PEETSFEA_PENDING_BUFFER_PER_ACCOUNT", "3")),
         capacity_scope=os.getenv("PEETSFEA_CAPACITY_SCOPE", "all_user_jobs"),
-        balance_metric=os.getenv("PEETSFEA_BALANCE_METRIC", "slot_throughput"),
+        balance_metric=os.getenv("PEETSFEA_BALANCE_METRIC", "license_max_520"),
         input_source_policy=os.getenv("PEETSFEA_INPUT_SOURCE_POLICY", "input_queue_only"),
         public_storage_mode=os.getenv("PEETSFEA_PUBLIC_STORAGE_MODE", "disabled"),
-        remote_storage_inode_block_percent=int(os.getenv("PEETSFEA_REMOTE_STORAGE_INODE_BLOCK_PERCENT", "98")),
-        remote_storage_min_free_mb=int(os.getenv("PEETSFEA_REMOTE_STORAGE_MIN_FREE_MB", "20480")),
+        remote_storage_inode_block_percent=int(os.getenv("PEETSFEA_REMOTE_STORAGE_INODE_BLOCK_PERCENT", "0")),
+        remote_storage_min_free_mb=int(os.getenv("PEETSFEA_REMOTE_STORAGE_MIN_FREE_MB", "0")),
         readiness_probe_timeout_seconds=int(os.getenv("PEETSFEA_READINESS_PROBE_TIMEOUT_SECONDS", "180")),
         preflight_probe_timeout_seconds=int(os.getenv("PEETSFEA_PREFLIGHT_PROBE_TIMEOUT_SECONDS", "180")),
     )

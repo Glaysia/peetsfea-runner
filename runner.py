@@ -40,7 +40,7 @@ def _build_config(workspace_root: Path) -> PipelineConfig:
         run_rotation_hours=int(os.getenv("PEETSFEA_RUN_ROTATION_HOURS", "24")),
         pending_buffer_per_account=int(os.getenv("PEETSFEA_PENDING_BUFFER_PER_ACCOUNT", "3")),
         capacity_scope=os.getenv("PEETSFEA_CAPACITY_SCOPE", "all_user_jobs"),
-        balance_metric=os.getenv("PEETSFEA_BALANCE_METRIC", "slot_throughput"),
+        balance_metric=os.getenv("PEETSFEA_BALANCE_METRIC", "license_max_520"),
         accounts_registry=(
             AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
             AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
