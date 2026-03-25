@@ -64,7 +64,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | `00:00` | CSV integrity hotfix, canary schema gate, 문서/운영 경계 정리 | 유지 | `1` | `CANARY_PASSED`, `FULL_ROLLOUT_READY`, `reason=ok` | `CANARY_FAILED`, `reason=output_variables_csv_schema_invalid`, `reason=output_variables_csv_missing`, `reason=materialized_output_missing` | `WORKER_LOOP_START`, `WORKER_LOOP_OK` 또는 `WORKER_LOOP_IDLE`, `SLURM_TRUTH_REFRESHED` |
 | `02:00` | `worker_bundle_multiplier` 상승 | 유지 | target `4`, fallback `2` | `00:00` green 유지, canary green, idle slot 감소 기대 | CSV gate red 재발, `failed_slots` 급증, throughput 개선 없음 | `WORKER_LOOP_OK`, `failed_slots` 급증 없음 |
-| `04:00` | bad-node / `/tmp` 정책 반영 | 유지 | 직전 green 값 유지 | CSV gate green 유지, resource 변경 후 canary green | `No space left on device` 지속, canary red, restart red | `WORKER_LOOP_OK`, node 오류 감소 추세 |
+| `04:00` | bad-node / scratch/tmpfs 정책 반영 | 유지 | 직전 green 값 유지 | CSV gate green 유지, resource 변경 후 canary green | `No space left on device` 지속, `REMOTE_SCRATCH_HARD_LIMIT`, `RUNTIME_TMPFS_PROBE_FAILED`, canary red, restart red | `WORKER_LOOP_OK`, node 오류 감소 추세 |
 | `06:00` | final hardening, threshold/logging, 최종 값 고정 | 유지 | `4` 또는 안정 fallback 값 | CSV regression 없음, canary green, restart green | `WORKER_LOOP_ERROR`, CSV red 재발, restart red | `WORKER_LOOP_OK/IDLE`, `WORKER_LOOP_ERROR` 부재 |
 
 주의사항은 아래와 같다.

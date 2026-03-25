@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .pipeline import AccountConfig, PipelineConfig
+from .runtime_policy import DEFAULT_REMOTE_ROOT
 from .state_store import StateStore
 from .systemd_worker import (
     _AutorecoveryControlState,
@@ -179,7 +180,7 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
         cpus_per_job=lane.cpus_per_job,
         mem="960G",
         time_limit="05:00:00",
-        remote_root="/tmp/$USER/aedt_runs",
+        remote_root=DEFAULT_REMOTE_ROOT,
         execute_remote=True,
         remote_execution_backend="slurm_batch",
         remote_container_runtime="enroot",

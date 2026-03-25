@@ -3,7 +3,7 @@
 ## 목적
 
 이 문서는 이미 수집 중인 자원 telemetry를 tonight dispatch 판단과 node 회피에 연결하는 운영 계획을 정의한다.
-핵심은 `/tmp` 부족, `No space left on device`, observed node, tunnel 상태를 triage와 exclude 계약에 반영하는 것이다.
+핵심은 GPFS scratch 사용량, `No space left on device`, slot tmpfs probe, observed node, tunnel 상태를 triage와 exclude 계약에 반영하는 것이다.
 
 ## Leaf 문서
 
@@ -24,7 +24,7 @@
 - `bad_nodes` 또는 동등한 node exclude 집합을 tonight 운영 개념으로 도입한다.
 - 차단 기준은 다음 두 가지를 기본으로 둔다.
   - `No space left on device`
-  - `/tmp free < 64 GiB`
+  - `scratch_usage_mb >= 90 GiB` 또는 `tmpfs probe failed`
 - node 차단 기준은 observed node를 기준으로 적용한다.
 - tonight 문서에서는 최초 차단 기간을 `8시간`으로 둔다.
 - `tunnel stale`은 바로 bad-node로 보지 않고 control-plane 문제로 분리해서 본다.
@@ -33,7 +33,7 @@
 운영 계약은 다음과 같다.
 
 - `No space left on device`가 확인되면 해당 node는 즉시 exclude 후보가 된다.
-- `/tmp free < 64 GiB`가 반복 관측되면 해당 node는 exclude 후보가 된다.
+- `scratch_usage_mb >= 90 GiB` 또는 `tmpfs probe failed`가 확인되면 해당 account/runtime은 dispatch 차단 후보가 된다.
 - exclude된 node는 cooldown 동안 신규 dispatch 대상에서 제거한다.
 - cooldown 만료 후에는 재평가 후보로 돌린다.
 
@@ -42,7 +42,7 @@
 resource-aware triage는 아래 순서로 문서화한다.
 
 1. node/worker/slot telemetry 확인
-2. `No space left on device` 또는 low `/tmp` signal 확인
+2. `No space left on device`, scratch hard-limit, tmpfs probe signal 확인
 3. CSV schema invalid 여부를 별도 분류
 4. observed node 기준으로 `bad_nodes` 반영
 5. 별도 validation lane에서 `10분 sample canary`
@@ -51,7 +51,8 @@ resource-aware triage는 아래 순서로 문서화한다.
 
 운영 지표는 아래를 우선 본다.
 
-- `node tmp free`
+- `scratch usage`
+- `tmpfs probe`
 - `No space left on device`
 - `observed_node`
 - `failed_slots`
@@ -62,7 +63,7 @@ resource-aware triage는 아래 순서로 문서화한다.
 ## 테스트/수용 기준
 
 - `No space left on device` 감지 시 node 차단 흐름 설명 가능
-- `/tmp free < 64 GiB` 노드 차단 규칙 명시
+- scratch hard-limit / tmpfs probe 차단 규칙 명시
 - `tunnel stale`를 bad-node와 분리 판단
 - `CSV schema invalid`를 resource/bad-node와 분리 판단
 - bad-node 적용 후 real 처리 지속성 확인

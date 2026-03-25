@@ -12,6 +12,7 @@ from unittest.mock import patch
 from peetsfea_runner.scheduler import (
     AccountCapacitySnapshot,
     AccountReadinessSnapshot,
+    _build_enroot_preflight_script,
     _build_windows_preflight_script,
     _build_windows_readiness_script,
     bootstrap_account_runtime,
@@ -50,6 +51,17 @@ class _WorkerOutcome:
 
 
 class TestScheduler(unittest.TestCase):
+    def test_build_enroot_preflight_script_extracts_numeric_inner_marker_values(self) -> None:
+        script = _build_enroot_preflight_script(
+            remote_container_image="~/runtime/enroot/aedt.sqsh",
+            remote_container_ansys_root="/opt/ohpc/pub/Electronics/v252",
+            remote_root="~/aedt_runs",
+        )
+
+        self.assertIn("sed -n 's/.*tmpfs=\\([01]\\).*/\\1/p'", script)
+        self.assertIn("sed -n 's/.*python=\\([01]\\).*/\\1/p'", script)
+        self.assertNotIn("\\\\1/p", script)
+
     def test_effective_slots_uses_max_jobs_per_account(self) -> None:
         slots = calculate_effective_slots(max_jobs_per_account=10)
         self.assertEqual(slots, 10)
@@ -167,6 +179,7 @@ class TestScheduler(unittest.TestCase):
                 module_ok=True,
                 binaries_ok=True,
                 ansys_ok=True,
+                scratch_root="$HOME/aedt_runs",
             ),
         )
 

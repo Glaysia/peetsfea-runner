@@ -10,6 +10,14 @@ from pathlib import Path
 from threading import Lock
 from typing import Callable, Generic, Protocol, Sequence, TypeVar
 
+from .runtime_policy import (
+    DEFAULT_REMOTE_ROOT,
+    REMOTE_SCRATCH_HARD_LIMIT_MB,
+    RUNTIME_PROBE_CACHE_TTL_SECONDS,
+    SLOT_TMPFS_SIZE_GB,
+    remote_runtime_root,
+)
+
 
 T = TypeVar("T")
 
@@ -93,6 +101,8 @@ class AccountReadinessSnapshot:
     storage_reason: str = "ok"
     inode_use_percent: int | None = None
     free_mb: int | None = None
+    scratch_root: str | None = None
+    scratch_usage_mb: int | None = None
 
 
 @dataclass(slots=True)
@@ -135,6 +145,8 @@ _SLURM_QUEUE_DELAY_MARKERS = (
     "requested nodes are busy",
     "requested node configuration is not available",
 )
+_RUNTIME_PROBE_CACHE: dict[tuple[str, str, str, str, str], tuple[float, AccountReadinessSnapshot]] = {}
+_RUNTIME_PROBE_CACHE_LOCK = Lock()
 
 
 def _parse_marker_values(*, marker_line: str, marker_prefix: str) -> dict[str, str]:
@@ -204,6 +216,10 @@ def _remote_shell_path(path: str) -> str:
     return normalized
 
 
+def _remote_runtime_root_shell_path(remote_root: str) -> str:
+    return _remote_shell_path(remote_runtime_root(remote_root))
+
+
 def _host_ansys_mount_root(path: str) -> str:
     normalized = _remote_shell_path(path).rstrip("/")
     if normalized.endswith("/AnsysEM"):
@@ -216,6 +232,65 @@ def _host_ansys_base_root(path: str) -> str:
     if normalized.endswith("/AnsysEM"):
         return str(Path(normalized).parent).rstrip("/")
     return normalized
+
+
+def _runtime_probe_cache_key(
+    *,
+    account: AccountConfigLike,
+    remote_root: str,
+    remote_container_image: str,
+    remote_container_ansys_root: str,
+) -> tuple[str, str, str, str, str]:
+    return (
+        account.account_id,
+        account.host_alias,
+        str(remote_root).strip() or DEFAULT_REMOTE_ROOT,
+        str(remote_container_image).strip(),
+        str(remote_container_ansys_root).strip(),
+    )
+
+
+def _cached_runtime_probe_snapshot(
+    *,
+    account: AccountConfigLike,
+    remote_root: str,
+    remote_container_image: str,
+    remote_container_ansys_root: str,
+) -> AccountReadinessSnapshot | None:
+    key = _runtime_probe_cache_key(
+        account=account,
+        remote_root=remote_root,
+        remote_container_image=remote_container_image,
+        remote_container_ansys_root=remote_container_ansys_root,
+    )
+    now = time.monotonic()
+    with _RUNTIME_PROBE_CACHE_LOCK:
+        cached = _RUNTIME_PROBE_CACHE.get(key)
+        if cached is None:
+            return None
+        cached_at, snapshot = cached
+        if (now - cached_at) > RUNTIME_PROBE_CACHE_TTL_SECONDS:
+            _RUNTIME_PROBE_CACHE.pop(key, None)
+            return None
+        return snapshot
+
+
+def _store_runtime_probe_snapshot(
+    *,
+    account: AccountConfigLike,
+    remote_root: str,
+    remote_container_image: str,
+    remote_container_ansys_root: str,
+    snapshot: AccountReadinessSnapshot,
+) -> None:
+    key = _runtime_probe_cache_key(
+        account=account,
+        remote_root=remote_root,
+        remote_container_image=remote_container_image,
+        remote_container_ansys_root=remote_container_ansys_root,
+    )
+    with _RUNTIME_PROBE_CACHE_LOCK:
+        _RUNTIME_PROBE_CACHE[key] = (time.monotonic(), snapshot)
 
 
 def _image_metadata_path(image_path: str) -> str:
@@ -428,6 +503,7 @@ def _parse_readiness_marker(
     remote_storage_inode_block_percent: int = 98,
     remote_storage_min_free_mb: int = 0,
     remote_container_image: str = "",
+    remote_root: str = DEFAULT_REMOTE_ROOT,
 ) -> AccountReadinessSnapshot:
     marker_line = next((line.strip() for line in text.splitlines() if line.strip().startswith(_READINESS_MARKER)), None)
     if marker_line is None:
@@ -451,6 +527,22 @@ def _parse_readiness_marker(
         remote_storage_inode_block_percent=remote_storage_inode_block_percent,
         remote_storage_min_free_mb=remote_storage_min_free_mb,
     )
+    scratch_root = raw_values.get("scratch_root", "").strip() or _remote_shell_path(remote_root)
+    raw_scratch_usage_mb = raw_values.get("scratch_usage_mb", "").strip()
+    try:
+        scratch_usage_mb = int(raw_scratch_usage_mb) if raw_scratch_usage_mb else None
+    except ValueError:
+        scratch_usage_mb = None
+    if scratch_usage_mb is not None and scratch_usage_mb >= REMOTE_SCRATCH_HARD_LIMIT_MB:
+        scratch_reason = (
+            f"remote_scratch_limit_exceeded usage_mb={scratch_usage_mb} "
+            f"limit_mb={REMOTE_SCRATCH_HARD_LIMIT_MB} root={scratch_root}"
+        )
+        if storage_ready:
+            storage_ready = False
+            storage_reason = scratch_reason
+        elif scratch_reason not in storage_reason:
+            storage_reason = f"{storage_reason},{scratch_reason}"
     bootstrap_needed = not runtime_path_ok or not env_ok or not python_ok or not binaries_ok
     hard_blocked = not home_ok or not module_ok or not ansys_ok
     failed_checks = [
@@ -506,6 +598,8 @@ def _parse_readiness_marker(
         storage_reason=storage_reason,
         inode_use_percent=inode_use_percent,
         free_mb=free_mb,
+        scratch_root=scratch_root,
+        scratch_usage_mb=scratch_usage_mb,
     )
 
 
@@ -673,11 +767,17 @@ def _query_windows_account_preflight(
     raise RuntimeError(f"preflight check failed account={account.account_id}: {details}")
 
 
-def _build_enroot_readiness_script(*, remote_container_image: str, remote_container_ansys_root: str) -> str:
+def _build_enroot_readiness_script(
+    *,
+    remote_container_image: str,
+    remote_container_ansys_root: str,
+    remote_root: str = DEFAULT_REMOTE_ROOT,
+) -> str:
     image_path = _remote_shell_path(remote_container_image)
     ansys_root = _host_ansys_mount_root(remote_container_ansys_root)
     ansys_base = _host_ansys_base_root(remote_container_ansys_root)
     metadata_path = _image_metadata_path(image_path)
+    scratch_root = _remote_shell_path(remote_root)
     return fr"""
 set +e
 HOME_OK=0
@@ -693,10 +793,10 @@ REMOTE_CONTAINER_IMAGE={_double_quoted_shell_value(image_path)}
 REMOTE_CONTAINER_METADATA={_double_quoted_shell_value(metadata_path)}
 REMOTE_CONTAINER_ANSYS_ROOT={_double_quoted_shell_value(ansys_root)}
 REMOTE_CONTAINER_ANSYS_BASE={_double_quoted_shell_value(ansys_base)}
+SCRATCH_ROOT={_double_quoted_shell_value(scratch_root)}
 IMAGE_CONTRACT_VERSION={_double_quoted_shell_value(_ENROOT_IMAGE_CONTRACT_VERSION)}
 IMAGE_PYTHON={_double_quoted_shell_value(_ENROOT_IMAGE_PYTHON)}
-BASE_DIR="/tmp/$USER/peetsfea-ready-${{SLURM_JOB_ID:-nojob}}-$$"
-CONTAINER_NAME="peetsfea-ready-${{SLURM_JOB_ID:-nojob}}-$$"
+SCRATCH_USAGE_MB=0
 if [ -n "${{HOME:-}}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
   HOME_OK=1
 fi
@@ -716,7 +816,15 @@ if [ -n "$REMOTE_CONTAINER_IMAGE" ] && [ -f "$REMOTE_CONTAINER_IMAGE" ] && [ -r 
 else
   MISSING+=("image_missing")
 fi
-if [ "$IMAGE_OK" -eq 1 ] && [ "$MODULE_OK" -eq 1 ]; then
+if mkdir -p "$SCRATCH_ROOT" >/dev/null 2>&1 && [ -w "$SCRATCH_ROOT" ]; then
+  :
+else
+  MISSING+=("scratch_root")
+fi
+if [ -d "$SCRATCH_ROOT" ]; then
+  SCRATCH_USAGE_MB=$(du -sm "$SCRATCH_ROOT" 2>/dev/null | awk 'NR==1 {{print $1+0}}' || echo 0)
+fi
+if [ "$IMAGE_OK" -eq 1 ] && [ "$MODULE_OK" -eq 1 ] && [ -d "$SCRATCH_ROOT" ] && [ -w "$SCRATCH_ROOT" ]; then
   RUNTIME_OK=1
   ENV_OK=1
   PYTHON_OK=1
@@ -730,15 +838,22 @@ INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {{gsub(/%/, "", $5); print $
 FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {{print $4+0}}' || echo 0)
 FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
 MISSING_TEXT=$(IFS=,; printf '%s' "${{MISSING[*]}}")
-printf '__PEETSFEA_READY__:home=%s runtime=%s env=%s python=%s module=%s binaries=%s ansys=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s image_path=%s env_path=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$ENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT" "$REMOTE_CONTAINER_IMAGE" "$IMAGE_PYTHON"
+printf '__PEETSFEA_READY__:home=%s runtime=%s env=%s python=%s module=%s binaries=%s ansys=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s image_path=%s env_path=%s scratch_root=%s scratch_usage_mb=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$ENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT" "$REMOTE_CONTAINER_IMAGE" "$IMAGE_PYTHON" "$SCRATCH_ROOT" "$SCRATCH_USAGE_MB"
 """
 
 
-def _build_enroot_preflight_script(*, remote_container_image: str, remote_container_ansys_root: str) -> str:
+def _build_enroot_preflight_script(
+    *,
+    remote_container_image: str,
+    remote_container_ansys_root: str,
+    remote_root: str = DEFAULT_REMOTE_ROOT,
+) -> str:
     image_path = _remote_shell_path(remote_container_image)
     ansys_root = _host_ansys_mount_root(remote_container_ansys_root)
     ansys_base = _host_ansys_base_root(remote_container_ansys_root)
     metadata_path = _image_metadata_path(image_path)
+    scratch_root = _remote_shell_path(remote_root)
+    runtime_root = _remote_runtime_root_shell_path(remote_root)
     return fr"""
 set +e
 HOME_OK=0
@@ -753,15 +868,19 @@ PYAEDT_OK=0
 PANDAS_OK=0
 PYVISTA_OK=0
 STORAGE_OK=1
+TMPFS_OK=0
 MISSING=()
 REMOTE_CONTAINER_IMAGE={_double_quoted_shell_value(image_path)}
 REMOTE_CONTAINER_METADATA={_double_quoted_shell_value(metadata_path)}
 REMOTE_CONTAINER_ANSYS_ROOT={_double_quoted_shell_value(ansys_root)}
 REMOTE_CONTAINER_ANSYS_BASE={_double_quoted_shell_value(ansys_base)}
+SCRATCH_ROOT={_double_quoted_shell_value(scratch_root)}
+RUNTIME_ROOT={_double_quoted_shell_value(runtime_root)}
 IMAGE_CONTRACT_VERSION={_double_quoted_shell_value(_ENROOT_IMAGE_CONTRACT_VERSION)}
 IMAGE_PYTHON={_double_quoted_shell_value(_ENROOT_IMAGE_PYTHON)}
-BASE_DIR="/tmp/$USER/peetsfea-preflight-${{SLURM_JOB_ID:-nojob}}-$$"
+BASE_DIR=""
 CONTAINER_NAME="peetsfea-preflight-${{SLURM_JOB_ID:-nojob}}-$$"
+SCRATCH_USAGE_MB=0
 if [ -n "${{HOME:-}}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
   HOME_OK=1
 fi
@@ -781,7 +900,15 @@ if [ -n "$REMOTE_CONTAINER_IMAGE" ] && [ -f "$REMOTE_CONTAINER_IMAGE" ] && [ -r 
 else
   MISSING+=("image_missing")
 fi
-if [ "$IMAGE_OK" -eq 1 ] && [ "$MODULE_OK" -eq 1 ]; then
+if mkdir -p "$SCRATCH_ROOT" "$RUNTIME_ROOT" >/dev/null 2>&1 && [ -w "$SCRATCH_ROOT" ] && [ -w "$RUNTIME_ROOT" ]; then
+  :
+else
+  MISSING+=("scratch_root")
+fi
+if [ -d "$SCRATCH_ROOT" ]; then
+  SCRATCH_USAGE_MB=$(du -sm "$SCRATCH_ROOT" 2>/dev/null | awk 'NR==1 {{print $1+0}}' || echo 0)
+fi
+if [ "$IMAGE_OK" -eq 1 ] && [ "$MODULE_OK" -eq 1 ] && [ -d "$RUNTIME_ROOT" ] && [ -w "$RUNTIME_ROOT" ]; then
   RUNTIME_OK=1
 fi
 if [ -n "$REMOTE_CONTAINER_ANSYS_ROOT" ] && [ -x "$REMOTE_CONTAINER_ANSYS_ROOT/ansysedt" ] && [ -x "$REMOTE_CONTAINER_ANSYS_BASE/licensingclient/linx64/ansyscl" ]; then
@@ -791,11 +918,14 @@ else
 fi
 cleanup() {{
   enroot remove -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  rm -rf "$BASE_DIR" >/dev/null 2>&1 || true
+  if [ -n "$BASE_DIR" ]; then
+    rm -rf "$BASE_DIR" >/dev/null 2>&1 || true
+  fi
 }}
 trap cleanup EXIT
 if [ "$RUNTIME_OK" -eq 1 ]; then
-  mkdir -p "$BASE_DIR/runtime" "$BASE_DIR/cache" "$BASE_DIR/data" "$BASE_DIR/tmp"
+  BASE_DIR=$(mktemp -d "$RUNTIME_ROOT/preflight.${{SLURM_JOB_ID:-nojob}}.XXXXXX")
+  mkdir -p "$BASE_DIR/runtime" "$BASE_DIR/cache" "$BASE_DIR/data" "$BASE_DIR/tmp" "$BASE_DIR/work/tmp" "$BASE_DIR/work/home"
   export ENROOT_RUNTIME_PATH="$BASE_DIR/runtime"
   export ENROOT_CACHE_PATH="$BASE_DIR/cache"
   export ENROOT_DATA_PATH="$BASE_DIR/data"
@@ -804,11 +934,30 @@ if [ "$RUNTIME_OK" -eq 1 ]; then
     PREFLIGHT_SCRIPT=$(cat <<'INNER'
 set +e
 IMAGE_PYTHON="/opt/miniconda3/bin/python"
-if [ ! -x "$IMAGE_PYTHON" ]; then
-  printf '__PEETSFEA_PREFLIGHT_INNER__:python=0 uv=0 pyaedt=0 pandas=0 pyvista=0\n'
+TMPFS_OK=0
+mkdir -p /work/tmp /work/home
+if mount -t tmpfs -o size={SLOT_TMPFS_SIZE_GB}G tmpfs /work/tmp >/dev/null 2>&1; then
+  TMPFS_OK=1
+fi
+cleanup_inner() {{
+  if [ "$TMPFS_OK" -eq 1 ]; then
+    umount /work/tmp >/dev/null 2>&1 || true
+  fi
+}}
+trap cleanup_inner EXIT
+export HOME=/work/home
+export TMPDIR=/work/tmp
+export XDG_CONFIG_HOME=/work/home/.config
+cd "${{TMPDIR:-/work}}" || true
+if [ "$TMPFS_OK" -ne 1 ]; then
+  printf '__PEETSFEA_PREFLIGHT_INNER__:tmpfs=0 python=0 uv=0 pyaedt=0 pandas=0 pyvista=0\n'
   exit 0
 fi
-printf '__PEETSFEA_PREFLIGHT_INNER__:python=1 '
+if [ ! -x "$IMAGE_PYTHON" ]; then
+  printf '__PEETSFEA_PREFLIGHT_INNER__:tmpfs=1 python=0 uv=0 pyaedt=0 pandas=0 pyvista=0\n'
+  exit 0
+fi
+printf '__PEETSFEA_PREFLIGHT_INNER__:tmpfs=1 python=1 '
 "$IMAGE_PYTHON" - <<'PY'
 import subprocess
 import sys
@@ -833,20 +982,25 @@ print(
 PY
 INNER
 )
-    PREFLIGHT_OUTPUT=$(enroot start --root --rw --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" --mount "$REMOTE_CONTAINER_ANSYS_BASE:/ansys_inc/v252" "$CONTAINER_NAME" /bin/bash -lc "mkdir -p /tmp/peetsfea-home /tmp/peetsfea-tmp && export HOME=/tmp/peetsfea-home && export TMPDIR=/tmp/peetsfea-tmp && export XDG_CONFIG_HOME=/tmp/peetsfea-home/.config && cd /tmp && $PREFLIGHT_SCRIPT" 2>/dev/null || true)
+    PREFLIGHT_OUTPUT=$(enroot start --root --rw --mount "$BASE_DIR/work:/work" --mount "$REMOTE_CONTAINER_ANSYS_ROOT:/mnt/AnsysEM" --mount "$REMOTE_CONTAINER_ANSYS_BASE:/ansys_inc/v252" "$CONTAINER_NAME" /bin/bash -lc "$PREFLIGHT_SCRIPT" 2>/dev/null || true)
     INNER_MARKER=$(printf '%s\n' "$PREFLIGHT_OUTPUT" | awk '/^__PEETSFEA_PREFLIGHT_INNER__:/ {{print; exit}}')
     if [ -n "$INNER_MARKER" ]; then
       ENV_OK=1
-      PYTHON_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*python=\([01]\).*/\\1/p')
-      UV_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*uv=\([01]\).*/\\1/p')
-      PYAEDT_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*pyaedt=\([01]\).*/\\1/p')
-      PANDAS_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*pandas=\([01]\).*/\\1/p')
-      PYVISTA_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*pyvista=\([01]\).*/\\1/p')
+      TMPFS_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*tmpfs=\([01]\).*/\1/p')
+      PYTHON_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*python=\([01]\).*/\1/p')
+      UV_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*uv=\([01]\).*/\1/p')
+      PYAEDT_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*pyaedt=\([01]\).*/\1/p')
+      PANDAS_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*pandas=\([01]\).*/\1/p')
+      PYVISTA_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*pyvista=\([01]\).*/\1/p')
+      : "${{TMPFS_OK:=0}}"
       : "${{PYTHON_OK:=0}}"
       : "${{UV_OK:=0}}"
       : "${{PYAEDT_OK:=0}}"
       : "${{PANDAS_OK:=0}}"
       : "${{PYVISTA_OK:=0}}"
+      if [ "$TMPFS_OK" -ne 1 ]; then
+        MISSING+=("tmpfs_mount_failed")
+      fi
     else
       MISSING+=("env")
     fi
@@ -858,7 +1012,7 @@ INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {{gsub(/%/, "", $5); print $
 FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {{print $4+0}}' || echo 0)
 FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
 MISSING_TEXT=$(IFS=,; printf '%s' "${{MISSING[*]}}")
-printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s env=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s pandas=%s pyvista=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s image_path=%s env_path=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$ENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK" "$PANDAS_OK" "$PYVISTA_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT" "$REMOTE_CONTAINER_IMAGE" "$IMAGE_PYTHON"
+printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s env=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s pandas=%s pyvista=%s tmpfs=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s image_path=%s env_path=%s scratch_root=%s scratch_usage_mb=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$ENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK" "$PANDAS_OK" "$PYVISTA_OK" "$TMPFS_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT" "$REMOTE_CONTAINER_IMAGE" "$IMAGE_PYTHON" "$SCRATCH_ROOT" "$SCRATCH_USAGE_MB"
 """
 
 
@@ -871,6 +1025,7 @@ def query_account_readiness(
     remote_storage_inode_block_percent: int = 98,
     remote_storage_min_free_mb: int = 0,
     remote_container_runtime: str = "none",
+    remote_root: str = DEFAULT_REMOTE_ROOT,
     remote_container_image: str = "",
     remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252",
     remote_ansys_executable: str = "",
@@ -890,6 +1045,7 @@ def query_account_readiness(
         remote_script = _build_enroot_readiness_script(
             remote_container_image=remote_container_image,
             remote_container_ansys_root=remote_container_ansys_root,
+            remote_root=remote_root,
         )
         command = [
             *_ssh_base_command(
@@ -937,6 +1093,7 @@ def query_account_readiness(
                 remote_storage_inode_block_percent=remote_storage_inode_block_percent,
                 remote_storage_min_free_mb=remote_storage_min_free_mb,
                 remote_container_image=remote_container_image,
+                remote_root=remote_root,
             )
             if return_code != 0 and snapshot.ready:
                 raise RuntimeError(
@@ -1064,6 +1221,7 @@ def _parse_preflight_marker(
     remote_storage_inode_block_percent: int = 98,
     remote_storage_min_free_mb: int = 0,
     remote_container_image: str = "",
+    remote_root: str = DEFAULT_REMOTE_ROOT,
 ) -> AccountReadinessSnapshot:
     marker_line = next((line.strip() for line in text.splitlines() if line.strip().startswith(_PREFLIGHT_MARKER)), None)
     if marker_line is None:
@@ -1085,11 +1243,28 @@ def _parse_preflight_marker(
     pyaedt_ok = values.get("pyaedt", False)
     pandas_ok = values.get("pandas", False)
     pyvista_ok = values.get("pyvista", False)
+    tmpfs_ok = values.get("tmpfs", True)
     storage_ready, storage_reason, inode_use_percent, free_mb = _storage_snapshot_from_values(
         values=raw_values,
         remote_storage_inode_block_percent=remote_storage_inode_block_percent,
         remote_storage_min_free_mb=remote_storage_min_free_mb,
     )
+    scratch_root = raw_values.get("scratch_root", "").strip() or _remote_shell_path(remote_root)
+    raw_scratch_usage_mb = raw_values.get("scratch_usage_mb", "").strip()
+    try:
+        scratch_usage_mb = int(raw_scratch_usage_mb) if raw_scratch_usage_mb else None
+    except ValueError:
+        scratch_usage_mb = None
+    if scratch_usage_mb is not None and scratch_usage_mb >= REMOTE_SCRATCH_HARD_LIMIT_MB:
+        scratch_reason = (
+            f"remote_scratch_limit_exceeded usage_mb={scratch_usage_mb} "
+            f"limit_mb={REMOTE_SCRATCH_HARD_LIMIT_MB} root={scratch_root}"
+        )
+        if storage_ready:
+            storage_ready = False
+            storage_reason = scratch_reason
+        elif scratch_reason not in storage_reason:
+            storage_reason = f"{storage_reason},{scratch_reason}"
     failed_checks = [
         check_name
         for check_name, check_ok in (
@@ -1104,6 +1279,7 @@ def _parse_preflight_marker(
             ("pyaedt", pyaedt_ok),
             ("pandas", pandas_ok),
             ("pyvista", pyvista_ok),
+            ("tmpfs", tmpfs_ok),
         )
         if not check_ok
     ]
@@ -1135,6 +1311,8 @@ def _parse_preflight_marker(
         storage_reason=storage_reason,
         inode_use_percent=inode_use_percent,
         free_mb=free_mb,
+        scratch_root=scratch_root,
+        scratch_usage_mb=scratch_usage_mb,
     )
 
 
@@ -1147,6 +1325,7 @@ def query_account_preflight(
     remote_storage_inode_block_percent: int = 98,
     remote_storage_min_free_mb: int = 0,
     remote_container_runtime: str = "none",
+    remote_root: str = DEFAULT_REMOTE_ROOT,
     remote_container_image: str = "",
     remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252",
     remote_ansys_executable: str = "",
@@ -1154,6 +1333,15 @@ def query_account_preflight(
 ) -> AccountReadinessSnapshot:
     container_runtime = _container_runtime(remote_container_runtime)
     if container_runtime == "enroot":
+        if run_command is None:
+            cached_snapshot = _cached_runtime_probe_snapshot(
+                account=account,
+                remote_root=remote_root,
+                remote_container_image=remote_container_image,
+                remote_container_ansys_root=remote_container_ansys_root,
+            )
+            if cached_snapshot is not None:
+                return cached_snapshot
         if (_account_platform(account), _account_scheduler(account)) != ("linux", "slurm"):
             raise RuntimeError(
                 f"unsupported account provider account={account.account_id} "
@@ -1166,6 +1354,7 @@ def query_account_preflight(
         remote_script = _build_enroot_preflight_script(
             remote_container_image=remote_container_image,
             remote_container_ansys_root=remote_container_ansys_root,
+            remote_root=remote_root,
         )
         command = [
             *_ssh_base_command(
@@ -1213,11 +1402,20 @@ def query_account_preflight(
                 remote_storage_inode_block_percent=remote_storage_inode_block_percent,
                 remote_storage_min_free_mb=remote_storage_min_free_mb,
                 remote_container_image=remote_container_image,
+                remote_root=remote_root,
             )
             if return_code != 0 and snapshot.ready:
                 raise RuntimeError(
                     f"preflight check failed account={account.account_id}: "
                     f"{(stderr or stdout).strip() or f'return code={return_code}'}"
+                )
+            if run_command is None and snapshot.reason != "scheduler_queue_delay":
+                _store_runtime_probe_snapshot(
+                    account=account,
+                    remote_root=remote_root,
+                    remote_container_image=remote_container_image,
+                    remote_container_ansys_root=remote_container_ansys_root,
+                    snapshot=snapshot,
                 )
             return snapshot
 

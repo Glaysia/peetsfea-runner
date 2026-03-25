@@ -4,6 +4,7 @@ import shutil
 from pathlib import Path
 
 from .pipeline import AccountConfig, PipelineConfig
+from .runtime_policy import DEFAULT_REMOTE_ROOT
 
 
 _PRUNE_ACCOUNTS = (
@@ -31,7 +32,7 @@ def build_enroot_validation_lane_config(
     lane: str,
     window: str,
     remote_container_image: str,
-    remote_root: str = "/tmp/$USER/aedt_runs",
+    remote_root: str = DEFAULT_REMOTE_ROOT,
     partition: str = "cpu2",
     mem: str = "960G",
     time_limit: str = "05:00:00",

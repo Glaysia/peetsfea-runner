@@ -5,7 +5,6 @@ from collections import deque
 import json
 import os
 import shutil
-import socket
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -58,6 +57,12 @@ from .scheduler import (
     run_slot_workers,
 )
 from .state_store import StateStore
+from .runtime_policy import (
+    DEFAULT_REMOTE_ROOT,
+    REMOTE_SCRATCH_HARD_LIMIT_MB,
+    REMOTE_SCRATCH_SOFT_LIMIT_MB,
+    join_remote_root,
+)
 from .version import get_version
 
 
@@ -68,7 +73,6 @@ _CANARY_REPORT_MANIFEST_COLUMNS = frozenset(
     {"design_name", "reports_dir", "report_count", "native_report_count", "synthetic_report_count", "status", "error_log"}
 )
 _DISPATCH_MODE_ALLOWED = frozenset({"run", "drain"})
-_BAD_NODE_TMP_FREE_THRESHOLD_MB = 65536
 _BAD_NODE_COOLDOWN_HOURS = 8
 _BAD_NODE_NO_SPACE_MARKER = "No space left on device"
 
@@ -76,20 +80,6 @@ _BAD_NODE_NO_SPACE_MARKER = "No space left on device"
 def _log_stage(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[peetsfea][{timestamp}] {message}", flush=True)
-
-
-def _should_auto_register_low_tmp_node(*, host: str, accounts: tuple[AccountConfig, ...]) -> bool:
-    normalized_host = host.strip().lower()
-    if not normalized_host:
-        return False
-    reserved_hosts = {
-        "localhost",
-        "127.0.0.1",
-        socket.gethostname().strip().lower(),
-        socket.getfqdn().strip().lower(),
-    }
-    reserved_hosts.update(account.host_alias.strip().lower() for account in accounts if account.host_alias.strip())
-    return normalized_host not in reserved_hosts
 
 
 def _dispatch_mode_control_path() -> Path:
@@ -312,7 +302,7 @@ class PipelineConfig:
     cpus_per_job: int = 16
     mem: str = "960G"
     time_limit: str = "05:00:00"
-    remote_root: str = "/tmp/$USER/aedt_runs"
+    remote_root: str = DEFAULT_REMOTE_ROOT
     execute_remote: bool = False
     remote_execution_backend: str = "slurm_batch"
     control_plane_host: str = "127.0.0.1"
@@ -459,6 +449,9 @@ class PipelineConfig:
             scheduler = account.scheduler.strip().lower()
             if (platform, scheduler) not in {("linux", "slurm"), ("windows", "none")}:
                 raise ValueError("account platform/scheduler must be linux/slurm or windows/none")
+        if self.execute_remote and self.remote_container_runtime == "enroot":
+            if any((account.platform.strip().lower(), account.scheduler.strip().lower()) != ("linux", "slurm") for account in accounts):
+                raise ValueError("remote enroot execution requires all accounts to be linux/slurm")
         if self.execute_remote and any(
             (account.platform.strip().lower(), account.scheduler.strip().lower()) == ("linux", "slurm")
             for account in accounts
@@ -546,6 +539,7 @@ class _BundleRuntimeOutcome:
 @dataclass(slots=True)
 class _RemoteExecutionConfig:
     host: str
+    remote_root: str
     partition: str
     nodes: int
     ntasks: int
@@ -892,6 +886,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     dispatch_drain_emitted = False
     bad_node_policy_warnings: set[str] = set()
     bad_node_registrations: set[tuple[str, str]] = set()
+    scratch_guard_events: set[tuple[str, str]] = set()
+    runtime_probe_events: set[tuple[str, str]] = set()
 
     def _current_dispatch_mode() -> str:
         mode, warning = _read_dispatch_mode(control_path=dispatch_mode_path)
@@ -941,13 +937,6 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         )
         bad_node_registrations.add(key)
 
-    for host, tmp_free_mb, _snapshot_ts in state_store.list_latest_low_tmp_nodes(
-        tmp_free_threshold_mb=_BAD_NODE_TMP_FREE_THRESHOLD_MB
-    ):
-        if not _should_auto_register_low_tmp_node(host=host, accounts=accounts):
-            continue
-        _register_bad_node(node=host, reason=f"tmp_free_mb={tmp_free_mb}")
-
     def _reconcile_terminal_worker_failure(
         *,
         job_id: str,
@@ -994,6 +983,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     continue
                 remote_cfg = _RemoteExecutionConfig(
                     host=account.host_alias,
+                    remote_root=config.remote_root,
                     partition=config.partition,
                     nodes=config.nodes,
                     ntasks=config.ntasks,
@@ -1089,6 +1079,42 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 worker_state=effective_worker_state,
                 observed_node=worker.get("observed_node"),
             )
+    if config.execute_remote:
+        for account in accounts:
+            janitor_cfg = _RemoteExecutionConfig(
+                host=account.host_alias,
+                remote_root=config.remote_root,
+                partition=config.partition,
+                nodes=config.nodes,
+                ntasks=config.ntasks,
+                cpus_per_job=config.cpus_per_job,
+                mem=config.mem,
+                time_limit=config.time_limit,
+                slots_per_job=config.slots_per_job,
+                cores_per_slot=config.cores_per_slot,
+                tasks_per_slot=config.tasks_per_slot,
+                platform=account.platform,
+                scheduler=account.scheduler,
+                remote_execution_backend=config.remote_execution_backend,
+                control_plane_host=config.control_plane_host,
+                control_plane_port=config.control_plane_port,
+                control_plane_ssh_target=config.control_plane_ssh_target,
+                control_plane_return_host=config.control_plane_return_host,
+                control_plane_return_port=config.control_plane_return_port,
+                control_plane_return_user=config.control_plane_return_user,
+                tunnel_heartbeat_timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
+                tunnel_recovery_grace_seconds=config.tunnel_recovery_grace_seconds,
+                remote_ssh_port=config.remote_ssh_port,
+                ssh_config_path=config.ssh_config_path,
+                remote_container_runtime=config.remote_container_runtime,
+                remote_container_image=config.remote_container_image,
+                remote_container_ansys_root=config.remote_container_ansys_root,
+                remote_ansys_executable=config.remote_ansys_executable,
+            )
+            try:
+                cleanup_orphan_sessions_for_run(config=janitor_cfg, run_id=run_id)
+            except _WorkflowError as exc:
+                _log_stage(f"startup janitor failed run_id={run_id} account={account.account_id} reason={exc}")
 
     def _capacity_log(snapshot: AccountCapacitySnapshot) -> None:
         state_store.record_account_capacity_snapshot(
@@ -1127,6 +1153,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             "remote_container_image": config.remote_container_image,
             "remote_container_ansys_root": config.remote_container_ansys_root,
             "remote_ansys_executable": config.remote_ansys_executable,
+        }
+
+    def _runtime_probe_kwargs() -> dict[str, str]:
+        return {
+            **_container_runtime_kwargs(),
+            "remote_root": config.remote_root,
         }
 
     def _capacity_lookup_with_cooldown(*, account: AccountConfig, pending_buffer_per_account: int) -> AccountCapacitySnapshot:
@@ -1243,6 +1275,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             storage_reason=snapshot.storage_reason,
             inode_use_percent=snapshot.inode_use_percent,
             free_mb=snapshot.free_mb,
+            scratch_root=snapshot.scratch_root,
+            scratch_usage_mb=snapshot.scratch_usage_mb,
         )
         if snapshot.ready:
             _log_stage(
@@ -1261,6 +1295,38 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 stage=snapshot.status,
                 message=f"account={snapshot.account_id} host={snapshot.host_alias} reason={snapshot.reason}",
             )
+        scratch_root = str(snapshot.scratch_root or config.remote_root)
+        if snapshot.scratch_usage_mb is not None and snapshot.scratch_usage_mb >= REMOTE_SCRATCH_SOFT_LIMIT_MB:
+            if snapshot.scratch_usage_mb >= REMOTE_SCRATCH_HARD_LIMIT_MB:
+                stage = "REMOTE_SCRATCH_HARD_LIMIT"
+                level = "ERROR"
+            else:
+                stage = "REMOTE_SCRATCH_SOFT_LIMIT"
+                level = "WARN"
+            event_key = (snapshot.account_id, stage)
+            if event_key not in scratch_guard_events:
+                state_store.append_event(
+                    run_id=run_id,
+                    job_id="__worker__",
+                    level=level,
+                    stage=stage,
+                    message=(
+                        f"account={snapshot.account_id} host={snapshot.host_alias} "
+                        f"scratch_root={scratch_root} usage_mb={snapshot.scratch_usage_mb}"
+                    ),
+                )
+                scratch_guard_events.add(event_key)
+        if "tmpfs_mount_failed" in str(snapshot.reason):
+            event_key = (snapshot.account_id, "RUNTIME_TMPFS_PROBE_FAILED")
+            if event_key not in runtime_probe_events:
+                state_store.append_event(
+                    run_id=run_id,
+                    job_id="__worker__",
+                    level="WARN",
+                    stage="RUNTIME_TMPFS_PROBE_FAILED",
+                    message=f"account={snapshot.account_id} host={snapshot.host_alias} reason={snapshot.reason}",
+                )
+                runtime_probe_events.add(event_key)
 
     def _resolve_dispatch_accounts() -> list[AccountConfig]:
         nonlocal ready_account_ids, blocked_account_ids, bootstrapping_account_ids, cutover_ready_emitted
@@ -1275,19 +1341,13 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         blocked_account_ids = []
         bootstrapping_account_ids = []
         for account in accounts:
-            account_platform = account.platform.strip().lower()
-            account_scheduler = account.scheduler.strip().lower()
-            skip_remote_preflight = (
-                str(config.remote_container_runtime).strip().lower() == "enroot"
-                and (account_platform, account_scheduler) == ("linux", "slurm")
-            )
             try:
                 snapshot = query_account_readiness(
                     account=account,
                     command_timeout_seconds=config.readiness_probe_timeout_seconds,
                     remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
                     remote_storage_min_free_mb=config.remote_storage_min_free_mb,
-                    **_container_runtime_kwargs(),
+                    **_runtime_probe_kwargs(),
                     **_ssh_config_kwargs(),
                 )
             except Exception as exc:
@@ -1333,41 +1393,39 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     stage="ACCOUNT_BOOTSTRAP_OK",
                     message=f"account={account.account_id} host={account.host_alias}",
                 )
-                if not skip_remote_preflight:
-                    try:
-                        snapshot = query_account_preflight(
-                            account=account,
-                            command_timeout_seconds=config.preflight_probe_timeout_seconds,
-                            remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
-                            remote_storage_min_free_mb=config.remote_storage_min_free_mb,
-                            **_container_runtime_kwargs(),
-                            **_ssh_config_kwargs(),
-                        )
-                    except Exception as exc:
-                        snapshot = _update_readiness_snapshot(
-                            snapshot,
-                            status="PREFLIGHT_FAILED",
-                            reason=str(exc),
-                            ready=False,
-                        )
+                try:
+                    snapshot = query_account_preflight(
+                        account=account,
+                        command_timeout_seconds=config.preflight_probe_timeout_seconds,
+                        remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
+                        remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                        **_runtime_probe_kwargs(),
+                        **_ssh_config_kwargs(),
+                    )
+                except Exception as exc:
+                    snapshot = _update_readiness_snapshot(
+                        snapshot,
+                        status="PREFLIGHT_FAILED",
+                        reason=str(exc),
+                        ready=False,
+                    )
             elif snapshot.ready:
-                if not skip_remote_preflight:
-                    try:
-                        snapshot = query_account_preflight(
-                            account=account,
-                            command_timeout_seconds=config.preflight_probe_timeout_seconds,
-                            remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
-                            remote_storage_min_free_mb=config.remote_storage_min_free_mb,
-                            **_container_runtime_kwargs(),
-                            **_ssh_config_kwargs(),
-                        )
-                    except Exception as exc:
-                        snapshot = _update_readiness_snapshot(
-                            snapshot,
-                            status="PREFLIGHT_FAILED",
-                            reason=str(exc),
-                            ready=False,
-                        )
+                try:
+                    snapshot = query_account_preflight(
+                        account=account,
+                        command_timeout_seconds=config.preflight_probe_timeout_seconds,
+                        remote_storage_inode_block_percent=config.remote_storage_inode_block_percent,
+                        remote_storage_min_free_mb=config.remote_storage_min_free_mb,
+                        **_runtime_probe_kwargs(),
+                        **_ssh_config_kwargs(),
+                    )
+                except Exception as exc:
+                    snapshot = _update_readiness_snapshot(
+                        snapshot,
+                        status="PREFLIGHT_FAILED",
+                        reason=str(exc),
+                        ready=False,
+                    )
 
             _record_readiness(snapshot)
             if snapshot.ready:
@@ -1777,6 +1835,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         for account in accounts:
             cleanup_cfg = _RemoteExecutionConfig(
                 host=account.host_alias,
+                remote_root=config.remote_root,
                 partition=config.partition,
                 nodes=config.nodes,
                 ntasks=config.ntasks,
@@ -2195,6 +2254,7 @@ def _run_bundle_with_retry(
 
     remote_cfg = _RemoteExecutionConfig(
         host=bundle.host_alias,
+        remote_root=config.remote_root,
         partition=config.partition,
         nodes=config.nodes,
         ntasks=config.ntasks,
@@ -3187,10 +3247,7 @@ def _ensure_positive(name: str, value: int) -> None:
 
 
 def _join_remote_root(remote_root: str, suffix: str) -> str:
-    normalized = remote_root.rstrip("/")
-    if normalized:
-        return f"{normalized}/{suffix}"
-    return suffix
+    return join_remote_root(remote_root, suffix)
 
 
 def _run_with_retry(

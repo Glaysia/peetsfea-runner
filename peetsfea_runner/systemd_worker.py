@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .pipeline import AccountConfig, PipelineConfig, PipelineResult, run_pipeline
+from .runtime_policy import DEFAULT_REMOTE_ROOT
 from .state_store import StateStore
 from .version import get_version
 from .web_status import start_status_server
@@ -363,7 +364,7 @@ def _build_config() -> PipelineConfig:
         cpus_per_job=int(os.getenv("PEETSFEA_CPUS_PER_JOB", "16")),
         mem=os.getenv("PEETSFEA_MEM", "960G"),
         time_limit=os.getenv("PEETSFEA_TIME_LIMIT", "05:00:00"),
-        remote_root=os.getenv("PEETSFEA_REMOTE_ROOT", "/tmp/$USER/aedt_runs"),
+        remote_root=os.getenv("PEETSFEA_REMOTE_ROOT", DEFAULT_REMOTE_ROOT),
         control_plane_host=os.getenv("PEETSFEA_CONTROL_PLANE_HOST", "127.0.0.1"),
         control_plane_port=int(os.getenv("PEETSFEA_CONTROL_PLANE_PORT", os.getenv("PEETSFEA_WEB_PORT", "8765"))),
         control_plane_ssh_target=control_plane_ssh_target,

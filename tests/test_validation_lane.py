@@ -35,7 +35,7 @@ class TestValidationLane(unittest.TestCase):
             self.assertEqual(config.remote_container_runtime, "enroot")
             self.assertEqual(config.ssh_config_path, str(repo_root / ".ssh" / "config"))
             self.assertEqual(config.host, "gate1-dhj02")
-            self.assertEqual(config.remote_root, "/tmp/$USER/aedt_runs")
+            self.assertEqual(config.remote_root, "~/aedt_runs")
             self.assertEqual(config.slots_per_job, 5)
             self.assertEqual(config.cpus_per_job, 20)
             self.assertEqual(config.cores_per_slot, 4)
@@ -57,7 +57,7 @@ class TestValidationLane(unittest.TestCase):
 
             self.assertEqual(config.run_namespace, "")
             self.assertEqual(config.host, "gate1-harry261")
-            self.assertEqual(config.remote_root, "/tmp/$USER/aedt_runs")
+            self.assertEqual(config.remote_root, "~/aedt_runs")
             self.assertEqual([account.host_alias for account in config.accounts_registry], ["gate1-harry261"])
             self.assertEqual(config.slots_per_job, 2)
             self.assertEqual(config.cpus_per_job, 32)

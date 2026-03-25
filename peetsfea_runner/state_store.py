@@ -210,6 +210,8 @@ class StateStore:
                         storage_reason TEXT NOT NULL DEFAULT 'ok',
                         inode_use_percent INTEGER,
                         free_mb BIGINT,
+                        scratch_root TEXT,
+                        scratch_usage_mb BIGINT,
                         ts TEXT NOT NULL
                     )
                     """
@@ -369,6 +371,8 @@ class StateStore:
                     "ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS inode_use_percent INTEGER"
                 )
                 conn.execute("ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS free_mb BIGINT")
+                conn.execute("ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS scratch_root TEXT")
+                conn.execute("ALTER TABLE account_readiness_snapshots ADD COLUMN IF NOT EXISTS scratch_usage_mb BIGINT")
                 conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_present BOOLEAN DEFAULT FALSE")
                 conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_mode TEXT DEFAULT 'SIDECAR'")
                 conn.execute("ALTER TABLE ingest_index ADD COLUMN IF NOT EXISTS ready_error TEXT")
@@ -1528,6 +1532,8 @@ class StateStore:
         storage_reason: str = "ok",
         inode_use_percent: int | None = None,
         free_mb: int | None = None,
+        scratch_root: str | None = None,
+        scratch_usage_mb: int | None = None,
     ) -> None:
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
@@ -1553,8 +1559,10 @@ class StateStore:
                         storage_reason,
                         inode_use_percent,
                         free_mb,
+                        scratch_root,
+                        scratch_usage_mb,
                         ts
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         account_id,
@@ -1575,6 +1583,8 @@ class StateStore:
                         storage_reason,
                         inode_use_percent,
                         free_mb,
+                        scratch_root,
+                        scratch_usage_mb,
                         _utc_now_iso(),
                     ],
                 )

@@ -22,7 +22,6 @@ from peetsfea_runner.pipeline import (
     _record_launch_transient_failure,
     _reconcile_slurm_truth,
     _materialize_slot_outputs,
-    _should_auto_register_low_tmp_node,
 )
 from peetsfea_runner.remote_job import CaseExecutionSummary, RemoteJobAttemptResult
 from peetsfea_runner.scheduler import AccountCapacitySnapshot, AccountReadinessSnapshot, BalancedBatchResult
@@ -149,7 +148,7 @@ class TestPipelineApi(unittest.TestCase):
             self.assertEqual(config.run_rotation_hours, 24)
             self.assertEqual(config.tasks_per_slot, 1)
             self.assertTrue(config.retain_aedtresults)
-            self.assertEqual(config.remote_root, "/tmp/$USER/aedt_runs")
+            self.assertEqual(config.remote_root, "~/aedt_runs")
             self.assertEqual(config.run_namespace, "")
             self.assertFalse((input_dir / "sample.aedt.ready").exists())
 
@@ -191,8 +190,8 @@ class TestPipelineApi(unittest.TestCase):
                         account_id="account_01",
                         host_alias="gate1-harry261",
                         max_jobs=1,
-                        platform="windows",
-                        scheduler="none",
+                        platform="linux",
+                        scheduler="slurm",
                     ),
                 ),
             )
@@ -292,6 +291,7 @@ class TestPipelineApi(unittest.TestCase):
             config = PipelineConfig(
                 input_queue_dir=str(input_dir),
                 continuous_mode=False,
+                execute_remote=True,
                 remote_execution_backend="slurm_batch",
                 remote_container_runtime="enroot",
                 remote_container_image="~/runtime/enroot/aedt.sqsh",
@@ -301,20 +301,6 @@ class TestPipelineApi(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "requires all accounts to be linux/slurm"):
                 config.validate()
-
-    def test_auto_register_low_tmp_node_skips_control_plane_and_gate_hosts(self) -> None:
-        accounts = (
-            AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
-            AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
-        )
-        with (
-            patch("peetsfea_runner.pipeline.socket.gethostname", return_value="5950xlinux"),
-            patch("peetsfea_runner.pipeline.socket.getfqdn", return_value="5950xlinux.local"),
-        ):
-            self.assertFalse(_should_auto_register_low_tmp_node(host="5950xlinux", accounts=accounts))
-            self.assertFalse(_should_auto_register_low_tmp_node(host="5950xlinux.local", accounts=accounts))
-            self.assertFalse(_should_auto_register_low_tmp_node(host="gate1-harry261", accounts=accounts))
-            self.assertTrue(_should_auto_register_low_tmp_node(host="n108", accounts=accounts))
 
     def test_slurm_batch_backend_records_worker_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -337,8 +323,8 @@ class TestPipelineApi(unittest.TestCase):
                         account_id="account_01",
                         host_alias="gate1-harry261",
                         max_jobs=1,
-                        platform="windows",
-                        scheduler="none",
+                        platform="linux",
+                        scheduler="slurm",
                     ),
                 ),
             )
@@ -615,7 +601,7 @@ class TestPipelineApi(unittest.TestCase):
                 rows,
             )
 
-    def test_slurm_batch_backend_registers_low_tmp_node_before_dispatch(self) -> None:
+    def test_slurm_batch_backend_records_remote_scratch_hard_limit_before_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
@@ -624,26 +610,6 @@ class TestPipelineApi(unittest.TestCase):
             (input_dir / "fixture_01.aedt.ready").write_text("", encoding="utf-8")
             output_root = Path(tmpdir) / "out"
             db_path = Path(tmpdir) / "state.duckdb"
-            bad_nodes_path = Path(tmpdir) / "runtime" / "bad_nodes.json"
-            store = StateStore(db_path)
-            store.initialize()
-            store.record_node_resource_snapshot(
-                run_id="seed_run",
-                host="n108",
-                allocated_mem_mb=0,
-                total_mem_mb=1024,
-                used_mem_mb=512,
-                free_mem_mb=512,
-                load_1=1.0,
-                load_5=1.0,
-                load_15=1.0,
-                tmp_total_mb=131072,
-                tmp_used_mb=67072,
-                tmp_free_mb=64000,
-                process_count=4,
-                running_worker_count=1,
-                active_slot_count=4,
-            )
             config = PipelineConfig(
                 input_queue_dir=str(input_dir),
                 output_root_dir=str(output_root),
@@ -657,40 +623,11 @@ class TestPipelineApi(unittest.TestCase):
             def _mock_attempt(
                 *,
                 config=None,
-                local_job_dir=None,
-                on_upload_success=None,
-                on_worker_submitted=None,
-                on_worker_state_change=None,
                 **kwargs,
             ):
-                self.assertIsNotNone(config)
-                self.assertEqual(tuple(getattr(config, "slurm_exclude_nodes", ())), ("n108",))
-                if on_upload_success is not None:
-                    on_upload_success()
-                if on_worker_submitted is not None:
-                    on_worker_submitted("552740", None)
-                if on_worker_state_change is not None:
-                    on_worker_state_change("PENDING", None)
-                    on_worker_state_change("RUNNING", "n115")
-                assert local_job_dir is not None
-                case_dir = Path(local_job_dir) / "case_01"
-                (case_dir / "project.aedtresults").mkdir(parents=True, exist_ok=True)
-                (case_dir / "project.aedt").write_text("simulated", encoding="utf-8")
-                (case_dir / "run.log").write_text("log", encoding="utf-8")
-                (case_dir / "exit.code").write_text("0", encoding="utf-8")
-                return RemoteJobAttemptResult(
-                    success=True,
-                    exit_code=0,
-                    session_name="s",
-                    case_summary=CaseExecutionSummary(success_cases=1, failed_cases=0, case_lines=[]),
-                    message="ok",
-                    failed_case_lines=[],
-                    slurm_job_id="552740",
-                    observed_node="n115",
-                )
+                raise AssertionError("dispatch should be blocked by scratch hard limit")
 
             with (
-                patch("peetsfea_runner.pipeline._bad_nodes_control_path", return_value=bad_nodes_path),
                 patch("peetsfea_runner.pipeline.run_remote_job_attempt", side_effect=_mock_attempt),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
@@ -699,9 +636,9 @@ class TestPipelineApi(unittest.TestCase):
                     return_value=AccountReadinessSnapshot(
                         account_id="account_01",
                         host_alias="gate1-harry261",
-                        ready=True,
-                        status="READY",
-                        reason="ok",
+                        ready=False,
+                        status="BLOCKED",
+                        reason="remote_scratch_limit_exceeded usage_mb=92160 limit_mb=92160 root=/home1/user/aedt_runs",
                         home_ok=True,
                         runtime_path_ok=True,
                         env_ok=True,
@@ -711,25 +648,8 @@ class TestPipelineApi(unittest.TestCase):
                         ansys_ok=True,
                         uv_ok=True,
                         pyaedt_ok=True,
-                    ),
-                ),
-                patch(
-                    "peetsfea_runner.pipeline.query_account_preflight",
-                    return_value=AccountReadinessSnapshot(
-                        account_id="account_01",
-                        host_alias="gate1-harry261",
-                        ready=True,
-                        status="READY",
-                        reason="ok",
-                        home_ok=True,
-                        runtime_path_ok=True,
-                        env_ok=True,
-                        python_ok=True,
-                        module_ok=True,
-                        binaries_ok=True,
-                        ansys_ok=True,
-                        uv_ok=True,
-                        pyaedt_ok=True,
+                        scratch_root="/home1/user/aedt_runs",
+                        scratch_usage_mb=92160,
                     ),
                 ),
                 patch(
@@ -745,10 +665,31 @@ class TestPipelineApi(unittest.TestCase):
             ):
                 result = run_pipeline(config)
 
-            self.assertTrue(result.success)
-            payload = json.loads(bad_nodes_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["bad_nodes"][0]["node"], "n108")
-            self.assertEqual(payload["bad_nodes"][0]["reason"], "tmp_free_mb=64000")
+            self.assertFalse(result.success)
+            self.assertEqual(result.ready_accounts, ())
+            self.assertEqual(result.blocked_accounts, ("account_01",))
+
+            conn = duckdb.connect(str(db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT stage, message
+                    FROM events
+                    WHERE run_id = ?
+                    ORDER BY ts
+                    """,
+                    [result.run_id],
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertIn(
+                (
+                    "REMOTE_SCRATCH_HARD_LIMIT",
+                    "account=account_01 host=gate1-harry261 scratch_root=/home1/user/aedt_runs usage_mb=92160",
+                ),
+                rows,
+            )
 
     def test_slurm_batch_backend_registers_bad_node_after_no_space_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3674,6 +3615,8 @@ class TestPipelineApi(unittest.TestCase):
                 patch("peetsfea_runner.pipeline.cleanup_orphan_session"),
                 patch("peetsfea_runner.pipeline.cleanup_orphan_sessions_for_run"),
                 patch("peetsfea_runner.scheduler.time.sleep"),
+                patch("peetsfea_runner.pipeline.query_account_readiness", return_value=_ready_account_snapshot()),
+                patch("peetsfea_runner.pipeline.query_account_preflight", return_value=_ready_account_snapshot()),
                 patch(
                     "peetsfea_runner.pipeline.query_account_capacity",
                     return_value=AccountCapacitySnapshot(
@@ -4705,7 +4648,7 @@ class TestPipelineApi(unittest.TestCase):
                 conn.close()
             self.assertEqual((row[0], row[1], bool(row[2]), bool(row[3])), ("PREFLIGHT_FAILED", "uv,pyaedt", False, False))
 
-    def test_remote_pipeline_skips_service_preflight_for_enroot(self) -> None:
+    def test_remote_pipeline_runs_compute_preflight_for_enroot(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "in"
             input_dir.mkdir(parents=True, exist_ok=True)
@@ -4741,14 +4684,15 @@ class TestPipelineApi(unittest.TestCase):
                         ansys_ok=True,
                     ),
                 ),
-                patch("peetsfea_runner.pipeline.query_account_preflight") as preflight_mock,
+                patch("peetsfea_runner.pipeline.query_account_preflight", return_value=_ready_account_snapshot()) as preflight_mock,
                 patch("peetsfea_runner.pipeline.run_slot_workers") as run_workers_mock,
             ):
                 run_workers_mock.return_value = BalancedBatchResult(results=[], max_inflight_jobs=0, submitted_jobs=0)
                 result = run_pipeline(config)
 
             self.assertTrue(result.success)
-            preflight_mock.assert_not_called()
+            preflight_mock.assert_called_once()
+            self.assertEqual(preflight_mock.call_args.kwargs["remote_root"], config.remote_root)
             run_workers_mock.assert_called_once()
 
     def test_remote_pipeline_caps_worker_jobs_at_account_max(self) -> None:

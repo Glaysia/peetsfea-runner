@@ -59,7 +59,7 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("export LC_ALL=C.UTF-8", content)
         self.assertIn("unset LANGUAGE", content)
         self.assertIn("export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81", content)
-        self.assertIn("TMP_SHARED_ROOT=\"/tmp/$USER/peetsfea-runner\"", content)
+        self.assertNotIn("TMP_SHARED_ROOT=", content)
         self.assertIn("IMAGE_PYTHON=\"/opt/miniconda3/bin/python\"", content)
         self.assertIn("IMAGE_LD_LIBRARY_PATH=\"$BASE_PREFIX/lib:${LD_LIBRARY_PATH:-}\"", content)
         self.assertIn('LD_LIBRARY_PATH="$IMAGE_LD_LIBRARY_PATH" "$IMAGE_PYTHON" run_sim.py', content)
@@ -73,7 +73,8 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("launch_env = build_ansys_launch_env()", content)
         self.assertIn("original_ld_library_path = os.environ.get('PEETS_ORIGINAL_LD_LIBRARY_PATH', '').strip()", content)
         self.assertIn("launch_env.pop('LD_LIBRARY_PATH', None)", content)
-        self.assertIn("process = subprocess.Popen(cmd, cwd='/tmp', env=launch_env, stdout=stdout_handle, stderr=stderr_handle)", content)
+        self.assertIn("runtime_cwd = Path(os.environ.get('TMPDIR', str(Path.cwd() / 'tmp'))).resolve()", content)
+        self.assertIn("process = subprocess.Popen(cmd, cwd=str(runtime_cwd), env=launch_env, stdout=stdout_handle, stderr=stderr_handle)", content)
         self.assertIn("from contextlib import contextmanager", content)
         self.assertIn("from typing import Any", content)
         self.assertIn("from ansys.aedt.core import Desktop, Hfss, Icepak, Maxwell3d, Q2d, Q3d, settings", content)
@@ -303,7 +304,7 @@ class TestPlan03Workflow(unittest.TestCase):
             remote_job_dir="/tmp/peetsfea/run_01/job_0001",
             case_count=2,
         )
-        self.assertIn("srun -D /tmp -p cpu2 -N 1 -n 1 -c 16 --mem=960G --time=05:00:00 --exclude=n108,n109", content)
+        self.assertIn('srun -D "$HOME/aedt_runs/_runtime" -p cpu2 -N 1 -n 1 -c 16 --mem=960G --time=05:00:00 --exclude=n108,n109', content)
         self.assertNotIn("screen -dmS", content)
         self.assertNotIn("srun --pty", content)
         self.assertIn("__PEETS_FAILED_COUNT__", content)
@@ -312,7 +313,7 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("wait -n \"${case_pids[@]}\" || true", content)
         self.assertIn('if PEETS_SLOT_CORES=4 PEETS_SLOT_TASKS=1 run_case_command "$case_dir_path" > run.log 2>&1; then', content)
         self.assertIn("echo \"$rc\" > exit.code", content)
-        self.assertIn("archive_path=$(mktemp \"/tmp/$USER/peetsfea-results.", content)
+        self.assertIn('archive_path=$(mktemp "$REMOTE_RUNTIME_ROOT/results.${SLURM_JOB_ID:-nojob}.XXXXXX.tgz")', content)
         self.assertIn('tar -czf "$archive_path" case_* case_summary.txt failed.count', content)
         self.assertNotIn("tar --exclude='.venv' --exclude='results.tgz' --exclude='.env_initialized' -czf results.tgz .", content)
 
@@ -401,12 +402,13 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("PEETS_REMOTE_CONTAINER_RUNTIME=enroot", content)
         self.assertIn('REMOTE_HOST_ANSYS_ROOT="/opt/ohpc/pub/Electronics/v252/AnsysEM"', content)
         self.assertIn('REMOTE_HOST_ANSYS_BASE="/opt/ohpc/pub/Electronics/v252"', content)
-        self.assertIn('enroot_base="/tmp/$USER/enroot/${SLURM_JOB_ID:-nojob}/${case_name}-$$"', content)
+        self.assertIn('enroot_base="$REMOTE_RUNTIME_ROOT/enroot/${SLURM_JOB_ID:-nojob}/${case_name}-$$"', content)
         self.assertIn('(\n    container_name="peets-${SLURM_JOB_ID:-nojob}-${case_name}-$$"', content)
         self.assertIn('container_name="peets-${SLURM_JOB_ID:-nojob}-${case_name}-$$"', content)
         self.assertIn('enroot create -f -n "$container_name" "$REMOTE_CONTAINER_IMAGE" >/dev/null', content)
         self.assertIn('enroot start --root --rw --mount "$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM" --mount "$REMOTE_HOST_ANSYS_BASE:/ansys_inc/v252" --mount "$case_dir:/work"', content)
         self.assertIn('mkdir -p /work/home /work/tmp', content)
+        self.assertIn('mount -t tmpfs -o size=16G tmpfs /work/tmp', content)
         self.assertIn('export HOME=/work/home', content)
         self.assertIn('export TMPDIR=/work/tmp', content)
         self.assertIn('export XDG_CONFIG_HOME=/work/home/.config', content)
@@ -416,6 +418,12 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn('case_name="$(basename "$case_dir")"', content)
         self.assertIn('mkdir -p "$REMOTE_JOB_DIR/$case_name"', content)
         self.assertIn('license_diagnostics.txt', content)
+        self.assertIn("cleanup_workdir() {", content)
+        self.assertIn("teardown_control_plane() {", content)
+        self.assertIn("teardown_control_plane", content)
+        self.assertIn("rmdir \"$REMOTE_RUNTIME_ROOT/enroot/${SLURM_JOB_ID:-nojob}\" >/dev/null 2>&1 || true", content)
+        self.assertEqual(content.count("trap cleanup EXIT"), 1)
+        self.assertNotIn("trap teardown_control_plane EXIT", content)
 
     def test_enroot_remote_job_script_uses_image_python_and_mounted_ansys(self) -> None:
         class _Cfg:
@@ -532,11 +540,12 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("#SBATCH -c 16", content)
         self.assertIn("#SBATCH -o slurm-%j.out", content)
         self.assertIn("#SBATCH -e slurm-%j.err", content)
-        self.assertIn("#SBATCH -D /tmp", content)
+        self.assertNotIn("#SBATCH -D /tmp", content)
         self.assertIn("#SBATCH --exclude=n108,n109", content)
         self.assertIn("export PATH=/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}", content)
         self.assertIn("SUBMIT_SPOOL_DIR=/tmp/peetsfea/run_01/job_0001", content)
-        self.assertIn("EXEC_DIR=$(mktemp -d \"/tmp/$USER/peetsfea-sbatch.", content)
+        self.assertIn('REMOTE_RUNTIME_ROOT="$HOME/aedt_runs/_runtime"', content)
+        self.assertIn('EXEC_DIR=$(mktemp -d "$REMOTE_RUNTIME_ROOT/sbatch.${SLURM_JOB_ID:-nojob}.XXXXXX")', content)
         self.assertIn("ssh \"${SSH_OPTS[@]}\" \"$SSH_REMOTE\"", content)
         self.assertIn("export REMOTE_JOB_DIR=\"$EXEC_DIR\"", content)
         self.assertIn("periodic_upload_loop() {", content)
@@ -706,7 +715,7 @@ class TestPlan03Workflow(unittest.TestCase):
 
             self.assertFalse(result.success)
             self.assertEqual(result.slurm_job_id, "552818")
-            cleanup_mock.assert_not_called()
+            cleanup_mock.assert_called_once()
 
     def test_read_remote_optional_text_file_falls_back_to_slurm_output(self) -> None:
         class _Cfg:

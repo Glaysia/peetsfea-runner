@@ -118,14 +118,14 @@ class TestBuiltInService(unittest.TestCase):
             self.assertEqual(preserve_cfg.input_source_policy, "input_queue_only")
             self.assertEqual(len(preserve_cfg.accounts_registry), 1)
             self.assertEqual(preserve_cfg.ssh_config_path, str(root / ".ssh" / "config"))
-            self.assertEqual(preserve_cfg.remote_root, "/tmp/$USER/aedt_runs")
+            self.assertEqual(preserve_cfg.remote_root, "~/aedt_runs")
             self.assertEqual(prune_cfg.run_namespace, "prune_results")
             self.assertEqual(prune_cfg.tasks_per_slot, 1)
             self.assertFalse(prune_cfg.retain_aedtresults)
             self.assertTrue(prune_cfg.rename_input_to_done_on_success)
             self.assertEqual(len(prune_cfg.accounts_registry), 4)
             self.assertEqual(prune_cfg.ssh_config_path, str(root / ".ssh" / "config"))
-            self.assertEqual(prune_cfg.remote_root, "/tmp/$USER/aedt_runs")
+            self.assertEqual(prune_cfg.remote_root, "~/aedt_runs")
 
 
 if __name__ == "__main__":

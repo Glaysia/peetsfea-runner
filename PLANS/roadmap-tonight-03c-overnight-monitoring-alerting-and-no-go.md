@@ -23,7 +23,7 @@
 | --- | --- |
 | `00:00` | CSV schema, restart rediscovery, tunnel 상태 |
 | `02:00` | CSV schema, multiplier 적용 후 idle slot, rolling throughput |
-| `04:00` | bad-node, `/tmp` free, observed node, failed slots |
+| `04:00` | bad-node, scratch usage, tmpfs probe, observed node, failed slots |
 | `06:00` | CSV regression 재확인, throughput 추세, bad-node 누적 상태 |
 
 - `06:00` 이후 `19:00`까지는 아래를 계속 본다.

@@ -18,10 +18,12 @@ from .constants import (
     EXIT_CODE_SLURM_FAILURE,
     EXIT_CODE_SSH_FAILURE,
 )
+from .runtime_policy import RUNTIME_JANITOR_MIN_TTL_SECONDS, SLOT_TMPFS_SIZE_GB, remote_runtime_root
 
 
 class RemoteJobConfig(Protocol):
     host: str
+    remote_root: str
     partition: str
     nodes: int
     ntasks: int
@@ -417,7 +419,7 @@ def run_remote_job_attempt(
         local_archive = local_job_dir / ("results.zip" if _remote_platform(config) == "windows" else "results.tgz")
         local_archive.write_bytes(workflow_result.archive_bytes)
         _extract_local_results_archive(local_job_dir=local_job_dir, archive_name=local_archive.name)
-        _cleanup_remote_workspace(config, remote_job_dir=resolved_remote_job_dir)
+        _cleanup_remote_workspace_best_effort(config, remote_job_dir=resolved_remote_job_dir)
     except WorkflowError as exc:
         _download_remote_debug_artifacts(
             config,
@@ -425,6 +427,7 @@ def run_remote_job_attempt(
             local_job_dir=local_job_dir,
             slurm_job_id=exc.slurm_job_id or slurm_job_id,
         )
+        _cleanup_remote_workspace_best_effort(config, remote_job_dir=resolved_remote_job_dir)
         worker_terminal_state = exc.worker_terminal_state or worker_terminal_state
         collect_probe_state = exc.collect_probe_state or collect_probe_state
         marker_present = exc.marker_present if exc.marker_present is not None else marker_present
@@ -534,8 +537,35 @@ def cleanup_orphan_session(*, config: RemoteJobConfig, session_name: str) -> Non
 
 
 def cleanup_orphan_sessions_for_run(*, config: RemoteJobConfig, run_id: str) -> None:
-    # The primary remote execution path is non-interactive and no longer creates screen sessions.
-    return None
+    if _remote_platform(config) != "linux":
+        return None
+    try:
+        runtime_root = _resolve_remote_path(config=config, path=_remote_runtime_root(config))
+        scratch_root = _resolve_remote_path(config=config, path=getattr(config, "remote_root", "~/aedt_runs"))
+        ttl_minutes = max(1, int(RUNTIME_JANITOR_MIN_TTL_SECONDS // 60))
+        command = "\n".join(
+            [
+                "set +e",
+                f"runtime_root={_double_quoted_shell_value(runtime_root)}",
+                f"scratch_root={_double_quoted_shell_value(scratch_root)}",
+                f"current_run={_double_quoted_shell_value(run_id)}",
+                f"ttl_minutes={ttl_minutes}",
+                'mkdir -p "$runtime_root" "$scratch_root" >/dev/null 2>&1 || true',
+                'if [ -d "$runtime_root" ]; then',
+                '  find "$runtime_root" -mindepth 1 -maxdepth 1 -type d -mmin +"$ttl_minutes" -exec rm -rf {} + >/dev/null 2>&1 || true',
+                "fi",
+                'if [ -d "$scratch_root" ]; then',
+                '  find "$scratch_root" -mindepth 1 -maxdepth 1 -type d ! -name "_runtime" ! -name "$current_run" -mmin +"$ttl_minutes" -exec rm -rf {} + >/dev/null 2>&1 || true',
+                "fi",
+            ]
+        )
+        _run_subprocess_with_transport_retry(
+            _ssh_command(config, config.host, f"bash -lc {shlex.quote(command)}"),
+            stage="remote cleanup",
+            exit_code=EXIT_CODE_REMOTE_CLEANUP_FAILURE,
+        )
+    except WorkflowError:
+        return None
 
 
 def _resolve_remote_path(*, config: RemoteJobConfig, path: str) -> str:
@@ -557,13 +587,17 @@ def _resolve_remote_path(*, config: RemoteJobConfig, path: str) -> str:
         if path == "~":
             return home
         return f"{home}/{path[2:]}"
-    if path == "/tmp/$USER" or path.startswith("/tmp/$USER/"):
+    remote_user: str | None = None
+    if "${USER}" in path or "$USER" in path:
         remote_user = _get_remote_user(config=config)
+        path = path.replace("${USER}", remote_user).replace("$USER", remote_user)
+    if path == "/tmp/$USER" or path.startswith("/tmp/$USER/"):
+        remote_user = remote_user or _get_remote_user(config=config)
         if path == "/tmp/$USER":
             return f"/tmp/{remote_user}"
         return f"/tmp/{remote_user}{path[len('/tmp/$USER'):]}"
     if path == "/tmp/peetsfea-runner" or path.startswith("/tmp/peetsfea-runner/"):
-        remote_user = _get_remote_user(config=config)
+        remote_user = remote_user or _get_remote_user(config=config)
         scoped_root = f"/tmp/{remote_user}/peetsfea-runner"
         if path == "/tmp/peetsfea-runner":
             return scoped_root
@@ -610,6 +644,7 @@ def _get_remote_user(*, config: RemoteJobConfig) -> str:
 
 def _prepare_remote_workspace(config: RemoteJobConfig, *, remote_job_dir: str) -> None:
     remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
+    runtime_root = _resolve_remote_path(config=config, path=_remote_runtime_root(config))
     _log_stage(f"prepare remote workspace path={remote_job_dir}")
     if _remote_platform(config) == "windows":
         command = (
@@ -623,7 +658,7 @@ def _prepare_remote_workspace(config: RemoteJobConfig, *, remote_job_dir: str) -
         )
         return
     _run_subprocess_with_transport_retry(
-        _ssh_command(config, config.host, f"mkdir -p {shlex.quote(remote_path)}"),
+        _ssh_command(config, config.host, f"mkdir -p {shlex.quote(remote_path)} {shlex.quote(runtime_root)}"),
         stage="ssh",
         exit_code=EXIT_CODE_SSH_FAILURE,
     )
@@ -1450,6 +1485,14 @@ def _remote_path_for_shell(*, config: RemoteJobConfig, path: str) -> str:
     return path
 
 
+def _remote_runtime_root(config: RemoteJobConfig) -> str:
+    return remote_runtime_root(getattr(config, "remote_root", "~/aedt_runs"))
+
+
+def _remote_runtime_root_shell_path(*, config: RemoteJobConfig) -> str:
+    return _remote_path_for_shell(config=config, path=_remote_runtime_root(config))
+
+
 def _double_quoted_shell_value(value: str) -> str:
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -1465,8 +1508,6 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81",
         "export ANSYSEM_ROOT252=/mnt/AnsysEM",
         "",
-        "TMP_SHARED_ROOT=\"/tmp/$USER/peetsfea-runner\"",
-        "mkdir -p \"$TMP_SHARED_ROOT\"",
         "IMAGE_PYTHON=\"/opt/miniconda3/bin/python\"",
         "if [ ! -x \"$IMAGE_PYTHON\" ]; then",
         "  echo \"[ERROR] image python is missing: $IMAGE_PYTHON\" >&2",
@@ -1558,7 +1599,9 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "    stdout_handle = stdout_path.open('w', encoding='utf-8')",
         "    stderr_handle = stderr_path.open('w', encoding='utf-8')",
         "    launch_env = build_ansys_launch_env()",
-        "    process = subprocess.Popen(cmd, cwd='/tmp', env=launch_env, stdout=stdout_handle, stderr=stderr_handle)",
+        "    runtime_cwd = Path(os.environ.get('TMPDIR', str(Path.cwd() / 'tmp'))).resolve()",
+        "    runtime_cwd.mkdir(parents=True, exist_ok=True)",
+        "    process = subprocess.Popen(cmd, cwd=str(runtime_cwd), env=launch_env, stdout=stdout_handle, stderr=stderr_handle)",
         "    deadline = time.time() + 180",
         "    while time.time() < deadline:",
         "        if process.poll() is not None:",
@@ -1647,14 +1690,16 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "",
         "",
         "def snapshot_pyaedt_logs() -> set[Path]:",
-        "    return {path.resolve() for path in Path('/tmp').glob('pyaedt_*.log') if path.is_file()}",
+        "    runtime_tmp = Path(os.environ.get('TMPDIR', str(Path.cwd() / 'tmp'))).resolve()",
+        "    return {path.resolve() for path in runtime_tmp.glob('pyaedt_*.log') if path.is_file()}",
         "",
         "",
         "def copy_runtime_logs(workdir: Path, existing_logs: set[Path]) -> None:",
         "    copied_paths: set[Path] = set()",
+        "    runtime_tmp = Path(os.environ.get('TMPDIR', str(Path.cwd() / 'tmp'))).resolve()",
         "    runtime_logs = [",
         "        path.resolve()",
-        "        for path in Path('/tmp').glob('pyaedt_*.log')",
+        "        for path in runtime_tmp.glob('pyaedt_*.log')",
         "        if path.is_file()",
         "    ]",
         "    for index, source_path in enumerate(sorted(runtime_logs), start=1):",
@@ -2853,11 +2898,14 @@ def _write_remote_dispatch_script(tmpdir: Path, *, config: RemoteJobConfig, remo
 
 def _build_remote_dispatch_script_content(*, config: RemoteJobConfig, remote_job_dir: str, case_count: int) -> str:
     remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
+    remote_runtime_root = _remote_runtime_root_shell_path(config=config)
     lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         f"REMOTE_JOB_DIR={shlex.quote(remote_path)}",
+        f"REMOTE_RUNTIME_ROOT={_double_quoted_shell_value(remote_runtime_root)}",
         "export REMOTE_JOB_DIR",
+        "mkdir -p \"$REMOTE_RUNTIME_ROOT\"",
         "cd \"$REMOTE_JOB_DIR\"",
         "tar -czf - remote_job.sh project_*.aedt | \\",
         "  " + _build_noninteractive_srun_command(
@@ -2921,8 +2969,9 @@ def _build_noninteractive_srun_command(*, config: RemoteJobConfig, remote_job_di
     payload = _build_worker_payload_script_content(config=config, case_count=case_count)
     exclude_nodes = _slurm_exclude_nodes(config)
     exclude_arg = f" --exclude={','.join(exclude_nodes)}" if exclude_nodes else ""
+    runtime_root = _remote_runtime_root_shell_path(config=config)
     return (
-        f"srun -D /tmp -p {config.partition} -N {config.nodes} -n {config.ntasks} "
+        f"srun -D {_double_quoted_shell_value(runtime_root)} -p {config.partition} -N {config.nodes} -n {config.ntasks} "
         f"-c {config.cpus_per_job} --mem={config.mem} --time={config.time_limit}{exclude_arg} "
         f"bash -lc {shlex.quote(payload)}"
     )
@@ -2953,16 +3002,26 @@ def _build_worker_payload_script_content(
     control_plane_return_user = _control_plane_return_user(config)
     control_plane_return_port = _control_plane_return_port(config)
     heartbeat_interval_seconds = max(5, int(getattr(config, "tunnel_recovery_grace_seconds", 30)))
+    runtime_root = _remote_runtime_root_shell_path(config=config)
     payload_lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}",
-        "mkdir -p \"/tmp/$USER\"",
-        "workdir=$(mktemp -d \"/tmp/$USER/peetsfea-slot.XXXXXX\")",
+        f"REMOTE_RUNTIME_ROOT={_double_quoted_shell_value(runtime_root)}",
+        "mkdir -p \"$REMOTE_RUNTIME_ROOT\"",
+        "workdir=$(mktemp -d \"$REMOTE_RUNTIME_ROOT/slot.${SLURM_JOB_ID:-nojob}.XXXXXX\")",
+        "cleanup_workdir() {",
+        "  cd \"$REMOTE_RUNTIME_ROOT\" >/dev/null 2>&1 || true",
+        "  rm -rf \"$workdir\" >/dev/null 2>&1 || true",
+        "  rmdir \"$REMOTE_RUNTIME_ROOT/enroot/${SLURM_JOB_ID:-nojob}\" >/dev/null 2>&1 || true",
+        "}",
+        "teardown_control_plane() {",
+        "  :",
+        "}",
         "cleanup() {",
         "  rc=$?",
-        "  cd /tmp >/dev/null 2>&1 || true",
-        "  rm -rf \"$workdir\"",
+        "  teardown_control_plane",
+        "  cleanup_workdir",
         "  exit \"$rc\"",
         "}",
         "trap cleanup EXIT",
@@ -3145,7 +3204,6 @@ def _build_worker_payload_script_content(
         "  fi",
         "  stop_control_tunnel",
         "}",
-        "trap teardown_control_plane EXIT",
         "run_case_command() {",
         "  case_dir=\"$1\"",
         "  case_name=\"$(basename \"$case_dir\")\"",
@@ -3156,7 +3214,7 @@ def _build_worker_payload_script_content(
         "  fi",
         "  (",
         "    container_name=\"peets-${SLURM_JOB_ID:-nojob}-${case_name}-$$\"",
-        "    enroot_base=\"/tmp/$USER/enroot/${SLURM_JOB_ID:-nojob}/${case_name}-$$\"",
+        "    enroot_base=\"$REMOTE_RUNTIME_ROOT/enroot/${SLURM_JOB_ID:-nojob}/${case_name}-$$\"",
         "    export ENROOT_RUNTIME_PATH=\"$enroot_base/runtime\"",
         "    export ENROOT_CACHE_PATH=\"$enroot_base/cache\"",
         "    export ENROOT_DATA_PATH=\"$enroot_base/data\"",
@@ -3165,7 +3223,9 @@ def _build_worker_payload_script_content(
         "    chmod 700 \"$ENROOT_RUNTIME_PATH\" \"$ENROOT_CACHE_PATH\" \"$ENROOT_DATA_PATH\" \"$ENROOT_TEMP_PATH\"",
         "    enroot create -f -n \"$container_name\" \"$REMOTE_CONTAINER_IMAGE\" >/dev/null",
         "    trap 'enroot remove -f \"$container_name\" >/dev/null 2>&1 || true; rm -rf \"$enroot_base\" >/dev/null 2>&1 || true' EXIT",
-        "    enroot start --root --rw --mount \"$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM\" --mount \"$REMOTE_HOST_ANSYS_BASE:/ansys_inc/v252\" --mount \"$case_dir:/work\" \"$container_name\" /bin/bash -lc \"mkdir -p /work/home /work/tmp && export HOME=/work/home && export TMPDIR=/work/tmp && export XDG_CONFIG_HOME=/work/home/.config && cd /work && export ANS_IGNOREOS=1 && bash ./remote_job.sh\"",
+        "    enroot start --root --rw --mount \"$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM\" --mount \"$REMOTE_HOST_ANSYS_BASE:/ansys_inc/v252\" --mount \"$case_dir:/work\" \"$container_name\" /bin/bash -lc \"set -euo pipefail; mkdir -p /work/home /work/tmp; mount -t tmpfs -o size="
+        + str(SLOT_TMPFS_SIZE_GB)
+        + "G tmpfs /work/tmp; cleanup_tmpfs(){ umount /work/tmp >/dev/null 2>&1 || true; }; trap cleanup_tmpfs EXIT; export HOME=/work/home; export TMPDIR=/work/tmp; export XDG_CONFIG_HOME=/work/home/.config; cd /work; export ANS_IGNOREOS=1; bash ./remote_job.sh\"",
         "  )",
         "}",
         "sync_case_artifacts_back() {",
@@ -3278,8 +3338,8 @@ def _build_worker_payload_script_content(
     payload_lines.extend(
         [
             _build_case_aggregation_command(case_count),
-            "mkdir -p \"/tmp/$USER\"",
-            "archive_path=$(mktemp \"/tmp/$USER/peetsfea-results.XXXXXX.tgz\")",
+            "mkdir -p \"$REMOTE_RUNTIME_ROOT\"",
+            "archive_path=$(mktemp \"$REMOTE_RUNTIME_ROOT/results.${SLURM_JOB_ID:-nojob}.XXXXXX.tgz\")",
             "cleanup_archive() { rm -f \"$archive_path\"; }",
             "trap cleanup_archive EXIT",
             "tar -czf \"$archive_path\" case_* case_summary.txt failed.count",
@@ -3350,6 +3410,7 @@ def _build_remote_sbatch_script_content(
     worker_id: str | None = None,
 ) -> str:
     remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
+    runtime_root = _remote_runtime_root_shell_path(config=config)
     control_plane_ssh_target = _control_plane_ssh_target(config)
     control_plane_return_host = _control_plane_return_host(config)
     control_plane_return_user = _control_plane_return_user(config)
@@ -3367,12 +3428,12 @@ def _build_remote_sbatch_script_content(
             f"#SBATCH --mem={config.mem}",
             f"#SBATCH --time={config.time_limit}",
             *exclude_lines,
-            "#SBATCH -D /tmp",
             "#SBATCH -o slurm-%j.out",
             "#SBATCH -e slurm-%j.err",
             "set -euo pipefail",
             "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}",
             f"SUBMIT_SPOOL_DIR={submit_spool_dir}",
+            f"REMOTE_RUNTIME_ROOT={_double_quoted_shell_value(runtime_root)}",
             f"export PEETS_CONTROL_RUN_ID={shlex.quote(run_id or '')}",
             f"export PEETS_CONTROL_WORKER_ID={shlex.quote(worker_id or '')}",
             f"export PEETS_CONTROL_HOST={shlex.quote(getattr(config, 'control_plane_host', '127.0.0.1'))}",
@@ -3386,8 +3447,8 @@ def _build_remote_sbatch_script_content(
             "SUBMIT_USER=\"${USER:-$(id -un)}\"",
             "SSH_REMOTE=\"${SUBMIT_USER}@${SUBMIT_HOST}\"",
             "SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2)",
-            "mkdir -p \"/tmp/$USER\"",
-            "EXEC_DIR=$(mktemp -d \"/tmp/$USER/peetsfea-sbatch.${SLURM_JOB_ID:-nojob}.XXXXXX\")",
+            "mkdir -p \"$REMOTE_RUNTIME_ROOT\"",
+            "EXEC_DIR=$(mktemp -d \"$REMOTE_RUNTIME_ROOT/sbatch.${SLURM_JOB_ID:-nojob}.XXXXXX\")",
             "uploader_pid=''",
             "upload_back() {",
             "  if [ -z \"$SUBMIT_HOST\" ] || [ ! -d \"$EXEC_DIR\" ]; then",
@@ -3421,7 +3482,7 @@ def _build_remote_sbatch_script_content(
             "  if [ -d \"$EXEC_DIR\" ]; then",
             "    cd \"$EXEC_DIR\" >/dev/null 2>&1 || true",
             "    upload_back",
-            "    cd /tmp >/dev/null 2>&1 || true",
+            "    cd \"$REMOTE_RUNTIME_ROOT\" >/dev/null 2>&1 || true",
             "    rm -rf \"$EXEC_DIR\" >/dev/null 2>&1 || true",
             "  fi",
             "  exit \"$rc\"",

@@ -8,7 +8,7 @@
 ## 현재 상태
 
 - 최근 운영 로그에는 `No space left on device`가 있었다.
-- telemetry에는 `/tmp` free 정보와 observed node 정보가 있다.
+- telemetry에는 scratch usage, tmpfs probe, observed node 정보가 있다.
 - 아직 node 단위 exclude 정책은 구현되지 않았다.
 
 ## 핵심 변경
@@ -16,7 +16,7 @@
 - runtime policy 파일 경로는 `tmp/runtime/bad_nodes.json`로 고정한다.
 - bad-node 후보 기준은 아래 두 가지다.
   - `No space left on device`
-  - `tmp_free_mb < 65536`
+  - `scratch_usage_mb >= 92160` 또는 `tmpfs probe failed`
 - 차단 단위는 observed node다.
 - 최초 cooldown은 `8시간`이다.
 - cooldown 만료 후에는 재평가 후보로 돌린다.
@@ -30,7 +30,7 @@
 
 ## 운영 절차
 
-1. `No space left on device` 또는 low `/tmp`를 확인한다.
+1. `No space left on device`, scratch hard-limit, tmpfs probe를 확인한다.
 2. 관련 worker의 observed node를 찾는다.
 3. 해당 node를 `tmp/runtime/bad_nodes.json`에 기록한다.
 4. cooldown 동안 신규 dispatch 대상에서 제외한다.
@@ -47,7 +47,7 @@
 ## 테스트/수용 기준
 
 - `No space left on device`가 bad-node 분류로 이어진다.
-- `/tmp free < 64 GiB`가 bad-node 분류로 이어진다.
+- scratch hard-limit 또는 tmpfs probe failure가 dispatch 차단으로 이어진다.
 - observed node 기준 차단이 문서상 명확하다.
 - cooldown `8시간`과 재평가 경계가 있다.
 - extractor 회귀가 bad-node로 잘못 분류되지 않는다.

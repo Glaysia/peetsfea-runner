@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 
 import duckdb
 
+from peetsfea_runner.runtime_policy import REMOTE_SCRATCH_HARD_LIMIT_MB, REMOTE_SCRATCH_SOFT_LIMIT_MB
 from peetsfea_runner.state_store import StateStore, _GLOBAL_DUCKDB_LOCK
 from peetsfea_runner.version import get_version
 
@@ -344,6 +345,8 @@ def _latest_account_readiness(db_path: Path) -> dict[str, dict[str, object]]:
             storage_reason,
             inode_use_percent,
             free_mb,
+            scratch_root,
+            scratch_usage_mb,
             ts
         FROM (
             SELECT
@@ -365,6 +368,8 @@ def _latest_account_readiness(db_path: Path) -> dict[str, dict[str, object]]:
                 storage_reason,
                 inode_use_percent,
                 free_mb,
+                scratch_root,
+                scratch_usage_mb,
                 ts,
                 ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY ts DESC) AS rn
             FROM account_readiness_snapshots
@@ -396,9 +401,39 @@ def _latest_account_readiness(db_path: Path) -> dict[str, dict[str, object]]:
             },
             "inode_use_percent": int(row[16]) if row[16] is not None else None,
             "free_mb": int(row[17]) if row[17] is not None else None,
-            "ts": row[18],
+            "scratch_root": row[18],
+            "scratch_usage_mb": int(row[19]) if row[19] is not None else None,
+            "ts": row[20],
         }
     return readiness
+
+
+def _scratch_summary_payload(db_path: Path) -> dict[str, object]:
+    readiness_map = _latest_account_readiness(db_path)
+    roots: dict[str, int] = {}
+    tmpfs_failed_accounts: list[str] = []
+    for account_id, snapshot in readiness_map.items():
+        scratch_root = str(snapshot.get("scratch_root") or "").strip()
+        scratch_usage_mb = snapshot.get("scratch_usage_mb")
+        if scratch_root and scratch_usage_mb is not None:
+            roots[scratch_root] = max(int(scratch_usage_mb), roots.get(scratch_root, 0))
+        if "tmpfs_mount_failed" in str(snapshot.get("reason") or ""):
+            tmpfs_failed_accounts.append(account_id)
+    total_usage_mb = sum(roots.values()) if roots else None
+    status = "UNKNOWN"
+    if tmpfs_failed_accounts or any(usage >= REMOTE_SCRATCH_HARD_LIMIT_MB for usage in roots.values()):
+        status = "RED"
+    elif any(usage >= REMOTE_SCRATCH_SOFT_LIMIT_MB for usage in roots.values()):
+        status = "DEGRADED"
+    elif roots:
+        status = "GREEN"
+    return {
+        "status": status,
+        "total_usage_mb": total_usage_mb,
+        "root_count": len(roots),
+        "roots": [{"scratch_root": root, "usage_mb": usage} for root, usage in sorted(roots.items())],
+        "tmpfs_failed_accounts": sorted(tmpfs_failed_accounts),
+    }
 
 
 def _configured_capacity_targets() -> dict[str, int]:
@@ -2133,6 +2168,8 @@ def _overview_account_payloads(db_path: Path, *, run_id: str | None) -> list[dic
                 "storage_reason": readiness_map.get(account_id, {}).get("checks", {}).get("storage_reason"),
                 "inode_use_percent": readiness_map.get(account_id, {}).get("inode_use_percent"),
                 "free_mb": readiness_map.get(account_id, {}).get("free_mb"),
+                "scratch_root": readiness_map.get(account_id, {}).get("scratch_root"),
+                "scratch_usage_mb": readiness_map.get(account_id, {}).get("scratch_usage_mb"),
                 "score": int(score_map.get(account_id, {}).get("score", 0)),
                 "slot_gap": max(target * _env_int("PEETSFEA_SLOTS_PER_JOB", 4) - active_slots, 0),
             }
@@ -2313,7 +2350,7 @@ def _overnight_ops_windows() -> list[dict[str, object]]:
             "start": datetime(2026, 3, 13, 4, 0, tzinfo=kst),
             "end": datetime(2026, 3, 13, 6, 0, tzinfo=kst),
             "goal": "telemetry exclude and bad-node triage",
-            "checks": ["bad-node", "/tmp free", "observed node", "failed slots"],
+            "checks": ["bad-node", "scratch usage", "observed node", "failed slots"],
         },
         {
             "label": "06:00",
@@ -2826,9 +2863,9 @@ def _ops_window_checklist_payload(
         items = [
             item("bad-node", "FAIL" if bad_node_count > 0 or resource_state == "RED" else "PASS", f"bad_node_count={bad_node_count}"),
             item(
-                "/tmp free",
-                "PASS" if str(node_summary.get("tmp_free_status") or "") == "GREEN" else "FAIL",
-                f"tmp_free_status={node_summary.get('tmp_free_status') or 'UNKNOWN'}",
+                "scratch usage",
+                "PASS" if str(rollout_status.get("scratch_status") or "") == "GREEN" else "FAIL",
+                str(rollout_status.get("scratch_detail") or "scratch_status=UNKNOWN"),
             ),
             item(
                 "observed node",
@@ -3502,11 +3539,11 @@ def _ops_window_runbook_payload(
                 f"bad_node_count={bad_node_count} resource_status={resource_status}",
             ),
             item(
-                "/tmp 기준",
+                "scratch 기준",
                 "PASS"
-                if str(node_summary.get("tmp_free_status") or "") == "GREEN"
-                else ("FAIL" if str(node_summary.get("tmp_free_status") or "") == "RED" else "WARN"),
-                f"tmp_free_status={node_summary.get('tmp_free_status') or 'UNKNOWN'}",
+                if str(rollout_status.get("scratch_status") or "") == "GREEN"
+                else ("FAIL" if str(rollout_status.get("scratch_status") or "") == "RED" else "WARN"),
+                str(rollout_status.get("scratch_detail") or "scratch_status=UNKNOWN"),
             ),
             item("exclude 대상 정리", "PASS", f"bad_node_count={bad_node_count}"),
         ]
@@ -3592,6 +3629,7 @@ def _overview_payload(db_path: Path, *, run_id: str | None) -> dict[str, object]
     workers = _slurm_worker_payloads(db_path, run_id=run_id)
     resource_summary = _latest_resource_summary_payload(db_path, run_id=run_id)
     node_summary = _latest_node_resource_payload(db_path, run_id=run_id)
+    scratch_summary = _scratch_summary_payload(db_path)
     worker_mix = _worker_mix_payload(db_path, run_id=run_id)
     observed_node_summary = _observed_node_summary_payload(db_path, run_id=run_id)
     slot_state_counts = _slot_state_counts(db_path, run_id=run_id)
@@ -3693,6 +3731,7 @@ def _overview_payload(db_path: Path, *, run_id: str | None) -> dict[str, object]
         "real_input_flow": real_input_flow,
         "resource_summary": resource_summary,
         "node_summary": node_summary,
+        "scratch_summary": scratch_summary,
         "worker_mix": worker_mix,
         "observed_node_summary": observed_node_summary,
         "slot_summary": slot_summary,
@@ -3764,6 +3803,9 @@ def _rollout_status_payload(db_path: Path, *, run_id: str | None) -> dict[str, o
             "resource_status": "UNKNOWN",
             "resource_reason": None,
             "last_resource_stage": None,
+            "scratch_status": "UNKNOWN",
+            "scratch_detail": None,
+            "scratch_usage_mb": None,
             "bad_node_active": False,
             "bad_node_count": 0,
             "bad_nodes": [],
@@ -3804,6 +3846,7 @@ def _rollout_status_payload(db_path: Path, *, run_id: str | None) -> dict[str, o
     )
     run_summary = str(run_rows[0][0]) if run_rows and run_rows[0][0] is not None else ""
     workers = _slurm_worker_payloads(db_path, run_id=run_id)
+    scratch_summary = _scratch_summary_payload(db_path)
     active_bad_nodes, bad_node_warnings = _active_bad_node_entries()
     tunnel_degraded_workers = sum(1 for worker in workers if worker.get("tunnel_state") == "DEGRADED")
     tunnel_stale_workers = sum(1 for worker in workers if worker.get("is_tunnel_stale"))
@@ -3937,7 +3980,16 @@ def _rollout_status_payload(db_path: Path, *, run_id: str | None) -> dict[str, o
         (
             row
             for row in rows
-            if str(row[0]) in {"BAD_NODE_REGISTERED", "BAD_NODE_EXCLUDE_ACTIVE", "BAD_NODES_INVALID", "CONTROL_TUNNEL_DEGRADED"}
+            if str(row[0])
+            in {
+                "BAD_NODE_REGISTERED",
+                "BAD_NODE_EXCLUDE_ACTIVE",
+                "BAD_NODES_INVALID",
+                "CONTROL_TUNNEL_DEGRADED",
+                "REMOTE_SCRATCH_HARD_LIMIT",
+                "REMOTE_SCRATCH_SOFT_LIMIT",
+                "RUNTIME_TMPFS_PROBE_FAILED",
+            }
             or "No space left on device" in str(row[2] or "")
         ),
         None,
@@ -3945,17 +3997,42 @@ def _rollout_status_payload(db_path: Path, *, run_id: str | None) -> dict[str, o
     resource_status = "UNKNOWN"
     resource_reason = None
     last_resource_stage = None
+    scratch_status = str(scratch_summary.get("status") or "UNKNOWN")
+    scratch_usage_mb = scratch_summary.get("total_usage_mb")
+    scratch_detail = (
+        f"scratch_usage_mb={scratch_usage_mb if scratch_usage_mb is not None else '-'} "
+        f"roots={scratch_summary.get('root_count') or 0} "
+        f"tmpfs_failed_accounts={','.join(scratch_summary.get('tmpfs_failed_accounts') or []) or 'none'}"
+    )
     bad_node_active = bool(active_bad_nodes)
     tunnel_degraded = tunnel_degraded_workers > 0
     if resource_event is not None:
         last_resource_stage = str(resource_event[0])
         resource_reason = str(resource_event[2]) if resource_event[2] is not None else None
-        if last_resource_stage in {"BAD_NODE_REGISTERED", "BAD_NODE_EXCLUDE_ACTIVE", "BAD_NODES_INVALID"} or "No space left on device" in str(resource_reason or ""):
+        if last_resource_stage in {
+            "BAD_NODE_REGISTERED",
+            "BAD_NODE_EXCLUDE_ACTIVE",
+            "BAD_NODES_INVALID",
+            "REMOTE_SCRATCH_HARD_LIMIT",
+            "RUNTIME_TMPFS_PROBE_FAILED",
+        } or "No space left on device" in str(resource_reason or ""):
             resource_status = "RED"
             bad_node_active = True
         else:
             resource_status = "DEGRADED"
             tunnel_degraded = True
+    elif scratch_status == "RED":
+        resource_status = "RED"
+        resource_reason = scratch_detail
+        last_resource_stage = (
+            "RUNTIME_TMPFS_PROBE_FAILED"
+            if scratch_summary.get("tmpfs_failed_accounts")
+            else "REMOTE_SCRATCH_HARD_LIMIT"
+        )
+    elif scratch_status == "DEGRADED":
+        resource_status = "DEGRADED"
+        resource_reason = scratch_detail
+        last_resource_stage = "REMOTE_SCRATCH_SOFT_LIMIT"
     elif active_bad_nodes:
         resource_status = "RED"
         first_bad_node = active_bad_nodes[0]
@@ -4140,6 +4217,9 @@ def _rollout_status_payload(db_path: Path, *, run_id: str | None) -> dict[str, o
         "resource_status": resource_status,
         "resource_reason": resource_reason,
         "last_resource_stage": last_resource_stage,
+        "scratch_status": scratch_status,
+        "scratch_detail": scratch_detail,
+        "scratch_usage_mb": scratch_usage_mb,
         "no_space_active": no_space_active,
         "no_space_node": no_space_node,
         "no_space_detail": no_space_detail,
@@ -5408,8 +5488,8 @@ def _dashboard_html(*, version: str) -> str:
           <div><div class="k">Allocated Memory</div><div class="v" id="res-alloc">-</div></div>
           <div><div class="k">Used Memory</div><div class="v" id="res-used">-</div></div>
           <div><div class="k">Free Memory</div><div class="v" id="res-free">-</div></div>
-          <div><div class="k">Tmp Free</div><div class="v" id="res-tmp-free">-</div></div>
-          <div><div class="k">Tmp Gate</div><div class="v" id="res-tmp-status" style="font-size:15px;">-</div></div>
+          <div><div class="k">Scratch Usage</div><div class="v" id="res-tmp-free">-</div></div>
+          <div><div class="k">Scratch Gate</div><div class="v" id="res-tmp-status" style="font-size:15px;">-</div></div>
           <div><div class="k">Load</div><div class="v" id="res-load">-</div></div>
           <div><div class="k">Observed Node</div><div class="v" id="res-observed-node" style="font-size:15px;">-</div></div>
           <div><div class="k">Process Count</div><div class="v" id="res-proc">-</div></div>
@@ -5575,6 +5655,7 @@ def _dashboard_html(*, version: str) -> str:
       const throughput = overview.throughput_kpi || {};
       const resource = overview.resource_summary || {};
       const node = overview.node_summary || {};
+      const scratch = overview.scratch_summary || {};
       const workerMix = overview.worker_mix || {};
       const observed = overview.observed_node_summary || {};
       const slotSummary = overview.slot_summary || {};
@@ -5651,12 +5732,12 @@ def _dashboard_html(*, version: str) -> str:
       document.getElementById('res-alloc').textContent = fmtMb(node.allocated_mem_mb ?? resource.allocated_mem_mb);
       document.getElementById('res-used').textContent = fmtMb(node.used_mem_mb ?? resource.used_mem_mb);
       document.getElementById('res-free').textContent = fmtMb(node.free_mem_mb ?? resource.free_mem_mb);
-      document.getElementById('res-tmp-free').textContent = fmtMb(node.tmp_free_mb);
-      document.getElementById('res-tmp-status').textContent = node.tmp_free_status == null
+      document.getElementById('res-tmp-free').textContent = fmtMb(scratch.total_usage_mb);
+      document.getElementById('res-tmp-status').textContent = scratch.status == null
         ? '-'
-        : (node.tmp_free_status === 'RED' && node.tmp_free_shortfall_mb != null
-            ? `${node.tmp_free_status} / -${fmtMb(node.tmp_free_shortfall_mb)}`
-            : node.tmp_free_status);
+        : (Array.isArray(scratch.tmpfs_failed_accounts) && scratch.tmpfs_failed_accounts.length
+            ? `${scratch.status} / tmpfs=${scratch.tmpfs_failed_accounts.join(',')}`
+            : scratch.status);
       document.getElementById('res-load').textContent = (node.load_1 ?? resource.load_1) == null ? '-' : (node.load_1 ?? resource.load_1).toFixed(2);
       document.getElementById('res-observed-node').textContent = observed.primary_node == null
         ? '-'
