@@ -38,8 +38,8 @@ class TestBuiltInService(unittest.TestCase):
         self.assertTrue(lane_by_id["preserve_results"].retain_aedtresults)
         self.assertTrue(lane_by_id["preserve_results"].rename_input_to_done_on_success)
         self.assertEqual(tuple(lane_by_id["preserve_results"].accounts), ())
-        self.assertEqual(lane_by_id["prune_results"].cpus_per_job, 20)
-        self.assertEqual(lane_by_id["prune_results"].slots_per_job, 5)
+        self.assertEqual(lane_by_id["prune_results"].cpus_per_job, 64)
+        self.assertEqual(lane_by_id["prune_results"].slots_per_job, 24)
         self.assertEqual(lane_by_id["prune_results"].cores_per_slot, 4)
         self.assertEqual(lane_by_id["prune_results"].tasks_per_slot, 1)
         self.assertFalse(lane_by_id["prune_results"].retain_aedtresults)
@@ -49,7 +49,7 @@ class TestBuiltInService(unittest.TestCase):
             ["gate1-harry261", "gate1-dhj02", "gate1-jji0930", "gate1-hmlee31", "gate1-dw16"],
         )
         total_slots = sum(len(lane.accounts) * 10 * lane.slots_per_job for lane in profile.lanes)
-        self.assertEqual(total_slots, 250)
+        self.assertEqual(total_slots, 1200)
 
     def test_validate_service_layout_creates_required_output_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -9,7 +9,7 @@ REMOTE_SCRATCH_SOFT_LIMIT_MB: Final[int] = 80 * 1024
 REMOTE_SCRATCH_HARD_LIMIT_MB: Final[int] = 90 * 1024
 RUNTIME_PROBE_CACHE_TTL_SECONDS: Final[int] = 30 * 60
 RUNTIME_JANITOR_MIN_TTL_SECONDS: Final[int] = 12 * 60 * 60
-SLOT_TMPFS_SIZE_GB: Final[int] = 16
+SLOT_TMPFS_SIZE_GB: Final[int] = 5
 
 
 def join_remote_root(remote_root: str, suffix: str) -> str:

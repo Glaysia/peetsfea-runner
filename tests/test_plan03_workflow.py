@@ -408,7 +408,7 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn('enroot create -f -n "$container_name" "$REMOTE_CONTAINER_IMAGE" >/dev/null', content)
         self.assertIn('enroot start --root --rw --mount "$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM" --mount "$REMOTE_HOST_ANSYS_BASE:/ansys_inc/v252" --mount "$case_dir:/work"', content)
         self.assertIn('mkdir -p /work/home /work/tmp', content)
-        self.assertIn('mount -t tmpfs -o size=16G tmpfs /work/tmp', content)
+        self.assertIn('mount -t tmpfs -o size=5G tmpfs /work/tmp', content)
         self.assertIn('export HOME=/work/home', content)
         self.assertIn('export TMPDIR=/work/tmp', content)
         self.assertIn('export XDG_CONFIG_HOME=/work/home/.config', content)
