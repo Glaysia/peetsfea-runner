@@ -130,7 +130,7 @@ class TestSystemdWorker(unittest.TestCase):
         self.assertEqual(config.control_plane_ssh_target, "peetsmain@harrypc")
         self.assertEqual(config.control_plane_return_user, "peetsmain")
         self.assertEqual(config.control_plane_return_host, "harrypc")
-        self.assertEqual(config.control_plane_return_port, 5722)
+        self.assertEqual(config.control_plane_return_port, 22)
 
     def test_build_config_prefers_explicit_return_host_and_port(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -140,8 +140,8 @@ class TestSystemdWorker(unittest.TestCase):
                     "PEETSFEA_INPUT_QUEUE_DIR": str(Path(tmpdir) / "in"),
                     "PEETSFEA_OUTPUT_ROOT_DIR": str(Path(tmpdir) / "out"),
                     "PEETSFEA_DB_PATH": str(Path(tmpdir) / "state.duckdb"),
-                    "PEETSFEA_CONTROL_PLANE_RETURN_HOST": "192.168.0.10",
-                    "PEETSFEA_CONTROL_PLANE_RETURN_PORT": "5722",
+                    "PEETSFEA_CONTROL_PLANE_RETURN_HOST": "172.16.165.146",
+                    "PEETSFEA_CONTROL_PLANE_RETURN_PORT": "22",
                     "PEETSFEA_CONTROL_PLANE_RETURN_USER": "peetsmain",
                     "USER": "peetsmain",
                 },
@@ -149,10 +149,10 @@ class TestSystemdWorker(unittest.TestCase):
             ):
                 config = _build_config()
 
-        self.assertEqual(config.control_plane_return_host, "192.168.0.10")
-        self.assertEqual(config.control_plane_return_port, 5722)
+        self.assertEqual(config.control_plane_return_host, "172.16.165.146")
+        self.assertEqual(config.control_plane_return_port, 22)
         self.assertEqual(config.control_plane_return_user, "peetsmain")
-        self.assertEqual(config.control_plane_ssh_target, "peetsmain@192.168.0.10")
+        self.assertEqual(config.control_plane_ssh_target, "peetsmain@172.16.165.146")
 
     def test_run_worker_iteration_marks_idle_when_pipeline_is_idle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

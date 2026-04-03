@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import tempfile
 import unittest
 from pathlib import Path
@@ -743,6 +744,81 @@ class TestStateStore(unittest.TestCase):
             self.assertEqual(worker_row, (4, 3, 512, "CONNECTED"))
             self.assertEqual(slot_row, (240 * 1024, 128, 1.5, 128, 3, 2, 4096, "RUNNING"))
             self.assertEqual(summary_row, (960 * 1024, 256, 5, False))
+
+    def test_acquire_slot_lease_assigns_unique_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            store.create_slot_task(
+                run_id="run_01",
+                slot_id="slot_01",
+                input_path="/tmp/a.aedt",
+                output_path="/tmp/out/a.aedt.out",
+                account_id="account_01",
+            )
+            store.create_slot_task(
+                run_id="run_01",
+                slot_id="slot_02",
+                input_path="/tmp/b.aedt",
+                output_path="/tmp/out/b.aedt.out",
+                account_id="account_01",
+            )
+
+            lease_01 = store.acquire_slot_lease(
+                run_id="run_01",
+                worker_id="worker_01",
+                job_id="worker_01",
+                account_id="account_01",
+                slurm_job_id="123",
+                lease_token="token-01",
+                lease_ttl_seconds=120,
+            )
+            lease_02 = store.acquire_slot_lease(
+                run_id="run_01",
+                worker_id="worker_02",
+                job_id="worker_02",
+                account_id="account_01",
+                slurm_job_id="124",
+                lease_token="token-02",
+                lease_ttl_seconds=120,
+            )
+
+            self.assertIsNotNone(lease_01)
+            self.assertIsNotNone(lease_02)
+            self.assertNotEqual(lease_01["slot_id"], lease_02["slot_id"])
+
+    def test_reap_expired_slot_leases_requeues_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.duckdb"
+            store = StateStore(db_path)
+            store.initialize()
+            store.create_slot_task(
+                run_id="run_01",
+                slot_id="slot_01",
+                input_path="/tmp/a.aedt",
+                output_path="/tmp/out/a.aedt.out",
+                account_id="account_01",
+            )
+            store.acquire_slot_lease(
+                run_id="run_01",
+                worker_id="worker_01",
+                job_id="worker_01",
+                account_id="account_01",
+                slurm_job_id="123",
+                lease_token="token-01",
+                lease_ttl_seconds=1,
+            )
+
+            reaped = store.reap_expired_slot_leases(
+                run_id="run_01",
+                now=datetime.now(timezone.utc) + timedelta(seconds=5),
+            )
+            slot_row = store.get_slot_task(run_id="run_01", slot_id="slot_01")
+
+            self.assertEqual(len(reaped), 1)
+            self.assertEqual(slot_row["state"], "RETRY_QUEUED")
+            self.assertIsNone(slot_row["lease_token"])
 
 
 if __name__ == "__main__":

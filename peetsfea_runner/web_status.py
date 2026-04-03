@@ -4,7 +4,9 @@ import csv
 import json
 import os
 import re
+import secrets
 import subprocess
+import tempfile
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -17,6 +19,12 @@ from peetsfea_runner.license_policy import (
     LICENSE_CEILING,
     compute_license_target_plan,
     normalize_license_account_states,
+)
+from peetsfea_runner.pipeline import (
+    LeaseServerContext,
+    _finalize_slot_input_cleanup,
+    materialize_pulled_slot_artifact,
+    slot_task_ref_from_record,
 )
 from peetsfea_runner.runtime_policy import REMOTE_SCRATCH_HARD_LIMIT_MB, REMOTE_SCRATCH_SOFT_LIMIT_MB
 from peetsfea_runner.state_store import StateStore, _GLOBAL_DUCKDB_LOCK
@@ -4357,7 +4365,7 @@ def _rollout_status_payload(db_path: Path, *, run_id: str | None) -> dict[str, o
     }
 
 
-def make_status_handler(*, db_path: Path):
+def make_status_handler(*, db_path: Path, lease_context: LeaseServerContext | None = None):
     stale_threshold = int(os.getenv("PEETSFEA_STALE_THRESHOLD_SECONDS", "90"))
     state_store = StateStore(db_path)
     state_store.initialize()
@@ -4381,9 +4389,30 @@ def make_status_handler(*, db_path: Path):
             self.end_headers()
             self.wfile.write(encoded)
 
-        def _read_json_body(self) -> dict[str, object]:
+        def _send_bytes(
+            self,
+            body: bytes,
+            *,
+            content_type: str = "application/octet-stream",
+            status: int = 200,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            for key, value in (extra_headers or {}).items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_raw_body(self) -> bytes:
             content_length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            raw = self.rfile.read(content_length) if content_length > 0 else b""
+            self._last_raw_body = raw
+            return raw
+
+        def _read_json_body(self) -> dict[str, object]:
+            raw = self._read_raw_body() or b"{}"
             if not raw:
                 return {}
             return json.loads(raw.decode("utf-8"))
@@ -4402,10 +4431,128 @@ def make_status_handler(*, db_path: Path):
                 return
             if self._reject_non_loopback():
                 return
+            if parsed.path == "/internal/leases/artifact":
+                if lease_context is None:
+                    self._send_json({"error": "lease_api_disabled"}, status=503)
+                    return
+                params = parse_qs(parsed.query)
+                run_id = _first_str_param(params, "run_id")
+                lease_token = _first_str_param(params, "lease_token")
+                if not run_id or not lease_token:
+                    self._send_json({"error": "run_id_and_lease_token_required"}, status=400)
+                    return
+                slot_record = state_store.get_slot_task_by_lease_token(run_id=run_id, lease_token=lease_token)
+                if slot_record is None:
+                    self._send_json({"error": "lease_not_found"}, status=404)
+                    return
+                body = self._read_raw_body()
+                if not body:
+                    self._send_json({"error": "artifact_body_required"}, status=400)
+                    return
+                slot = slot_task_ref_from_record(run_id=run_id, slot_record=slot_record)
+                tmp_handle = tempfile.NamedTemporaryFile(prefix="peetsfea-artifact-", suffix=".tgz", delete=False)
+                tmp_path = Path(tmp_handle.name)
+                try:
+                    tmp_handle.write(body)
+                    tmp_handle.close()
+                    materialized = materialize_pulled_slot_artifact(
+                        slot=slot,
+                        archive_path=tmp_path,
+                        retain_aedtresults=lease_context.retain_aedtresults,
+                    )
+                except Exception as exc:
+                    self._send_json({"error": "artifact_materialize_failed", "detail": str(exc)}, status=400)
+                    return
+                finally:
+                    try:
+                        tmp_handle.close()
+                    except Exception:
+                        pass
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                state_store.update_slot_lease_state(
+                    run_id=run_id,
+                    lease_token=lease_token,
+                    state="UPLOADING",
+                    artifact_uploaded=True,
+                    extend_ttl_seconds=lease_context.lease_ttl_seconds,
+                )
+                state_store.append_slot_event(
+                    run_id=run_id,
+                    slot_id=slot.slot_id,
+                    level="INFO",
+                    stage="ARTIFACT_UPLOADED",
+                    message=f"worker_id={slot_record.get('worker_id') or 'unknown'} materialized={materialized}",
+                )
+                finalized_state = None
+                exit_code = None
+                exit_path = slot.output_dir / "exit.code"
+                if materialized and exit_path.exists():
+                    try:
+                        exit_code = int(exit_path.read_text(encoding="utf-8").strip())
+                    except (OSError, ValueError):
+                        exit_code = None
+                if exit_code is not None:
+                    worker_id = str(slot_record.get("worker_id") or "unknown").strip() or "unknown"
+                    if exit_code == 0:
+                        state_store.clear_slot_lease(
+                            run_id=run_id,
+                            lease_token=lease_token,
+                            final_state="SUCCEEDED",
+                        )
+                        state_store.mark_ingest_state(input_path=str(slot.input_path), state="SUCCEEDED")
+                        state_store.record_artifact(run_id=run_id, job_id=slot.slot_id, artifact_root=str(slot.output_dir))
+                        _finalize_slot_input_cleanup(
+                            config=lease_context,
+                            state_store=state_store,
+                            run_id=run_id,
+                            slot=slot,
+                            deleted_slot_ids=set(),
+                        )
+                        state_store.append_slot_event(
+                            run_id=run_id,
+                            slot_id=slot.slot_id,
+                            level="INFO",
+                            stage="SUCCEEDED",
+                            message=f"worker_id={worker_id} artifact_upload_finalized",
+                        )
+                        finalized_state = "SUCCEEDED"
+                    else:
+                        failure_reason = str(slot_record.get("failure_reason") or "").strip() or f"slot exited rc={exit_code}"
+                        state_store.clear_slot_lease(
+                            run_id=run_id,
+                            lease_token=lease_token,
+                            final_state="FAILED",
+                            failure_reason=failure_reason,
+                        )
+                        state_store.mark_ingest_state(input_path=str(slot.input_path), state="FAILED")
+                        state_store.append_slot_event(
+                            run_id=run_id,
+                            slot_id=slot.slot_id,
+                            level="WARN",
+                            stage="FAILED",
+                            message=failure_reason,
+                        )
+                        finalized_state = "FAILED"
+                self._send_json({"ok": True, "materialized": materialized, "state": finalized_state or "UPLOADING"})
+                return
             try:
                 payload = self._read_json_body()
-            except json.JSONDecodeError:
-                self._send_json({"error": "invalid_json"}, status=400)
+            except json.JSONDecodeError as exc:
+                body_preview = ""
+                raw = getattr(self, "_last_raw_body", b"")
+                if raw:
+                    body_preview = raw.decode("utf-8", "replace")[:400]
+                self._send_json(
+                    {
+                        "error": "invalid_json",
+                        "detail": str(exc),
+                        "body_preview": body_preview,
+                    },
+                    status=400,
+                )
                 return
 
             run_id = str(payload.get("run_id") or "").strip()
@@ -4440,6 +4587,154 @@ def make_status_handler(*, db_path: Path):
                     ),
                 )
                 self._send_json({"ok": True})
+                return
+
+            if parsed.path == "/internal/leases/request":
+                if lease_context is None:
+                    self._send_json({"error": "lease_api_disabled"}, status=503)
+                    return
+                if not run_id or not worker_id:
+                    self._send_json({"error": "run_id_and_worker_id_required"}, status=400)
+                    return
+                worker = state_store.get_slurm_worker(run_id=run_id, worker_id=worker_id)
+                if worker is None:
+                    self._send_json({"error": "worker_not_found"}, status=404)
+                    return
+                account_id = str(payload.get("account_id") or worker.get("account_id") or "").strip()
+                if not account_id:
+                    self._send_json({"error": "account_id_required"}, status=400)
+                    return
+                lease_token = secrets.token_urlsafe(24)
+                slot_record = state_store.acquire_slot_lease(
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    job_id=worker_id,
+                    account_id=account_id,
+                    slurm_job_id=str(payload.get("slurm_job_id") or worker.get("slurm_job_id") or "").strip() or None,
+                    lease_token=lease_token,
+                    lease_ttl_seconds=lease_context.lease_ttl_seconds,
+                )
+                if slot_record is None:
+                    self._send_json({"ok": True, "lease_available": False})
+                    return
+                state_store.mark_ingest_state(input_path=str(slot_record["input_path"]), state="LEASED")
+                state_store.append_slot_event(
+                    run_id=run_id,
+                    slot_id=str(slot_record["slot_id"]),
+                    level="INFO",
+                    stage="LEASED",
+                    message=f"worker_id={worker_id} slurm_job_id={slot_record.get('slurm_job_id') or 'unknown'}",
+                )
+                self._send_json(
+                    {
+                        "ok": True,
+                        "lease_available": True,
+                        "lease_token": lease_token,
+                        "slot_id": str(slot_record["slot_id"]),
+                        "attempt_no": int(slot_record.get("attempt_no") or 0),
+                        "input_name": Path(str(slot_record["input_path"])).name,
+                    }
+                )
+                return
+
+            if parsed.path == "/internal/leases/heartbeat":
+                if lease_context is None:
+                    self._send_json({"error": "lease_api_disabled"}, status=503)
+                    return
+                lease_token = str(payload.get("lease_token") or "").strip()
+                if not run_id or not lease_token:
+                    self._send_json({"error": "run_id_and_lease_token_required"}, status=400)
+                    return
+                current = state_store.get_slot_task_by_lease_token(run_id=run_id, lease_token=lease_token)
+                if current is None:
+                    self._send_json({"error": "lease_not_found"}, status=404)
+                    return
+                slot_state = str(payload.get("slot_state") or current.get("state") or "LEASED").strip().upper()
+                updated = state_store.update_slot_lease_state(
+                    run_id=run_id,
+                    lease_token=lease_token,
+                    state=slot_state,
+                    failure_reason=str(current.get("failure_reason") or "").strip() or None,
+                    extend_ttl_seconds=lease_context.lease_ttl_seconds,
+                )
+                if updated is None:
+                    self._send_json({"error": "lease_not_found"}, status=404)
+                    return
+                self._send_json({"ok": True, "slot_state": slot_state})
+                return
+
+            if parsed.path == "/internal/leases/complete":
+                if lease_context is None:
+                    self._send_json({"error": "lease_api_disabled"}, status=503)
+                    return
+                lease_token = str(payload.get("lease_token") or "").strip()
+                if not run_id or not lease_token:
+                    self._send_json({"error": "run_id_and_lease_token_required"}, status=400)
+                    return
+                slot_record = state_store.get_slot_task_by_lease_token(run_id=run_id, lease_token=lease_token)
+                if slot_record is None:
+                    self._send_json({"error": "lease_not_found"}, status=404)
+                    return
+                if not slot_record.get("artifact_uploaded_at"):
+                    self._send_json({"error": "artifact_missing"}, status=409)
+                    return
+                slot = slot_task_ref_from_record(run_id=run_id, slot_record=slot_record)
+                state_store.clear_slot_lease(
+                    run_id=run_id,
+                    lease_token=lease_token,
+                    final_state="SUCCEEDED",
+                )
+                state_store.mark_ingest_state(input_path=str(slot.input_path), state="SUCCEEDED")
+                state_store.record_artifact(run_id=run_id, job_id=slot.slot_id, artifact_root=str(slot.output_dir))
+                _finalize_slot_input_cleanup(
+                    config=lease_context,
+                    state_store=state_store,
+                    run_id=run_id,
+                    slot=slot,
+                    deleted_slot_ids=set(),
+                )
+                state_store.append_slot_event(
+                    run_id=run_id,
+                    slot_id=slot.slot_id,
+                    level="INFO",
+                    stage="SUCCEEDED",
+                    message=f"worker_id={slot_record.get('worker_id') or 'unknown'}",
+                )
+                self._send_json({"ok": True, "state": "SUCCEEDED"})
+                return
+
+            if parsed.path == "/internal/leases/fail":
+                if lease_context is None:
+                    self._send_json({"error": "lease_api_disabled"}, status=503)
+                    return
+                lease_token = str(payload.get("lease_token") or "").strip()
+                if not run_id or not lease_token:
+                    self._send_json({"error": "run_id_and_lease_token_required"}, status=400)
+                    return
+                slot_record = state_store.get_slot_task_by_lease_token(run_id=run_id, lease_token=lease_token)
+                if slot_record is None:
+                    self._send_json({"error": "lease_not_found"}, status=404)
+                    return
+                reason = str(payload.get("reason") or "slot failed").strip()
+                attempt_no = int(slot_record.get("attempt_no") or 0)
+                retry_allowed = attempt_no <= lease_context.worker_requeue_limit
+                final_state = "RETRY_QUEUED" if retry_allowed else "FAILED"
+                slot = slot_task_ref_from_record(run_id=run_id, slot_record=slot_record)
+                state_store.clear_slot_lease(
+                    run_id=run_id,
+                    lease_token=lease_token,
+                    final_state=final_state,
+                    failure_reason=reason,
+                )
+                state_store.mark_ingest_state(input_path=str(slot.input_path), state=final_state)
+                state_store.append_slot_event(
+                    run_id=run_id,
+                    slot_id=slot.slot_id,
+                    level="WARN" if retry_allowed else "ERROR",
+                    stage=final_state,
+                    message=reason,
+                )
+                self._send_json({"ok": True, "state": final_state, "retry_queued": retry_allowed})
                 return
 
             if parsed.path == "/internal/workers/heartbeat":
@@ -4585,6 +4880,42 @@ def make_status_handler(*, db_path: Path):
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
+
+            if parsed.path == "/internal/leases/input":
+                if self._reject_non_loopback():
+                    return
+                if lease_context is None:
+                    self._send_json({"error": "lease_api_disabled"}, status=503)
+                    return
+                run_id = _first_str_param(params, "run_id")
+                lease_token = _first_str_param(params, "lease_token")
+                if not run_id or not lease_token:
+                    self._send_json({"error": "run_id_and_lease_token_required"}, status=400)
+                    return
+                slot_record = state_store.get_slot_task_by_lease_token(run_id=run_id, lease_token=lease_token)
+                if slot_record is None:
+                    self._send_json({"error": "lease_not_found"}, status=404)
+                    return
+                input_path = Path(str(slot_record["input_path"])).expanduser().resolve()
+                if not input_path.exists():
+                    self._send_json({"error": "input_not_found"}, status=404)
+                    return
+                state_store.update_slot_lease_state(
+                    run_id=run_id,
+                    lease_token=lease_token,
+                    state="DOWNLOADING",
+                    failure_reason=None,
+                    extend_ttl_seconds=lease_context.lease_ttl_seconds,
+                )
+                self._send_bytes(
+                    input_path.read_bytes(),
+                    content_type="application/octet-stream",
+                    extra_headers={
+                        "X-Peets-Input-Name": input_path.name,
+                        "X-Peets-Slot-Id": str(slot_record["slot_id"]),
+                    },
+                )
+                return
 
             if parsed.path == "/":
                 self._send_html(_dashboard_html(version=APP_VERSION))
@@ -5475,8 +5806,14 @@ def make_status_handler(*, db_path: Path):
     return StatusHandler
 
 
-def start_status_server(*, db_path: str, host: str = "127.0.0.1", port: int = 8765) -> HTTPServer:
-    handler = make_status_handler(db_path=Path(db_path).expanduser().resolve())
+def start_status_server(
+    *,
+    db_path: str,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    lease_context: LeaseServerContext | None = None,
+) -> HTTPServer:
+    handler = make_status_handler(db_path=Path(db_path).expanduser().resolve(), lease_context=lease_context)
     # Keep the status API single-threaded to avoid DuckDB file-handle conflicts
     # from concurrent dashboard polling requests.
     server = HTTPServer((host, port), handler)

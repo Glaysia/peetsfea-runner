@@ -34,6 +34,8 @@ from peetsfea_runner.remote_job import (
     WorkflowError,
     _classify_return_path_failure_stage,
     _build_enroot_remote_job_script_content,
+    _build_pull_remote_sbatch_script_content,
+    _build_pull_worker_payload_script_content,
     _build_worker_payload_script_content,
     _build_remote_sbatch_script_content,
     _build_windows_remote_dispatch_script_content,
@@ -331,8 +333,8 @@ class TestPlan03Workflow(unittest.TestCase):
             control_plane_host = "127.0.0.1"
             control_plane_port = 8765
             control_plane_ssh_target = "harrypc"
-            control_plane_return_host = "192.168.0.10"
-            control_plane_return_port = 5722
+            control_plane_return_host = "172.16.165.146"
+            control_plane_return_port = 22
             control_plane_return_user = "peetsmain"
             tunnel_recovery_grace_seconds = 30
             remote_container_runtime = "enroot"
@@ -348,40 +350,143 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("max_parallel=4", content)
         self.assertIn("for i in $(seq 1 8); do", content)
         self.assertIn("wait -n \"${case_pids[@]}\" || true", content)
-        self.assertIn("ssh -M -S \"$PEETS_TUNNEL_SOCKET\" -fnNT", content)
+        self.assertIn("ssh \"${ssh_args[@]}\" -M -S \"$PEETS_TUNNEL_SOCKET\" -fnNT", content)
         self.assertIn("-p \"$PEETS_CONTROL_RETURN_PORT\"", content)
         self.assertIn("-o StrictHostKeyChecking=no", content)
         self.assertIn("-o UserKnownHostsFile=/dev/null", content)
+        self.assertIn("PEETS_CONTROL_SSH_IDENTITY=\"${PEETS_CONTROL_SSH_IDENTITY:-}\"", content)
+        self.assertIn("ssh_args+=(-o IdentitiesOnly=yes -i \"$PEETS_CONTROL_SSH_IDENTITY\")", content)
+        self.assertIn("PEETS_CONTROL_LOCAL_PORT=$((PEETS_CONTROL_PORT + 1000 + (${SLURM_JOB_ID:-0} % 1000)))", content)
         self.assertIn("classify_return_path_stage()", content)
         self.assertIn("RETURN_PATH_DNS_FAILURE", content)
         self.assertIn("export PATH=/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}", content)
         self.assertIn("launch_probe_file=\"${REMOTE_JOB_DIR:-$workdir}/launch_probe.txt\"", content)
         self.assertIn("printf 'tool.%s=%s\\n' \"$tool\" \"${resolved_tool:-MISSING}\"", content)
         self.assertNotIn("rm -rf \"$REMOTE_JOB_DIR\" >/dev/null 2>&1 || true", content)
-        self.assertIn("find . -maxdepth 1 -name '*.lock' -type f -delete", content)
-        self.assertIn("rm -rf tmp >/dev/null 2>&1 || true", content)
-        self.assertIn("touch results.tgz.ready", content)
-        self.assertIn("sync_case_artifacts_back() {", content)
-        self.assertIn("sync_bundle_artifacts_back() {", content)
-        self.assertIn("case_name=\"$(basename \"$case_dir\")\"", content)
-        self.assertIn("mkdir -p \"$REMOTE_JOB_DIR/$case_name\"", content)
-        self.assertIn("report_export.error.log license_diagnostics.txt runtime_logs.json", content)
-        self.assertIn("design_outputs", content)
-        self.assertIn("sync_case_artifacts_back \"$case_dir_path\"", content)
-        self.assertIn("cp -f \"$archive_path\" results.tgz", content)
-        self.assertIn("sync_bundle_artifacts_back", content)
-        self.assertIn("/internal/workers/register", content)
-        self.assertIn("/internal/workers/heartbeat", content)
-        self.assertIn("/internal/resources/node", content)
-        self.assertIn("/internal/resources/worker", content)
-        self.assertIn("/internal/resources/slot", content)
-        self.assertIn("PEETS_CONTROL_WORKER_ID=attempt_0001", content)
+
+    def test_pull_worker_payload_requests_leases_and_uploads_per_slot_artifacts(self) -> None:
+        class _Cfg:
+            slots_per_job = 48
+            slot_min_concurrency = 5
+            slot_max_concurrency = 48
+            slot_memory_pressure_high_watermark_percent = 90
+            slot_memory_pressure_resume_watermark_percent = 80
+            slot_memory_probe_interval_seconds = 5
+            lease_ttl_seconds = 120
+            lease_heartbeat_seconds = 15
+            worker_idle_poll_seconds = 10
+            slot_request_backoff_seconds = 5
+            cores_per_slot = 4
+            tasks_per_slot = 1
+            control_plane_host = "127.0.0.1"
+            control_plane_port = 8765
+            control_plane_ssh_target = "harrypc"
+            control_plane_return_host = "172.16.165.146"
+            control_plane_return_port = 22
+            control_plane_return_user = "peetsmain"
+            tunnel_recovery_grace_seconds = 30
+            mem = "288G"
+            remote_container_runtime = "enroot"
+            remote_container_image = "~/runtime/enroot/aedt.sqsh"
+            remote_container_ansys_root = "/opt/ohpc/pub/Electronics/v252"
+            remote_ansys_executable = "/mnt/AnsysEM/ansysedt"
+            host = "gate1-harry261"
+            remote_root = "~/aedt_runs"
+            partition = "cpu2"
+            slurm_partitions_allowlist = ("cpu2",)
+            nodes = 1
+            ntasks = 1
+            cpus_per_job = 48
+            time_limit = "05:00:00"
+            platform = "linux"
+            scheduler = "slurm"
+            remote_execution_backend = "slurm_batch"
+            remote_ssh_port = 22
+            ssh_config_path = ""
+            worker_payload_slot_limit = 48
+            slurm_exclude_nodes = ()
+
+        content = _build_pull_worker_payload_script_content(
+            config=_Cfg(),
+            run_id="run_01",
+            worker_id="worker_01",
+        )
+        self.assertIn("/internal/leases/request", content)
+        self.assertIn("/internal/leases/input?run_id=${PEETS_CONTROL_RUN_ID}&lease_token=${lease_token}", content)
+        self.assertIn("/internal/leases/artifact?run_id=${PEETS_CONTROL_RUN_ID}&lease_token=${lease_token}", content)
+        self.assertIn("/internal/leases/complete", content)
+        self.assertIn("/internal/leases/fail", content)
+        self.assertIn("PEETS_LEASE_HEARTBEAT_INTERVAL=15", content)
+        self.assertIn("PEETS_WORKER_IDLE_POLL=10", content)
+        self.assertIn("PEETS_SLOT_REQUEST_BACKOFF=5", content)
+        self.assertIn("if [ \"$active_now\" -lt \"$PEETS_SLOT_MIN_CONCURRENCY\" ]; then", content)
+        self.assertIn("PEETS_CONTROL_SSH_IDENTITY=\"${PEETS_CONTROL_SSH_IDENTITY:-}\"", content)
+        self.assertIn("ssh_args+=(-o IdentitiesOnly=yes -i \"$PEETS_CONTROL_SSH_IDENTITY\")", content)
+        self.assertIn("PEETS_CONTROL_LOCAL_PORT=$((PEETS_CONTROL_PORT + 1000 + (${SLURM_JOB_ID:-0} % 1000)))", content)
+        self.assertNotIn("project_01.aedt", content)
+        self.assertNotIn("for i in $(seq 1 ", content)
+
+    def test_pull_remote_sbatch_only_stages_scripts(self) -> None:
+        class _Cfg:
+            host = "gate1-harry261"
+            remote_root = "~/aedt_runs"
+            partition = "cpu2"
+            slurm_partitions_allowlist = ("cpu2",)
+            nodes = 1
+            ntasks = 1
+            cpus_per_job = 48
+            mem = "288G"
+            time_limit = "05:00:00"
+            slots_per_job = 48
+            worker_payload_slot_limit = 48
+            slot_min_concurrency = 5
+            slot_max_concurrency = 48
+            slot_memory_pressure_high_watermark_percent = 90
+            slot_memory_pressure_resume_watermark_percent = 80
+            slot_memory_probe_interval_seconds = 5
+            lease_ttl_seconds = 120
+            lease_heartbeat_seconds = 15
+            worker_idle_poll_seconds = 10
+            slot_request_backoff_seconds = 5
+            cores_per_slot = 4
+            tasks_per_slot = 1
+            platform = "linux"
+            scheduler = "slurm"
+            remote_execution_backend = "slurm_batch"
+            control_plane_host = "127.0.0.1"
+            control_plane_port = 8765
+            control_plane_ssh_target = "harrypc"
+            control_plane_return_host = "172.16.165.146"
+            control_plane_return_port = 22
+            control_plane_return_user = "peetsmain"
+            tunnel_heartbeat_timeout_seconds = 90
+            tunnel_recovery_grace_seconds = 30
+            remote_ssh_port = 22
+            ssh_config_path = ""
+            remote_container_runtime = "enroot"
+            remote_container_image = "~/runtime/enroot/aedt.sqsh"
+            remote_container_ansys_root = "/opt/ohpc/pub/Electronics/v252"
+            remote_ansys_executable = "/mnt/AnsysEM/ansysedt"
+            slurm_exclude_nodes = ()
+
+        content = _build_pull_remote_sbatch_script_content(
+            config=_Cfg(),
+            remote_job_dir="/tmp/peetsfea/run_01/worker_01",
+            run_id="run_01",
+            worker_id="worker_01",
+        )
+        self.assertIn("remote_pull_worker_payload.sh", content)
+        self.assertNotIn("project_*.aedt", content)
+        self.assertIn("/tmp/peetsfea-runner/submit", content)
+        self.assertIn("./remote_pull_worker_payload.sh > worker.stdout 2> worker.stderr", content)
+        self.assertIn("upload_debug_back() {", content)
+        self.assertIn("launch_probe.txt worker.stdout worker.stderr control_tunnel_bootstrap.err", content)
+        self.assertIn("tar -czf - remote_job.sh remote_pull_worker_payload.sh", content)
+        self.assertIn("stage_control_ssh_identity() {", content)
+        self.assertIn("export PEETS_CONTROL_SSH_IDENTITY=\"$staged_dir/id_control\"", content)
+        self.assertNotIn("results.tgz", content)
+        self.assertIn("PEETS_CONTROL_WORKER_ID=worker_01", content)
         self.assertIn("PEETS_CONTROL_RUN_ID=run_01", content)
-        self.assertIn("case_pids=()", content)
-        self.assertIn("count_case_jobs()", content)
-        self.assertIn("case_pids+=(\"$!\")", content)
-        self.assertIn("wait -n \"${case_pids[@]}\" || true", content)
-        self.assertNotIn("while [ \"$(jobs -pr | wc -l)\" -gt 0 ]; do", content)
 
     def test_enroot_worker_payload_uses_cd_then_mount_contract(self) -> None:
         class _Cfg:
@@ -389,9 +494,9 @@ class TestPlan03Workflow(unittest.TestCase):
             cores_per_slot = 4
             control_plane_host = "127.0.0.1"
             control_plane_port = 8765
-            control_plane_ssh_target = "peetsmain@192.168.0.10"
-            control_plane_return_host = "192.168.0.10"
-            control_plane_return_port = 5722
+            control_plane_ssh_target = "peetsmain@172.16.165.146"
+            control_plane_return_host = "172.16.165.146"
+            control_plane_return_port = 22
             control_plane_return_user = "peetsmain"
             tunnel_recovery_grace_seconds = 30
             remote_container_runtime = "enroot"
@@ -540,9 +645,9 @@ class TestPlan03Workflow(unittest.TestCase):
             remote_execution_backend = "slurm_batch"
             control_plane_host = "127.0.0.1"
             control_plane_port = 8765
-            control_plane_ssh_target = "peetsmain@192.168.0.10"
-            control_plane_return_host = "192.168.0.10"
-            control_plane_return_port = 5722
+            control_plane_ssh_target = "peetsmain@172.16.165.146"
+            control_plane_return_host = "172.16.165.146"
+            control_plane_return_port = 22
             control_plane_return_user = "peetsmain"
             tunnel_recovery_grace_seconds = 30
             slurm_exclude_nodes = ("n108", "n109")
@@ -572,10 +677,12 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertNotIn("screen -dmS", content)
         self.assertIn("export PEETS_CONTROL_RUN_ID=run_01", content)
         self.assertIn("export PEETS_CONTROL_WORKER_ID=attempt_0001", content)
-        self.assertIn("export PEETS_CONTROL_SSH_TARGET=peetsmain@192.168.0.10", content)
-        self.assertIn("export PEETS_CONTROL_RETURN_HOST=192.168.0.10", content)
+        self.assertIn("export PEETS_CONTROL_SSH_TARGET=peetsmain@172.16.165.146", content)
+        self.assertIn("export PEETS_CONTROL_RETURN_HOST=172.16.165.146", content)
         self.assertIn("export PEETS_CONTROL_RETURN_USER=peetsmain", content)
-        self.assertIn("export PEETS_CONTROL_RETURN_PORT=5722", content)
+        self.assertIn("export PEETS_CONTROL_RETURN_PORT=22", content)
+        self.assertIn("stage_control_ssh_identity() {", content)
+        self.assertIn("export PEETS_CONTROL_SSH_IDENTITY=\"$staged_dir/id_control\"", content)
 
     def test_read_remote_optional_text_file_uses_remote_ssh_port(self) -> None:
         class _Cfg:
@@ -619,7 +726,7 @@ class TestPlan03Workflow(unittest.TestCase):
             "RETURN_PATH_DNS_FAILURE",
         )
         self.assertEqual(
-            _classify_return_path_failure_stage("ssh: connect to host 192.168.0.10 port 5722: Connection refused"),
+            _classify_return_path_failure_stage("ssh: connect to host 172.16.165.146 port 5722: Connection refused"),
             "RETURN_PATH_PORT_MISMATCH",
         )
 

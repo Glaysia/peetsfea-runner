@@ -116,6 +116,9 @@ class TestBuiltInService(unittest.TestCase):
             self.assertEqual(len(prune_cfg.accounts_registry), 1)
             self.assertEqual(prune_cfg.ssh_config_path, str(root / ".ssh" / "config"))
             self.assertEqual(prune_cfg.remote_root, "~/aedt_runs")
+            self.assertEqual(prune_cfg.worker_pool_size, 10)
+            self.assertEqual(prune_cfg.lease_ttl_seconds, 120)
+            self.assertEqual(prune_cfg.lease_heartbeat_seconds, 15)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .pipeline import AccountConfig, PipelineConfig, PipelineResult, run_pipeline
+from .pipeline import AccountConfig, PipelineConfig, PipelineResult, build_lease_server_context, run_pipeline
 from .runtime_policy import DEFAULT_REMOTE_ROOT
 from .state_store import StateStore
 from .version import get_version
@@ -357,7 +357,7 @@ def _build_config() -> PipelineConfig:
         or target_host
         or _discover_control_plane_return_host()
     )
-    control_plane_return_port = int(os.getenv("PEETSFEA_CONTROL_PLANE_RETURN_PORT", "5722"))
+    control_plane_return_port = int(os.getenv("PEETSFEA_CONTROL_PLANE_RETURN_PORT", "22"))
     if control_plane_return_user and control_plane_return_host:
         control_plane_ssh_target = f"{control_plane_return_user}@{control_plane_return_host}"
 
@@ -403,6 +403,11 @@ def _build_config() -> PipelineConfig:
         slot_memory_pressure_high_watermark_percent=int(os.getenv("PEETSFEA_SLOT_MEMORY_PRESSURE_HIGH_WATERMARK_PERCENT", "90")),
         slot_memory_pressure_resume_watermark_percent=int(os.getenv("PEETSFEA_SLOT_MEMORY_PRESSURE_RESUME_WATERMARK_PERCENT", "80")),
         slot_memory_probe_interval_seconds=int(os.getenv("PEETSFEA_SLOT_MEMORY_PROBE_INTERVAL_SECONDS", "5")),
+        worker_pool_size=int(os.getenv("PEETSFEA_WORKER_POOL_SIZE", "10")),
+        lease_ttl_seconds=int(os.getenv("PEETSFEA_LEASE_TTL_SECONDS", "120")),
+        lease_heartbeat_seconds=int(os.getenv("PEETSFEA_LEASE_HEARTBEAT_SECONDS", "15")),
+        worker_idle_poll_seconds=int(os.getenv("PEETSFEA_WORKER_IDLE_POLL_SECONDS", "10")),
+        slot_request_backoff_seconds=int(os.getenv("PEETSFEA_SLOT_REQUEST_BACKOFF_SECONDS", "5")),
         worker_bundle_multiplier=int(os.getenv("PEETSFEA_WORKER_BUNDLE_MULTIPLIER", "1")),
         cores_per_slot=int(os.getenv("PEETSFEA_CORES_PER_SLOT", "4")),
         tasks_per_slot=int(os.getenv("PEETSFEA_TASKS_PER_SLOT", "1")),
@@ -434,7 +439,12 @@ def _start_embedded_web_if_enabled() -> None:
     if port <= 0 or port > 65535:
         raise ValueError("PEETSFEA_WEB_PORT must be in 1..65535")
 
-    server = start_status_server(db_path=db_path, host=host, port=port)
+    server = start_status_server(
+        db_path=db_path,
+        host=host,
+        port=port,
+        lease_context=build_lease_server_context(config=_build_pipeline_config_from_env()),
+    )
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="peetsfea-web")
     thread.start()
     print(f"[peetsfea][web] version={APP_VERSION} embedded status server listening on http://{host}:{port}", flush=True)

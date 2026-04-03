@@ -5,6 +5,7 @@ from collections import deque
 import json
 import os
 import shutil
+import tarfile
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,7 @@ from .remote_job import (
     cleanup_orphan_sessions_for_run,
     query_slurm_job_state,
     run_remote_job_attempt,
+    submit_pull_worker,
 )
 from .license_policy import (
     LICENSE_ACCOUNT_STATE_TTL_SECONDS,
@@ -319,7 +321,7 @@ class PipelineConfig:
     control_plane_port: int = 8765
     control_plane_ssh_target: str = ""
     control_plane_return_host: str = ""
-    control_plane_return_port: int = 5722
+    control_plane_return_port: int = 22
     control_plane_return_user: str = ""
     tunnel_heartbeat_timeout_seconds: int = 90
     tunnel_recovery_grace_seconds: int = 30
@@ -336,6 +338,11 @@ class PipelineConfig:
     slot_memory_pressure_high_watermark_percent: int = 90
     slot_memory_pressure_resume_watermark_percent: int = 80
     slot_memory_probe_interval_seconds: int = 5
+    worker_pool_size: int = 0
+    lease_ttl_seconds: int = 120
+    lease_heartbeat_seconds: int = 15
+    worker_idle_poll_seconds: int = 10
+    slot_request_backoff_seconds: int = 5
     worker_bundle_multiplier: int = 1
     cores_per_slot: int = 4
     tasks_per_slot: int = 1
@@ -393,6 +400,12 @@ class PipelineConfig:
         if self.slot_max_concurrency < 0:
             raise ValueError("slot_max_concurrency must be >= 0")
         _ensure_positive("slot_memory_probe_interval_seconds", self.slot_memory_probe_interval_seconds)
+        if self.worker_pool_size < 0:
+            raise ValueError("worker_pool_size must be >= 0")
+        _ensure_positive("lease_ttl_seconds", self.lease_ttl_seconds)
+        _ensure_positive("lease_heartbeat_seconds", self.lease_heartbeat_seconds)
+        _ensure_positive("worker_idle_poll_seconds", self.worker_idle_poll_seconds)
+        _ensure_positive("slot_request_backoff_seconds", self.slot_request_backoff_seconds)
         _ensure_positive("worker_bundle_multiplier", self.worker_bundle_multiplier)
         _ensure_positive("cores_per_slot", self.cores_per_slot)
         _ensure_positive("tasks_per_slot", self.tasks_per_slot)
@@ -564,6 +577,17 @@ class PipelineResult:
         )
 
 
+@dataclass(slots=True, frozen=True)
+class LeaseServerContext:
+    delete_input_after_upload: bool
+    rename_input_to_done_on_success: bool
+    delete_failed_quarantine_dir: str
+    ready_sidecar_suffix: str
+    retain_aedtresults: bool
+    worker_requeue_limit: int
+    lease_ttl_seconds: int
+
+
 @dataclass(slots=True)
 class _BundleRuntimeOutcome:
     job_id: str
@@ -601,6 +625,10 @@ class _RemoteExecutionConfig:
     slot_memory_probe_interval_seconds: int
     cores_per_slot: int
     tasks_per_slot: int
+    lease_ttl_seconds: int = 120
+    lease_heartbeat_seconds: int = 15
+    worker_idle_poll_seconds: int = 10
+    slot_request_backoff_seconds: int = 5
     platform: str = "linux"
     scheduler: str = "slurm"
     remote_execution_backend: str = "foreground_ssh"
@@ -608,7 +636,7 @@ class _RemoteExecutionConfig:
     control_plane_port: int = 8765
     control_plane_ssh_target: str = ""
     control_plane_return_host: str = ""
-    control_plane_return_port: int = 5722
+    control_plane_return_port: int = 22
     control_plane_return_user: str = ""
     tunnel_heartbeat_timeout_seconds: int = 90
     tunnel_recovery_grace_seconds: int = 30
@@ -777,6 +805,77 @@ def _worker_bundle_slot_limit(*, config: PipelineConfig) -> int:
     if config.remote_execution_backend != "slurm_batch":
         return payload_limit
     return max(payload_limit, payload_limit * config.worker_bundle_multiplier)
+
+
+def _use_pull_workers(*, config: PipelineConfig) -> bool:
+    return bool(
+        config.continuous_mode
+        and config.execute_remote
+        and config.remote_execution_backend == "slurm_batch"
+        and config.worker_pool_size > 0
+    )
+
+
+def build_lease_server_context(*, config: PipelineConfig) -> LeaseServerContext:
+    return LeaseServerContext(
+        delete_input_after_upload=config.delete_input_after_upload,
+        rename_input_to_done_on_success=config.rename_input_to_done_on_success,
+        delete_failed_quarantine_dir=config.delete_failed_quarantine_dir,
+        ready_sidecar_suffix=config.ready_sidecar_suffix,
+        retain_aedtresults=config.retain_aedtresults,
+        worker_requeue_limit=config.worker_requeue_limit,
+        lease_ttl_seconds=config.lease_ttl_seconds,
+    )
+
+
+def slot_task_ref_from_record(*, run_id: str, slot_record: dict[str, object], input_root: Path | None = None) -> SlotTaskRef:
+    input_path = Path(str(slot_record["input_path"])).expanduser()
+    if input_root is not None:
+        try:
+            relative_path = input_path.relative_to(input_root)
+        except ValueError:
+            relative_path = Path(input_path.name)
+    else:
+        relative_path = Path(input_path.name)
+    return SlotTaskRef(
+        run_id=run_id,
+        slot_id=str(slot_record["slot_id"]),
+        input_path=input_path,
+        relative_path=relative_path,
+        output_dir=Path(str(slot_record["output_path"])).expanduser().resolve(),
+        attempt_no=int(slot_record.get("attempt_no") or 0),
+    )
+
+
+def materialize_pulled_slot_artifact(
+    *,
+    slot: SlotTaskRef,
+    archive_path: Path,
+    retain_aedtresults: bool,
+) -> bool:
+    if not archive_path.exists():
+        return False
+    with TemporaryDirectory(prefix=f"peetsfea_lease_{slot.slot_id}_") as tmpdir:
+        extract_root = Path(tmpdir) / "artifact"
+        extract_root.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive_path, "r:gz") as handle:
+            try:
+                handle.extractall(extract_root, filter="data")
+            except TypeError:
+                handle.extractall(extract_root)
+        _initialize_slot_output_dir(slot=slot, seed_input_path=slot.input_path)
+        copied_any = False
+        for item in sorted(extract_root.iterdir(), key=lambda path: path.name):
+            target_name = _rename_case_output_name(case_name=item.name, input_name=slot.input_path.name)
+            if not retain_aedtresults and target_name.endswith(".aedtresults"):
+                continue
+            target_path = slot.output_dir / target_name
+            if item.is_dir():
+                shutil.copytree(item, target_path, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target_path)
+            copied_any = True
+        return copied_any
 
 
 def _continuous_backlog_limits(*, config: PipelineConfig, accounts: list[AccountConfig]) -> tuple[int, int]:
@@ -1709,6 +1808,316 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             cutover_ready_emitted = True
         _publish_license_account_states(queued_slot_count=len(queued_slots))
         return ready_accounts
+
+    def _pull_remote_cfg(account: AccountConfig) -> _RemoteExecutionConfig:
+        return _RemoteExecutionConfig(
+            host=account.host_alias,
+            remote_root=config.remote_root,
+            partition=config.partition,
+            slurm_partitions_allowlist=config.slurm_partitions_allowlist,
+            nodes=config.nodes,
+            ntasks=config.ntasks,
+            cpus_per_job=config.cpus_per_job,
+            mem=config.mem,
+            time_limit=config.time_limit,
+            slots_per_job=config.slots_per_job,
+            worker_payload_slot_limit=effective_worker_payload_slot_limit,
+            slot_min_concurrency=effective_slot_min_concurrency,
+            slot_max_concurrency=effective_slot_max_concurrency,
+            slot_memory_pressure_high_watermark_percent=config.slot_memory_pressure_high_watermark_percent,
+            slot_memory_pressure_resume_watermark_percent=config.slot_memory_pressure_resume_watermark_percent,
+            slot_memory_probe_interval_seconds=config.slot_memory_probe_interval_seconds,
+            cores_per_slot=config.cores_per_slot,
+            tasks_per_slot=config.tasks_per_slot,
+            lease_ttl_seconds=config.lease_ttl_seconds,
+            lease_heartbeat_seconds=config.lease_heartbeat_seconds,
+            worker_idle_poll_seconds=config.worker_idle_poll_seconds,
+            slot_request_backoff_seconds=config.slot_request_backoff_seconds,
+            platform=account.platform,
+            scheduler=account.scheduler,
+            remote_execution_backend=config.remote_execution_backend,
+            control_plane_host=config.control_plane_host,
+            control_plane_port=config.control_plane_port,
+            control_plane_ssh_target=config.control_plane_ssh_target,
+            control_plane_return_host=config.control_plane_return_host,
+            control_plane_return_port=config.control_plane_return_port,
+            control_plane_return_user=config.control_plane_return_user,
+            tunnel_heartbeat_timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
+            tunnel_recovery_grace_seconds=config.tunnel_recovery_grace_seconds,
+            remote_ssh_port=config.remote_ssh_port,
+            ssh_config_path=config.ssh_config_path,
+            remote_container_runtime=config.remote_container_runtime,
+            remote_container_image=config.remote_container_image,
+            remote_container_ansys_root=config.remote_container_ansys_root,
+            remote_ansys_executable=config.remote_ansys_executable,
+        )
+
+    def _run_pull_control_iteration() -> PipelineResult:
+        nonlocal discovered_count, total_slots, readiness_blocked_slots, cutover_blocked_emitted
+
+        scan_files = _scan_input_aedt_files(input_root=input_root, recursive=config.scan_recursive)
+        if scan_files:
+            slots, discovered_delta = _ingest_slot_queue(
+                config=config,
+                state_store=state_store,
+                run_id=run_id,
+                input_root=input_root,
+                output_root=output_root,
+                aedt_files=scan_files,
+            )
+            discovered_count += discovered_delta
+            if slots:
+                queued_slots.extend(slots)
+
+        expired_leases = state_store.reap_expired_slot_leases(run_id=run_id)
+        for slot_record in expired_leases:
+            state_store.append_slot_event(
+                run_id=run_id,
+                slot_id=str(slot_record["slot_id"]),
+                level="WARN",
+                stage="LEASE_REAPED",
+                message="lease expired; slot requeued",
+            )
+        reconciled_uploaded_slots = _reconcile_uploaded_pull_slots(
+            config=config,
+            state_store=state_store,
+            run_id=run_id,
+            input_root=input_root,
+        )
+        if reconciled_uploaded_slots:
+            _append_worker_event(
+                level="INFO",
+                stage="UPLOADING_RECONCILED",
+                message=f"run_id={run_id} reconciled_slots={reconciled_uploaded_slots}",
+            )
+
+        dispatch_accounts = _resolve_dispatch_accounts()
+        slot_counts_before_submit = state_store.count_slots_by_state(run_id=run_id)
+        queued_slot_count = sum(
+            count
+            for state, count in slot_counts_before_submit.items()
+            if state in {"QUEUED", "RETRY_QUEUED"}
+        )
+
+        refreshed_workers = 0
+        requeued_from_workers = 0
+        active_workers = state_store.list_active_slurm_workers(run_id=run_id)
+        account_by_id = {account.account_id: account for account in accounts}
+        for worker in active_workers:
+            account = account_by_id.get(str(worker["account_id"]))
+            if account is None:
+                continue
+            remote_cfg = _pull_remote_cfg(account)
+            try:
+                worker_state, observed_node = query_slurm_job_state(
+                    remote_cfg,
+                    slurm_job_id=str(worker["slurm_job_id"]),
+                )
+            except Exception:
+                continue
+            effective_worker_state = "LOST" if worker_state == "UNKNOWN" else worker_state
+            state_store.upsert_slurm_worker(
+                run_id=run_id,
+                worker_id=str(worker["worker_id"]),
+                job_id=str(worker["job_id"]),
+                attempt_no=int(worker["attempt_no"]),
+                account_id=str(worker["account_id"]),
+                host_alias=str(worker["host_alias"]),
+                slurm_job_id=str(worker["slurm_job_id"]),
+                worker_state=effective_worker_state,
+                observed_node=observed_node,
+                slots_configured=int(worker["slots_configured"]),
+                backend=str(worker["backend"]),
+                tunnel_session_id=str(worker["tunnel_session_id"]) if worker.get("tunnel_session_id") else None,
+                tunnel_state=str(worker["tunnel_state"]) if worker.get("tunnel_state") else None,
+                heartbeat_ts=str(worker["heartbeat_ts"]) if worker.get("heartbeat_ts") else None,
+                degraded_reason=str(worker["degraded_reason"]) if worker.get("degraded_reason") else None,
+            )
+            refreshed_workers += 1
+            if effective_worker_state in {"FAILED", "LOST", "COMPLETED"}:
+                requeued = state_store.requeue_worker_leases(
+                    run_id=run_id,
+                    worker_id=str(worker["worker_id"]),
+                    failure_reason=(
+                        f"worker_terminal_state={effective_worker_state} "
+                        f"slurm_job_id={worker['slurm_job_id']} observed_node={observed_node or 'unknown'}"
+                    ),
+                )
+                requeued_from_workers += len(requeued)
+                if requeued:
+                    _append_worker_event(
+                        level="WARN" if effective_worker_state in {"FAILED", "LOST"} else "INFO",
+                        stage="WORKER_LEASES_REQUEUED",
+                        message=(
+                            f"worker_id={worker['worker_id']} slurm_job_id={worker['slurm_job_id']} "
+                            f"worker_state={effective_worker_state} requeued_slots={len(requeued)}"
+                        ),
+                    )
+            if effective_worker_state in {"RUNNING", "IDLE_DRAINING"} and _is_stale_worker_heartbeat(
+                heartbeat_ts=worker.get("heartbeat_ts"),
+                timeout_seconds=config.tunnel_heartbeat_timeout_seconds,
+            ):
+                state_store.update_slurm_worker_control_plane(
+                    run_id=run_id,
+                    worker_id=str(worker["worker_id"]),
+                    tunnel_state="DEGRADED",
+                    degraded_reason="tunnel heartbeat stale after main restart",
+                    observed_node=observed_node,
+                )
+
+        if refreshed_workers:
+            _append_worker_event(
+                level="INFO",
+                stage="SLURM_WORKERS_REDISCOVERED",
+                message=f"run_id={run_id} count={refreshed_workers}",
+            )
+
+        submitted_workers = 0
+        if not _dispatch_drained(queued_count=queued_slot_count):
+            if not dispatch_accounts:
+                readiness_blocked_slots = queued_slot_count
+                if queued_slot_count and not cutover_blocked_emitted:
+                    _append_worker_event(
+                        level="WARN",
+                        stage="CUTOVER_BLOCKED",
+                        message=(
+                            f"run_id={run_id} queued_slots={queued_slot_count} "
+                            f"blocked_accounts={','.join(blocked_account_ids) or 'none'}"
+                        ),
+                    )
+                    cutover_blocked_emitted = True
+            else:
+                capacity_by_account: dict[str, int] = {}
+                for account in dispatch_accounts:
+                    try:
+                        snapshot = query_account_capacity(
+                            account=account,
+                            pending_buffer_per_account=config.pending_buffer_per_account,
+                            **_ssh_config_kwargs(),
+                        )
+                        _capacity_log(snapshot)
+                        capacity_by_account[account.account_id] = max(0, snapshot.allowed_submit)
+                    except Exception as exc:
+                        capacity_by_account[account.account_id] = 0
+                        _capacity_error(account, exc)
+
+                workers_by_id = {
+                    str(row["worker_id"]): row
+                    for row in state_store.list_slurm_workers(run_id=run_id)
+                }
+                logical_workers = tuple(f"worker_{index:02d}" for index in range(1, config.worker_pool_size + 1))
+                for index, logical_worker_id in enumerate(logical_workers):
+                    assigned_account = dispatch_accounts[index % len(dispatch_accounts)]
+                    existing_worker = workers_by_id.get(logical_worker_id)
+                    existing_state = str(existing_worker["worker_state"]).upper() if existing_worker is not None else ""
+                    if existing_state in {"SUBMITTED", "PENDING", "RUNNING", "IDLE_DRAINING"}:
+                        continue
+                    if capacity_by_account.get(assigned_account.account_id, 0) <= 0:
+                        continue
+                    attempt_no = 1 if existing_worker is None else int(existing_worker["attempt_no"]) + 1
+                    remote_cfg = _pull_remote_cfg(assigned_account)
+                    remote_job_dir = _join_remote_root(
+                        _join_remote_root(_join_remote_root(remote_run_dir, assigned_account.account_id), logical_worker_id),
+                        f"attempt_{attempt_no:02d}",
+                    )
+                    job_id = logical_worker_id
+                    try:
+                        slurm_job_id = submit_pull_worker(
+                            config=remote_cfg,
+                            run_id=run_id,
+                            worker_id=logical_worker_id,
+                            remote_job_dir=remote_job_dir,
+                        )
+                    except Exception as exc:
+                        _append_worker_event(
+                            level="ERROR",
+                            stage="WORKER_SUBMIT_FAILED",
+                            message=(
+                                f"worker_id={logical_worker_id} account={assigned_account.account_id} "
+                                f"attempt={attempt_no} reason={exc}"
+                            ),
+                        )
+                        continue
+                    state_store.upsert_slurm_worker(
+                        run_id=run_id,
+                        worker_id=logical_worker_id,
+                        job_id=job_id,
+                        attempt_no=attempt_no,
+                        account_id=assigned_account.account_id,
+                        host_alias=assigned_account.host_alias,
+                        slurm_job_id=slurm_job_id,
+                        worker_state="SUBMITTED",
+                        observed_node=None,
+                        slots_configured=effective_slot_max_concurrency,
+                        backend="slurm_pull",
+                    )
+                    _append_worker_event(
+                        level="INFO",
+                        stage="WORKER_SUBMITTED",
+                        message=(
+                            f"worker_id={logical_worker_id} account={assigned_account.account_id} "
+                            f"attempt={attempt_no} slurm_job_id={slurm_job_id}"
+                        ),
+                    )
+                    capacity_by_account[assigned_account.account_id] = max(
+                        0,
+                        capacity_by_account.get(assigned_account.account_id, 0) - 1,
+                    )
+                    submitted_workers += 1
+
+        slot_counts = state_store.count_slots_by_state(run_id=run_id)
+        total_slots_local = sum(slot_counts.values())
+        active_slots_local = sum(slot_counts.get(state, 0) for state in ("LEASED", "DOWNLOADING", "RUNNING", "UPLOADING"))
+        queued_slots_local = sum(slot_counts.get(state, 0) for state in ("QUEUED", "RETRY_QUEUED"))
+        success_slots_local = slot_counts.get("SUCCEEDED", 0)
+        failed_slots_local = slot_counts.get("FAILED", 0)
+        quarantined_slots_local = slot_counts.get("QUARANTINED", 0)
+        pull_workers = state_store.list_slurm_workers(run_id=run_id)
+        active_worker_count = sum(
+            1
+            for worker in pull_workers
+            if str(worker["worker_state"]).upper() in {"SUBMITTED", "PENDING", "RUNNING", "IDLE_DRAINING"}
+        )
+        total_slots = total_slots_local
+        _publish_license_account_states(queued_slot_count=queued_slots_local)
+        summary = (
+            f"version={APP_VERSION} mode=pull_control_plane worker_pool_size={config.worker_pool_size} "
+            f"active_workers={active_worker_count} submitted_workers={submitted_workers} "
+            f"requeued_worker_leases={requeued_from_workers} expired_leases={len(expired_leases)} "
+            f"reconciled_uploaded_slots={reconciled_uploaded_slots} "
+            f"total_slots={total_slots_local} active_slots={active_slots_local} success_slots={success_slots_local} "
+            f"failed_slots={failed_slots_local} quarantined_slots={quarantined_slots_local} "
+            f"queued_slots={queued_slots_local} ingest_discovered={discovered_count} "
+            f"ready_accounts={','.join(ready_account_ids) or 'none'} blocked_accounts={','.join(blocked_account_ids) or 'none'}"
+        )
+        state_store.update_run_summary(run_id=run_id, summary=summary)
+        return PipelineResult(
+            success=not blocked_account_ids or queued_slots_local == 0,
+            exit_code=EXIT_CODE_SUCCESS,
+            run_id=run_id,
+            remote_run_dir=remote_run_dir,
+            local_artifacts_dir=str(output_root),
+            summary=summary,
+            total_jobs=len(pull_workers),
+            success_jobs=0,
+            failed_jobs=0,
+            quarantined_jobs=0,
+            total_slots=total_slots_local,
+            active_slots=active_slots_local,
+            success_slots=success_slots_local,
+            failed_slots=failed_slots_local,
+            quarantined_slots=quarantined_slots_local,
+            queued_slots=queued_slots_local,
+            terminal_jobs=0,
+            replacement_jobs=submitted_workers,
+            ready_accounts=tuple(ready_account_ids),
+            blocked_accounts=tuple(blocked_account_ids),
+            bootstrapping_accounts=tuple(bootstrapping_account_ids),
+            readiness_blocked_slots=readiness_blocked_slots,
+        )
+
+    if _use_pull_workers(config=config):
+        return _run_pull_control_iteration()
 
     if config.continuous_mode and config.execute_remote and not queued_slots:
         _resolve_dispatch_accounts()
@@ -3472,6 +3881,84 @@ def _slot_output_has_materialized_artifacts(*, output_dir: Path, input_name: str
             continue
         return True
     return False
+
+
+def _read_slot_output_exit_code(*, output_dir: Path) -> int | None:
+    exit_path = output_dir / "exit.code"
+    if not exit_path.exists():
+        return None
+    try:
+        return int(exit_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _reconcile_uploaded_pull_slots(
+    *,
+    config: PipelineConfig,
+    state_store: StateStore,
+    run_id: str,
+    input_root: Path,
+) -> int:
+    reconciled = 0
+    deleted_slot_ids: set[str] = set()
+    for slot_record in state_store.list_slot_tasks_by_states(run_id=run_id, states=("UPLOADING",)):
+        if not slot_record.get("artifact_uploaded_at"):
+            continue
+        slot = slot_task_ref_from_record(run_id=run_id, slot_record=slot_record, input_root=input_root)
+        if not _slot_output_has_materialized_artifacts(output_dir=slot.output_dir, input_name=slot.input_path.name):
+            continue
+        exit_code = _read_slot_output_exit_code(output_dir=slot.output_dir)
+        if exit_code is None:
+            continue
+        lease_token = str(slot_record.get("lease_token") or "").strip()
+        worker_id = str(slot_record.get("worker_id") or "unknown").strip() or "unknown"
+        failure_reason = str(slot_record.get("failure_reason") or "").strip() or f"slot exited rc={exit_code}"
+        if lease_token:
+            state_store.clear_slot_lease(
+                run_id=run_id,
+                lease_token=lease_token,
+                final_state="SUCCEEDED" if exit_code == 0 else "FAILED",
+                failure_reason=None if exit_code == 0 else failure_reason,
+            )
+        else:
+            state_store.update_slot_task(
+                run_id=run_id,
+                slot_id=slot.slot_id,
+                state="SUCCEEDED" if exit_code == 0 else "FAILED",
+                attempt_no=int(slot_record.get("attempt_no") or 0),
+                job_id=str(slot_record.get("job_id") or "") or slot.slot_id,
+                account_id=str(slot_record.get("account_id") or "") or None,
+                failure_reason=None if exit_code == 0 else failure_reason,
+            )
+        if exit_code == 0:
+            state_store.mark_ingest_state(input_path=str(slot.input_path), state="SUCCEEDED")
+            state_store.record_artifact(run_id=run_id, job_id=slot.slot_id, artifact_root=str(slot.output_dir))
+            _finalize_slot_input_cleanup(
+                config=config,
+                state_store=state_store,
+                run_id=run_id,
+                slot=slot,
+                deleted_slot_ids=deleted_slot_ids,
+            )
+            state_store.append_slot_event(
+                run_id=run_id,
+                slot_id=slot.slot_id,
+                level="INFO",
+                stage="SUCCEEDED",
+                message=f"worker_id={worker_id} reconciled_uploaded_artifact",
+            )
+        else:
+            state_store.mark_ingest_state(input_path=str(slot.input_path), state="FAILED")
+            state_store.append_slot_event(
+                run_id=run_id,
+                slot_id=slot.slot_id,
+                level="WARN",
+                stage="FAILED",
+                message=failure_reason,
+            )
+        reconciled += 1
+    return reconciled
 
 
 def _mark_slot_lifecycle_stage(

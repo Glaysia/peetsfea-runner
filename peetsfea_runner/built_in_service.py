@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .pipeline import AccountConfig, PipelineConfig
+from .pipeline import AccountConfig, PipelineConfig, build_lease_server_context
 from .runtime_policy import DEFAULT_REMOTE_ROOT
 from .state_store import StateStore
 from .systemd_worker import (
@@ -76,7 +76,7 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
     delete_failed_root = output_root / "_delete_failed"
     db_path = resolved_repo_root / "peetsfea_runner.duckdb"
     control_plane_return_host = "172.16.165.146"
-    control_plane_return_port = 5722
+    control_plane_return_port = 22
     control_plane_return_user = service_user
     control_plane_ssh_target = f"{control_plane_return_user}@{control_plane_return_host}"
 
@@ -203,6 +203,11 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
         slot_memory_pressure_high_watermark_percent=90,
         slot_memory_pressure_resume_watermark_percent=80,
         slot_memory_probe_interval_seconds=5,
+        worker_pool_size=10,
+        lease_ttl_seconds=120,
+        lease_heartbeat_seconds=15,
+        worker_idle_poll_seconds=10,
+        slot_request_backoff_seconds=5,
         worker_bundle_multiplier=1,
         cores_per_slot=lane.cores_per_slot,
         tasks_per_slot=lane.tasks_per_slot,
@@ -304,11 +309,17 @@ def _lane_worker_loop(*, profile: ServiceProfile, lane: LaneSpec, stop_event: th
 def run_built_in_service() -> None:
     profile = build_service_profile()
     validate_service_layout(profile=profile)
+    lease_context = None
+    for lane in profile.lanes:
+        if lane.accounts:
+            lease_context = build_lease_server_context(config=_lane_pipeline_config(profile, lane))
+            break
 
     server = start_status_server(
         db_path=str(profile.db_path),
         host=profile.web_host,
         port=profile.web_port,
+        lease_context=lease_context,
     )
     threading.Thread(target=server.serve_forever, daemon=True, name="peetsfea-web").start()
     print(

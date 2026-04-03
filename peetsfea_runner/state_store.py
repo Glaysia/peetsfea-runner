@@ -30,6 +30,29 @@ class StateStore:
         self._lock = _GLOBAL_DUCKDB_LOCK
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _slot_task_row_to_dict(row: tuple[object, ...]) -> dict[str, object]:
+        return {
+            "run_id": str(row[0]),
+            "slot_id": str(row[1]),
+            "job_id": str(row[2]) if row[2] is not None else None,
+            "account_id": str(row[3]) if row[3] is not None else None,
+            "input_path": str(row[4]),
+            "output_path": str(row[5]),
+            "state": str(row[6]),
+            "attempt_no": int(row[7] or 0),
+            "failure_reason": str(row[8]) if row[8] is not None else None,
+            "created_at": str(row[9]) if row[9] is not None else None,
+            "updated_at": str(row[10]) if row[10] is not None else None,
+            "lease_token": str(row[11]) if row[11] is not None else None,
+            "worker_id": str(row[12]) if row[12] is not None else None,
+            "slurm_job_id": str(row[13]) if row[13] is not None else None,
+            "lease_started_at": str(row[14]) if row[14] is not None else None,
+            "lease_heartbeat_ts": str(row[15]) if row[15] is not None else None,
+            "lease_expires_at": str(row[16]) if row[16] is not None else None,
+            "artifact_uploaded_at": str(row[17]) if row[17] is not None else None,
+        }
+
     def initialize(self) -> None:
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
@@ -148,6 +171,13 @@ class StateStore:
                     )
                     """
                 )
+                conn.execute("ALTER TABLE slot_tasks ADD COLUMN IF NOT EXISTS lease_token TEXT")
+                conn.execute("ALTER TABLE slot_tasks ADD COLUMN IF NOT EXISTS worker_id TEXT")
+                conn.execute("ALTER TABLE slot_tasks ADD COLUMN IF NOT EXISTS slurm_job_id TEXT")
+                conn.execute("ALTER TABLE slot_tasks ADD COLUMN IF NOT EXISTS lease_started_at TEXT")
+                conn.execute("ALTER TABLE slot_tasks ADD COLUMN IF NOT EXISTS lease_heartbeat_ts TEXT")
+                conn.execute("ALTER TABLE slot_tasks ADD COLUMN IF NOT EXISTS lease_expires_at TEXT")
+                conn.execute("ALTER TABLE slot_tasks ADD COLUMN IF NOT EXISTS artifact_uploaded_at TEXT")
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS slot_events (
@@ -619,6 +649,374 @@ class StateStore:
             finally:
                 conn.close()
 
+    def get_slot_task(self, *, run_id: str, slot_id: str) -> dict[str, object] | None:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT
+                        run_id,
+                        slot_id,
+                        job_id,
+                        account_id,
+                        input_path,
+                        output_path,
+                        state,
+                        attempt_no,
+                        failure_reason,
+                        created_at,
+                        updated_at,
+                        lease_token,
+                        worker_id,
+                        slurm_job_id,
+                        lease_started_at,
+                        lease_heartbeat_ts,
+                        lease_expires_at,
+                        artifact_uploaded_at
+                    FROM slot_tasks
+                    WHERE run_id = ? AND slot_id = ?
+                    """,
+                    [run_id, slot_id],
+                ).fetchone()
+            finally:
+                conn.close()
+        return None if row is None else self._slot_task_row_to_dict(row)
+
+    def get_slot_task_by_lease_token(self, *, run_id: str, lease_token: str) -> dict[str, object] | None:
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT
+                        run_id,
+                        slot_id,
+                        job_id,
+                        account_id,
+                        input_path,
+                        output_path,
+                        state,
+                        attempt_no,
+                        failure_reason,
+                        created_at,
+                        updated_at,
+                        lease_token,
+                        worker_id,
+                        slurm_job_id,
+                        lease_started_at,
+                        lease_heartbeat_ts,
+                        lease_expires_at,
+                        artifact_uploaded_at
+                    FROM slot_tasks
+                    WHERE run_id = ? AND lease_token = ?
+                    """,
+                    [run_id, lease_token],
+                ).fetchone()
+            finally:
+                conn.close()
+        return None if row is None else self._slot_task_row_to_dict(row)
+
+    def acquire_slot_lease(
+        self,
+        *,
+        run_id: str,
+        worker_id: str,
+        job_id: str,
+        account_id: str,
+        slurm_job_id: str | None,
+        lease_token: str,
+        lease_ttl_seconds: int,
+    ) -> dict[str, object] | None:
+        now = _utc_now_iso()
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(seconds=max(1, lease_ttl_seconds))).isoformat()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                row = conn.execute(
+                    """
+                    SELECT slot_id, input_path, output_path, attempt_no
+                    FROM slot_tasks
+                    WHERE run_id = ?
+                      AND state IN ('QUEUED', 'RETRY_QUEUED')
+                    ORDER BY created_at, slot_id
+                    LIMIT 1
+                    """,
+                    [run_id],
+                ).fetchone()
+                if row is None:
+                    return None
+                slot_id = str(row[0])
+                input_path = str(row[1])
+                output_path = str(row[2])
+                attempt_no = int(row[3] or 0) + 1
+                updated = conn.execute(
+                    """
+                    UPDATE slot_tasks
+                    SET
+                        state = 'LEASED',
+                        attempt_no = ?,
+                        job_id = ?,
+                        account_id = ?,
+                        updated_at = ?,
+                        failure_reason = NULL,
+                        lease_token = ?,
+                        worker_id = ?,
+                        slurm_job_id = ?,
+                        lease_started_at = ?,
+                        lease_heartbeat_ts = ?,
+                        lease_expires_at = ?,
+                        artifact_uploaded_at = NULL
+                    WHERE run_id = ? AND slot_id = ? AND state IN ('QUEUED', 'RETRY_QUEUED')
+                    RETURNING slot_id
+                    """,
+                    [
+                        attempt_no,
+                        job_id,
+                        account_id,
+                        now,
+                        lease_token,
+                        worker_id,
+                        slurm_job_id,
+                        now,
+                        now,
+                        expires_at,
+                        run_id,
+                        slot_id,
+                    ],
+                ).fetchone()
+                if updated is None:
+                    return None
+            finally:
+                conn.close()
+        return {
+            "run_id": run_id,
+            "slot_id": slot_id,
+            "job_id": job_id,
+            "account_id": account_id,
+            "input_path": input_path,
+            "output_path": output_path,
+            "state": "LEASED",
+            "attempt_no": attempt_no,
+            "failure_reason": None,
+            "lease_token": lease_token,
+            "worker_id": worker_id,
+            "slurm_job_id": slurm_job_id,
+            "lease_started_at": now,
+            "lease_heartbeat_ts": now,
+            "lease_expires_at": expires_at,
+            "artifact_uploaded_at": None,
+        }
+
+    def update_slot_lease_state(
+        self,
+        *,
+        run_id: str,
+        lease_token: str,
+        state: str,
+        failure_reason: str | None = None,
+        artifact_uploaded: bool = False,
+        extend_ttl_seconds: int | None = None,
+    ) -> dict[str, object] | None:
+        now = _utc_now_iso()
+        expires_at = None
+        if extend_ttl_seconds is not None:
+            expires_at = (datetime.now(tz=timezone.utc) + timedelta(seconds=max(1, extend_ttl_seconds))).isoformat()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                fields = [
+                    "state = ?",
+                    "updated_at = ?",
+                    "lease_heartbeat_ts = ?",
+                    "failure_reason = ?",
+                ]
+                values: list[object] = [state, now, now, failure_reason]
+                if expires_at is not None:
+                    fields.append("lease_expires_at = ?")
+                    values.append(expires_at)
+                if artifact_uploaded:
+                    fields.append("artifact_uploaded_at = ?")
+                    values.append(now)
+                row = conn.execute(
+                    f"""
+                    UPDATE slot_tasks
+                    SET {', '.join(fields)}
+                    WHERE run_id = ? AND lease_token = ?
+                    RETURNING
+                        run_id,
+                        slot_id,
+                        job_id,
+                        account_id,
+                        input_path,
+                        output_path,
+                        state,
+                        attempt_no,
+                        failure_reason,
+                        created_at,
+                        updated_at,
+                        lease_token,
+                        worker_id,
+                        slurm_job_id,
+                        lease_started_at,
+                        lease_heartbeat_ts,
+                        lease_expires_at,
+                        artifact_uploaded_at
+                    """,
+                    [*values, run_id, lease_token],
+                ).fetchone()
+            finally:
+                conn.close()
+        return None if row is None else self._slot_task_row_to_dict(row)
+
+    def clear_slot_lease(
+        self,
+        *,
+        run_id: str,
+        lease_token: str,
+        final_state: str,
+        failure_reason: str | None = None,
+    ) -> dict[str, object] | None:
+        now = _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                row = conn.execute(
+                    """
+                    UPDATE slot_tasks
+                    SET
+                        state = ?,
+                        updated_at = ?,
+                        failure_reason = ?,
+                        lease_token = NULL,
+                        lease_heartbeat_ts = NULL,
+                        lease_expires_at = NULL
+                    WHERE run_id = ? AND lease_token = ?
+                    RETURNING
+                        run_id,
+                        slot_id,
+                        job_id,
+                        account_id,
+                        input_path,
+                        output_path,
+                        state,
+                        attempt_no,
+                        failure_reason,
+                        created_at,
+                        updated_at,
+                        lease_token,
+                        worker_id,
+                        slurm_job_id,
+                        lease_started_at,
+                        lease_heartbeat_ts,
+                        lease_expires_at,
+                        artifact_uploaded_at
+                    """,
+                    [final_state, now, failure_reason, run_id, lease_token],
+                ).fetchone()
+            finally:
+                conn.close()
+        return None if row is None else self._slot_task_row_to_dict(row)
+
+    def requeue_worker_leases(
+        self,
+        *,
+        run_id: str,
+        worker_id: str,
+        failure_reason: str,
+    ) -> list[dict[str, object]]:
+        now = _utc_now_iso()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    UPDATE slot_tasks
+                    SET
+                        state = 'RETRY_QUEUED',
+                        updated_at = ?,
+                        failure_reason = ?,
+                        lease_token = NULL,
+                        lease_heartbeat_ts = NULL,
+                        lease_expires_at = NULL,
+                        artifact_uploaded_at = NULL
+                    WHERE run_id = ? AND worker_id = ?
+                      AND state IN ('LEASED', 'DOWNLOADING', 'RUNNING', 'UPLOADING')
+                    RETURNING
+                        run_id,
+                        slot_id,
+                        job_id,
+                        account_id,
+                        input_path,
+                        output_path,
+                        state,
+                        attempt_no,
+                        failure_reason,
+                        created_at,
+                        updated_at,
+                        lease_token,
+                        worker_id,
+                        slurm_job_id,
+                        lease_started_at,
+                        lease_heartbeat_ts,
+                        lease_expires_at,
+                        artifact_uploaded_at
+                    """,
+                    [now, failure_reason, run_id, worker_id],
+                ).fetchall()
+            finally:
+                conn.close()
+        return [self._slot_task_row_to_dict(row) for row in rows]
+
+    def reap_expired_slot_leases(self, *, run_id: str, now: datetime | None = None) -> list[dict[str, object]]:
+        reference = now or datetime.now(tz=timezone.utc)
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+        now_iso = reference.isoformat()
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    UPDATE slot_tasks
+                    SET
+                        state = 'RETRY_QUEUED',
+                        updated_at = ?,
+                        failure_reason = 'lease expired',
+                        lease_token = NULL,
+                        lease_heartbeat_ts = NULL,
+                        lease_expires_at = NULL,
+                        artifact_uploaded_at = NULL
+                    WHERE run_id = ?
+                      AND state IN ('LEASED', 'DOWNLOADING', 'RUNNING', 'UPLOADING')
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at <= ?
+                    RETURNING
+                        run_id,
+                        slot_id,
+                        job_id,
+                        account_id,
+                        input_path,
+                        output_path,
+                        state,
+                        attempt_no,
+                        failure_reason,
+                        created_at,
+                        updated_at,
+                        lease_token,
+                        worker_id,
+                        slurm_job_id,
+                        lease_started_at,
+                        lease_heartbeat_ts,
+                        lease_expires_at,
+                        artifact_uploaded_at
+                    """,
+                    [now_iso, run_id, now_iso],
+                ).fetchall()
+            finally:
+                conn.close()
+        return [self._slot_task_row_to_dict(row) for row in rows]
+
     def get_slot_throughput_score(self, *, run_id: str, account_id: str) -> tuple[int, int]:
         with self._lock:
             conn = duckdb.connect(str(self.db_path))
@@ -937,6 +1335,45 @@ class StateStore:
             finally:
                 conn.close()
         return [(str(row[0]), str(row[1]), str(row[2]), int(row[3] or 0)) for row in rows]
+
+    def list_slot_tasks_by_states(self, *, run_id: str, states: tuple[str, ...]) -> list[dict[str, object]]:
+        if not states:
+            return []
+        placeholders = ", ".join("?" for _ in states)
+        with self._lock:
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT
+                        run_id,
+                        slot_id,
+                        job_id,
+                        account_id,
+                        input_path,
+                        output_path,
+                        state,
+                        attempt_no,
+                        failure_reason,
+                        created_at,
+                        updated_at,
+                        lease_token,
+                        worker_id,
+                        slurm_job_id,
+                        lease_started_at,
+                        lease_heartbeat_ts,
+                        lease_expires_at,
+                        artifact_uploaded_at
+                    FROM slot_tasks
+                    WHERE run_id = ?
+                      AND state IN ({placeholders})
+                    ORDER BY updated_at, slot_id
+                    """,
+                    [run_id, *states],
+                ).fetchall()
+            finally:
+                conn.close()
+        return [self._slot_task_row_to_dict(row) for row in rows]
 
     def list_jobs_with_terminal_slurm_workers(self, *, run_id: str) -> list[dict[str, object]]:
         with self._lock:

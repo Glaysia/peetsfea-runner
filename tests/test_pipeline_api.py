@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections import deque
 from datetime import datetime, timedelta, timezone
+import io
 import json
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,12 +21,13 @@ from peetsfea_runner.pipeline import (
     _BundleRuntimeOutcome,
     _ensure_ready_artifact,
     _is_stale_worker_heartbeat,
+    materialize_pulled_slot_artifact,
     _record_launch_transient_failure,
     _reconcile_slurm_truth,
     _materialize_slot_outputs,
 )
 from peetsfea_runner.remote_job import CaseExecutionSummary, RemoteJobAttemptResult
-from peetsfea_runner.scheduler import AccountCapacitySnapshot, AccountReadinessSnapshot, BalancedBatchResult
+from peetsfea_runner.scheduler import AccountCapacitySnapshot, AccountReadinessSnapshot, BalancedBatchResult, SlotTaskRef
 from peetsfea_runner.state_store import StateStore
 
 
@@ -301,6 +304,42 @@ class TestPipelineApi(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "requires all accounts to be linux/slurm"):
                 config.validate()
+
+    def test_materialize_pulled_slot_artifact_copies_run_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            input_path = root / "sample.aedt"
+            output_dir = root / "sample.aedt.out"
+            archive_path = root / "artifact.tgz"
+            input_path.write_text("fixture", encoding="utf-8")
+            slot = SlotTaskRef(
+                run_id="run_01",
+                slot_id="slot_01",
+                input_path=input_path,
+                relative_path=Path("sample.aedt"),
+                output_dir=output_dir,
+                attempt_no=1,
+            )
+
+            with tarfile.open(archive_path, "w:gz") as handle:
+                run_log_bytes = b"log"
+                run_log_info = tarfile.TarInfo("run.log")
+                run_log_info.size = len(run_log_bytes)
+                handle.addfile(run_log_info, io.BytesIO(run_log_bytes))
+                exit_bytes = b"0"
+                exit_info = tarfile.TarInfo("exit.code")
+                exit_info.size = len(exit_bytes)
+                handle.addfile(exit_info, io.BytesIO(exit_bytes))
+
+            materialized = materialize_pulled_slot_artifact(
+                slot=slot,
+                archive_path=archive_path,
+                retain_aedtresults=False,
+            )
+
+            self.assertTrue(materialized)
+            self.assertTrue((output_dir / "run.log").exists())
+            self.assertEqual((output_dir / "exit.code").read_text(encoding="utf-8"), "0")
 
     def test_slurm_batch_backend_records_worker_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
