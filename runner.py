@@ -34,17 +34,16 @@ def _build_config(workspace_root: Path) -> PipelineConfig:
         continuous_mode=_env_bool("PEETSFEA_CONTINUOUS_MODE", True),
         ingest_poll_seconds=int(os.getenv("PEETSFEA_INGEST_POLL_SECONDS", "30")),
         ready_sidecar_suffix=os.getenv("PEETSFEA_READY_SIDECAR_SUFFIX", ".ready"),
-        slots_per_job=int(os.getenv("PEETSFEA_SLOTS_PER_JOB", "4")),
+        slots_per_job=int(os.getenv("PEETSFEA_SLOTS_PER_JOB", "5")),
         cores_per_slot=int(os.getenv("PEETSFEA_CORES_PER_SLOT", "4")),
         worker_requeue_limit=int(os.getenv("PEETSFEA_WORKER_REQUEUE_LIMIT", "1")),
         run_rotation_hours=int(os.getenv("PEETSFEA_RUN_ROTATION_HOURS", "24")),
         pending_buffer_per_account=int(os.getenv("PEETSFEA_PENDING_BUFFER_PER_ACCOUNT", "3")),
         capacity_scope=os.getenv("PEETSFEA_CAPACITY_SCOPE", "all_user_jobs"),
         balance_metric=os.getenv("PEETSFEA_BALANCE_METRIC", "license_max_520"),
+        license_observe_only=_env_bool("PEETSFEA_LICENSE_OBSERVE_ONLY", True),
         accounts_registry=(
             AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
-            AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
-            AccountConfig(account_id="account_03", host_alias="gate1-jji0930", max_jobs=10),
         ),
     )
 

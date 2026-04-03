@@ -1196,7 +1196,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
 
     def _refresh_license_targets(*, queued_slot_count: int) -> dict[str, int]:
         nonlocal license_target_slots_by_account, license_slot_deficits_by_account, license_dispatchable_account_ids
-        if not config.execute_remote:
+        if not config.execute_remote or config.license_observe_only:
+            if config.execute_remote:
+                _publish_license_account_states(queued_slot_count=queued_slot_count)
             license_target_slots_by_account = {}
             license_dispatchable_account_ids = tuple(account.account_id for account in accounts)
             license_slot_deficits_by_account = {
