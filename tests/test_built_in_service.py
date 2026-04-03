@@ -46,10 +46,16 @@ class TestBuiltInService(unittest.TestCase):
         self.assertTrue(lane_by_id["prune_results"].rename_input_to_done_on_success)
         self.assertEqual(
             [account.host_alias for account in lane_by_id["prune_results"].accounts],
-            ["gate1-harry261"],
+            [
+                "gate1-harry261",
+                "gate1-dhj02",
+                "gate1-jji0930",
+                "gate1-hmlee31",
+                "gate1-dw16",
+            ],
         )
         total_slots = sum(len(lane.accounts) * 10 * lane.slots_per_job for lane in profile.lanes)
-        self.assertEqual(total_slots, 480)
+        self.assertEqual(total_slots, 2400)
 
     def test_validate_service_layout_creates_required_output_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -113,10 +119,10 @@ class TestBuiltInService(unittest.TestCase):
             self.assertEqual(prune_cfg.tasks_per_slot, 1)
             self.assertFalse(prune_cfg.retain_aedtresults)
             self.assertTrue(prune_cfg.rename_input_to_done_on_success)
-            self.assertEqual(len(prune_cfg.accounts_registry), 1)
+            self.assertEqual(len(prune_cfg.accounts_registry), 5)
             self.assertEqual(prune_cfg.ssh_config_path, str(root / ".ssh" / "config"))
             self.assertEqual(prune_cfg.remote_root, "~/aedt_runs")
-            self.assertEqual(prune_cfg.worker_pool_size, 10)
+            self.assertEqual(prune_cfg.worker_pool_size, 50)
             self.assertEqual(prune_cfg.lease_ttl_seconds, 120)
             self.assertEqual(prune_cfg.lease_heartbeat_seconds, 15)
 

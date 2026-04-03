@@ -3569,7 +3569,7 @@ def _build_pull_worker_payload_script_content(
     lease_heartbeat_seconds = max(5, int(getattr(config, "lease_heartbeat_seconds", 15)))
     worker_idle_poll_seconds = max(1, int(getattr(config, "worker_idle_poll_seconds", 10)))
     slot_request_backoff_seconds = max(1, int(getattr(config, "slot_request_backoff_seconds", 5)))
-    runtime_root = _remote_path_for_shell(config=config, path="/tmp/peetsfea-runner/runtime")
+    runtime_root = _remote_path_for_shell(config=config, path="/tmp/$USER/peetsfea-runner/runtime")
     payload_lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
@@ -4301,7 +4301,7 @@ def _build_pull_remote_sbatch_script_content(
     worker_id: str,
 ) -> str:
     remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
-    exec_root = _remote_path_for_shell(config=config, path="/tmp/peetsfea-runner/submit")
+    exec_root = _remote_path_for_shell(config=config, path="/tmp/$USER/peetsfea-runner/submit")
     control_plane_ssh_target = _control_plane_ssh_target(config)
     control_plane_return_host = _control_plane_return_host(config)
     control_plane_return_user = _control_plane_return_user(config)

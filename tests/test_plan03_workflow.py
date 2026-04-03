@@ -477,7 +477,7 @@ class TestPlan03Workflow(unittest.TestCase):
         )
         self.assertIn("remote_pull_worker_payload.sh", content)
         self.assertNotIn("project_*.aedt", content)
-        self.assertIn("/tmp/peetsfea-runner/submit", content)
+        self.assertIn("/tmp/$USER/peetsfea-runner/submit", content)
         self.assertIn("./remote_pull_worker_payload.sh > worker.stdout 2> worker.stderr", content)
         self.assertIn("upload_debug_back() {", content)
         self.assertIn("launch_probe.txt worker.stdout worker.stderr control_tunnel_bootstrap.err", content)
