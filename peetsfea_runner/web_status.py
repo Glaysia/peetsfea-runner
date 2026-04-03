@@ -443,7 +443,7 @@ def _scratch_summary_payload(db_path: Path) -> dict[str, object]:
 
 
 def _configured_capacity_targets() -> dict[str, int]:
-    slots_per_job = _env_int("PEETSFEA_SLOTS_PER_JOB", 4)
+    slots_per_job = _env_int("PEETSFEA_SLOT_MAX_CONCURRENCY", _env_int("PEETSFEA_SLOTS_PER_JOB", 48))
     raw_accounts = os.getenv("PEETSFEA_ACCOUNTS", "").strip()
     configured_accounts = 0
     configured_worker_jobs = 0
@@ -4493,16 +4493,91 @@ def make_status_handler(*, db_path: Path):
                 self._send_json({"ok": True})
                 return
 
+            if parsed.path == "/internal/events/worker":
+                if not run_id or not worker_id:
+                    self._send_json({"error": "run_id_and_worker_id_required"}, status=400)
+                    return
+                stage = str(payload.get("stage") or "WORKER_EVENT").strip().upper()
+                message = str(payload.get("message") or "").strip() or f"worker_id={worker_id}"
+                state_store.append_event(
+                    run_id=run_id,
+                    job_id="__worker__",
+                    level="INFO",
+                    stage=stage,
+                    message=f"worker_id={worker_id} {message}",
+                )
+                self._send_json({"ok": True})
+                return
+
             if parsed.path == "/internal/resources/node":
-                self._send_json({"ok": True, "ignored": True})
+                if not run_id:
+                    self._send_json({"error": "run_id_required"}, status=400)
+                    return
+                state_store.record_node_resource_snapshot(
+                    run_id=run_id,
+                    host=str(payload.get("host") or "").strip() or "unknown",
+                    allocated_mem_mb=int(payload.get("allocated_mem_mb") or 0) if payload.get("allocated_mem_mb") is not None else None,
+                    total_mem_mb=int(payload.get("total_mem_mb") or 0) if payload.get("total_mem_mb") is not None else None,
+                    used_mem_mb=int(payload.get("used_mem_mb") or 0) if payload.get("used_mem_mb") is not None else None,
+                    free_mem_mb=int(payload.get("free_mem_mb") or 0) if payload.get("free_mem_mb") is not None else None,
+                    load_1=float(payload.get("load_1") or 0) if payload.get("load_1") is not None else None,
+                    load_5=float(payload.get("load_5") or 0) if payload.get("load_5") is not None else None,
+                    load_15=float(payload.get("load_15") or 0) if payload.get("load_15") is not None else None,
+                    tmp_total_mb=int(payload.get("tmp_total_mb") or 0) if payload.get("tmp_total_mb") is not None else None,
+                    tmp_used_mb=int(payload.get("tmp_used_mb") or 0) if payload.get("tmp_used_mb") is not None else None,
+                    tmp_free_mb=int(payload.get("tmp_free_mb") or 0) if payload.get("tmp_free_mb") is not None else None,
+                    process_count=int(payload.get("process_count") or 0),
+                    running_worker_count=int(payload.get("running_worker_count") or 0),
+                    active_slot_count=int(payload.get("active_slot_count") or 0),
+                )
+                self._send_json({"ok": True})
                 return
 
             if parsed.path == "/internal/resources/worker":
-                self._send_json({"ok": True, "ignored": True})
+                if not run_id or not worker_id:
+                    self._send_json({"error": "run_id_and_worker_id_required"}, status=400)
+                    return
+                state_store.record_worker_resource_snapshot(
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    host=str(payload.get("host") or "").strip() or "unknown",
+                    slurm_job_id=str(payload.get("slurm_job_id") or "").strip() or None,
+                    configured_slots=int(payload.get("configured_slots") or 0),
+                    active_slots=int(payload.get("active_slots") or 0),
+                    idle_slots=int(payload.get("idle_slots") or 0),
+                    target_slots=int(payload.get("target_slots") or 0),
+                    memory_pressure_pct=int(payload.get("memory_pressure_pct") or 0),
+                    memory_gate_open=bool(int(payload.get("memory_gate_open") or 0)),
+                    queued_slots_inside_worker=int(payload.get("queued_slots_inside_worker") or 0),
+                    rss_mb=int(payload.get("rss_mb") or 0) if payload.get("rss_mb") is not None else None,
+                    cpu_pct=float(payload.get("cpu_pct") or 0) if payload.get("cpu_pct") is not None else None,
+                    tunnel_state=str(payload.get("tunnel_state") or "").strip() or None,
+                    process_count=int(payload.get("process_count") or 0),
+                )
+                self._send_json({"ok": True})
                 return
 
             if parsed.path == "/internal/resources/slot":
-                self._send_json({"ok": True, "ignored": True})
+                if not run_id:
+                    self._send_json({"error": "run_id_required"}, status=400)
+                    return
+                state_store.record_slot_resource_snapshot(
+                    run_id=run_id,
+                    slot_id=str(payload.get("slot_id") or "").strip() or "unknown",
+                    worker_id=worker_id or None,
+                    host=str(payload.get("host") or "").strip() or None,
+                    allocated_mem_mb=int(payload.get("allocated_mem_mb") or 0) if payload.get("allocated_mem_mb") is not None else None,
+                    used_mem_mb=int(payload.get("used_mem_mb") or 0) if payload.get("used_mem_mb") is not None else None,
+                    load_1=float(payload.get("load_1") or 0) if payload.get("load_1") is not None else None,
+                    rss_mb=int(payload.get("rss_mb") or 0) if payload.get("rss_mb") is not None else None,
+                    cpu_pct=float(payload.get("cpu_pct") or 0) if payload.get("cpu_pct") is not None else None,
+                    process_count=int(payload.get("process_count") or 0),
+                    active_process_count=int(payload.get("active_process_count") or 0),
+                    artifact_bytes=int(payload.get("artifact_bytes") or 0),
+                    progress_ts=str(payload.get("progress_ts") or "").strip() or None,
+                    state=str(payload.get("state") or "").strip() or None,
+                )
+                self._send_json({"ok": True})
                 return
 
             self._send_json({"error": "not_found"}, status=404)

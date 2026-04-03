@@ -24,6 +24,7 @@ from .web_status import start_status_server
 
 APP_VERSION = get_version()
 EXPECTED_LANE_NAMES = ("preserve_results", "prune_results")
+_PRUNE_SLURM_PARTITIONS_ALLOWLIST = ("cpu2",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +75,7 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
     output_root = resolved_repo_root / "output"
     delete_failed_root = output_root / "_delete_failed"
     db_path = resolved_repo_root / "peetsfea_runner.duckdb"
-    control_plane_return_host = "172.16.165.84"
+    control_plane_return_host = "172.16.165.146"
     control_plane_return_port = 5722
     control_plane_return_user = service_user
     control_plane_ssh_target = f"{control_plane_return_user}@{control_plane_return_host}"
@@ -99,8 +100,8 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
         accounts=(
             AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
         ),
-        cpus_per_job=64,
-        slots_per_job=5,
+        cpus_per_job=48,
+        slots_per_job=48,
         cores_per_slot=4,
         tasks_per_slot=1,
         retain_aedtresults=False,
@@ -171,11 +172,12 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
         delete_failed_quarantine_dir=str(profile.delete_failed_root),
         metadata_db_path=str(profile.db_path),
         accounts_registry=lane.accounts,
-        partition="cpu2",
+        partition="",
+        slurm_partitions_allowlist=_PRUNE_SLURM_PARTITIONS_ALLOWLIST if lane.lane_id == "prune_results" else (),
         nodes=1,
         ntasks=1,
         cpus_per_job=lane.cpus_per_job,
-        mem="960G",
+        mem="288G" if lane.lane_id == "prune_results" else "960G",
         time_limit="05:00:00",
         remote_root=DEFAULT_REMOTE_ROOT,
         execute_remote=True,
@@ -195,6 +197,12 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
         remote_ssh_port=22,
         ssh_config_path=str(profile.ssh_config_path) if profile.ssh_config_path is not None else "",
         slots_per_job=lane.slots_per_job,
+        worker_payload_slot_limit=lane.slots_per_job,
+        slot_min_concurrency=5,
+        slot_max_concurrency=48,
+        slot_memory_pressure_high_watermark_percent=90,
+        slot_memory_pressure_resume_watermark_percent=80,
+        slot_memory_probe_interval_seconds=5,
         worker_bundle_multiplier=1,
         cores_per_slot=lane.cores_per_slot,
         tasks_per_slot=lane.tasks_per_slot,

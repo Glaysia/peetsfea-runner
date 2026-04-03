@@ -12,8 +12,8 @@ from typing import Callable, Generic, Protocol, Sequence, TypeVar
 
 from .runtime_policy import (
     DEFAULT_REMOTE_ROOT,
+    JOB_TMPFS_SIZE_GB,
     RUNTIME_PROBE_CACHE_TTL_SECONDS,
-    SLOT_TMPFS_SIZE_GB,
     remote_runtime_root,
 )
 
@@ -128,7 +128,7 @@ PENDING_STATES = frozenset({"PD", "PENDING"})
 _READINESS_MARKER = "__PEETSFEA_READY__:"
 _PREFLIGHT_MARKER = "__PEETSFEA_PREFLIGHT__:"
 _BOOTSTRAP_MARKER = "__PEETSFEA_BOOTSTRAP__:ok"
-_DEFAULT_SLURM_PROBE_PARTITION = "cpu2"
+_DEFAULT_SLURM_PROBE_PARTITION = ""
 _DEFAULT_SLURM_PROBE_IMMEDIATE_SECONDS = 15
 _ENROOT_IMAGE_PYTHON = "/opt/miniconda3/bin/python"
 _ENROOT_IMAGE_CONTRACT_VERSION = "2026-03-18-aedt-sqsh-v2"
@@ -303,13 +303,29 @@ def _load_remote_build_enroot_image_script() -> str:
     return script_path.read_text(encoding="utf-8")
 
 
+def _slurm_partition_argument(partition: str = "", slurm_partitions_allowlist: tuple[str, ...] | str = ()) -> str:
+    raw_allowlist = slurm_partitions_allowlist.split(",") if isinstance(slurm_partitions_allowlist, str) else slurm_partitions_allowlist
+    normalized_allowlist = [str(item).strip() for item in raw_allowlist if str(item).strip()]
+    if normalized_allowlist:
+        return f" -p {shlex.quote(','.join(dict.fromkeys(normalized_allowlist)))}"
+    normalized_partition = str(partition).strip()
+    if normalized_partition:
+        return f" -p {shlex.quote(normalized_partition)}"
+    return ""
+
+
 def _wrap_with_slurm_probe(
     script: str,
     *,
     partition: str = _DEFAULT_SLURM_PROBE_PARTITION,
+    slurm_partitions_allowlist: tuple[str, ...] | str = (),
     immediate_seconds: int | None = None,
 ) -> str:
-    srun_command = f"srun -p {shlex.quote(partition)} -N1 -n1 --job-name=peetsfea-probe --time=00:05:00"
+    srun_command = (
+        "srun"
+        f"{_slurm_partition_argument(partition=partition, slurm_partitions_allowlist=slurm_partitions_allowlist)}"
+        " -N1 -n1 --job-name=peetsfea-probe --time=00:05:00"
+    )
     if immediate_seconds is not None:
         if immediate_seconds <= 0:
             raise ValueError("immediate_seconds must be > 0 when provided")
@@ -326,10 +342,13 @@ def _wrap_with_slurm_bootstrap(
     script: str,
     *,
     partition: str = _DEFAULT_SLURM_PROBE_PARTITION,
+    slurm_partitions_allowlist: tuple[str, ...] | str = (),
     time_limit: str = "01:30:00",
 ) -> str:
     srun_command = (
-        f"srun -p {shlex.quote(partition)} -N1 -n1 --job-name=peetsfea-bootstrap --time={shlex.quote(time_limit)}"
+        "srun"
+        f"{_slurm_partition_argument(partition=partition, slurm_partitions_allowlist=slurm_partitions_allowlist)}"
+        f" -N1 -n1 --job-name=peetsfea-bootstrap --time={shlex.quote(time_limit)}"
     )
     return "\n".join(
         [
@@ -925,7 +944,7 @@ set +e
 IMAGE_PYTHON="/opt/miniconda3/bin/python"
 TMPFS_OK=0
 mkdir -p /work/tmp /work/home
-if mount -t tmpfs -o size={SLOT_TMPFS_SIZE_GB}G tmpfs /work/tmp >/dev/null 2>&1; then
+if mount -t tmpfs -o size={JOB_TMPFS_SIZE_GB}G tmpfs /work/tmp >/dev/null 2>&1; then
   TMPFS_OK=1
 fi
 cleanup_inner() {{
@@ -1528,6 +1547,8 @@ def bootstrap_account_runtime(
     remote_container_image: str = "",
     remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252",
     remote_ansys_executable: str = "",
+    partition: str = _DEFAULT_SLURM_PROBE_PARTITION,
+    slurm_partitions_allowlist: tuple[str, ...] | str = (),
     ssh_config_path: str = "",
 ) -> str:
     if _container_runtime(remote_container_runtime) == "enroot":
@@ -1563,7 +1584,7 @@ HOST_ANSYS_BASE={_double_quoted_shell_value(host_ansys_base)} \\
                 ssh_config_path=ssh_config_path,
             ),
             account.host_alias,
-            f"bash -lc {shlex.quote(_wrap_with_slurm_bootstrap(remote_script))}",
+            f"bash -lc {shlex.quote(_wrap_with_slurm_bootstrap(remote_script, partition=partition, slurm_partitions_allowlist=slurm_partitions_allowlist))}",
         ]
         bootstrap_timeout_seconds = max(command_timeout_seconds, 5400)
         if run_command is None:

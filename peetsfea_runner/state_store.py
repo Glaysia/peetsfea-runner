@@ -276,6 +276,10 @@ class StateStore:
                         configured_slots INTEGER NOT NULL DEFAULT 0,
                         active_slots INTEGER NOT NULL DEFAULT 0,
                         idle_slots INTEGER NOT NULL DEFAULT 0,
+                        target_slots INTEGER NOT NULL DEFAULT 0,
+                        memory_pressure_pct INTEGER NOT NULL DEFAULT 0,
+                        memory_gate_open BOOLEAN NOT NULL DEFAULT TRUE,
+                        queued_slots_inside_worker INTEGER NOT NULL DEFAULT 0,
                         rss_mb BIGINT,
                         cpu_pct DOUBLE,
                         tunnel_state TEXT,
@@ -434,6 +438,10 @@ class StateStore:
                 conn.execute("ALTER TABLE slot_resource_snapshots ADD COLUMN IF NOT EXISTS used_mem_mb BIGINT")
                 conn.execute("ALTER TABLE slot_resource_snapshots ADD COLUMN IF NOT EXISTS load_1 DOUBLE")
                 conn.execute("ALTER TABLE slot_resource_snapshots ADD COLUMN IF NOT EXISTS process_count INTEGER DEFAULT 0")
+                conn.execute("ALTER TABLE worker_resource_snapshots ADD COLUMN IF NOT EXISTS target_slots INTEGER DEFAULT 0")
+                conn.execute("ALTER TABLE worker_resource_snapshots ADD COLUMN IF NOT EXISTS memory_pressure_pct INTEGER DEFAULT 0")
+                conn.execute("ALTER TABLE worker_resource_snapshots ADD COLUMN IF NOT EXISTS memory_gate_open BOOLEAN DEFAULT TRUE")
+                conn.execute("ALTER TABLE worker_resource_snapshots ADD COLUMN IF NOT EXISTS queued_slots_inside_worker INTEGER DEFAULT 0")
             finally:
                 conn.close()
 
@@ -1982,6 +1990,10 @@ class StateStore:
         configured_slots: int,
         active_slots: int,
         idle_slots: int,
+        target_slots: int = 0,
+        memory_pressure_pct: int = 0,
+        memory_gate_open: bool = True,
+        queued_slots_inside_worker: int = 0,
         rss_mb: int | None,
         cpu_pct: float | None,
         tunnel_state: str | None,
@@ -1996,8 +2008,9 @@ class StateStore:
                     """
                     INSERT INTO worker_resource_snapshots (
                         run_id, worker_id, host, slurm_job_id, configured_slots, active_slots,
-                        idle_slots, rss_mb, cpu_pct, tunnel_state, process_count, ts
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        idle_slots, target_slots, memory_pressure_pct, memory_gate_open, queued_slots_inside_worker,
+                        rss_mb, cpu_pct, tunnel_state, process_count, ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         run_id,
@@ -2007,6 +2020,10 @@ class StateStore:
                         configured_slots,
                         active_slots,
                         idle_slots,
+                        target_slots,
+                        memory_pressure_pct,
+                        memory_gate_open,
+                        queued_slots_inside_worker,
                         rss_mb,
                         cpu_pct,
                         tunnel_state,

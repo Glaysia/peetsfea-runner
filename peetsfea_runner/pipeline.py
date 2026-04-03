@@ -305,7 +305,8 @@ class PipelineConfig:
         default_factory=lambda: (AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),)
     )
     # Execution/runtime settings
-    partition: str = "cpu2"
+    partition: str = ""
+    slurm_partitions_allowlist: tuple[str, ...] = ()
     nodes: int = 1
     ntasks: int = 1
     cpus_per_job: int = 16
@@ -329,6 +330,12 @@ class PipelineConfig:
     remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252"
     remote_ansys_executable: str = "/mnt/AnsysEM/ansysedt"
     slots_per_job: int = 4
+    worker_payload_slot_limit: int = 0
+    slot_min_concurrency: int = 0
+    slot_max_concurrency: int = 0
+    slot_memory_pressure_high_watermark_percent: int = 90
+    slot_memory_pressure_resume_watermark_percent: int = 80
+    slot_memory_probe_interval_seconds: int = 5
     worker_bundle_multiplier: int = 1
     cores_per_slot: int = 4
     tasks_per_slot: int = 1
@@ -379,6 +386,13 @@ class PipelineConfig:
         _ensure_positive("ntasks", self.ntasks)
         _ensure_positive("cpus_per_job", self.cpus_per_job)
         _ensure_positive("slots_per_job", self.slots_per_job)
+        if self.worker_payload_slot_limit < 0:
+            raise ValueError("worker_payload_slot_limit must be >= 0")
+        if self.slot_min_concurrency < 0:
+            raise ValueError("slot_min_concurrency must be >= 0")
+        if self.slot_max_concurrency < 0:
+            raise ValueError("slot_max_concurrency must be >= 0")
+        _ensure_positive("slot_memory_probe_interval_seconds", self.slot_memory_probe_interval_seconds)
         _ensure_positive("worker_bundle_multiplier", self.worker_bundle_multiplier)
         _ensure_positive("cores_per_slot", self.cores_per_slot)
         _ensure_positive("tasks_per_slot", self.tasks_per_slot)
@@ -395,6 +409,33 @@ class PipelineConfig:
             raise ValueError("worker_requeue_limit must be >= 0")
         if self.pending_buffer_per_account < 0:
             raise ValueError("pending_buffer_per_account must be >= 0")
+        effective_slot_max = max(1, int(self.slot_max_concurrency or self.slots_per_job))
+        effective_slot_min = max(
+            1,
+            min(
+                effective_slot_max,
+                int(self.slot_min_concurrency or min(5, effective_slot_max)),
+            ),
+        )
+        effective_payload_limit = max(
+            effective_slot_min,
+            int(self.worker_payload_slot_limit or self.slots_per_job),
+        )
+        if effective_slot_min > effective_slot_max:
+            raise ValueError("slot_min_concurrency must be <= slot_max_concurrency")
+        if effective_payload_limit < effective_slot_min:
+            raise ValueError("worker_payload_slot_limit must be >= slot_min_concurrency")
+        if not 0 <= self.slot_memory_pressure_resume_watermark_percent <= 100:
+            raise ValueError("slot_memory_pressure_resume_watermark_percent must be in 0..100")
+        if not 0 <= self.slot_memory_pressure_high_watermark_percent <= 100:
+            raise ValueError("slot_memory_pressure_high_watermark_percent must be in 0..100")
+        if (
+            self.slot_memory_pressure_resume_watermark_percent
+            > self.slot_memory_pressure_high_watermark_percent
+        ):
+            raise ValueError(
+                "slot_memory_pressure_resume_watermark_percent must be <= slot_memory_pressure_high_watermark_percent"
+            )
         if self.capacity_scope != "all_user_jobs":
             raise ValueError("capacity_scope must be 'all_user_jobs'")
         if self.balance_metric != _LICENSE_BALANCE_METRIC:
@@ -422,7 +463,6 @@ class PipelineConfig:
         if not self.ready_sidecar_suffix.strip():
             raise ValueError("ready_sidecar_suffix must not be empty")
         for name in (
-            "partition",
             "mem",
             "time_limit",
             "remote_root",
@@ -439,10 +479,6 @@ class PipelineConfig:
                 raise FileNotFoundError(f"ssh_config_path not found: {ssh_config}")
             if not ssh_config.is_file():
                 raise ValueError(f"ssh_config_path must be a file: {ssh_config}")
-        if self.cpus_per_job < (self.slots_per_job * self.cores_per_slot):
-            raise ValueError(
-                f"cpus_per_job must be >= slots_per_job * cores_per_slot ({self.slots_per_job * self.cores_per_slot})"
-            )
 
         accounts = [account for account in self.accounts_registry if account.enabled]
         if not accounts:
@@ -550,12 +586,19 @@ class _RemoteExecutionConfig:
     host: str
     remote_root: str
     partition: str
+    slurm_partitions_allowlist: tuple[str, ...]
     nodes: int
     ntasks: int
     cpus_per_job: int
     mem: str
     time_limit: str
     slots_per_job: int
+    worker_payload_slot_limit: int
+    slot_min_concurrency: int
+    slot_max_concurrency: int
+    slot_memory_pressure_high_watermark_percent: int
+    slot_memory_pressure_resume_watermark_percent: int
+    slot_memory_probe_interval_seconds: int
     cores_per_slot: int
     tasks_per_slot: int
     platform: str = "linux"
@@ -711,18 +754,33 @@ def _iter_input_aedt_files(*, input_root: Path, recursive: bool) -> Iterator[Pat
             yield path
 
 
+def _effective_slot_max_concurrency(*, config: PipelineConfig) -> int:
+    return max(1, int(config.slot_max_concurrency or config.slots_per_job))
+
+
+def _effective_slot_min_concurrency(*, config: PipelineConfig) -> int:
+    maximum = _effective_slot_max_concurrency(config=config)
+    raw_minimum = int(config.slot_min_concurrency or min(5, maximum))
+    return max(1, min(maximum, raw_minimum))
+
+
+def _effective_worker_payload_slot_limit(*, config: PipelineConfig) -> int:
+    return max(_effective_slot_min_concurrency(config=config), int(config.worker_payload_slot_limit or config.slots_per_job))
+
+
 def _configured_target_slots(*, config: PipelineConfig, accounts: list[AccountConfig]) -> int:
-    return sum(max(1, account.max_jobs) for account in accounts) * config.slots_per_job
+    return sum(max(1, account.max_jobs) for account in accounts) * _effective_slot_max_concurrency(config=config)
 
 
 def _worker_bundle_slot_limit(*, config: PipelineConfig) -> int:
+    payload_limit = _effective_worker_payload_slot_limit(config=config)
     if config.remote_execution_backend != "slurm_batch":
-        return config.slots_per_job
-    return max(config.slots_per_job, config.slots_per_job * config.worker_bundle_multiplier)
+        return payload_limit
+    return max(payload_limit, payload_limit * config.worker_bundle_multiplier)
 
 
 def _continuous_backlog_limits(*, config: PipelineConfig, accounts: list[AccountConfig]) -> tuple[int, int]:
-    low_watermark = max(config.slots_per_job, _configured_target_slots(config=config, accounts=accounts))
+    low_watermark = max(_effective_slot_min_concurrency(config=config), _configured_target_slots(config=config, accounts=accounts))
     high_watermark = max(low_watermark, low_watermark * 2)
     return low_watermark, high_watermark
 
@@ -836,6 +894,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         raise TypeError("config must be a PipelineConfig")
 
     input_root, output_root, aedt_files, accounts = config.validate()
+    effective_slot_min_concurrency = _effective_slot_min_concurrency(config=config)
+    effective_slot_max_concurrency = _effective_slot_max_concurrency(config=config)
+    effective_worker_payload_slot_limit = _effective_worker_payload_slot_limit(config=config)
     state_store = StateStore(Path(config.metadata_db_path))
     state_store.initialize()
     if config.continuous_mode:
@@ -997,12 +1058,19 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     host=account.host_alias,
                     remote_root=config.remote_root,
                     partition=config.partition,
+                    slurm_partitions_allowlist=config.slurm_partitions_allowlist,
                     nodes=config.nodes,
                     ntasks=config.ntasks,
                     cpus_per_job=config.cpus_per_job,
                     mem=config.mem,
                     time_limit=config.time_limit,
                     slots_per_job=config.slots_per_job,
+                    worker_payload_slot_limit=effective_worker_payload_slot_limit,
+                    slot_min_concurrency=effective_slot_min_concurrency,
+                    slot_max_concurrency=effective_slot_max_concurrency,
+                    slot_memory_pressure_high_watermark_percent=config.slot_memory_pressure_high_watermark_percent,
+                    slot_memory_pressure_resume_watermark_percent=config.slot_memory_pressure_resume_watermark_percent,
+                    slot_memory_probe_interval_seconds=config.slot_memory_probe_interval_seconds,
                     cores_per_slot=config.cores_per_slot,
                     tasks_per_slot=config.tasks_per_slot,
                     platform=account.platform,
@@ -1097,12 +1165,19 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 host=account.host_alias,
                 remote_root=config.remote_root,
                 partition=config.partition,
+                slurm_partitions_allowlist=config.slurm_partitions_allowlist,
                 nodes=config.nodes,
                 ntasks=config.ntasks,
                 cpus_per_job=config.cpus_per_job,
                 mem=config.mem,
                 time_limit=config.time_limit,
                 slots_per_job=config.slots_per_job,
+                worker_payload_slot_limit=effective_worker_payload_slot_limit,
+                slot_min_concurrency=effective_slot_min_concurrency,
+                slot_max_concurrency=effective_slot_max_concurrency,
+                slot_memory_pressure_high_watermark_percent=config.slot_memory_pressure_high_watermark_percent,
+                slot_memory_pressure_resume_watermark_percent=config.slot_memory_pressure_resume_watermark_percent,
+                slot_memory_probe_interval_seconds=config.slot_memory_probe_interval_seconds,
                 cores_per_slot=config.cores_per_slot,
                 tasks_per_slot=config.tasks_per_slot,
                 platform=account.platform,
@@ -1173,6 +1248,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             "remote_root": config.remote_root,
         }
 
+    def _slurm_probe_kwargs() -> dict[str, object]:
+        return {
+            "partition": config.partition,
+            "slurm_partitions_allowlist": config.slurm_partitions_allowlist,
+        }
+
     def _append_license_event_once(*, level: str, stage: str, message: str) -> None:
         marker = (stage, message)
         if marker in license_event_markers:
@@ -1191,7 +1272,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 ready=account.account_id in ready_accounts_set,
                 queued_slots=max(0, queued_slot_count),
                 active_slots=active_slots_by_account.get(account.account_id, 0),
-                max_active_slots=max(0, account.max_jobs * config.slots_per_job),
+                max_active_slots=max(0, account.max_jobs * effective_slot_max_concurrency),
             )
 
     def _refresh_license_targets(*, queued_slot_count: int) -> dict[str, int]:
@@ -1498,6 +1579,17 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 stage="RUNTIME_TMPFS_PROBE_FAILED",
                 message=f"account={snapshot.account_id} host={snapshot.host_alias} reason={snapshot.reason}",
             )
+        if "remote_scratch_limit_exceeded" in str(snapshot.reason):
+            scratch_root = snapshot.scratch_root or "unknown"
+            scratch_usage_mb = snapshot.scratch_usage_mb if snapshot.scratch_usage_mb is not None else -1
+            _append_worker_event(
+                level="WARN",
+                stage="REMOTE_SCRATCH_HARD_LIMIT",
+                message=(
+                    f"account={snapshot.account_id} host={snapshot.host_alias} "
+                    f"scratch_root={scratch_root} usage_mb={scratch_usage_mb}"
+                ),
+            )
 
     def _resolve_dispatch_accounts() -> list[AccountConfig]:
         nonlocal ready_account_ids, blocked_account_ids, bootstrapping_account_ids, cutover_ready_emitted
@@ -1544,6 +1636,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 try:
                     bootstrap_account_runtime(
                         account=account,
+                        **_slurm_probe_kwargs(),
                         **_container_runtime_kwargs(),
                         **_ssh_config_kwargs(),
                     )
@@ -1646,7 +1739,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             batch = run_slot_workers(
                 slot_queue=slot_batch,
                 accounts=dispatch_accounts,
-                slots_per_job=config.slots_per_job,
+                slots_per_job=effective_slot_min_concurrency,
                 bundle_slot_limit=_worker_bundle_slot_limit(config=config),
                 pending_buffer_per_account=config.pending_buffer_per_account,
                 worker=lambda bundle: _run_bundle_with_retry(
@@ -1665,13 +1758,17 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 on_bundle_submitted=_bundle_submitted,
                 recovery_slots_lookup=lambda _bundle, outcome: outcome.requeue_slots,
                 terminal_bundle_lookup=lambda _bundle, outcome: outcome.terminal_worker,
-                slot_deficit_lookup=(lambda: _refresh_license_targets(queued_slot_count=len(slot_batch))),
+                slot_deficit_lookup=(
+                    None
+                    if config.license_observe_only
+                    else (lambda: _refresh_license_targets(queued_slot_count=len(slot_batch)))
+                ),
             )
         else:
             batch = run_slot_workers(
                 slot_queue=slot_batch,
                 accounts=dispatch_accounts,
-                slots_per_job=config.slots_per_job,
+                slots_per_job=effective_slot_min_concurrency,
                 pending_buffer_per_account=config.pending_buffer_per_account,
                 worker=lambda bundle: _run_dry_bundle(
                     run_id=run_id,
@@ -1758,7 +1855,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             _refresh_license_targets(queued_slot_count=len(queued_slots))
             controller = SlotWorkerController(
                 accounts=dispatch_accounts,
-                slots_per_job=config.slots_per_job,
+                slots_per_job=effective_slot_min_concurrency,
                 bundle_slot_limit=_worker_bundle_slot_limit(config=config) if config.execute_remote else None,
                 pending_buffer_per_account=config.pending_buffer_per_account,
                 worker=(
@@ -1797,7 +1894,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 ),
                 slot_deficit_lookup=(
                     (lambda: _refresh_license_targets(queued_slot_count=_current_license_backlog_slots()))
-                    if config.execute_remote
+                    if config.execute_remote and not config.license_observe_only
                     else None
                 ),
             )
@@ -1845,7 +1942,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                         continue
                 else:
                     scan_backlog_empty = not pending_scan_files and not rescan_scan_files
-                    forced_start = scan_backlog_empty or len(queued_slots) >= config.slots_per_job
+                    forced_start = scan_backlog_empty or len(queued_slots) >= effective_slot_min_concurrency
                     if forced_start and _start_controller(force=scan_backlog_empty):
                         continue
 
@@ -1891,7 +1988,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                         queued_slots.extend(slots)
                         if config.execute_remote:
                             _start_controller(force=True)
-                        elif len(queued_slots) >= config.slots_per_job:
+                        elif len(queued_slots) >= effective_slot_min_concurrency:
                             _start_controller()
                 continue
 
@@ -2021,12 +2118,19 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 host=account.host_alias,
                 remote_root=config.remote_root,
                 partition=config.partition,
+                slurm_partitions_allowlist=config.slurm_partitions_allowlist,
                 nodes=config.nodes,
                 ntasks=config.ntasks,
                 cpus_per_job=config.cpus_per_job,
                 mem=config.mem,
                 time_limit=config.time_limit,
                 slots_per_job=config.slots_per_job,
+                worker_payload_slot_limit=effective_worker_payload_slot_limit,
+                slot_min_concurrency=effective_slot_min_concurrency,
+                slot_max_concurrency=effective_slot_max_concurrency,
+                slot_memory_pressure_high_watermark_percent=config.slot_memory_pressure_high_watermark_percent,
+                slot_memory_pressure_resume_watermark_percent=config.slot_memory_pressure_resume_watermark_percent,
+                slot_memory_probe_interval_seconds=config.slot_memory_probe_interval_seconds,
                 cores_per_slot=config.cores_per_slot,
                 tasks_per_slot=config.tasks_per_slot,
                 platform=account.platform,
@@ -2440,12 +2544,19 @@ def _run_bundle_with_retry(
         host=bundle.host_alias,
         remote_root=config.remote_root,
         partition=config.partition,
+        slurm_partitions_allowlist=config.slurm_partitions_allowlist,
         nodes=config.nodes,
         ntasks=config.ntasks,
         cpus_per_job=config.cpus_per_job,
         mem=config.mem,
         time_limit=config.time_limit,
         slots_per_job=config.slots_per_job,
+        worker_payload_slot_limit=_effective_worker_payload_slot_limit(config=config),
+        slot_min_concurrency=_effective_slot_min_concurrency(config=config),
+        slot_max_concurrency=_effective_slot_max_concurrency(config=config),
+        slot_memory_pressure_high_watermark_percent=config.slot_memory_pressure_high_watermark_percent,
+        slot_memory_pressure_resume_watermark_percent=config.slot_memory_pressure_resume_watermark_percent,
+        slot_memory_probe_interval_seconds=config.slot_memory_probe_interval_seconds,
         cores_per_slot=config.cores_per_slot,
         tasks_per_slot=config.tasks_per_slot,
         platform=bundle.platform,
@@ -2599,7 +2710,7 @@ def _run_bundle_with_retry(
                     slurm_job_id=slurm_job_id,
                     worker_state="SUBMITTED",
                     observed_node=observed_node,
-                    slots_configured=config.slots_per_job,
+                    slots_configured=_effective_slot_max_concurrency(config=config),
                     backend=config.remote_execution_backend,
                     collect_probe_state=None,
                     marker_present=None,
@@ -2618,7 +2729,7 @@ def _run_bundle_with_retry(
                     slurm_job_id=submitted_slurm_job_id,
                     worker_state=worker_state,
                     observed_node=observed_node,
-                    slots_configured=config.slots_per_job,
+                    slots_configured=_effective_slot_max_concurrency(config=config),
                     backend=config.remote_execution_backend,
                     collect_probe_state=None,
                     marker_present=None,
@@ -2717,7 +2828,7 @@ def _run_bundle_with_retry(
                     slurm_job_id=result.slurm_job_id,
                     worker_state=final_worker_state,
                     observed_node=result.observed_node,
-                    slots_configured=config.slots_per_job,
+                    slots_configured=_effective_slot_max_concurrency(config=config),
                     backend=config.remote_execution_backend,
                     collect_probe_state=result.collect_probe_state,
                     marker_present=result.marker_present,

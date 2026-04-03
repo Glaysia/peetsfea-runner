@@ -8,15 +8,13 @@ from .runtime_policy import DEFAULT_REMOTE_ROOT
 
 
 _PRUNE_ACCOUNTS = (
-    AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
-    AccountConfig(account_id="account_03", host_alias="gate1-jji0930", max_jobs=10),
-    AccountConfig(account_id="account_04", host_alias="gate1-hmlee31", max_jobs=10),
-    AccountConfig(account_id="account_05", host_alias="gate1-dw16", max_jobs=10),
+    AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
 )
 
 _PRESERVE_ACCOUNTS = (
     AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
 )
+_PRUNE_SLURM_PARTITIONS_ALLOWLIST = ("cpu2",)
 
 
 def _repo_local_ssh_config_path(repo_root: Path) -> str:
@@ -33,7 +31,7 @@ def build_enroot_validation_lane_config(
     window: str,
     remote_container_image: str,
     remote_root: str = DEFAULT_REMOTE_ROOT,
-    partition: str = "cpu2",
+    partition: str = "",
     mem: str = "960G",
     time_limit: str = "05:00:00",
     remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252",
@@ -72,8 +70,8 @@ def build_enroot_validation_lane_config(
 
     if lane_key == "prune":
         accounts = _PRUNE_ACCOUNTS
-        cpus_per_job = 20
-        slots_per_job = 5
+        cpus_per_job = 48
+        slots_per_job = 48
         cores_per_slot = 4
         tasks_per_slot = 1
     else:
@@ -92,12 +90,19 @@ def build_enroot_validation_lane_config(
         execute_remote=True,
         remote_execution_backend="slurm_batch",
         partition=partition,
+        slurm_partitions_allowlist=_PRUNE_SLURM_PARTITIONS_ALLOWLIST if lane_key == "prune" else (),
         cpus_per_job=cpus_per_job,
-        mem=mem,
+        mem="288G" if lane_key == "prune" and str(mem).strip() == "960G" else mem,
         time_limit=time_limit,
         remote_root=remote_root,
         continuous_mode=False,
         slots_per_job=slots_per_job,
+        worker_payload_slot_limit=slots_per_job,
+        slot_min_concurrency=5,
+        slot_max_concurrency=48 if lane_key == "prune" else 2,
+        slot_memory_pressure_high_watermark_percent=90,
+        slot_memory_pressure_resume_watermark_percent=80,
+        slot_memory_probe_interval_seconds=5,
         worker_bundle_multiplier=1,
         cores_per_slot=cores_per_slot,
         tasks_per_slot=tasks_per_slot,

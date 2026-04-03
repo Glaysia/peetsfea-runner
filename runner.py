@@ -13,6 +13,13 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_csv_tuple(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return ()
+    return tuple(chunk.strip() for chunk in raw.split(",") if chunk.strip())
+
+
 def _build_config(workspace_root: Path) -> PipelineConfig:
     input_dir = Path(os.getenv("PEETSFEA_INPUT_QUEUE_DIR", str(workspace_root / "input_queue")))
     output_root = Path(os.getenv("PEETSFEA_OUTPUT_ROOT_DIR", str(workspace_root / "output")))
@@ -26,7 +33,8 @@ def _build_config(workspace_root: Path) -> PipelineConfig:
         delete_failed_quarantine_dir=str(delete_failed_dir),
         metadata_db_path=metadata_db_path,
         execute_remote=_env_bool("PEETSFEA_EXECUTE_REMOTE", True),
-        partition=os.getenv("PEETSFEA_PARTITION", "cpu2"),
+        partition=os.getenv("PEETSFEA_PARTITION", ""),
+        slurm_partitions_allowlist=_env_csv_tuple("PEETSFEA_SLURM_PARTITIONS_ALLOWLIST"),
         cpus_per_job=int(os.getenv("PEETSFEA_CPUS_PER_JOB", "16")),
         mem=os.getenv("PEETSFEA_MEM", "960G"),
         time_limit=os.getenv("PEETSFEA_TIME_LIMIT", "05:00:00"),
@@ -34,7 +42,13 @@ def _build_config(workspace_root: Path) -> PipelineConfig:
         continuous_mode=_env_bool("PEETSFEA_CONTINUOUS_MODE", True),
         ingest_poll_seconds=int(os.getenv("PEETSFEA_INGEST_POLL_SECONDS", "30")),
         ready_sidecar_suffix=os.getenv("PEETSFEA_READY_SIDECAR_SUFFIX", ".ready"),
-        slots_per_job=int(os.getenv("PEETSFEA_SLOTS_PER_JOB", "5")),
+        slots_per_job=int(os.getenv("PEETSFEA_SLOTS_PER_JOB", "48")),
+        worker_payload_slot_limit=int(os.getenv("PEETSFEA_WORKER_PAYLOAD_SLOT_LIMIT", os.getenv("PEETSFEA_SLOTS_PER_JOB", "48"))),
+        slot_min_concurrency=int(os.getenv("PEETSFEA_SLOT_MIN_CONCURRENCY", "5")),
+        slot_max_concurrency=int(os.getenv("PEETSFEA_SLOT_MAX_CONCURRENCY", "48")),
+        slot_memory_pressure_high_watermark_percent=int(os.getenv("PEETSFEA_SLOT_MEMORY_PRESSURE_HIGH_WATERMARK_PERCENT", "90")),
+        slot_memory_pressure_resume_watermark_percent=int(os.getenv("PEETSFEA_SLOT_MEMORY_PRESSURE_RESUME_WATERMARK_PERCENT", "80")),
+        slot_memory_probe_interval_seconds=int(os.getenv("PEETSFEA_SLOT_MEMORY_PROBE_INTERVAL_SECONDS", "5")),
         cores_per_slot=int(os.getenv("PEETSFEA_CORES_PER_SLOT", "4")),
         worker_requeue_limit=int(os.getenv("PEETSFEA_WORKER_REQUEUE_LIMIT", "1")),
         run_rotation_hours=int(os.getenv("PEETSFEA_RUN_ROTATION_HOURS", "24")),

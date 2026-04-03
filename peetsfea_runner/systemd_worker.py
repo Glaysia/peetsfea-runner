@@ -166,7 +166,65 @@ def _record_local_resource_snapshots(
     pid: int,
     runtime_state: _WorkerRuntimeState,
 ) -> None:
-    return
+    del service_name, pid
+    run_id, _status = runtime_state.snapshot()
+    if not run_id:
+        return
+    allocated_mem_mb = _parse_mem_to_mb(config.mem)
+    total_mem_mb, used_mem_mb, free_mem_mb = _read_meminfo_mb()
+    load_1, load_5, load_15 = _load_average()
+    tmp_total_mb, tmp_used_mb, tmp_free_mb = _tmp_usage_mb()
+    rss_mb = _read_self_rss_mb()
+    process_count = _system_process_count()
+    configured_slots = max(
+        0,
+        int(getattr(config, "slot_max_concurrency", 0) or getattr(config, "slots_per_job", 0)),
+    )
+    store.record_node_resource_snapshot(
+        run_id=run_id,
+        host=host,
+        allocated_mem_mb=allocated_mem_mb,
+        total_mem_mb=total_mem_mb,
+        used_mem_mb=used_mem_mb,
+        free_mem_mb=free_mem_mb,
+        load_1=load_1,
+        load_5=load_5,
+        load_15=load_15,
+        tmp_total_mb=tmp_total_mb,
+        tmp_used_mb=tmp_used_mb,
+        tmp_free_mb=tmp_free_mb,
+        process_count=process_count,
+        running_worker_count=0,
+        active_slot_count=0,
+    )
+    store.record_worker_resource_snapshot(
+        run_id=run_id,
+        worker_id=host,
+        host=host,
+        slurm_job_id=None,
+        configured_slots=configured_slots,
+        active_slots=0,
+        idle_slots=configured_slots,
+        target_slots=configured_slots,
+        memory_pressure_pct=0,
+        memory_gate_open=True,
+        queued_slots_inside_worker=0,
+        rss_mb=rss_mb,
+        cpu_pct=load_1,
+        tunnel_state="LOCAL",
+        process_count=process_count,
+    )
+    store.record_resource_summary_snapshot(
+        run_id=run_id,
+        host=host,
+        allocated_mem_mb=allocated_mem_mb,
+        used_mem_mb=used_mem_mb,
+        free_mem_mb=free_mem_mb,
+        load_1=load_1,
+        running_worker_count=0,
+        active_slot_count=0,
+        stale=False,
+    )
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -174,6 +232,13 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_csv_tuple(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return ()
+    return tuple(chunk.strip() for chunk in raw.split(",") if chunk.strip())
 
 
 @dataclass(slots=True)
@@ -305,7 +370,8 @@ def _build_config() -> PipelineConfig:
         accounts_registry=accounts_registry,
         execute_remote=_env_bool("PEETSFEA_EXECUTE_REMOTE", True),
         remote_execution_backend=os.getenv("PEETSFEA_REMOTE_EXECUTION_BACKEND", "slurm_batch"),
-        partition=os.getenv("PEETSFEA_PARTITION", "cpu2"),
+        partition=os.getenv("PEETSFEA_PARTITION", ""),
+        slurm_partitions_allowlist=_env_csv_tuple("PEETSFEA_SLURM_PARTITIONS_ALLOWLIST"),
         cpus_per_job=int(os.getenv("PEETSFEA_CPUS_PER_JOB", "16")),
         mem=os.getenv("PEETSFEA_MEM", "960G"),
         time_limit=os.getenv("PEETSFEA_TIME_LIMIT", "05:00:00"),
@@ -330,7 +396,13 @@ def _build_config() -> PipelineConfig:
         continuous_mode=_env_bool("PEETSFEA_CONTINUOUS_MODE", True),
         ingest_poll_seconds=int(os.getenv("PEETSFEA_INGEST_POLL_SECONDS", "30")),
         ready_sidecar_suffix=os.getenv("PEETSFEA_READY_SIDECAR_SUFFIX", ".ready"),
-        slots_per_job=int(os.getenv("PEETSFEA_SLOTS_PER_JOB", "4")),
+        slots_per_job=int(os.getenv("PEETSFEA_SLOTS_PER_JOB", "48")),
+        worker_payload_slot_limit=int(os.getenv("PEETSFEA_WORKER_PAYLOAD_SLOT_LIMIT", os.getenv("PEETSFEA_SLOTS_PER_JOB", "48"))),
+        slot_min_concurrency=int(os.getenv("PEETSFEA_SLOT_MIN_CONCURRENCY", "5")),
+        slot_max_concurrency=int(os.getenv("PEETSFEA_SLOT_MAX_CONCURRENCY", "48")),
+        slot_memory_pressure_high_watermark_percent=int(os.getenv("PEETSFEA_SLOT_MEMORY_PRESSURE_HIGH_WATERMARK_PERCENT", "90")),
+        slot_memory_pressure_resume_watermark_percent=int(os.getenv("PEETSFEA_SLOT_MEMORY_PRESSURE_RESUME_WATERMARK_PERCENT", "80")),
+        slot_memory_probe_interval_seconds=int(os.getenv("PEETSFEA_SLOT_MEMORY_PROBE_INTERVAL_SECONDS", "5")),
         worker_bundle_multiplier=int(os.getenv("PEETSFEA_WORKER_BUNDLE_MULTIPLIER", "1")),
         cores_per_slot=int(os.getenv("PEETSFEA_CORES_PER_SLOT", "4")),
         tasks_per_slot=int(os.getenv("PEETSFEA_TASKS_PER_SLOT", "1")),

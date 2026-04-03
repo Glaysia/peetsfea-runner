@@ -18,19 +18,31 @@ from .constants import (
     EXIT_CODE_SLURM_FAILURE,
     EXIT_CODE_SSH_FAILURE,
 )
-from .runtime_policy import RUNTIME_JANITOR_MIN_TTL_SECONDS, SLOT_TMPFS_SIZE_GB, remote_runtime_root
+from .runtime_policy import (
+    JOB_DISK_FILESYSTEM_SIZE_GB,
+    JOB_TMPFS_SIZE_GB,
+    RUNTIME_JANITOR_MIN_TTL_SECONDS,
+    remote_runtime_root,
+)
 
 
 class RemoteJobConfig(Protocol):
     host: str
     remote_root: str
     partition: str
+    slurm_partitions_allowlist: tuple[str, ...]
     nodes: int
     ntasks: int
     cpus_per_job: int
     mem: str
     time_limit: str
     slots_per_job: int
+    worker_payload_slot_limit: int
+    slot_min_concurrency: int
+    slot_max_concurrency: int
+    slot_memory_pressure_high_watermark_percent: int
+    slot_memory_pressure_resume_watermark_percent: int
+    slot_memory_probe_interval_seconds: int
     cores_per_slot: int
     tasks_per_slot: int
     platform: str
@@ -307,6 +319,23 @@ def _memory_to_mb(mem: str) -> int | None:
         return int(float(raw) * multiplier)
     except ValueError:
         return None
+
+
+def _slurm_partitions_allowlist(config: RemoteJobConfig) -> tuple[str, ...]:
+    raw = getattr(config, "slurm_partitions_allowlist", ())
+    if isinstance(raw, str):
+        iterable = raw.split(",")
+    else:
+        iterable = raw
+    normalized = [str(item).strip() for item in iterable if str(item).strip()]
+    if normalized:
+        return tuple(dict.fromkeys(normalized))
+    fallback = str(getattr(config, "partition", "")).strip()
+    return (fallback,) if fallback else ()
+
+
+def _slurm_partition_value(config: RemoteJobConfig) -> str:
+    return ",".join(_slurm_partitions_allowlist(config))
 
 
 def run_remote_job_attempt(
@@ -1469,9 +1498,10 @@ def _normalize_slot_inputs(
         return normalized
 
     assert aedt_path is not None
+    payload_slot_limit = max(1, int(getattr(config, "worker_payload_slot_limit", getattr(config, "slots_per_job", 1))))
     return [
         SlotInput(slot_id=f"case_{index:02d}", input_path=aedt_path)
-        for index in range(1, config.slots_per_job + 1)
+        for index in range(1, payload_slot_limit + 1)
     ]
 
 
@@ -1507,6 +1537,16 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "unset LANGUAGE",
         "export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81",
         "export ANSYSEM_ROOT252=/mnt/AnsysEM",
+        "export PEETS_RAMDISK_ROOT=\"${PEETS_RAMDISK_ROOT:-$HOME/ansys_ram}\"",
+        "export PEETS_RAMDISK_TMPDIR=\"${PEETS_RAMDISK_TMPDIR:-$PEETS_RAMDISK_ROOT/tmp}\"",
+        "export PEETS_RAMDISK_ANSYS_WORK_DIR=\"${PEETS_RAMDISK_ANSYS_WORK_DIR:-$PEETS_RAMDISK_ROOT/ansys_tmp}\"",
+        "export PEETS_DISK_ROOT=\"${PEETS_DISK_ROOT:-$HOME}\"",
+        "export PEETS_DISK_TMPDIR=\"${PEETS_DISK_TMPDIR:-$PEETS_DISK_ROOT/tmp}\"",
+        "export PEETS_DISK_ANSYS_WORK_DIR=\"${PEETS_DISK_ANSYS_WORK_DIR:-$PEETS_DISK_ROOT/ansys_tmp}\"",
+        "mkdir -p \"$HOME\" \"$PEETS_RAMDISK_TMPDIR\" \"$PEETS_RAMDISK_ANSYS_WORK_DIR\" \"$PEETS_DISK_TMPDIR\" \"$PEETS_DISK_ANSYS_WORK_DIR\"",
+        "export ANSYS_WORK_DIR=\"${ANSYS_WORK_DIR:-$PEETS_RAMDISK_ANSYS_WORK_DIR}\"",
+        "export TEMP=\"${TEMP:-$PEETS_DISK_TMPDIR}\"",
+        "export TMPDIR=\"${TMPDIR:-$PEETS_DISK_TMPDIR}\"",
         "",
         "IMAGE_PYTHON=\"/opt/miniconda3/bin/python\"",
         "if [ ! -x \"$IMAGE_PYTHON\" ]; then",
@@ -1643,6 +1683,7 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "        'PWD',",
         "        'SHELL',",
         "        'TERM',",
+        "        'ANSYS_WORK_DIR',",
         "        'TMP',",
         "        'TEMP',",
         "        'TMPDIR',",
@@ -2704,8 +2745,12 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "",
         "    existing_runtime_logs = snapshot_pyaedt_logs()",
         "    write_license_diagnostics(workdir)",
-        "    tmpdir = workdir / 'tmp'",
+        "    tmpdir = Path(os.environ.get('TMPDIR', str(workdir / 'tmp'))).resolve()",
         "    tmpdir.mkdir(parents=True, exist_ok=True)",
+        "    ansys_work_dir = Path(os.environ.get('ANSYS_WORK_DIR', str(tmpdir / 'ansys_tmp'))).resolve()",
+        "    ansys_work_dir.mkdir(parents=True, exist_ok=True)",
+        "    os.environ['ANSYS_WORK_DIR'] = str(ansys_work_dir)",
+        "    os.environ['TEMP'] = str(tmpdir)",
         "    os.environ['TMPDIR'] = str(tmpdir)",
         "    cores = int(os.environ.get('PEETS_SLOT_CORES', '4'))",
         "    tasks = int(os.environ.get('PEETS_SLOT_TASKS', '1'))",
@@ -2970,8 +3015,10 @@ def _build_noninteractive_srun_command(*, config: RemoteJobConfig, remote_job_di
     exclude_nodes = _slurm_exclude_nodes(config)
     exclude_arg = f" --exclude={','.join(exclude_nodes)}" if exclude_nodes else ""
     runtime_root = _remote_runtime_root_shell_path(config=config)
+    partition_value = _slurm_partition_value(config)
+    partition_arg = f" -p {partition_value}" if partition_value else ""
     return (
-        f"srun -D {_double_quoted_shell_value(runtime_root)} -p {config.partition} -N {config.nodes} -n {config.ntasks} "
+        f"srun -D {_double_quoted_shell_value(runtime_root)}{partition_arg} -N {config.nodes} -n {config.ntasks} "
         f"-c {config.cpus_per_job} --mem={config.mem} --time={config.time_limit}{exclude_arg} "
         f"bash -lc {shlex.quote(payload)}"
     )
@@ -2984,7 +3031,10 @@ def _build_worker_payload_script_content(
     run_id: str | None = None,
     worker_id: str | None = None,
 ) -> str:
-    max_parallel = max(1, int(getattr(config, "slots_per_job", case_count)))
+    configured_max_parallel = int(getattr(config, "slot_max_concurrency", getattr(config, "slots_per_job", case_count)))
+    max_parallel = max(1, configured_max_parallel)
+    min_parallel = max(1, int(getattr(config, "slot_min_concurrency", min(5, max_parallel))))
+    max_parallel = max(min_parallel, max_parallel)
     tasks_per_slot = int(getattr(config, "tasks_per_slot", 1))
     container_runtime = _remote_container_runtime(config)
     container_image = _remote_container_image(config)
@@ -3010,8 +3060,27 @@ def _build_worker_payload_script_content(
         f"REMOTE_RUNTIME_ROOT={_double_quoted_shell_value(runtime_root)}",
         "mkdir -p \"$REMOTE_RUNTIME_ROOT\"",
         "workdir=$(mktemp -d \"$REMOTE_RUNTIME_ROOT/slot.${SLURM_JOB_ID:-nojob}.XXXXXX\")",
+        "JOB_TMPFS_ROOT=\"$workdir/job_tmpfs\"",
+        "JOB_DISK_ROOT=\"$workdir/job_disk\"",
+        "JOB_DISK_BUDGET_GB=" + str(JOB_DISK_FILESYSTEM_SIZE_GB),
+        "enter_job_filesystem_namespace() {",
+        "  mkdir -p \"$JOB_TMPFS_ROOT\" \"$JOB_DISK_ROOT\"",
+        "  if [ \"${PEETS_JOB_TMPFS_NAMESPACE_READY:-0}\" = \"1\" ]; then",
+        "    return 0",
+        "  fi",
+        "  if ! command -v unshare >/dev/null 2>&1; then",
+        "    echo \"[ERROR] unshare is required for rootless job tmpfs setup\" >&2",
+        "    return 127",
+        "  fi",
+        "  exec unshare --user --map-root-user --mount /bin/bash -c 'set -euo pipefail; job_tmpfs_root=\"$1\"; shift; mount -t tmpfs -o size="
+        + str(JOB_TMPFS_SIZE_GB)
+        + "G tmpfs \"$job_tmpfs_root\"; export PEETS_JOB_TMPFS_NAMESPACE_READY=1; export PEETS_JOB_TMPFS_NAMESPACE_ACTIVE=1; exec \"$@\"' /bin/bash \"$JOB_TMPFS_ROOT\" /bin/bash \"$0\" \"$@\"",
+        "}",
         "cleanup_workdir() {",
         "  cd \"$REMOTE_RUNTIME_ROOT\" >/dev/null 2>&1 || true",
+        "  if [ \"${PEETS_JOB_TMPFS_NAMESPACE_ACTIVE:-0}\" = \"1\" ] && awk -v target=\"$JOB_TMPFS_ROOT\" '$2 == target && $3 == \"tmpfs\" {found=1} END {exit found?0:1}' /proc/mounts; then",
+        "    umount \"$JOB_TMPFS_ROOT\" >/dev/null 2>&1 || true",
+        "  fi",
         "  rm -rf \"$workdir\" >/dev/null 2>&1 || true",
         "  rmdir \"$REMOTE_RUNTIME_ROOT/enroot/${SLURM_JOB_ID:-nojob}\" >/dev/null 2>&1 || true",
         "}",
@@ -3025,11 +3094,16 @@ def _build_worker_payload_script_content(
         "  exit \"$rc\"",
         "}",
         "trap cleanup EXIT",
+        "enter_job_filesystem_namespace \"$@\"",
         "launch_probe_file=\"${REMOTE_JOB_DIR:-$workdir}/launch_probe.txt\"",
         "{",
         "  printf 'hostname=%s\\n' \"$(hostname 2>/dev/null || true)\"",
         "  printf 'pwd=%s\\n' \"$PWD\"",
         "  printf 'path=%s\\n' \"$PATH\"",
+        "  printf 'job_tmpfs_root=%s\\n' \"$JOB_TMPFS_ROOT\"",
+        "  printf 'job_tmpfs_size_gb=%s\\n' \"" + str(JOB_TMPFS_SIZE_GB) + "\"",
+        "  printf 'job_disk_root=%s\\n' \"$JOB_DISK_ROOT\"",
+        "  printf 'job_disk_budget_gb=%s\\n' \"$JOB_DISK_BUDGET_GB\"",
         "  for tool in bash tar seq cp base64 ssh enroot python3 python; do",
         "    resolved_tool=\"$(command -v \"$tool\" 2>/dev/null || true)\"",
         "    printf 'tool.%s=%s\\n' \"$tool\" \"${resolved_tool:-MISSING}\"",
@@ -3039,14 +3113,18 @@ def _build_worker_payload_script_content(
         "  fi",
         "} > \"$launch_probe_file\" 2>&1 || true",
         "cd \"$workdir\"",
-        "tar -xzf -",
+        "tar --no-same-owner -xzf -",
         f"PEETS_CONTROL_RUN_ID={shlex.quote(run_id or '')}",
         f"PEETS_CONTROL_WORKER_ID={shlex.quote(worker_id or '')}",
         f"PEETS_CONTROL_HOST={shlex.quote(control_plane_host)}",
         f"PEETS_CONTROL_PORT={control_plane_port}",
         f"PEETS_CONTROL_SSH_TARGET={shlex.quote(control_plane_ssh_target)}",
         f"PEETS_CONTROL_HEARTBEAT_INTERVAL={heartbeat_interval_seconds}",
+        f"PEETS_SLOT_MIN_CONCURRENCY={min_parallel}",
         f"max_parallel={max_parallel}",
+        f"PEETS_SLOT_MEMORY_PRESSURE_HIGH_WATERMARK={int(getattr(config, 'slot_memory_pressure_high_watermark_percent', 90))}",
+        f"PEETS_SLOT_MEMORY_PRESSURE_RESUME_WATERMARK={int(getattr(config, 'slot_memory_pressure_resume_watermark_percent', 80))}",
+        f"PEETS_SLOT_MEMORY_PROBE_INTERVAL={max(1, int(getattr(config, 'slot_memory_probe_interval_seconds', 5)))}",
         "PEETS_CONTROL_LOCAL_PORT=$((PEETS_CONTROL_PORT + 1000))",
         "PEETS_TUNNEL_SOCKET=\"$workdir/control-plane.sock\"",
         "PEETS_TUNNEL_SESSION_ID=\"${SLURM_JOB_ID:-nojob}-${PEETS_CONTROL_WORKER_ID:-worker}-$$\"",
@@ -3075,6 +3153,59 @@ def _build_worker_payload_script_content(
         "  done",
         "  case_pids=(\"${active_pids[@]}\")",
         "  printf '%s\\n' \"${#case_pids[@]}\"",
+        "}",
+        "memory_stats() {",
+        "  local total_kb avail_kb used_kb pressure_pct",
+        "  total_kb=$(awk '/MemTotal/ {print $2+0}' /proc/meminfo 2>/dev/null || echo 0)",
+        "  avail_kb=$(awk '/MemAvailable/ {print $2+0}' /proc/meminfo 2>/dev/null || echo 0)",
+        "  used_kb=$(( total_kb - avail_kb ))",
+        "  if [ \"$used_kb\" -lt 0 ]; then used_kb=0; fi",
+        "  if [ \"$total_kb\" -gt 0 ]; then",
+        "    pressure_pct=$(( (used_kb * 100) / total_kb ))",
+        "  else",
+        "    pressure_pct=0",
+        "  fi",
+        "  printf '%s %s %s %s\\n' \"$(( total_kb / 1024 ))\" \"$(( avail_kb / 1024 ))\" \"$(( used_kb / 1024 ))\" \"$pressure_pct\"",
+        "}",
+        "memory_gate_open=1",
+        "last_target_slots=''",
+        "last_memory_gate=''",
+        "emit_scheduler_event() {",
+        "  stage=\"$1\"",
+        "  message=\"$2\"",
+        "  control_plane_post /internal/events/worker \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"stage\\\":\\\"${stage}\\\",\\\"message\\\":\\\"${message}\\\"}\" >/dev/null 2>&1 || true",
+        "}",
+        "compute_target_slots() {",
+        "  active_now=\"$1\"",
+        "  queued_now=\"$2\"",
+        "  read -r total_mem_mb avail_mem_mb used_mem_mb memory_pressure_pct <<EOF",
+        "  $(memory_stats)",
+        "EOF",
+        "  if [ \"${memory_pressure_pct:-0}\" -ge \"$PEETS_SLOT_MEMORY_PRESSURE_HIGH_WATERMARK\" ]; then",
+        "    memory_gate_open=0",
+        "  elif [ \"${memory_pressure_pct:-0}\" -le \"$PEETS_SLOT_MEMORY_PRESSURE_RESUME_WATERMARK\" ]; then",
+        "    memory_gate_open=1",
+        "  fi",
+        "  if [ \"$memory_gate_open\" -eq 1 ]; then",
+        "    target_slots=\"$max_parallel\"",
+        "  else",
+        "    target_slots=\"$active_now\"",
+        "  fi",
+        "  if [ \"$target_slots\" -gt \"$max_parallel\" ]; then target_slots=\"$max_parallel\"; fi",
+        "  if [ \"$target_slots\" -lt \"$active_now\" ]; then target_slots=\"$active_now\"; fi",
+        "  if [ \"$target_slots\" -lt 0 ]; then target_slots=0; fi",
+        "  if [ \"$last_target_slots\" != \"$target_slots\" ] && [ \"$target_slots\" -gt \"$active_now\" ]; then",
+        "    emit_scheduler_event SLOT_SCALE_UP \"target_slots=${target_slots} active_slots=${active_now} memory_pressure_pct=${memory_pressure_pct} queued_slots=${queued_now}\"",
+        "  fi",
+        "  if [ \"$memory_gate_open\" -eq 0 ] && [ \"$last_memory_gate\" != \"0\" ]; then",
+        "    emit_scheduler_event SLOT_START_BLOCKED_MEMORY \"active_slots=${active_now} memory_pressure_pct=${memory_pressure_pct} queued_slots=${queued_now}\"",
+        "  fi",
+        "  if [ \"$memory_gate_open\" -eq 0 ] && [ \"$queued_now\" -gt 0 ] && [ \"$active_now\" -gt 0 ]; then",
+        "    emit_scheduler_event SLOT_DRAIN_CONTINUE \"active_slots=${active_now} memory_pressure_pct=${memory_pressure_pct} queued_slots=${queued_now}\"",
+        "  fi",
+        "  last_target_slots=\"$target_slots\"",
+        "  last_memory_gate=\"$memory_gate_open\"",
+        "  printf '%s %s %s %s %s\\n' \"$target_slots\" \"$memory_pressure_pct\" \"$memory_gate_open\" \"$avail_mem_mb\" \"$used_mem_mb\"",
         "}",
         "control_plane_post() {",
         "  endpoint=\"$1\"",
@@ -3156,10 +3287,14 @@ def _build_worker_payload_script_content(
         "emit_worker_snapshot() {",
         "  active_slots=\"${1:-0}\"",
         "  idle_slots=\"${2:-0}\"",
+        "  target_slots=\"${3:-0}\"",
+        "  memory_pressure_pct=\"${4:-0}\"",
+        "  memory_gate_open=\"${5:-1}\"",
+        "  queued_slots_inside_worker=\"${6:-0}\"",
         "  rss_mb=$(awk '/VmRSS/ {print int($2/1024)}' /proc/$$/status 2>/dev/null || echo 0)",
         "  cpu_pct=$(ps -p $$ -o %cpu= 2>/dev/null | awk '{print $1+0}' || echo 0)",
         "  process_count=$(ps --no-headers --ppid $$ 2>/dev/null | wc -l | awk '{print $1+0}')",
-        "  control_plane_post /internal/resources/worker \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"host\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\",\\\"slurm_job_id\\\":\\\"${SLURM_JOB_ID:-}\\\",\\\"configured_slots\\\":${max_parallel},\\\"active_slots\\\":${active_slots},\\\"idle_slots\\\":${idle_slots},\\\"rss_mb\\\":${rss_mb:-0},\\\"cpu_pct\\\":${cpu_pct:-0},\\\"tunnel_state\\\":\\\"CONNECTED\\\",\\\"process_count\\\":${process_count:-0}}\" >/dev/null 2>&1 || true",
+        "  control_plane_post /internal/resources/worker \"{\\\"run_id\\\":\\\"${PEETS_CONTROL_RUN_ID}\\\",\\\"worker_id\\\":\\\"${PEETS_CONTROL_WORKER_ID}\\\",\\\"host\\\":\\\"${SLURMD_NODENAME:-${HOSTNAME:-}}\\\",\\\"slurm_job_id\\\":\\\"${SLURM_JOB_ID:-}\\\",\\\"configured_slots\\\":${max_parallel},\\\"active_slots\\\":${active_slots},\\\"idle_slots\\\":${idle_slots},\\\"target_slots\\\":${target_slots},\\\"memory_pressure_pct\\\":${memory_pressure_pct},\\\"memory_gate_open\\\":${memory_gate_open},\\\"queued_slots_inside_worker\\\":${queued_slots_inside_worker},\\\"rss_mb\\\":${rss_mb:-0},\\\"cpu_pct\\\":${cpu_pct:-0},\\\"tunnel_state\\\":\\\"CONNECTED\\\",\\\"process_count\\\":${process_count:-0}}\" >/dev/null 2>&1 || true",
         "}",
         "emit_slot_snapshot() {",
         "  slot_id=\"$1\"",
@@ -3180,16 +3315,20 @@ def _build_worker_payload_script_content(
         "    emit_control_heartbeat",
         "    emit_node_snapshot",
         "    active_now=$(count_case_jobs)",
-        "    idle_now=$(( max_parallel - active_now ))",
+        "    read -r target_now pressure_now gate_open_now avail_mem_now used_mem_now <<EOF",
+        "  $(compute_target_slots \"$active_now\" 0)",
+        "EOF",
+        "    idle_now=$(( target_now - active_now ))",
         "    if [ \"$idle_now\" -lt 0 ]; then idle_now=0; fi",
-        "    emit_worker_snapshot \"$active_now\" \"$idle_now\"",
+        "    emit_worker_snapshot \"$active_now\" \"$idle_now\" \"$target_now\" \"$pressure_now\" \"$gate_open_now\" 0",
         "  done",
         "}",
         "heartbeat_pid=''",
         "if start_control_tunnel 2> control_tunnel_bootstrap.err; then",
         "  emit_control_register",
         "  emit_node_snapshot",
-        "  emit_worker_snapshot 0 \"$max_parallel\"",
+        "  emit_worker_snapshot 0 \"$PEETS_SLOT_MIN_CONCURRENCY\" \"$PEETS_SLOT_MIN_CONCURRENCY\" 0 1 "
+        + str(case_count),
         "  heartbeat_loop &",
         "  heartbeat_pid=$!",
         "else",
@@ -3214,6 +3353,9 @@ def _build_worker_payload_script_content(
         "  fi",
         "  (",
         "    container_name=\"peets-${SLURM_JOB_ID:-nojob}-${case_name}-$$\"",
+        "    case_ram_root=\"$JOB_TMPFS_ROOT/$case_name\"",
+        "    case_disk_root=\"$JOB_DISK_ROOT/$case_name\"",
+        "    mkdir -p \"$case_ram_root/tmp\" \"$case_ram_root/ansys_tmp\" \"$case_disk_root/home\" \"$case_disk_root/tmp\" \"$case_disk_root/ansys_tmp\"",
         "    enroot_base=\"$REMOTE_RUNTIME_ROOT/enroot/${SLURM_JOB_ID:-nojob}/${case_name}-$$\"",
         "    export ENROOT_RUNTIME_PATH=\"$enroot_base/runtime\"",
         "    export ENROOT_CACHE_PATH=\"$enroot_base/cache\"",
@@ -3223,9 +3365,7 @@ def _build_worker_payload_script_content(
         "    chmod 700 \"$ENROOT_RUNTIME_PATH\" \"$ENROOT_CACHE_PATH\" \"$ENROOT_DATA_PATH\" \"$ENROOT_TEMP_PATH\"",
         "    enroot create -f -n \"$container_name\" \"$REMOTE_CONTAINER_IMAGE\" >/dev/null",
         "    trap 'enroot remove -f \"$container_name\" >/dev/null 2>&1 || true; rm -rf \"$enroot_base\" >/dev/null 2>&1 || true' EXIT",
-        "    enroot start --root --rw --mount \"$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM\" --mount \"$REMOTE_HOST_ANSYS_BASE:/ansys_inc/v252\" --mount \"$case_dir:/work\" \"$container_name\" /bin/bash -lc \"set -euo pipefail; mkdir -p /work/home /work/tmp; mount -t tmpfs -o size="
-        + str(SLOT_TMPFS_SIZE_GB)
-        + "G tmpfs /work/tmp; cleanup_tmpfs(){ umount /work/tmp >/dev/null 2>&1 || true; }; trap cleanup_tmpfs EXIT; export HOME=/work/home; export TMPDIR=/work/tmp; export XDG_CONFIG_HOME=/work/home/.config; cd /work; export ANS_IGNOREOS=1; bash ./remote_job.sh\"",
+        "    enroot start --root --rw --mount \"$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM\" --mount \"$REMOTE_HOST_ANSYS_BASE:/ansys_inc/v252\" --mount \"$case_dir:/work\" --mount \"$JOB_TMPFS_ROOT:/job_tmpfs\" --mount \"$JOB_DISK_ROOT:/job_disk\" \"$container_name\" /bin/bash -lc \"set -euo pipefail; case_ram_root=/job_tmpfs/$case_name; case_disk_root=/job_disk/$case_name; mkdir -p \\\"$case_ram_root/tmp\\\" \\\"$case_ram_root/ansys_tmp\\\" \\\"$case_disk_root/home\\\" \\\"$case_disk_root/tmp\\\" \\\"$case_disk_root/ansys_tmp\\\"; export HOME=\\\"$case_disk_root/home\\\"; export PEETS_RAMDISK_ROOT=\\\"$case_ram_root\\\"; export PEETS_RAMDISK_TMPDIR=\\\"$case_ram_root/tmp\\\"; export PEETS_RAMDISK_ANSYS_WORK_DIR=\\\"$case_ram_root/ansys_tmp\\\"; export PEETS_DISK_ROOT=\\\"$case_disk_root\\\"; export PEETS_DISK_TMPDIR=\\\"$case_disk_root/tmp\\\"; export PEETS_DISK_ANSYS_WORK_DIR=\\\"$case_disk_root/ansys_tmp\\\"; export ANSYS_WORK_DIR=\\\"$case_ram_root/ansys_tmp\\\"; export TEMP=\\\"$case_disk_root/tmp\\\"; export TMPDIR=\\\"$case_disk_root/tmp\\\"; export XDG_CONFIG_HOME=\\\"$case_disk_root/home/.config\\\"; cd /work; export ANS_IGNOREOS=1; bash ./remote_job.sh\"",
         "  )",
         "}",
         "sync_case_artifacts_back() {",
@@ -3248,7 +3388,7 @@ def _build_worker_payload_script_content(
         "    tar -czf - \"${files[@]}\"",
         "  ) | (",
         "    cd \"$REMOTE_JOB_DIR/$case_name\"",
-        "    tar -xzf -",
+        "    tar --no-same-owner -xzf -",
         "  ) >/dev/null 2>&1 || true",
         "}",
         "sync_bundle_artifacts_back() {",
@@ -3266,7 +3406,7 @@ def _build_worker_payload_script_content(
         "  fi",
         "  tar -czf - \"${files[@]}\" | (",
         "    cd \"$REMOTE_JOB_DIR\"",
-        "    tar -xzf -",
+        "    tar --no-same-owner -xzf -",
         "  ) >/dev/null 2>&1 || true",
         "}",
     ]
@@ -3283,8 +3423,23 @@ def _build_worker_payload_script_content(
     payload_lines.extend(
         [
             "for i in $(seq 1 " + str(case_count) + "); do",
-            "  while [ \"$(count_case_jobs)\" -ge \"$max_parallel\" ]; do",
-            "    wait -n \"${case_pids[@]}\" || true",
+            "  queued_remaining=$(( " + str(case_count) + " - i + 1 ))",
+            "  while true; do",
+            "    active_now=$(count_case_jobs)",
+            "    read -r target_now pressure_now gate_open_now avail_mem_now used_mem_now <<EOF",
+            "  $(compute_target_slots \"$active_now\" \"$queued_remaining\")",
+            "EOF",
+            "    idle_now=$(( target_now - active_now ))",
+            "    if [ \"$idle_now\" -lt 0 ]; then idle_now=0; fi",
+            "    emit_worker_snapshot \"$active_now\" \"$idle_now\" \"$target_now\" \"$pressure_now\" \"$gate_open_now\" \"$queued_remaining\"",
+            "    if [ \"$active_now\" -lt \"$target_now\" ]; then",
+            "      break",
+            "    fi",
+            "    if [ \"$active_now\" -gt 0 ]; then",
+            "      wait -n \"${case_pids[@]}\" || true",
+            "    else",
+            "      sleep \"$PEETS_SLOT_MEMORY_PROBE_INTERVAL\"",
+            "    fi",
             "  done",
             "  case_dir=$(printf 'case_%02d' \"$i\")",
             "  (",
@@ -3325,13 +3480,24 @@ def _build_worker_payload_script_content(
             "    sync_case_artifacts_back \"$case_dir_path\"",
             "  ) &",
             "  case_pids+=(\"$!\")",
+            "  active_now=$(count_case_jobs)",
+            "  queued_after_launch=$(( " + str(case_count) + " - i ))",
+            "  read -r target_now pressure_now gate_open_now avail_mem_now used_mem_now <<EOF",
+            "  $(compute_target_slots \"$active_now\" \"$queued_after_launch\")",
+            "EOF",
+            "  idle_now=$(( target_now - active_now ))",
+            "  if [ \"$idle_now\" -lt 0 ]; then idle_now=0; fi",
+            "  emit_worker_snapshot \"$active_now\" \"$idle_now\" \"$target_now\" \"$pressure_now\" \"$gate_open_now\" \"$queued_after_launch\"",
             "done",
             "while [ \"$(count_case_jobs)\" -gt 0 ]; do",
             "  wait -n \"${case_pids[@]}\" || true",
             "  active_now=$(count_case_jobs)",
-            "  idle_now=$(( max_parallel - active_now ))",
+            "  read -r target_now pressure_now gate_open_now avail_mem_now used_mem_now <<EOF",
+            "  $(compute_target_slots \"$active_now\" 0)",
+            "EOF",
+            "  idle_now=$(( target_now - active_now ))",
             "  if [ \"$idle_now\" -lt 0 ]; then idle_now=0; fi",
-            "  emit_worker_snapshot \"$active_now\" \"$idle_now\"",
+            "  emit_worker_snapshot \"$active_now\" \"$idle_now\" \"$target_now\" \"$pressure_now\" \"$gate_open_now\" 0",
             "done",
         ]
     )
@@ -3417,11 +3583,13 @@ def _build_remote_sbatch_script_content(
     control_plane_return_port = _control_plane_return_port(config)
     exclude_nodes = _slurm_exclude_nodes(config)
     exclude_lines = [f"#SBATCH --exclude={','.join(exclude_nodes)}"] if exclude_nodes else []
+    partition_value = _slurm_partition_value(config)
+    partition_lines = [f"#SBATCH -p {partition_value}"] if partition_value else []
     submit_spool_dir = shlex.quote(remote_path)
     return "\n".join(
         [
             "#!/bin/bash",
-            f"#SBATCH -p {config.partition}",
+            *partition_lines,
             f"#SBATCH -N {config.nodes}",
             f"#SBATCH -n {config.ntasks}",
             f"#SBATCH -c {config.cpus_per_job}",
@@ -3466,7 +3634,7 @@ def _build_remote_sbatch_script_content(
             + submit_spool_dir
             + " && cd "
             + submit_spool_dir
-            + " && tar -xzf -'\" >/dev/null 2>&1 || true",
+            + " && tar --no-same-owner -xzf -'\" >/dev/null 2>&1 || true",
             "}",
             "periodic_upload_loop() {",
             "  while sleep 5; do",
@@ -3504,7 +3672,7 @@ def _build_remote_sbatch_script_content(
             "done",
             "ssh \"${SSH_OPTS[@]}\" \"$SSH_REMOTE\" \"bash -lc 'set -euo pipefail; shopt -s nullglob; cd "
             + submit_spool_dir
-            + " && tar -czf - remote_job.sh remote_worker_payload.sh project_*.aedt'\" | tar -xzf -",
+            + " && tar -czf - remote_job.sh remote_worker_payload.sh project_*.aedt'\" | tar --no-same-owner -xzf -",
             "chmod 700 remote_job.sh remote_worker_payload.sh >/dev/null 2>&1 || true",
             "export REMOTE_JOB_DIR=\"$EXEC_DIR\"",
             "periodic_upload_loop &",

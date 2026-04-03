@@ -34,13 +34,13 @@ class TestValidationLane(unittest.TestCase):
             self.assertFalse(config.continuous_mode)
             self.assertEqual(config.remote_container_runtime, "enroot")
             self.assertEqual(config.ssh_config_path, str(repo_root / ".ssh" / "config"))
-            self.assertEqual(config.host, "gate1-dhj02")
+            self.assertEqual(config.host, "gate1-harry261")
             self.assertEqual(config.remote_root, "~/aedt_runs")
-            self.assertEqual(config.slots_per_job, 5)
-            self.assertEqual(config.cpus_per_job, 20)
+            self.assertEqual(config.slots_per_job, 48)
+            self.assertEqual(config.cpus_per_job, 48)
             self.assertEqual(config.cores_per_slot, 4)
             self.assertEqual(config.tasks_per_slot, 1)
-            self.assertEqual(len(config.accounts_registry), 4)
+            self.assertEqual(len(config.accounts_registry), 1)
 
     def test_build_enroot_validation_lane_config_for_preserve_uses_single_account_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
