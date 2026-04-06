@@ -14,7 +14,7 @@ _PRUNE_ACCOUNTS = (
 _PRESERVE_ACCOUNTS = (
     AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
 )
-_PRUNE_SLURM_PARTITIONS_ALLOWLIST = ("cpu2",)
+_PRUNE_SLURM_PARTITIONS_ALLOWLIST: tuple[str, ...] = ()
 
 
 def _repo_local_ssh_config_path(repo_root: Path) -> str:
@@ -68,7 +68,7 @@ def build_enroot_validation_lane_config(
 
     if lane_key == "prune":
         accounts = _PRUNE_ACCOUNTS
-        cpus_per_job = 48
+        cpus_per_job = 32
         slots_per_job = 48
         cores_per_slot = 4
         tasks_per_slot = 1
@@ -89,7 +89,7 @@ def build_enroot_validation_lane_config(
         partition=partition,
         slurm_partitions_allowlist=_PRUNE_SLURM_PARTITIONS_ALLOWLIST if lane_key == "prune" else (),
         cpus_per_job=cpus_per_job,
-        mem="288G" if lane_key == "prune" and str(mem).strip() == "960G" else mem,
+        mem="192G" if lane_key == "prune" and str(mem).strip() == "960G" else mem,
         time_limit=time_limit,
         remote_root=remote_root,
         continuous_mode=False,

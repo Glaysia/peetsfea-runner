@@ -24,7 +24,7 @@ from .web_status import start_status_server
 
 APP_VERSION = get_version()
 EXPECTED_LANE_NAMES = ("preserve_results", "prune_results")
-_PRUNE_SLURM_PARTITIONS_ALLOWLIST = ("cpu2",)
+_PRUNE_SLURM_PARTITIONS_ALLOWLIST: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +104,7 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
             AccountConfig(account_id="account_04", host_alias="gate1-hmlee31", max_jobs=10),
             AccountConfig(account_id="account_05", host_alias="gate1-dw16", max_jobs=10),
         ),
-        cpus_per_job=48,
+        cpus_per_job=32,
         slots_per_job=48,
         cores_per_slot=4,
         tasks_per_slot=1,
@@ -181,7 +181,7 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
         nodes=1,
         ntasks=1,
         cpus_per_job=lane.cpus_per_job,
-        mem="288G" if lane.lane_id == "prune_results" else "960G",
+        mem="192G" if lane.lane_id == "prune_results" else "960G",
         time_limit="05:00:00",
         remote_root=DEFAULT_REMOTE_ROOT,
         execute_remote=True,
