@@ -24,7 +24,15 @@ from .web_status import start_status_server
 
 APP_VERSION = get_version()
 EXPECTED_LANE_NAMES = ("preserve_results", "prune_results")
-_PRUNE_SLURM_PARTITIONS_ALLOWLIST: tuple[str, ...] = ()
+_PRUNE_SLURM_PARTITIONS_ALLOWLIST = (
+    "cpu2",
+    "gpu1",
+    "gpu2",
+    "gpu3",
+    "gpu4",
+    "gpu5",
+    "gpu6",
+)
 
 
 @dataclass(frozen=True, slots=True)

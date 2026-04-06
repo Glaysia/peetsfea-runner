@@ -14,7 +14,15 @@ _PRUNE_ACCOUNTS = (
 _PRESERVE_ACCOUNTS = (
     AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
 )
-_PRUNE_SLURM_PARTITIONS_ALLOWLIST: tuple[str, ...] = ()
+_PRUNE_SLURM_PARTITIONS_ALLOWLIST = (
+    "cpu2",
+    "gpu1",
+    "gpu2",
+    "gpu3",
+    "gpu4",
+    "gpu5",
+    "gpu6",
+)
 
 
 def _repo_local_ssh_config_path(repo_root: Path) -> str:
