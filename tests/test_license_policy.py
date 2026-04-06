@@ -11,18 +11,27 @@ from peetsfea_runner.license_policy import (
 
 
 class TestLicensePolicy(unittest.TestCase):
-    def test_parse_license_usage_uses_max_of_two_levels(self) -> None:
+    def test_parse_license_usage_uses_root_entries_for_effective_usage(self) -> None:
         snapshot = parse_license_usage(
             """
             Users of elec_solve_level1:  (Total of 550 licenses issued;  Total of 67 licenses in use)
+              root nib110.hpc n110.hpc 1896957 (v2025.0506) (license-server/1055 6785), start Mon 4/6 19:59, PID: 1896801
+              root nib110.hpc n110.hpc 1903224 (v2025.0506) (license-server/1055 18420), start Mon 4/6 20:00, PID: 1902908
+              harry harrypc harrypc 372 (v2025.0506) (license-server/1055 20301), start Mon 4/6 19:42, PID: 224
             Users of elec_solve_level2:  (Total of 550 licenses issued;  Total of 69 licenses in use)
+              root nib116.hpc n116.hpc 1707934 (v2025.0506) (license-server/1055 87029), start Mon 4/6 20:00, PID: 1707668
+              root nib107.hpc n107.hpc 1316733 (v2025.0506) (license-server/1055 134663), start Mon 4/6 20:00, PID: 1316601
+              root nib112.hpc n112.hpc 1781571 (v2025.0506) (license-server/1055 82769), start Mon 4/6 20:01, PID: 1781088
             """
         )
 
         self.assertEqual(snapshot.status, "OK")
-        self.assertEqual(snapshot.level1_in_use, 67)
-        self.assertEqual(snapshot.level2_in_use, 69)
-        self.assertEqual(snapshot.effective_in_use, 69)
+        self.assertEqual(snapshot.level1_in_use, 2)
+        self.assertEqual(snapshot.level2_in_use, 3)
+        self.assertEqual(snapshot.effective_in_use, 3)
+        self.assertEqual(snapshot.reported_level1_in_use, 67)
+        self.assertEqual(snapshot.reported_level2_in_use, 69)
+        self.assertEqual(snapshot.reported_effective_in_use, 69)
 
     def test_parse_license_usage_fails_when_required_lines_missing(self) -> None:
         snapshot = parse_license_usage("Users of elec_solve_level1:  (Total of 550 licenses issued;  Total of 67 licenses in use)")

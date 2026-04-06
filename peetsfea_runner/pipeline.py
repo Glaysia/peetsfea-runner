@@ -299,10 +299,10 @@ class _SlurmTruthAccountState:
 class PipelineConfig:
     input_queue_dir: str
     output_root_dir: str = "./output"
+    runtime_state_path: str = ""
     delete_input_after_upload: bool = True
     rename_input_to_done_on_success: bool = False
     delete_failed_quarantine_dir: str = "./output/_delete_failed"
-    metadata_db_path: str = "./peetsfea_runner.duckdb"
     accounts_registry: tuple[AccountConfig, ...] = field(
         default_factory=lambda: (AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),)
     )
@@ -479,7 +479,6 @@ class PipelineConfig:
             "mem",
             "time_limit",
             "remote_root",
-            "metadata_db_path",
             "control_plane_host",
             "remote_container_ansys_root",
         ):
@@ -651,6 +650,17 @@ class _RemoteExecutionConfig:
 
 def _scan_input_aedt_files(*, input_root: Path, recursive: bool) -> list[Path]:
     return list(_iter_input_aedt_files(input_root=input_root, recursive=recursive))
+
+
+def _runtime_state_path_for_config(config: PipelineConfig) -> Path:
+    configured = str(getattr(config, "runtime_state_path", "") or "").strip()
+    if configured:
+        path = Path(configured).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+    output_root = Path(config.output_root_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    return output_root / ".runtime.state"
 
 
 def _storage_boundary_message(*, config: PipelineConfig) -> str:
@@ -996,7 +1006,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     effective_slot_min_concurrency = _effective_slot_min_concurrency(config=config)
     effective_slot_max_concurrency = _effective_slot_max_concurrency(config=config)
     effective_worker_payload_slot_limit = _effective_worker_payload_slot_limit(config=config)
-    state_store = StateStore(Path(config.metadata_db_path))
+    state_store = StateStore(_runtime_state_path_for_config(config))
     state_store.initialize()
     if config.continuous_mode:
         run_id = state_store.ensure_continuous_run(
@@ -1046,7 +1056,6 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 f"run_id={run_id} {canary_label} validation_lane=started "
                 f"continuous_mode={config.continuous_mode} execute_remote={config.execute_remote} "
                 f"input_dir={config.input_queue_dir} output_root={config.output_root_dir} "
-                f"db_path={config.metadata_db_path} "
                 f"delete_failed_dir={config.delete_failed_quarantine_dir}"
             ),
         )
@@ -1419,6 +1428,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 level1_in_use=snapshot.level1_in_use,
                 level2_in_use=snapshot.level2_in_use,
                 effective_in_use=snapshot.effective_in_use,
+                reported_level1_in_use=snapshot.reported_level1_in_use,
+                reported_level2_in_use=snapshot.reported_level2_in_use,
+                reported_effective_in_use=snapshot.reported_effective_in_use,
                 ceiling=snapshot.ceiling,
                 status=snapshot.status,
                 error=snapshot.error,
@@ -1461,8 +1473,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     level="INFO",
                     stage="LICENSE_POLL_OK",
                     message=(
-                        f"source_host={snapshot.source_host} level1_in_use={snapshot.level1_in_use} "
-                        f"level2_in_use={snapshot.level2_in_use} effective_in_use={snapshot.effective_in_use} "
+                        f"source_host={snapshot.source_host} root_level1_in_use={snapshot.level1_in_use} "
+                        f"root_level2_in_use={snapshot.level2_in_use} effective_in_use={snapshot.effective_in_use} "
+                        f"reported_level1_in_use={snapshot.reported_level1_in_use} "
+                        f"reported_level2_in_use={snapshot.reported_level2_in_use} "
+                        f"reported_effective_in_use={snapshot.reported_effective_in_use} "
                         f"ceiling={snapshot.ceiling}"
                     ),
                 )

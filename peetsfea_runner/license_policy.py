@@ -23,6 +23,8 @@ _LEVEL2_PATTERN = re.compile(
     r"Users of elec_solve_level2:\s+\(Total of \d+ licenses issued;\s+Total of (\d+) licenses in use\)",
     re.IGNORECASE,
 )
+_FEATURE_HEADER_PATTERN = re.compile(r"Users of (elec_solve_level[12]):", re.IGNORECASE)
+_ROOT_ENTRY_PATTERN = re.compile(r"^\s*root\s+\S+", re.IGNORECASE | re.MULTILINE)
 
 
 @dataclass(slots=True, frozen=True)
@@ -34,6 +36,9 @@ class LicenseUsageSnapshot:
     ceiling: int
     status: str
     error: str | None = None
+    reported_level1_in_use: int | None = None
+    reported_level2_in_use: int | None = None
+    reported_effective_in_use: int | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -66,6 +71,24 @@ class _AggregatedAccountState:
     max_active_slots: int
 
 
+def _extract_feature_section(text: str, feature_name: str) -> str | None:
+    normalized_text = text or ""
+    feature_name = feature_name.strip().lower()
+    section_start: int | None = None
+    section_end = len(normalized_text)
+    for match in _FEATURE_HEADER_PATTERN.finditer(normalized_text):
+        found_feature = str(match.group(1) or "").strip().lower()
+        if section_start is None:
+            if found_feature == feature_name:
+                section_start = match.end()
+            continue
+        section_end = match.start()
+        break
+    if section_start is None:
+        return None
+    return normalized_text[section_start:section_end]
+
+
 def parse_license_usage(text: str, *, source_host: str = LICENSE_POLL_SOURCE_HOST) -> LicenseUsageSnapshot:
     level1_match = _LEVEL1_PATTERN.search(text or "")
     level2_match = _LEVEL2_PATTERN.search(text or "")
@@ -80,17 +103,27 @@ def parse_license_usage(text: str, *, source_host: str = LICENSE_POLL_SOURCE_HOS
             level1_in_use=None,
             level2_in_use=None,
             effective_in_use=None,
+            reported_level1_in_use=None,
+            reported_level2_in_use=None,
+            reported_effective_in_use=None,
             ceiling=LICENSE_CEILING,
             status="FAILED",
             error=f"missing_license_lines={','.join(missing)}",
         )
-    level1_in_use = int(level1_match.group(1))
-    level2_in_use = int(level2_match.group(1))
+    reported_level1_in_use = int(level1_match.group(1))
+    reported_level2_in_use = int(level2_match.group(1))
+    level1_section = _extract_feature_section(text or "", "elec_solve_level1") or ""
+    level2_section = _extract_feature_section(text or "", "elec_solve_level2") or ""
+    level1_in_use = len(_ROOT_ENTRY_PATTERN.findall(level1_section))
+    level2_in_use = len(_ROOT_ENTRY_PATTERN.findall(level2_section))
     return LicenseUsageSnapshot(
         source_host=source_host,
         level1_in_use=level1_in_use,
         level2_in_use=level2_in_use,
         effective_in_use=max(level1_in_use, level2_in_use),
+        reported_level1_in_use=reported_level1_in_use,
+        reported_level2_in_use=reported_level2_in_use,
+        reported_effective_in_use=max(reported_level1_in_use, reported_level2_in_use),
         ceiling=LICENSE_CEILING,
         status="OK",
         error=None,

@@ -49,7 +49,7 @@ class ServiceProfile:
     input_queue_root: Path
     output_root: Path
     delete_failed_root: Path
-    db_path: Path
+    state_path: Path
     control_plane_host: str
     control_plane_port: int
     control_plane_ssh_target: str
@@ -74,7 +74,7 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
     input_queue_root = resolved_repo_root / "input_queue"
     output_root = resolved_repo_root / "output"
     delete_failed_root = output_root / "_delete_failed"
-    db_path = resolved_repo_root / "peetsfea_runner.duckdb"
+    state_path = resolved_repo_root / "peetsfea_runner.state"
     control_plane_return_host = "172.16.165.146"
     control_plane_return_port = 22
     control_plane_return_user = service_user
@@ -118,7 +118,7 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
         input_queue_root=input_queue_root,
         output_root=output_root,
         delete_failed_root=delete_failed_root,
-        db_path=db_path,
+        state_path=state_path,
         control_plane_host="127.0.0.1",
         control_plane_port=8765,
         control_plane_ssh_target=control_plane_ssh_target,
@@ -171,10 +171,10 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
     return PipelineConfig(
         input_queue_dir=str(lane.input_root),
         output_root_dir=str(lane.output_root),
+        runtime_state_path=str(profile.state_path),
         delete_input_after_upload=lane.delete_input_after_upload,
         rename_input_to_done_on_success=lane.rename_input_to_done_on_success,
         delete_failed_quarantine_dir=str(profile.delete_failed_root),
-        metadata_db_path=str(profile.db_path),
         accounts_registry=lane.accounts,
         partition="",
         slurm_partitions_allowlist=_PRUNE_SLURM_PARTITIONS_ALLOWLIST if lane.lane_id == "prune_results" else (),
@@ -238,7 +238,7 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
 def _lane_worker_loop(*, profile: ServiceProfile, lane: LaneSpec, stop_event: threading.Event) -> None:
     validate_service_layout(profile=profile)
     config = _lane_pipeline_config(profile, lane)
-    store = StateStore(profile.db_path)
+    store = StateStore(profile.state_path)
     store.initialize()
     runtime_state = _WorkerRuntimeState()
     control_state = _AutorecoveryControlState()
@@ -319,8 +319,10 @@ def run_built_in_service() -> None:
             lease_context = build_lease_server_context(config=_lane_pipeline_config(profile, lane))
             break
 
+    shared_store = StateStore(profile.state_path)
+    shared_store.initialize()
     server = start_status_server(
-        db_path=str(profile.db_path),
+        state_store=shared_store,
         host=profile.web_host,
         port=profile.web_port,
         lease_context=lease_context,

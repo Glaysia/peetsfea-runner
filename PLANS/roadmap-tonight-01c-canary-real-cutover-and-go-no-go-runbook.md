@@ -40,7 +40,7 @@
 
 1. `systemctl --user status peetsfea-runner --no-pager -n 20`
 2. `systemctl --user stop peetsfea-runner`
-3. DB 유지/삭제 규칙 적용
+3. 콜드 스타트 규칙 적용
 4. one-shot validation lane 수행
 5. validation lane output에서 CSV schema gate 확인
 6. `systemctl --user start peetsfea-runner`
@@ -60,7 +60,6 @@ root = repo / "tmp" / "tonight-canary" / window
 input_dir = root / "input"
 output_dir = root / "output"
 delete_failed_dir = root / "delete_failed"
-db_path = root / "state.duckdb"
 input_dir.mkdir(parents=True, exist_ok=True)
 output_dir.mkdir(parents=True, exist_ok=True)
 delete_failed_dir.mkdir(parents=True, exist_ok=True)
@@ -74,7 +73,6 @@ config = PipelineConfig(
     input_queue_dir=str(input_dir),
     output_root_dir=str(output_dir),
     delete_failed_quarantine_dir=str(delete_failed_dir),
-    metadata_db_path=str(db_path),
     accounts_registry=(
         AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
         AccountConfig(account_id="account_03", host_alias="gate1-jji0930", max_jobs=10),
@@ -130,7 +128,6 @@ root = repo / "tmp" / "tonight-canary" / window
 input_dir = root / "input"
 output_dir = root / "output"
 delete_failed_dir = root / "delete_failed"
-db_path = root / "state.duckdb"
 input_dir.mkdir(parents=True, exist_ok=True)
 output_dir.mkdir(parents=True, exist_ok=True)
 delete_failed_dir.mkdir(parents=True, exist_ok=True)
@@ -141,7 +138,6 @@ config = PipelineConfig(
     input_queue_dir=str(input_dir),
     output_root_dir=str(output_dir),
     delete_failed_quarantine_dir=str(delete_failed_dir),
-    metadata_db_path=str(db_path),
     accounts_registry=(
         AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
         AccountConfig(account_id="account_03", host_alias="gate1-jji0930", max_jobs=10),
@@ -192,7 +188,7 @@ PY
   - `00`: `1`
   - `02` 이후 CSV gate green이면 target 값 반영
 - validation lane 산출물은 live continuous service output과 섞지 않는다.
-- validation lane DB는 live service DB와 섞지 않는다.
+- validation lane state는 live service state를 재사용하지 않는다.
 
 실관측 신호는 아래와 같이 둔다.
 

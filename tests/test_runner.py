@@ -21,7 +21,6 @@ class TestRunnerConfig(unittest.TestCase):
                     "PEETSFEA_INPUT_QUEUE_DIR": str(root / "in"),
                     "PEETSFEA_OUTPUT_ROOT_DIR": str(root / "out"),
                     "PEETSFEA_DELETE_FAILED_DIR": str(root / "out" / "_delete_failed"),
-                    "PEETSFEA_DB_PATH": str(root / "state.duckdb"),
                     "PEETSFEA_EXECUTE_REMOTE": "false",
                     "PEETSFEA_CPUS_PER_JOB": "24",
                     "PEETSFEA_MEM": "512G",

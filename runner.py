@@ -3,6 +3,7 @@ import threading
 from pathlib import Path
 
 from peetsfea_runner import AccountConfig, PipelineConfig, __version__, run_pipeline
+from peetsfea_runner.state_store import StateStore
 from peetsfea_runner.web_status import start_status_server
 
 
@@ -26,12 +27,11 @@ def _build_config(workspace_root: Path) -> PipelineConfig:
     delete_failed_dir = Path(
         os.getenv("PEETSFEA_DELETE_FAILED_DIR", str(workspace_root / "output" / "_delete_failed"))
     )
-    metadata_db_path = os.getenv("PEETSFEA_DB_PATH", str(workspace_root / "peetsfea_runner.duckdb"))
     return PipelineConfig(
         input_queue_dir=str(input_dir),
         output_root_dir=str(output_root),
+        runtime_state_path=str(workspace_root / "peetsfea_runner.state"),
         delete_failed_quarantine_dir=str(delete_failed_dir),
-        metadata_db_path=metadata_db_path,
         execute_remote=_env_bool("PEETSFEA_EXECUTE_REMOTE", True),
         partition=os.getenv("PEETSFEA_PARTITION", ""),
         slurm_partitions_allowlist=_env_csv_tuple("PEETSFEA_SLURM_PARTITIONS_ALLOWLIST"),
@@ -69,8 +69,10 @@ def main() -> None:
     if os.getenv("PEETSFEA_EMBED_WEB", "true").strip().lower() in {"1", "true", "yes", "y", "on"}:
         web_host = os.getenv("PEETSFEA_WEB_HOST", "127.0.0.1")
         web_port = int(os.getenv("PEETSFEA_WEB_PORT", "8765"))
+        store = StateStore(workspace_root / "peetsfea_runner.state")
+        store.initialize()
         web_server = start_status_server(
-            db_path=str(workspace_root / "peetsfea_runner.duckdb"),
+            state_store=store,
             host=web_host,
             port=web_port,
         )

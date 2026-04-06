@@ -56,8 +56,6 @@ def build_enroot_validation_lane_config(
     input_dir = root / "input"
     output_dir = root / "output"
     delete_failed_dir = root / "delete_failed"
-    db_path = root / "state.duckdb"
-
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     delete_failed_dir.mkdir(parents=True, exist_ok=True)
@@ -85,7 +83,6 @@ def build_enroot_validation_lane_config(
         input_queue_dir=str(input_dir),
         output_root_dir=str(output_dir),
         delete_failed_quarantine_dir=str(delete_failed_dir),
-        metadata_db_path=str(db_path),
         accounts_registry=accounts,
         execute_remote=True,
         remote_execution_backend="slurm_batch",

@@ -1,83 +1,46 @@
-# Roadmap Tonight 01B: Restart Rediscovery and DB Retention Policy
+# Roadmap Tonight 01B: Restart and Cold-Start State Policy
 
 ## 목적
 
-이 문서는 tonight restart-safe 복구 기준과 DB 보존 정책을 고정한다.
-목표는 `peetsfea_runner.duckdb`를 단순 캐시가 아니라 런타임 상태 저장소로 다루고, 삭제가 필요한 경우를 예외로 한정하는 것이다.
+이 문서는 restart-safe 복구 대신 콜드 스타트 정책을 고정한다.
+현재 기준에서 durable truth는 DB가 아니라 입력/출력 파일시스템이다.
 
 ## 현재 상태
 
-- runner는 restart 후 slurm worker를 rediscover한다.
-- worker 상태, `observed_node`, `tunnel_state`, `heartbeat_ts`는 DuckDB에 저장된다.
-- 현재 DB 경로 기본값은 `/home/peetsmain/peetsfea-runner/peetsfea_runner.duckdb`다.
-- DB를 무조건 삭제하면 restart-safe 복구와 충돌한다.
+- service restart는 old worker/state를 이어받지 않는다.
+- old worker는 cancel 후 새 worker pool을 채운다.
+- 입력의 진실은 `input_queue/**/*.aedt`, `*.ready`, `*.done`이다.
+- 결과의 진실은 `output/**/*.aedt.out`이다.
+- 런타임 상태는 프로세스 메모리와 `*.state` 네임스페이스로만 유지한다.
 
 ## 핵심 변경
 
-- DB 기본 정책은 `유지`다.
-- DB 삭제는 아래 경우만 허용한다.
-  - schema 변경
-  - state 의미 변경
-  - ingest 의미 변경
-- restart-safe 운영 변경에서는 DB를 지우지 않는다.
-- live continuous service DB와 sample canary DB는 분리한다.
-
-판단표는 아래로 고정한다.
-
-| 변경 유형 | DB 처리 |
-| --- | --- |
-| `dispatch.mode` 도입 | 유지 |
-| canary gate 강화 | 유지 |
-| `worker_bundle_multiplier` 조정 | 유지 |
-| bad-node 정책 추가 | 유지 |
-| schema 변경 | 삭제 |
-| state 의미 변경 | 삭제 |
-| ingest 의미 변경 | 삭제 |
-
-rediscovery 성공 조건은 아래와 같이 둔다.
-
-- active slurm worker가 DB에 다시 연결된다.
-- `observed_node`가 다시 보인다.
-- `tunnel_state`가 `CONNECTED` 또는 명확한 `DEGRADED`로 보인다.
-- `heartbeat_ts`가 stale 범위를 벗어나지 않는다.
-
-경로 정책은 아래와 같이 둔다.
-
-- live service DB
-  - `/home/peetsmain/peetsfea-runner/peetsfea_runner.duckdb`
-- validation lane DB
-  - `/home/peetsmain/peetsfea-runner/tmp/tonight-canary/<window>/state.duckdb`
-- validation lane output root
-  - `/home/peetsmain/peetsfea-runner/tmp/tonight-canary/<window>/output`
-- validation lane은 live DB를 재사용하지 않는다.
+- DB 보존/삭제 정책을 폐기한다.
+- restart 정책은 아래로 고정한다.
+  - service stop
+  - old worker cancel
+  - 새 service start
+  - input tree 전체 rescan
+  - `.done`이 아닌 입력 재큐잉
+- stale lease/token은 restart 후 전부 무효다.
+- validation lane은 live output과 섞지 않는 별도 input/output 경로를 사용한다.
 
 ## 운영 절차
 
-1. restart 전 `dispatch.mode=drain`으로 신규 submit을 멈춘다.
-2. 변경 유형을 위 판단표로 분류한다.
-3. DB 유지 변경이면 service stop 후 DB를 건드리지 않고 restart한다.
-4. DB 삭제 변경이면 service가 완전히 내려간 뒤 DB를 삭제하고 restart한다.
-5. sample canary는 dedicated canary DB/output root로 별도 수행한다.
-6. continuous service restart 직후 slurm rediscovery와 tunnel heartbeat를 확인한다.
-7. rediscovery가 깨지면 real `.aedt`로 넘어가지 않는다.
-
-restart 복구와 stale tunnel의 경계는 아래로 둔다.
-
-- stale tunnel은 control-plane 복구 문제다.
-- worker가 slurm에서 계속 `RUNNING`이면 즉시 worker loss로 보지 않는다.
-- DB 유지 restart에서 stale tunnel이 보여도 rediscovery가 되면 다음 판단으로 넘긴다.
+1. restart 전 현재 runner worker를 정리한다.
+2. service를 내린다.
+3. old worker가 남아 있으면 모두 cancel한다.
+4. service를 다시 올린다.
+5. `input_queue`를 처음부터 다시 스캔한다.
+6. `.done`이 아닌 입력이 queue에 다시 올라오는지 확인한다.
+7. 새 worker pool이 목표 수까지 채워지는지 확인한다.
 
 ## 테스트/수용 기준
 
-- DB 유지 restart에서 active worker rediscovery가 된다.
-- schema/state/ingest 변경일 때만 DB 삭제로 분기한다.
-- `observed_node`, `tunnel_state`, `heartbeat_ts`를 restart 후 다시 확인할 수 있다.
-- stale tunnel과 worker loss를 같은 bucket으로 보지 않는다.
-
-수용 기준은 다음과 같다.
-
-- DB 삭제 규칙이 tonight 범위에서 과도하지 않다.
-- restart-safe 변경과 DB reset 변경의 경계가 구현자에게 명확하다.
+- restart 후 old worker가 남지 않는다.
+- restart 후 `.done`이 아닌 입력이 다시 pending으로 인식된다.
+- restart 후 새 worker pool이 정상 제출된다.
+- 런타임 상태 저장소를 운영 진실로 참조하지 않는다.
 
 ## 참고 문서
 

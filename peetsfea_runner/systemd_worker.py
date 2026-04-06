@@ -335,7 +335,6 @@ def _build_config() -> PipelineConfig:
     input_queue_dir = os.getenv("PEETSFEA_INPUT_QUEUE_DIR", str(repo_root / "input_queue"))
     output_root_dir = os.getenv("PEETSFEA_OUTPUT_ROOT_DIR", str(repo_root / "output"))
     delete_failed_dir = os.getenv("PEETSFEA_DELETE_FAILED_DIR", str(repo_root / "output" / "_delete_failed"))
-    metadata_db_path = os.getenv("PEETSFEA_DB_PATH", str(repo_root / "peetsfea_runner.duckdb"))
 
     accounts_registry = _parse_accounts_from_env()
     if not accounts_registry:
@@ -364,9 +363,9 @@ def _build_config() -> PipelineConfig:
     return PipelineConfig(
         input_queue_dir=input_queue_dir,
         output_root_dir=output_root_dir,
+        runtime_state_path=str(repo_root / "peetsfea_runner.state"),
         delete_input_after_upload=_env_bool("PEETSFEA_DELETE_INPUT_AFTER_UPLOAD", True),
         delete_failed_quarantine_dir=delete_failed_dir,
-        metadata_db_path=metadata_db_path,
         accounts_registry=accounts_registry,
         execute_remote=_env_bool("PEETSFEA_EXECUTE_REMOTE", True),
         remote_execution_backend=os.getenv("PEETSFEA_REMOTE_EXECUTION_BACKEND", "slurm_batch"),
@@ -433,14 +432,15 @@ def _start_embedded_web_if_enabled() -> None:
     if not embed_web and backend != "slurm_batch":
         return
     repo_root = Path(__file__).resolve().parent.parent
-    db_path = os.getenv("PEETSFEA_DB_PATH", str(repo_root / "peetsfea_runner.duckdb"))
     host = os.getenv("PEETSFEA_WEB_HOST", "127.0.0.1")
     port = int(os.getenv("PEETSFEA_WEB_PORT", "8765"))
     if port <= 0 or port > 65535:
         raise ValueError("PEETSFEA_WEB_PORT must be in 1..65535")
 
+    store = StateStore(repo_root / "peetsfea_runner.state")
+    store.initialize()
     server = start_status_server(
-        db_path=db_path,
+        state_store=store,
         host=host,
         port=port,
         lease_context=build_lease_server_context(config=_build_pipeline_config_from_env()),
@@ -654,7 +654,7 @@ def run_user_worker_loop() -> None:
 
     config = _build_config()
     _start_embedded_web_if_enabled()
-    store = StateStore(Path(config.metadata_db_path))
+    store = StateStore(Path(config.output_root_dir).expanduser().resolve() / ".runtime.state")
     store.initialize()
     service_name = os.getenv("PEETSFEA_WORKER_SERVICE_NAME", "peetsfea-runner")
     host = socket.gethostname()

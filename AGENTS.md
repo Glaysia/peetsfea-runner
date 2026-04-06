@@ -43,12 +43,12 @@
 1. `/home/peetsmain/.config/systemd/user/peetsfea-runner.service`는 심볼릭 링크를 풀지 말고 직접 수정하지 않는다.
 2. systemd service 변경이 필요하면 `/home/peetsmain/peetsfea-runner/systemd/peetsfea-runner.service`만 수정한다.
 
-## DB Reset Rule
+## Runtime State Rule
 
-1. live DB 기본 정책은 `유지`다. restart-safe 운영 변경, canary gate 강화, throughput knob 조정, telemetry 추가, bad-node 정책 추가만으로는 `/home/peetsmain/peetsfea-runner/peetsfea_runner.duckdb`를 삭제하지 않는다.
-2. DB 삭제는 `schema 변경`, `state 의미 변경`, `ingest 의미 변경`일 때만 허용한다.
-3. DB 삭제가 필요하면 service가 완전히 내려간 뒤에만 수행한다.
-4. sample canary나 validation lane은 live DB를 재사용하지 않고 별도 DB 경로를 사용한다.
+1. durable truth는 DB가 아니라 `input_queue/**/*.aedt`, `*.ready`, `*.done`, `output/**/*.aedt.out`이다.
+2. 런타임 상태는 프로세스 메모리와 `*.state` 네임스페이스를 사용한다.
+3. service restart는 콜드 스타트로 취급하고, old worker/state를 복구하지 않는다.
+4. sample canary나 validation lane은 live output과 섞지 않는 별도 input/output 경로를 사용한다.
 
 ## Input Source Rule
 
@@ -70,7 +70,7 @@
    - `input_queue` 아래 sample이 service ingest 대상이 된다.
    - `output/<lane>/.../sample.aedt.out` 아래 실제 산출물이 materialize 된다.
    - service 정책에 따라 입력이 active queue에서 빠진다. 현재 built-in service는 성공 시 `.done`으로 나가야 한다.
-   - `/api/events/recent` 또는 DB 상태에서 `QUEUED -> submit/worker -> terminal` 진행이 확인된다.
+   - service journal 또는 실행 로그에서 `QUEUED -> submit/worker -> terminal` 진행이 확인된다.
 3. unit test, direct `run_pipeline(config)` validation lane, 원격 수동 probe는 보조 검증일 뿐이며, 이 규칙을 대체하지 못한다.
 4. 위 round-trip이 끝나지 않았으면 복구 완료로 간주하지 말고 계속 수정과 재검증을 반복한다.
 
