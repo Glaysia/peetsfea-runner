@@ -398,7 +398,7 @@ def _build_config() -> PipelineConfig:
         ready_sidecar_suffix=os.getenv("PEETSFEA_READY_SIDECAR_SUFFIX", ".ready"),
         slots_per_job=int(os.getenv("PEETSFEA_SLOTS_PER_JOB", "48")),
         worker_payload_slot_limit=int(os.getenv("PEETSFEA_WORKER_PAYLOAD_SLOT_LIMIT", os.getenv("PEETSFEA_SLOTS_PER_JOB", "48"))),
-        slot_min_concurrency=int(os.getenv("PEETSFEA_SLOT_MIN_CONCURRENCY", "5")),
+        slot_min_concurrency=int(os.getenv("PEETSFEA_SLOT_MIN_CONCURRENCY", "30")),
         slot_max_concurrency=int(os.getenv("PEETSFEA_SLOT_MAX_CONCURRENCY", "48")),
         slot_memory_pressure_high_watermark_percent=int(os.getenv("PEETSFEA_SLOT_MEMORY_PRESSURE_HIGH_WATERMARK_PERCENT", "90")),
         slot_memory_pressure_resume_watermark_percent=int(os.getenv("PEETSFEA_SLOT_MEMORY_PRESSURE_RESUME_WATERMARK_PERCENT", "80")),

@@ -1855,20 +1855,6 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     def _run_pull_control_iteration() -> PipelineResult:
         nonlocal discovered_count, total_slots, readiness_blocked_slots, cutover_blocked_emitted
 
-        scan_files = _scan_input_aedt_files(input_root=input_root, recursive=config.scan_recursive)
-        if scan_files:
-            slots, discovered_delta = _ingest_slot_queue(
-                config=config,
-                state_store=state_store,
-                run_id=run_id,
-                input_root=input_root,
-                output_root=output_root,
-                aedt_files=scan_files,
-            )
-            discovered_count += discovered_delta
-            if slots:
-                queued_slots.extend(slots)
-
         expired_leases = state_store.reap_expired_slot_leases(run_id=run_id)
         for slot_record in expired_leases:
             state_store.append_slot_event(
@@ -1898,6 +1884,51 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             for state, count in slot_counts_before_submit.items()
             if state in {"QUEUED", "RETRY_QUEUED"}
         )
+
+        # Prioritize dispatching already-queued work before walking the entire
+        # input tree again. The live prune lane can contain large recursive
+        # symlink trees, and a full rescan can otherwise delay worker submit
+        # for minutes even when schedulable slots are already queued.
+        if queued_slot_count == 0:
+            immediate_scan_files = _scan_input_aedt_files(input_root=input_root, recursive=False)
+            if immediate_scan_files:
+                slots, discovered_delta = _ingest_slot_queue(
+                    config=config,
+                    state_store=state_store,
+                    run_id=run_id,
+                    input_root=input_root,
+                    output_root=output_root,
+                    aedt_files=immediate_scan_files,
+                )
+                discovered_count += discovered_delta
+                if slots:
+                    queued_slots.extend(slots)
+            slot_counts_before_submit = state_store.count_slots_by_state(run_id=run_id)
+            queued_slot_count = sum(
+                count
+                for state, count in slot_counts_before_submit.items()
+                if state in {"QUEUED", "RETRY_QUEUED"}
+            )
+            if queued_slot_count == 0 and config.scan_recursive:
+                scan_files = _scan_input_aedt_files(input_root=input_root, recursive=True)
+                if scan_files:
+                    slots, discovered_delta = _ingest_slot_queue(
+                        config=config,
+                        state_store=state_store,
+                        run_id=run_id,
+                        input_root=input_root,
+                        output_root=output_root,
+                        aedt_files=scan_files,
+                    )
+                    discovered_count += discovered_delta
+                    if slots:
+                        queued_slots.extend(slots)
+                slot_counts_before_submit = state_store.count_slots_by_state(run_id=run_id)
+                queued_slot_count = sum(
+                    count
+                    for state, count in slot_counts_before_submit.items()
+                    if state in {"QUEUED", "RETRY_QUEUED"}
+                )
 
         refreshed_workers = 0
         requeued_from_workers = 0

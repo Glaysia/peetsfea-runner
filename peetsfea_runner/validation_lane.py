@@ -98,7 +98,7 @@ def build_enroot_validation_lane_config(
         continuous_mode=False,
         slots_per_job=slots_per_job,
         worker_payload_slot_limit=slots_per_job,
-        slot_min_concurrency=5,
+        slot_min_concurrency=30 if lane_key == "prune" else 5,
         slot_max_concurrency=48 if lane_key == "prune" else 2,
         slot_memory_pressure_high_watermark_percent=90,
         slot_memory_pressure_resume_watermark_percent=80,

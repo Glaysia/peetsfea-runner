@@ -202,7 +202,7 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
         ssh_config_path=str(profile.ssh_config_path) if profile.ssh_config_path is not None else "",
         slots_per_job=lane.slots_per_job,
         worker_payload_slot_limit=lane.slots_per_job,
-        slot_min_concurrency=5,
+        slot_min_concurrency=30,
         slot_max_concurrency=48,
         slot_memory_pressure_high_watermark_percent=90,
         slot_memory_pressure_resume_watermark_percent=80,
