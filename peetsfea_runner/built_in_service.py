@@ -106,7 +106,7 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
         input_root=input_queue_root / "prune_results",
         output_root=output_root / "prune_results",
         accounts=(
-            AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=10),
+            AccountConfig(account_id="account_01", host_alias="gate1-harry261", max_jobs=7),
             AccountConfig(account_id="account_02", host_alias="gate1-dhj02", max_jobs=10),
             AccountConfig(account_id="account_03", host_alias="gate1-jji0930", max_jobs=10),
             AccountConfig(account_id="account_04", host_alias="gate1-hmlee31", max_jobs=10),
