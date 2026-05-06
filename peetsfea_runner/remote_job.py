@@ -28,6 +28,7 @@ from .runtime_policy import (
 
 
 class RemoteJobConfig(Protocol):
+    account_id: str
     host: str
     remote_root: str
     partition: str
@@ -2843,6 +2844,7 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "                except Exception as exc:",
         "                    print(f'[WARN] failed to set AEDT HPC license type to Pool: {exc}')",
         "            setup_name = resolve_first_setup_name(solve_hfss, project_file, solve_design_name)",
+        "            analyze_warning = None",
         "            solved = solve_hfss.analyze(",
         "                setup=setup_name,",
         "                cores=cores,",
@@ -2851,9 +2853,10 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "                blocking=True,",
         "            )",
         "            if not solved:",
-        "                raise RuntimeError(",
+        "                analyze_warning = (",
         "                    f'HFSS analyze returned false for project={solve_project_name!r} setup={setup_name!r}'",
         "                )",
+        "                print(f'[WARN] {analyze_warning}; continuing to report export before final classification')",
         "            remove_lock_files(workdir)",
         "            save_project = getattr(solve_hfss, 'save_project', None)",
         "            if callable(save_project):",
@@ -2866,6 +2869,8 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "                        error_log_path.unlink()",
         "                except Exception as exc:",
         "                    (workdir / REPORT_EXPORT_ERROR_LOG_NAME).write_text(str(exc), encoding='utf-8')",
+        "                    if analyze_warning:",
+        "                        raise RuntimeError(f'{analyze_warning}; report export failed: {exc}') from exc",
         "                    print(f'[WARN] design report export failed but solve completed: {exc}')",
         "            return 0",
         "    finally:",
@@ -3115,9 +3120,15 @@ def _build_worker_payload_script_content(
         "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}",
         f"REMOTE_RUNTIME_ROOT={_double_quoted_shell_value(runtime_root)}",
         "mkdir -p \"$REMOTE_RUNTIME_ROOT\"",
-        "workdir=$(mktemp -d \"$REMOTE_RUNTIME_ROOT/slot.${SLURM_JOB_ID:-nojob}.XXXXXX\")",
+        "if [ -n \"${PEETS_JOB_WORKDIR:-}\" ]; then",
+        "  workdir=\"$PEETS_JOB_WORKDIR\"",
+        "else",
+        "  workdir=$(mktemp -d \"$REMOTE_RUNTIME_ROOT/slot.${SLURM_JOB_ID:-nojob}.XXXXXX\")",
+        "  export PEETS_JOB_WORKDIR=\"$workdir\"",
+        "fi",
         "JOB_TMPFS_ROOT=\"$workdir/job_tmpfs\"",
         "JOB_DISK_ROOT=\"$workdir/job_disk\"",
+        "ENROOT_CREATE_LOCK=\"$workdir/enroot-create.lock\"",
         "JOB_DISK_BUDGET_GB=" + str(JOB_DISK_FILESYSTEM_SIZE_GB),
         "enter_job_filesystem_namespace() {",
         "  mkdir -p \"$JOB_TMPFS_ROOT\" \"$JOB_DISK_ROOT\"",
@@ -3420,14 +3431,18 @@ def _build_worker_payload_script_content(
         "    case_ram_root=\"$JOB_TMPFS_ROOT/$case_name\"",
         "    case_disk_root=\"$JOB_DISK_ROOT/$case_name\"",
         "    mkdir -p \"$case_ram_root/tmp\" \"$case_ram_root/ansys_tmp\" \"$case_disk_root/home\" \"$case_disk_root/tmp\" \"$case_disk_root/ansys_tmp\"",
-        "    enroot_base=\"$REMOTE_RUNTIME_ROOT/enroot/${SLURM_JOB_ID:-nojob}/${case_name}-$$\"",
+        "    enroot_base=\"$JOB_TMPFS_ROOT/enroot/${SLURM_JOB_ID:-nojob}/${case_name}-$$\"",
         "    export ENROOT_RUNTIME_PATH=\"$enroot_base/runtime\"",
         "    export ENROOT_CACHE_PATH=\"$enroot_base/cache\"",
         "    export ENROOT_DATA_PATH=\"$enroot_base/data\"",
         "    export ENROOT_TEMP_PATH=\"$enroot_base/tmp\"",
         "    mkdir -p \"$ENROOT_RUNTIME_PATH\" \"$ENROOT_CACHE_PATH\" \"$ENROOT_DATA_PATH\" \"$ENROOT_TEMP_PATH\"",
         "    chmod 700 \"$ENROOT_RUNTIME_PATH\" \"$ENROOT_CACHE_PATH\" \"$ENROOT_DATA_PATH\" \"$ENROOT_TEMP_PATH\"",
-        "    enroot create -f -n \"$container_name\" \"$REMOTE_CONTAINER_IMAGE\" >/dev/null",
+        "    if command -v flock >/dev/null 2>&1; then",
+        "      ( flock 9; enroot create -f -n \"$container_name\" \"$REMOTE_CONTAINER_IMAGE\" >/dev/null ) 9>\"$ENROOT_CREATE_LOCK\"",
+        "    else",
+        "      enroot create -f -n \"$container_name\" \"$REMOTE_CONTAINER_IMAGE\" >/dev/null",
+        "    fi",
         "    trap 'enroot remove -f \"$container_name\" >/dev/null 2>&1 || true; rm -rf \"$enroot_base\" >/dev/null 2>&1 || true' EXIT",
         "    enroot start --root --rw --mount \"$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM\" --mount \"$REMOTE_HOST_ANSYS_BASE:/ansys_inc/v252\" --mount \"$REMOTE_HOST_ANSYS_BASE/licensingclient:/mnt/licensingclient\" --mount \"$case_dir:/work\" --mount \"$JOB_TMPFS_ROOT:/job_tmpfs\" --mount \"$JOB_DISK_ROOT:/job_disk\" \"$container_name\" /bin/bash -lc \"set -euo pipefail; case_ram_root=/job_tmpfs/$case_name; case_disk_root=/job_disk/$case_name; mkdir -p \\\"$case_ram_root/tmp\\\" \\\"$case_ram_root/ansys_tmp\\\" \\\"$case_disk_root/home\\\" \\\"$case_disk_root/tmp\\\" \\\"$case_disk_root/ansys_tmp\\\"; export HOME=\\\"$case_disk_root/home\\\"; export PEETS_RAMDISK_ROOT=\\\"$case_ram_root\\\"; export PEETS_RAMDISK_TMPDIR=\\\"$case_ram_root/tmp\\\"; export PEETS_RAMDISK_ANSYS_WORK_DIR=\\\"$case_ram_root/ansys_tmp\\\"; export PEETS_DISK_ROOT=\\\"$case_disk_root\\\"; export PEETS_DISK_TMPDIR=\\\"$case_disk_root/tmp\\\"; export PEETS_DISK_ANSYS_WORK_DIR=\\\"$case_disk_root/ansys_tmp\\\"; export ANSYS_WORK_DIR=\\\"$case_ram_root/ansys_tmp\\\"; export TMP=\\\"$case_disk_root/tmp\\\"; export TEMP=\\\"$case_disk_root/tmp\\\"; export TMPDIR=\\\"$case_disk_root/tmp\\\"; export XDG_CONFIG_HOME=\\\"$case_disk_root/home/.config\\\"; cd /work; export ANS_IGNOREOS=1; bash ./remote_job.sh\"",
         "  )",
@@ -3630,12 +3645,18 @@ def _build_pull_worker_payload_script_content(
         "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}",
         f"REMOTE_RUNTIME_ROOT={_double_quoted_shell_value(runtime_root)}",
         "mkdir -p \"$REMOTE_RUNTIME_ROOT\"",
-        "workdir=$(mktemp -d \"$REMOTE_RUNTIME_ROOT/pull.${SLURM_JOB_ID:-nojob}.XXXXXX\")",
+        "if [ -n \"${PEETS_JOB_WORKDIR:-}\" ]; then",
+        "  workdir=\"$PEETS_JOB_WORKDIR\"",
+        "else",
+        "  workdir=$(mktemp -d \"$REMOTE_RUNTIME_ROOT/pull.${SLURM_JOB_ID:-nojob}.XXXXXX\")",
+        "  export PEETS_JOB_WORKDIR=\"$workdir\"",
+        "fi",
         "slots_root=\"$workdir/slots\"",
         "artifacts_root=\"$workdir/artifacts\"",
         "mkdir -p \"$slots_root\" \"$artifacts_root\"",
         "JOB_TMPFS_ROOT=\"$workdir/job_tmpfs\"",
         "JOB_DISK_ROOT=\"$workdir/job_disk\"",
+        "ENROOT_CREATE_LOCK=\"$workdir/enroot-create.lock\"",
         "JOB_DISK_BUDGET_GB=" + str(JOB_DISK_FILESYSTEM_SIZE_GB),
         "enter_job_filesystem_namespace() {",
         "  mkdir -p \"$JOB_TMPFS_ROOT\" \"$JOB_DISK_ROOT\"",
@@ -4161,7 +4182,7 @@ def _build_pull_worker_payload_script_content(
         "  session_ram_root=\"$JOB_TMPFS_ROOT/$session_id\"",
         "  session_disk_root=\"$JOB_DISK_ROOT/$session_id\"",
         "  mkdir -p \"$session_root\" \"$session_ram_root/tmp\" \"$session_ram_root/ansys_tmp\" \"$session_disk_root/home\" \"$session_disk_root/tmp\" \"$session_disk_root/ansys_tmp\"",
-        "  enroot_base=\"$REMOTE_RUNTIME_ROOT/enroot/${SLURM_JOB_ID:-nojob}/${session_id}-$$\"",
+        "  enroot_base=\"$JOB_TMPFS_ROOT/enroot/${SLURM_JOB_ID:-nojob}/${session_id}-$$\"",
         "  bootstrap_create_stdout=\"$session_root/enroot.create.stdout\"",
         "  bootstrap_create_stderr=\"$session_root/enroot.create.stderr\"",
         "  bootstrap_start_stdout=\"$session_root/session.stdout\"",
@@ -4169,7 +4190,11 @@ def _build_pull_worker_payload_script_content(
         "  mkdir -p \"$enroot_base/runtime\" \"$enroot_base/cache\" \"$enroot_base/data\" \"$enroot_base/tmp\"",
         "  chmod 700 \"$enroot_base/runtime\" \"$enroot_base/cache\" \"$enroot_base/data\" \"$enroot_base/tmp\"",
         "  write_slot_session_bootstrap_script \"$session_id\" \"$session_root\" \"$grpc_port\"",
-        "  ENROOT_RUNTIME_PATH=\"$enroot_base/runtime\" ENROOT_CACHE_PATH=\"$enroot_base/cache\" ENROOT_DATA_PATH=\"$enroot_base/data\" ENROOT_TEMP_PATH=\"$enroot_base/tmp\" enroot create -f -n \"$container_name\" \"$REMOTE_CONTAINER_IMAGE\" >\"$bootstrap_create_stdout\" 2>\"$bootstrap_create_stderr\"",
+        "  if command -v flock >/dev/null 2>&1; then",
+        "    ( flock 9; ENROOT_RUNTIME_PATH=\"$enroot_base/runtime\" ENROOT_CACHE_PATH=\"$enroot_base/cache\" ENROOT_DATA_PATH=\"$enroot_base/data\" ENROOT_TEMP_PATH=\"$enroot_base/tmp\" enroot create -f -n \"$container_name\" \"$REMOTE_CONTAINER_IMAGE\" >\"$bootstrap_create_stdout\" 2>\"$bootstrap_create_stderr\" ) 9>\"$ENROOT_CREATE_LOCK\"",
+        "  else",
+        "    ENROOT_RUNTIME_PATH=\"$enroot_base/runtime\" ENROOT_CACHE_PATH=\"$enroot_base/cache\" ENROOT_DATA_PATH=\"$enroot_base/data\" ENROOT_TEMP_PATH=\"$enroot_base/tmp\" enroot create -f -n \"$container_name\" \"$REMOTE_CONTAINER_IMAGE\" >\"$bootstrap_create_stdout\" 2>\"$bootstrap_create_stderr\"",
+        "  fi",
         "  rm -f \"$session_root/session.ready\" \"$session_root/ansys.pid\"",
         "  ENROOT_RUNTIME_PATH=\"$enroot_base/runtime\" ENROOT_CACHE_PATH=\"$enroot_base/cache\" ENROOT_DATA_PATH=\"$enroot_base/data\" ENROOT_TEMP_PATH=\"$enroot_base/tmp\" \\",
         "    enroot start --root --rw --mount \"$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM\" --mount \"$REMOTE_HOST_ANSYS_BASE:/ansys_inc/v252\" --mount \"$REMOTE_HOST_ANSYS_BASE/licensingclient:/mnt/licensingclient\" --mount \"$session_root:/work\" --mount \"$JOB_TMPFS_ROOT:/job_tmpfs\" --mount \"$JOB_DISK_ROOT:/job_disk\" \"$container_name\" /bin/bash /work/session_bootstrap.sh > \"$bootstrap_start_stdout\" 2> \"$bootstrap_start_stderr\" &",
@@ -4551,6 +4576,7 @@ def _build_pull_remote_sbatch_script_content(
 ) -> str:
     remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
     exec_root = _remote_submit_root_shell_path(config=config)
+    account_id = str(getattr(config, "account_id", "") or "account_01")
     control_plane_ssh_target = _control_plane_ssh_target(config)
     control_plane_return_host = _control_plane_return_host(config)
     control_plane_return_user = _control_plane_return_user(config)
@@ -4585,7 +4611,7 @@ def _build_pull_remote_sbatch_script_content(
             f"export PEETS_CONTROL_RETURN_USER={shlex.quote(control_plane_return_user)}",
             f"export PEETS_CONTROL_RETURN_PORT={control_plane_return_port}",
             f"export PEETS_CONTROL_HEARTBEAT_INTERVAL={max(5, int(getattr(config, 'tunnel_recovery_grace_seconds', 30)))}",
-            "export PEETS_ACCOUNT_ID=\"${PEETS_ACCOUNT_ID:-account_01}\"",
+            f"export PEETS_ACCOUNT_ID={shlex.quote(account_id)}",
             "SUBMIT_HOST=\"${SLURM_SUBMIT_HOST:-}\"",
             "SUBMIT_USER=\"${USER:-$(id -un)}\"",
             "SSH_REMOTE=\"${SUBMIT_USER}@${SUBMIT_HOST}\"",
@@ -4653,7 +4679,7 @@ def _build_pull_remote_sbatch_script_content(
             + " && tar -czf - remote_job.sh remote_pull_worker_payload.sh'\" | tar --no-same-owner -xzf -",
             "chmod 700 remote_job.sh remote_pull_worker_payload.sh >/dev/null 2>&1 || true",
             "export REMOTE_JOB_DIR=\"$EXEC_DIR\"",
-            "export PEETS_ACCOUNT_ID=\"${PEETS_ACCOUNT_ID:-account_01}\"",
+            f"export PEETS_ACCOUNT_ID={shlex.quote(account_id)}",
             "./remote_pull_worker_payload.sh > worker.stdout 2> worker.stderr",
         ]
     ) + "\n"

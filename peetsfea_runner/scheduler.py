@@ -830,7 +830,7 @@ else
   MISSING+=("scratch_root")
 fi
 if [ -d "$SCRATCH_ROOT" ]; then
-  SCRATCH_USAGE_MB=$(du -sm "$SCRATCH_ROOT" 2>/dev/null | awk 'NR==1 {{print $1+0}}' || echo 0)
+  SCRATCH_USAGE_MB=$(df -Pm "$SCRATCH_ROOT" 2>/dev/null | awk 'NR==2 {{print $3+0}}' || echo 0)
 fi
 if [ "$IMAGE_OK" -eq 1 ] && [ "$MODULE_OK" -eq 1 ] && [ -d "$SCRATCH_ROOT" ] && [ -w "$SCRATCH_ROOT" ]; then
   RUNTIME_OK=1
@@ -914,7 +914,7 @@ else
   MISSING+=("scratch_root")
 fi
 if [ -d "$SCRATCH_ROOT" ]; then
-  SCRATCH_USAGE_MB=$(du -sm "$SCRATCH_ROOT" 2>/dev/null | awk 'NR==1 {{print $1+0}}' || echo 0)
+  SCRATCH_USAGE_MB=$(df -Pm "$SCRATCH_ROOT" 2>/dev/null | awk 'NR==2 {{print $3+0}}' || echo 0)
 fi
 if [ "$IMAGE_OK" -eq 1 ] && [ "$MODULE_OK" -eq 1 ] && [ -d "$RUNTIME_ROOT" ] && [ -w "$RUNTIME_ROOT" ]; then
   RUNTIME_OK=1

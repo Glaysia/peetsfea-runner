@@ -606,6 +606,7 @@ class _BundleRuntimeOutcome:
 
 @dataclass(slots=True)
 class _RemoteExecutionConfig:
+    account_id: str
     host: str
     remote_root: str
     partition: str
@@ -1163,6 +1164,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 if account is None:
                     continue
                 remote_cfg = _RemoteExecutionConfig(
+                    account_id=account.account_id,
                     host=account.host_alias,
                     remote_root=config.remote_root,
                     partition=config.partition,
@@ -1270,6 +1272,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     if config.execute_remote:
         for account in accounts:
             janitor_cfg = _RemoteExecutionConfig(
+                account_id=account.account_id,
                 host=account.host_alias,
                 remote_root=config.remote_root,
                 partition=config.partition,
@@ -1826,6 +1829,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
 
     def _pull_remote_cfg(account: AccountConfig) -> _RemoteExecutionConfig:
         return _RemoteExecutionConfig(
+            account_id=account.account_id,
             host=account.host_alias,
             remote_root=config.remote_root,
             partition=config.partition,
@@ -2570,6 +2574,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     if config.execute_remote:
         for account in accounts:
             cleanup_cfg = _RemoteExecutionConfig(
+                account_id=account.account_id,
                 host=account.host_alias,
                 remote_root=config.remote_root,
                 partition=config.partition,
@@ -2996,6 +3001,7 @@ def _run_bundle_with_retry(
         )
 
     remote_cfg = _RemoteExecutionConfig(
+        account_id=bundle.account_id,
         host=bundle.host_alias,
         remote_root=config.remote_root,
         partition=config.partition,

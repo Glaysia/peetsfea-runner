@@ -95,6 +95,8 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("settings.aedt_environment_variables[env_key] = env_value", content)
         self.assertIn("def use_ansys_launch_env() -> object:", content)
         self.assertIn("with use_ansys_launch_env():", content)
+        self.assertIn("continuing to report export before final classification", content)
+        self.assertIn("report export failed: {exc}", content)
         self.assertIn("def connect_grpc_desktop(grpc_port: int, *, close_on_exit: bool) -> Desktop:", content)
         self.assertIn("def release_desktop_session(handle: Any, *, close_projects: bool, close_desktop: bool) -> None:", content)
         self.assertIn("{'close_projects': close_projects, 'close_desktop': close_desktop}", content)
@@ -422,6 +424,11 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("ssh_args+=(-o IdentitiesOnly=yes -i \"$PEETS_CONTROL_SSH_IDENTITY\")", content)
         self.assertIn("PEETS_CONTROL_LOCAL_PORT=$((PEETS_CONTROL_PORT + 1000 + (${SLURM_JOB_ID:-0} % 1000)))", content)
         self.assertIn('REMOTE_RUNTIME_ROOT="$HOME/aedt_runs/_runtime"', content)
+        self.assertIn('if [ -n "${PEETS_JOB_WORKDIR:-}" ]; then', content)
+        self.assertIn('export PEETS_JOB_WORKDIR="$workdir"', content)
+        self.assertIn('ENROOT_CREATE_LOCK="$workdir/enroot-create.lock"', content)
+        self.assertIn('enroot_base="$JOB_TMPFS_ROOT/enroot/${SLURM_JOB_ID:-nojob}/${session_id}-$$"', content)
+        self.assertIn('flock 9; ENROOT_RUNTIME_PATH="$enroot_base/runtime"', content)
         self.assertNotIn("/tmp/$USER/peetsfea-runner/runtime", content)
         self.assertIn('export TMP="$PWD/tmp"', content)
         self.assertIn('export TEMP="$PWD/tmp"', content)
@@ -430,6 +437,7 @@ class TestPlan03Workflow(unittest.TestCase):
 
     def test_pull_remote_sbatch_only_stages_scripts(self) -> None:
         class _Cfg:
+            account_id = "account_03"
             host = "gate1-harry261"
             remote_root = "~/aedt_runs"
             partition = "cpu2"
@@ -490,6 +498,8 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertNotIn("results.tgz", content)
         self.assertIn("PEETS_CONTROL_WORKER_ID=worker_01", content)
         self.assertIn("PEETS_CONTROL_RUN_ID=run_01", content)
+        self.assertIn("export PEETS_ACCOUNT_ID=account_03", content)
+        self.assertNotIn('export PEETS_ACCOUNT_ID="${PEETS_ACCOUNT_ID:-account_01}"', content)
 
     def test_enroot_worker_payload_uses_cd_then_mount_contract(self) -> None:
         class _Cfg:
@@ -517,9 +527,13 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("PEETS_REMOTE_CONTAINER_RUNTIME=enroot", content)
         self.assertIn('REMOTE_HOST_ANSYS_ROOT="/opt/ohpc/pub/Electronics/v252/AnsysEM"', content)
         self.assertIn('REMOTE_HOST_ANSYS_BASE="/opt/ohpc/pub/Electronics/v252"', content)
-        self.assertIn('enroot_base="$REMOTE_RUNTIME_ROOT/enroot/${SLURM_JOB_ID:-nojob}/${case_name}-$$"', content)
+        self.assertIn('if [ -n "${PEETS_JOB_WORKDIR:-}" ]; then', content)
+        self.assertIn('export PEETS_JOB_WORKDIR="$workdir"', content)
+        self.assertIn('ENROOT_CREATE_LOCK="$workdir/enroot-create.lock"', content)
+        self.assertIn('enroot_base="$JOB_TMPFS_ROOT/enroot/${SLURM_JOB_ID:-nojob}/${case_name}-$$"', content)
         self.assertIn('(\n    container_name="peets-${SLURM_JOB_ID:-nojob}-${case_name}-$$"', content)
         self.assertIn('container_name="peets-${SLURM_JOB_ID:-nojob}-${case_name}-$$"', content)
+        self.assertIn('flock 9; enroot create -f -n "$container_name" "$REMOTE_CONTAINER_IMAGE" >/dev/null', content)
         self.assertIn('enroot create -f -n "$container_name" "$REMOTE_CONTAINER_IMAGE" >/dev/null', content)
         self.assertIn('JOB_TMPFS_ROOT="$workdir/job_tmpfs"', content)
         self.assertIn('JOB_DISK_ROOT="$workdir/job_disk"', content)
