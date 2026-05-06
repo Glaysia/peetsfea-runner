@@ -216,7 +216,7 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
         slot_memory_pressure_resume_watermark_percent=80,
         slot_memory_probe_interval_seconds=5,
         worker_pool_size=50,
-        lease_ttl_seconds=120,
+        lease_ttl_seconds=600,
         lease_heartbeat_seconds=15,
         worker_idle_poll_seconds=10,
         slot_request_backoff_seconds=5,

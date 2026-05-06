@@ -4,7 +4,9 @@ from typing import Final
 
 
 DEFAULT_REMOTE_ROOT: Final[str] = "~/aedt_runs"
+REMOTE_COMPUTE_ROOT: Final[str] = "/tmp/$USER/peetsfea-runner"
 REMOTE_RUNTIME_DIRNAME: Final[str] = "_runtime"
+REMOTE_SUBMIT_DIRNAME: Final[str] = "_submit"
 REMOTE_SCRATCH_SOFT_LIMIT_MB: Final[int] = 80 * 1024
 REMOTE_SCRATCH_HARD_LIMIT_MB: Final[int] = 90 * 1024
 RUNTIME_PROBE_CACHE_TTL_SECONDS: Final[int] = 30 * 60
@@ -21,4 +23,12 @@ def join_remote_root(remote_root: str, suffix: str) -> str:
 
 
 def remote_runtime_root(remote_root: str) -> str:
+    if str(remote_root).strip() in {"", DEFAULT_REMOTE_ROOT}:
+        return join_remote_root(REMOTE_COMPUTE_ROOT, REMOTE_RUNTIME_DIRNAME)
     return join_remote_root(remote_root, REMOTE_RUNTIME_DIRNAME)
+
+
+def remote_submit_root(remote_root: str) -> str:
+    if str(remote_root).strip() in {"", DEFAULT_REMOTE_ROOT}:
+        return join_remote_root(REMOTE_COMPUTE_ROOT, REMOTE_SUBMIT_DIRNAME)
+    return join_remote_root(remote_root, REMOTE_SUBMIT_DIRNAME)

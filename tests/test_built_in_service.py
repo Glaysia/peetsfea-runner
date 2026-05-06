@@ -130,7 +130,7 @@ class TestBuiltInService(unittest.TestCase):
             self.assertEqual(prune_cfg.slot_max_concurrency, 5)
             self.assertEqual(prune_cfg.worker_bundle_multiplier, 4)
             self.assertEqual(prune_cfg.worker_pool_size, 50)
-            self.assertEqual(prune_cfg.lease_ttl_seconds, 120)
+            self.assertEqual(prune_cfg.lease_ttl_seconds, 600)
             self.assertEqual(prune_cfg.lease_heartbeat_seconds, 15)
 
 

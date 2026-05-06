@@ -24,6 +24,7 @@ from .runtime_policy import (
     RUNTIME_JANITOR_MIN_TTL_SECONDS,
     join_remote_root,
     remote_runtime_root,
+    remote_submit_root,
 )
 
 
@@ -1530,7 +1531,7 @@ def _remote_runtime_root_shell_path(*, config: RemoteJobConfig) -> str:
 
 
 def _remote_submit_root(config: RemoteJobConfig) -> str:
-    return join_remote_root(getattr(config, "remote_root", "~/aedt_runs"), "_submit")
+    return remote_submit_root(getattr(config, "remote_root", "~/aedt_runs"))
 
 
 def _remote_submit_root_shell_path(*, config: RemoteJobConfig) -> str:
@@ -4530,6 +4531,7 @@ def _build_remote_sbatch_script_content(
             "cd \"$EXEC_DIR\"",
             "printf 'hostname=%s\\n' \"$(hostname 2>/dev/null || true)\" > launch_probe.txt",
             "printf 'pwd=%s\\n' \"$PWD\" >> launch_probe.txt",
+            "printf 'exec_root=%s\\n' \"$REMOTE_RUNTIME_ROOT\" >> launch_probe.txt",
             "printf 'path=%s\\n' \"$PATH\" >> launch_probe.txt",
             "printf 'submit_host=%s\\n' \"$SUBMIT_HOST\" >> launch_probe.txt",
             "printf 'submit_spool_dir=%s\\n' \"$SUBMIT_SPOOL_DIR\" >> launch_probe.txt",
@@ -4654,6 +4656,7 @@ def _build_pull_remote_sbatch_script_content(
             "cd \"$EXEC_DIR\"",
             "printf 'hostname=%s\\n' \"$(hostname 2>/dev/null || true)\" > launch_probe.txt",
             "printf 'pwd=%s\\n' \"$PWD\" >> launch_probe.txt",
+            "printf 'exec_root=%s\\n' \"$EXEC_ROOT\" >> launch_probe.txt",
             "printf 'submit_host=%s\\n' \"$SUBMIT_HOST\" >> launch_probe.txt",
             "printf 'submit_spool_dir=%s\\n' \"$SUBMIT_SPOOL_DIR\" >> launch_probe.txt",
             "stage_control_ssh_identity() {",
