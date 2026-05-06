@@ -22,6 +22,7 @@ from .runtime_policy import (
     JOB_DISK_FILESYSTEM_SIZE_GB,
     JOB_TMPFS_SIZE_GB,
     RUNTIME_JANITOR_MIN_TTL_SECONDS,
+    join_remote_root,
     remote_runtime_root,
 )
 
@@ -1527,6 +1528,14 @@ def _remote_runtime_root_shell_path(*, config: RemoteJobConfig) -> str:
     return _remote_path_for_shell(config=config, path=_remote_runtime_root(config))
 
 
+def _remote_submit_root(config: RemoteJobConfig) -> str:
+    return join_remote_root(getattr(config, "remote_root", "~/aedt_runs"), "_submit")
+
+
+def _remote_submit_root_shell_path(*, config: RemoteJobConfig) -> str:
+    return _remote_path_for_shell(config=config, path=_remote_submit_root(config))
+
+
 def _double_quoted_shell_value(value: str) -> str:
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -1549,6 +1558,7 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "export PEETS_DISK_ANSYS_WORK_DIR=\"${PEETS_DISK_ANSYS_WORK_DIR:-$PEETS_DISK_ROOT/ansys_tmp}\"",
         "mkdir -p \"$HOME\" \"$PEETS_RAMDISK_TMPDIR\" \"$PEETS_RAMDISK_ANSYS_WORK_DIR\" \"$PEETS_DISK_TMPDIR\" \"$PEETS_DISK_ANSYS_WORK_DIR\"",
         "export ANSYS_WORK_DIR=\"${ANSYS_WORK_DIR:-$PEETS_RAMDISK_ANSYS_WORK_DIR}\"",
+        "export TMP=\"${TMP:-$PEETS_DISK_TMPDIR}\"",
         "export TEMP=\"${TEMP:-$PEETS_DISK_TMPDIR}\"",
         "export TMPDIR=\"${TMPDIR:-$PEETS_DISK_TMPDIR}\"",
         "",
@@ -1600,7 +1610,7 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "",
         "settings.wait_for_license = True",
         "settings.skip_license_check = False",
-        "for env_key in ('ANSYSLMD_LICENSE_FILE', 'ANSYSEM_ROOT252', 'ANS_IGNOREOS'):",
+        "for env_key in ('ANSYSLMD_LICENSE_FILE', 'ANSYSEM_ROOT252', 'ANS_IGNOREOS', 'ANSYS_WORK_DIR', 'TMP', 'TEMP', 'TMPDIR'):",
         "    env_value = os.environ.get(env_key, '').strip()",
         "    if env_value:",
         "        settings.aedt_environment_variables[env_key] = env_value",
@@ -2777,8 +2787,11 @@ def _build_remote_job_script_content(*, emit_output_variables_csv: bool = True) 
         "    ansys_work_dir = Path(os.environ.get('ANSYS_WORK_DIR', str(tmpdir / 'ansys_tmp'))).resolve()",
         "    ansys_work_dir.mkdir(parents=True, exist_ok=True)",
         "    os.environ['ANSYS_WORK_DIR'] = str(ansys_work_dir)",
+        "    os.environ['TMP'] = str(tmpdir)",
         "    os.environ['TEMP'] = str(tmpdir)",
         "    os.environ['TMPDIR'] = str(tmpdir)",
+        "    for env_key in ('ANSYS_WORK_DIR', 'TMP', 'TEMP', 'TMPDIR'):",
+        "        settings.aedt_environment_variables[env_key] = os.environ[env_key]",
         "    cores = int(os.environ.get('PEETS_SLOT_CORES', '4'))",
         "    tasks = int(os.environ.get('PEETS_SLOT_TASKS', '1'))",
         "    remove_lock_files(workdir)",
@@ -2918,6 +2931,11 @@ def _build_windows_remote_job_script_content() -> str:
         "        raise FileNotFoundError(project_file)",
         "    tmpdir = workdir / 'tmp'",
         "    tmpdir.mkdir(parents=True, exist_ok=True)",
+        "    ansys_work_dir = tmpdir / 'ansys_tmp'",
+        "    ansys_work_dir.mkdir(parents=True, exist_ok=True)",
+        "    os.environ['ANSYS_WORK_DIR'] = str(ansys_work_dir)",
+        "    os.environ['TMP'] = str(tmpdir)",
+        "    os.environ['TEMP'] = str(tmpdir)",
         "    os.environ['TMPDIR'] = str(tmpdir)",
         "    cores = int(os.environ.get('PEETS_SLOT_CORES', '4'))",
         "    tasks = int(os.environ.get('PEETS_SLOT_TASKS', '1'))",
@@ -3411,7 +3429,7 @@ def _build_worker_payload_script_content(
         "    chmod 700 \"$ENROOT_RUNTIME_PATH\" \"$ENROOT_CACHE_PATH\" \"$ENROOT_DATA_PATH\" \"$ENROOT_TEMP_PATH\"",
         "    enroot create -f -n \"$container_name\" \"$REMOTE_CONTAINER_IMAGE\" >/dev/null",
         "    trap 'enroot remove -f \"$container_name\" >/dev/null 2>&1 || true; rm -rf \"$enroot_base\" >/dev/null 2>&1 || true' EXIT",
-        "    enroot start --root --rw --mount \"$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM\" --mount \"$REMOTE_HOST_ANSYS_BASE:/ansys_inc/v252\" --mount \"$REMOTE_HOST_ANSYS_BASE/licensingclient:/mnt/licensingclient\" --mount \"$case_dir:/work\" --mount \"$JOB_TMPFS_ROOT:/job_tmpfs\" --mount \"$JOB_DISK_ROOT:/job_disk\" \"$container_name\" /bin/bash -lc \"set -euo pipefail; case_ram_root=/job_tmpfs/$case_name; case_disk_root=/job_disk/$case_name; mkdir -p \\\"$case_ram_root/tmp\\\" \\\"$case_ram_root/ansys_tmp\\\" \\\"$case_disk_root/home\\\" \\\"$case_disk_root/tmp\\\" \\\"$case_disk_root/ansys_tmp\\\"; export HOME=\\\"$case_disk_root/home\\\"; export PEETS_RAMDISK_ROOT=\\\"$case_ram_root\\\"; export PEETS_RAMDISK_TMPDIR=\\\"$case_ram_root/tmp\\\"; export PEETS_RAMDISK_ANSYS_WORK_DIR=\\\"$case_ram_root/ansys_tmp\\\"; export PEETS_DISK_ROOT=\\\"$case_disk_root\\\"; export PEETS_DISK_TMPDIR=\\\"$case_disk_root/tmp\\\"; export PEETS_DISK_ANSYS_WORK_DIR=\\\"$case_disk_root/ansys_tmp\\\"; export ANSYS_WORK_DIR=\\\"$case_ram_root/ansys_tmp\\\"; export TEMP=\\\"$case_disk_root/tmp\\\"; export TMPDIR=\\\"$case_disk_root/tmp\\\"; export XDG_CONFIG_HOME=\\\"$case_disk_root/home/.config\\\"; cd /work; export ANS_IGNOREOS=1; bash ./remote_job.sh\"",
+        "    enroot start --root --rw --mount \"$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM\" --mount \"$REMOTE_HOST_ANSYS_BASE:/ansys_inc/v252\" --mount \"$REMOTE_HOST_ANSYS_BASE/licensingclient:/mnt/licensingclient\" --mount \"$case_dir:/work\" --mount \"$JOB_TMPFS_ROOT:/job_tmpfs\" --mount \"$JOB_DISK_ROOT:/job_disk\" \"$container_name\" /bin/bash -lc \"set -euo pipefail; case_ram_root=/job_tmpfs/$case_name; case_disk_root=/job_disk/$case_name; mkdir -p \\\"$case_ram_root/tmp\\\" \\\"$case_ram_root/ansys_tmp\\\" \\\"$case_disk_root/home\\\" \\\"$case_disk_root/tmp\\\" \\\"$case_disk_root/ansys_tmp\\\"; export HOME=\\\"$case_disk_root/home\\\"; export PEETS_RAMDISK_ROOT=\\\"$case_ram_root\\\"; export PEETS_RAMDISK_TMPDIR=\\\"$case_ram_root/tmp\\\"; export PEETS_RAMDISK_ANSYS_WORK_DIR=\\\"$case_ram_root/ansys_tmp\\\"; export PEETS_DISK_ROOT=\\\"$case_disk_root\\\"; export PEETS_DISK_TMPDIR=\\\"$case_disk_root/tmp\\\"; export PEETS_DISK_ANSYS_WORK_DIR=\\\"$case_disk_root/ansys_tmp\\\"; export ANSYS_WORK_DIR=\\\"$case_ram_root/ansys_tmp\\\"; export TMP=\\\"$case_disk_root/tmp\\\"; export TEMP=\\\"$case_disk_root/tmp\\\"; export TMPDIR=\\\"$case_disk_root/tmp\\\"; export XDG_CONFIG_HOME=\\\"$case_disk_root/home/.config\\\"; cd /work; export ANS_IGNOREOS=1; bash ./remote_job.sh\"",
         "  )",
         "}",
         "sync_case_artifacts_back() {",
@@ -3491,6 +3509,8 @@ def _build_worker_payload_script_content(
             "  (",
             "    cd \"$case_dir\"",
             "    mkdir -p tmp",
+            "    export TMP=\"$PWD/tmp\"",
+            "    export TEMP=\"$PWD/tmp\"",
             "    export TMPDIR=\"$PWD/tmp\"",
             "    case_dir_path=\"$PWD\"",
             "    sync_pid=''",
@@ -3603,7 +3623,7 @@ def _build_pull_worker_payload_script_content(
     lease_heartbeat_seconds = max(5, int(getattr(config, "lease_heartbeat_seconds", 15)))
     worker_idle_poll_seconds = max(1, int(getattr(config, "worker_idle_poll_seconds", 10)))
     slot_request_backoff_seconds = max(1, int(getattr(config, "slot_request_backoff_seconds", 5)))
-    runtime_root = _remote_path_for_shell(config=config, path="/tmp/$USER/peetsfea-runner/runtime")
+    runtime_root = _remote_runtime_root_shell_path(config=config)
     payload_lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
@@ -4052,6 +4072,7 @@ def _build_pull_worker_payload_script_content(
         "    printf '%s\\n' 'mkdir -p /work/session_logs'",
         "    printf '%s\\n' 'export HOME=\"$session_disk_root/home\"'",
         "    printf '%s\\n' 'export XDG_CONFIG_HOME=\"$session_disk_root/home/.config\"'",
+        "    printf '%s\\n' 'export TMP=\"$session_disk_root/tmp\"'",
         "    printf '%s\\n' 'export TMPDIR=\"$session_disk_root/tmp\"'",
         "    printf '%s\\n' 'export TEMP=\"$session_disk_root/tmp\"'",
         "    printf '%s\\n' 'export ANSYS_WORK_DIR=\"$session_ram_root/ansys_tmp\"'",
@@ -4108,6 +4129,7 @@ def _build_pull_worker_payload_script_content(
         "    printf '%s\\n' 'mkdir -p \"$case_disk_root/home\" \"$case_disk_root/tmp\" \"$case_disk_root/ansys_tmp\"'",
         "    printf '%s\\n' 'export HOME=\"$case_disk_root/home\"'",
         "    printf '%s\\n' 'export XDG_CONFIG_HOME=\"$case_disk_root/home/.config\"'",
+        "    printf '%s\\n' 'export TMP=\"$case_disk_root/tmp\"'",
         "    printf '%s\\n' 'export TMPDIR=\"$case_disk_root/tmp\"'",
         "    printf '%s\\n' 'export TEMP=\"$case_disk_root/tmp\"'",
         "    printf '%s\\n' 'export ANSYS_WORK_DIR=\"$case_ram_root/ansys_tmp\"'",
@@ -4220,6 +4242,8 @@ def _build_pull_worker_payload_script_content(
         "        cp -f \"$workdir/remote_job.sh.seed\" \"$case_dir/remote_job.sh\"",
         "        cd \"$case_dir\"",
         "        mkdir -p tmp",
+        "        export TMP=\"$PWD/tmp\"",
+        "        export TEMP=\"$PWD/tmp\"",
         "        export TMPDIR=\"$PWD/tmp\"",
         "        emit_slot_snapshot \"$slot_id\" \"RUNNING\" 0",
         "        slot_hb_pid=''",
@@ -4526,7 +4550,7 @@ def _build_pull_remote_sbatch_script_content(
     worker_id: str,
 ) -> str:
     remote_path = _remote_path_for_shell(config=config, path=remote_job_dir)
-    exec_root = _remote_path_for_shell(config=config, path="/tmp/$USER/peetsfea-runner/submit")
+    exec_root = _remote_submit_root_shell_path(config=config)
     control_plane_ssh_target = _control_plane_ssh_target(config)
     control_plane_return_host = _control_plane_return_host(config)
     control_plane_return_user = _control_plane_return_user(config)
