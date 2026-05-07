@@ -24,8 +24,7 @@ Each logical slot owns:
 
 - one slot id
 - one current lease, or idle state
-- one distinct host-side case directory under the job workdir
-- one matching container-side case directory under `/work/slots/...`
+- one distinct container-side case directory under `/work/slots/...`
 - optional warm AEDT/grpc state for that slot
 - repeated project open / solve / export cycles
 
@@ -63,7 +62,7 @@ Behavior:
 Each leased input is processed as:
 
 1. Acquire lease
-2. Resolve input and output paths inside the sshfs mount
+2. Resolve workspace-root-relative input and output paths inside the sshfs mount
 3. Create a unique case working directory for the slot and run it through the
    container-side `/work/slots/...` path
 4. Open project in the slot's AEDT context
@@ -85,3 +84,8 @@ A slot's AEDT state is restarted only when:
 Successful cases do not trigger a slot recycle. Slot recycle must not restart
 the worker container or remount sshfs unless the container-wide mount or runtime
 is unhealthy.
+
+Generated slot scripts must not reference the host job workdir path after they
+enter the container. Copy, `cd`, solve, and artifact copy operations use only
+the container paths: `$PEETS_WORKSPACE_MOUNT_ROOT/...` for mounted input/output
+and `/work/slots/...` for case scratch.

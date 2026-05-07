@@ -615,6 +615,7 @@ class LeaseServerContext:
     input_queue_dir: str
     output_root_dir: str
     worker_storage: WorkerStorageConfig
+    pull_workspace_path: str
 
 
 @dataclass(slots=True)
@@ -873,6 +874,7 @@ def build_lease_server_context(*, config: PipelineConfig) -> LeaseServerContext:
         input_queue_dir=config.input_queue_dir,
         output_root_dir=config.output_root_dir,
         worker_storage=config.worker_storage,
+        pull_workspace_path=config.pull_workspace_path,
     )
 
 

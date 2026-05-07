@@ -41,8 +41,8 @@ Each lease stores:
 - slurm job id
 - input path
 - output path
-- input relative path
-- output relative path
+- input relative path from the repository workspace root
+- output relative path from the repository workspace root
 - storage mode
 - started at
 - expires at

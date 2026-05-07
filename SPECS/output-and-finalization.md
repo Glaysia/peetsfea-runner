@@ -16,6 +16,8 @@ The default prune-lane worker model is sshfs direct materialization.
   the sshfs-mounted local workspace.
 - The mounted workspace is
   `peets@172.16.165.146:/home/peets/mnt/8tb/peetsfea-runner`.
+- Lease output paths are repository-workspace-relative and include the
+  top-level `output/` prefix.
 - The control plane validates completion metadata and finalizes the input.
 - Partial output writes are treated as non-final.
 

@@ -56,8 +56,19 @@ starting the enroot container:
 - `PEETS_WORKSPACE_REMOTE`
 - `PEETS_WORKSPACE_MOUNT_ROOT`
 
-The SSH identity is mounted into the container under `/root/.ssh`, and sshfs
-uses root-friendly ownership options such as `idmap=user,uid=0,gid=0,umask=000`.
+After `enroot create`, the payload runs a short preparation start that creates
+these container-side directories:
+
+- `/etc/peetsfea_ssh`
+- `/workspace`
+- `/work/slots`
+
+The SSH identity directory is mounted into the long-lived container as
+`/etc/peetsfea_ssh` without a `:ro` suffix. The observed compute-node enroot
+runtime rejects the previous `/root/.ssh:ro` mount shape with mount errors, while
+the writable directory mount succeeds. sshfs uses
+`IdentityFile=/etc/peetsfea_ssh/id_control` plus root-friendly ownership options
+such as `idmap=user,uid=0,gid=0,umask=000`.
 
 ## Slot Contract
 

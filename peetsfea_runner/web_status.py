@@ -42,6 +42,35 @@ def _safe_relpath(path: Path, base: Path | None) -> str:
         return path.name
 
 
+def _workspace_root_from_context(lease_context: LeaseServerContext | None) -> Path | None:
+    if lease_context is None:
+        return None
+    pull_workspace_path = str(getattr(lease_context, "pull_workspace_path", "") or "").strip()
+    if not pull_workspace_path:
+        return None
+    return Path(pull_workspace_path).expanduser().resolve()
+
+
+def _workspace_relative_path(
+    path: Path,
+    *,
+    workspace_root: Path | None,
+    fallback_root: Path | None,
+    durable_prefix: str,
+) -> str | None:
+    if workspace_root is not None:
+        workspace_relative = _relpath_under_root(path, workspace_root)
+        if workspace_relative is not None:
+            return workspace_relative
+    if fallback_root is None:
+        return None
+    legacy_relative = _relpath_under_root(path, fallback_root)
+    if legacy_relative is None:
+        return None
+    durable_root = durable_prefix.strip().strip("/")
+    return f"{durable_root}/{legacy_relative}" if durable_root else legacy_relative
+
+
 def _relpath_under_root(path: Path, root: Path) -> str | None:
     try:
         return str(path.expanduser().resolve().relative_to(root.expanduser().resolve()))
@@ -200,18 +229,41 @@ def make_status_handler(
                 storage_mode = str(lease_context.worker_storage.storage_mode).strip() or "payload"
                 input_path = Path(str(slot_record["input_path"]))
                 output_path = Path(str(slot_record["output_path"]))
-                input_relpath = _relpath_under_root(input_path, Path(lease_context.input_queue_dir))
-                output_relpath = _relpath_under_root(output_path, Path(lease_context.output_root_dir))
-                if storage_mode == "sshfs_direct" and (input_relpath is None or output_relpath is None):
-                    store.clear_slot_lease(
-                        run_id=run_id,
-                        lease_token=lease_token,
-                        final_state="RETRY_QUEUED",
-                        failure_reason="lease path outside configured root",
+                if storage_mode == "sshfs_direct":
+                    workspace_root = _workspace_root_from_context(lease_context)
+                    workspace_input_relpath = _workspace_relative_path(
+                        input_path,
+                        workspace_root=workspace_root,
+                        fallback_root=Path(lease_context.input_queue_dir),
+                        durable_prefix="input_queue",
                     )
-                    store.mark_ingest_state(input_path=str(slot_record["input_path"]), state="RETRY_QUEUED")
-                    self._send_json({"error": "lease_path_outside_root"}, status=409)
-                    return
+                    workspace_output_relpath = _workspace_relative_path(
+                        output_path,
+                        workspace_root=workspace_root,
+                        fallback_root=Path(lease_context.output_root_dir),
+                        durable_prefix="output",
+                    )
+                    if workspace_input_relpath is None or workspace_output_relpath is None:
+                        store.clear_slot_lease(
+                            run_id=run_id,
+                            lease_token=lease_token,
+                            final_state="RETRY_QUEUED",
+                            failure_reason="lease path outside configured root",
+                        )
+                        store.mark_ingest_state(input_path=str(slot_record["input_path"]), state="RETRY_QUEUED")
+                        self._send_json({"error": "lease_path_outside_root"}, status=409)
+                        return
+                    input_relpath = workspace_input_relpath
+                    output_relpath = workspace_output_relpath
+                else:
+                    input_relpath = _safe_relpath(
+                        input_path.resolve(),
+                        Path(lease_context.input_queue_dir).expanduser().resolve(),
+                    )
+                    output_relpath = _safe_relpath(
+                        output_path.resolve(),
+                        Path(lease_context.output_root_dir).expanduser().resolve(),
+                    )
                 self._send_json(
                     {
                         "ok": True,
@@ -220,16 +272,8 @@ def make_status_handler(
                         "slot_id": str(slot_record["slot_id"]),
                         "attempt_no": int(slot_record.get("attempt_no") or 0),
                         "input_name": input_path.name,
-                        "input_relpath": input_relpath
-                        or _safe_relpath(
-                            input_path.resolve(),
-                            Path(lease_context.input_queue_dir).expanduser().resolve(),
-                        ),
-                        "output_relpath": output_relpath
-                        or _safe_relpath(
-                            output_path.resolve(),
-                            Path(lease_context.output_root_dir).expanduser().resolve(),
-                        ),
+                        "input_relpath": input_relpath,
+                        "output_relpath": output_relpath,
                         "storage_mode": storage_mode,
                     }
                 )
@@ -336,7 +380,13 @@ def make_status_handler(
                     if not output_materialized:
                         self._send_json({"error": "output_not_materialized"}, status=409)
                         return
-                    expected_output_relpath = _relpath_under_root(output_dir, Path(lease_context.output_root_dir))
+                    workspace_root = _workspace_root_from_context(lease_context)
+                    expected_output_relpath = _workspace_relative_path(
+                        output_dir,
+                        workspace_root=workspace_root,
+                        fallback_root=Path(lease_context.output_root_dir),
+                        durable_prefix="output",
+                    )
                     reported_output_relpath = str(payload.get("output_relpath") or "").strip()
                     if expected_output_relpath is None:
                         self._send_json({"error": "output_path_outside_root"}, status=409)

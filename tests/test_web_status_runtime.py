@@ -67,11 +67,17 @@ def _build_context(
     input_queue_dir: Path,
     output_root_dir: Path,
     storage_mode: str,
+    pull_workspace_path: str | None = None,
 ) -> PipelineConfig:
+    config_kwargs = {
+        "input_queue_dir": str(input_queue_dir),
+        "output_root_dir": str(output_root_dir),
+        "worker_storage": WorkerStorageConfig(model="single_container_sshfs", storage_mode=storage_mode),
+    }
+    if pull_workspace_path is not None:
+        config_kwargs["pull_workspace_path"] = pull_workspace_path
     return PipelineConfig(
-        input_queue_dir=str(input_queue_dir),
-        output_root_dir=str(output_root_dir),
-        worker_storage=WorkerStorageConfig(model="single_container_sshfs", storage_mode=storage_mode),
+        **config_kwargs,
     )
 
 
@@ -188,14 +194,15 @@ def test_sshfs_direct_complete_requires_output_materialized_and_output_dir() -> 
         config = _build_context(input_queue_dir=input_root, output_root_dir=output_root, storage_mode="sshfs_direct")
         config.delete_input_after_upload = False
         config.rename_input_to_done_on_success = True
+        config.pull_workspace_path = str(Path(tmpdir))
         context = build_lease_server_context(config=config)
         server, thread = _start_server(store=store, context=context)
         try:
             lease = _request_lease(server=server, run_id="run-sshfs", worker_id="worker-01", account_id="account_01")
             assert lease["lease_available"] is True
             assert lease["storage_mode"] == "sshfs_direct"
-            assert lease["input_relpath"] == "lane/sample.aedt"
-            assert lease["output_relpath"] == "lane/sample.aedt.out"
+            assert lease["input_relpath"] == "input_queue/lane/sample.aedt"
+            assert lease["output_relpath"] == "output/lane/sample.aedt.out"
             lease_token = lease["lease_token"]
 
             status, body = _get_binary(
@@ -231,7 +238,7 @@ def test_sshfs_direct_complete_requires_output_materialized_and_output_dir() -> 
                     "run_id": "run-sshfs",
                     "lease_token": lease_token,
                     "output_materialized": True,
-                    "output_relpath": "lane/sample.aedt.out",
+                    "output_relpath": "output/lane/sample.aedt.out",
                 },
             )
             assert final_status == 200
@@ -285,6 +292,7 @@ def test_sshfs_direct_complete_rejects_output_relpath_mismatch_and_stale_token()
         config = _build_context(input_queue_dir=input_root, output_root_dir=output_root, storage_mode="sshfs_direct")
         config.delete_input_after_upload = False
         config.rename_input_to_done_on_success = True
+        config.pull_workspace_path = str(Path(tmpdir))
         context = build_lease_server_context(config=config)
         server, thread = _start_server(store=store, context=context)
         try:
@@ -298,7 +306,7 @@ def test_sshfs_direct_complete_rejects_output_relpath_mismatch_and_stale_token()
                     "run_id": "run-stale",
                     "lease_token": lease_token,
                     "output_materialized": True,
-                    "output_relpath": "other/sample.aedt.out",
+                    "output_relpath": "output/other/sample.aedt.out",
                 },
             )
             assert mismatch_status == 409
@@ -312,7 +320,7 @@ def test_sshfs_direct_complete_rejects_output_relpath_mismatch_and_stale_token()
                     "run_id": "run-stale",
                     "lease_token": "stale-token",
                     "output_materialized": True,
-                    "output_relpath": "lane/sample.aedt.out",
+                    "output_relpath": "output/lane/sample.aedt.out",
                 },
             )
             assert stale_status == 404
@@ -385,6 +393,77 @@ def test_sshfs_direct_endpoints_stay_compatible() -> None:
             assert artifact_status == 200
             assert artifact_body["ok"] is True
             assert artifact_body["state"] == "UPLOADING"
+        finally:
+            server.shutdown()
+            thread.join(timeout=1)
+
+
+def test_sshfs_direct_uses_workspace_root_prefix_or_fallback() -> None:
+    with TemporaryDirectory() as tmpdir:
+        input_root = Path(tmpdir) / "input_queue"
+        output_root = Path(tmpdir) / "output"
+        input_file = input_root / "lane" / "sample.aedt"
+        output_dir = output_root / "lane" / "sample.aedt.out"
+        input_root.mkdir(parents=True)
+        output_root.mkdir(parents=True)
+        input_file.parent.mkdir(parents=True, exist_ok=True)
+        input_file.write_text("project", encoding="utf-8")
+        output_dir.mkdir(parents=True)
+        (output_dir / "results.txt").write_text("done", encoding="utf-8")
+
+        store = StateStore(Path(tmpdir) / "runtime.state")
+        store.initialize()
+        store.start_run("run-fallback")
+        store.create_slot_task(
+            run_id="run-fallback",
+            slot_id="slot-01",
+            input_path=str(input_file),
+            output_path=str(output_dir),
+            account_id="account_01",
+        )
+        store.upsert_slurm_worker(
+            run_id="run-fallback",
+            worker_id="worker-01",
+            job_id="job-01",
+            attempt_no=1,
+            account_id="account_01",
+            host_alias="host",
+            slurm_job_id="12345",
+            worker_state="RUNNING",
+            slots_configured=1,
+            backend="slurm_batch",
+        )
+
+        # point workspace at a different path to force non-relative fallback behavior
+        config = _build_context(
+            input_queue_dir=input_root,
+            output_root_dir=output_root,
+            storage_mode="sshfs_direct",
+            pull_workspace_path="/different/workspace",
+        )
+        config.delete_input_after_upload = False
+        config.rename_input_to_done_on_success = True
+        context = build_lease_server_context(config=config)
+        server, thread = _start_server(store=store, context=context)
+        try:
+            lease = _request_lease(server=server, run_id="run-fallback", worker_id="worker-01", account_id="account_01")
+            assert lease["lease_available"] is True
+            assert lease["input_relpath"] == "input_queue/lane/sample.aedt"
+            assert lease["output_relpath"] == "output/lane/sample.aedt.out"
+
+            complete_status, complete_body = _post_json(
+                server=server,
+                path="/internal/leases/complete",
+                payload={
+                    "run_id": "run-fallback",
+                    "lease_token": lease["lease_token"],
+                    "output_materialized": True,
+                    "output_relpath": "output/lane/sample.aedt.out",
+                },
+            )
+            assert complete_status == 200
+            assert complete_body["ok"] is True
+            assert complete_body["state"] == "SUCCEEDED"
         finally:
             server.shutdown()
             thread.join(timeout=1)

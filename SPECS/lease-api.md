@@ -40,8 +40,12 @@ Response:
 If no input is available, returns `ok=true` with `lease_token=null`.
 
 For `storage_mode="sshfs_direct"`, the worker joins `input_relpath` and
-`output_relpath` against its configured sshfs mount root. The control plane does
-not send the `.aedt` payload for the normal solve path.
+`output_relpath` against its configured sshfs mount root. Both relpaths are
+relative to the repository workspace root. They include their top-level durable
+truth prefix, for example `input_queue/prune_results/sample.aedt` and
+`output/prune_results/sample.aedt.out`. They are not relative to the configured
+input lane root or output lane root. The control plane does not send the `.aedt`
+payload for the normal solve path.
 
 The default prune-lane worker treats non-`sshfs_direct` leases as incompatible
 with the single-container sshfs path and must fail them explicitly rather than

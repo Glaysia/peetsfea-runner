@@ -86,7 +86,19 @@ The worker container receives the workspace contract as environment:
 - `PEETS_WORKSPACE_MOUNT_ROOT`
 
 The mounted root is the only normal input/output/work storage path seen by
-`sshfs_direct` workers.
+`sshfs_direct` workers. Lease `input_relpath` and `output_relpath` values are
+always relative to the repository workspace root, not relative to
+`input_queue_dir` or `output_root_dir`. Therefore a worker resolves
+`input_queue/prune_results/case.aedt` as
+`$PEETS_WORKSPACE_MOUNT_ROOT/input_queue/prune_results/case.aedt` and writes
+`output/prune_results/case.aedt.out` as
+`$PEETS_WORKSPACE_MOUNT_ROOT/output/prune_results/case.aedt.out`.
+
+The container bootstrap must create the in-container mount targets before the
+long-lived worker starts. The SSH identity directory is mounted at
+`/etc/peetsfea_ssh` without a read-only mount suffix because the observed enroot
+runtime rejects the previous `/root/.ssh:ro` directory mount shape on compute
+nodes. The worker uses `IdentityFile=/etc/peetsfea_ssh/id_control`.
 
 ## Restart Model
 
