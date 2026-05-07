@@ -357,6 +357,10 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("PEETS_CONTROL_SSH_IDENTITY=\"${PEETS_CONTROL_SSH_IDENTITY:-}\"", content)
         self.assertIn("ssh_args+=(-o IdentitiesOnly=yes -i \"$PEETS_CONTROL_SSH_IDENTITY\")", content)
         self.assertIn("PEETS_CONTROL_LOCAL_PORT=$((PEETS_CONTROL_PORT + 1000 + (${SLURM_JOB_ID:-0} % 1000)))", content)
+        self.assertIn(
+            'PEETS_TUNNEL_SOCKET="/tmp/peets-cp-${SLURM_JOB_ID:-nojob}-${PEETS_CONTROL_LOCAL_PORT}-$$.sock"',
+            content,
+        )
         self.assertIn("classify_return_path_stage()", content)
         self.assertIn("RETURN_PATH_DNS_FAILURE", content)
         self.assertIn("export PATH=/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}", content)
@@ -435,6 +439,10 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("PEETS_CONTROL_SSH_IDENTITY=\"${PEETS_CONTROL_SSH_IDENTITY:-}\"", content)
         self.assertIn("ssh_args+=(-o IdentitiesOnly=yes -i \"$PEETS_CONTROL_SSH_IDENTITY\")", content)
         self.assertIn("PEETS_CONTROL_LOCAL_PORT=$((PEETS_CONTROL_PORT + 1000 + (${SLURM_JOB_ID:-0} % 1000)))", content)
+        self.assertIn(
+            'PEETS_TUNNEL_SOCKET="/tmp/peets-cp-${SLURM_JOB_ID:-nojob}-${PEETS_CONTROL_LOCAL_PORT}-$$.sock"',
+            content,
+        )
         self.assertIn('REMOTE_RUNTIME_ROOT="/tmp/$USER/peetsfea-runner/_runtime"', content)
         self.assertIn('if [ -n "${PEETS_JOB_WORKDIR:-}" ]; then', content)
         self.assertIn('export PEETS_JOB_WORKDIR="$workdir"', content)
