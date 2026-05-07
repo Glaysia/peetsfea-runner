@@ -12,6 +12,7 @@ from unittest.mock import patch
 from peetsfea_runner.scheduler import (
     AccountCapacitySnapshot,
     AccountReadinessSnapshot,
+    _build_enroot_readiness_script,
     _build_enroot_preflight_script,
     _build_windows_preflight_script,
     _build_windows_readiness_script,
@@ -61,6 +62,30 @@ class TestScheduler(unittest.TestCase):
         self.assertIn("sed -n 's/.*tmpfs=\\([01]\\).*/\\1/p'", script)
         self.assertIn("sed -n 's/.*python=\\([01]\\).*/\\1/p'", script)
         self.assertNotIn("\\\\1/p", script)
+
+    def test_build_enroot_scripts_include_sshfs_identity_checks(self) -> None:
+        script = _build_enroot_preflight_script(
+            remote_container_image="~/runtime/enroot/aedt.sqsh",
+            remote_container_ansys_root="/opt/ohpc/pub/Electronics/v252",
+            remote_root="~/aedt_runs",
+        )
+
+        self.assertIn("command -v sshfs", script)
+        self.assertIn("fusermount", script)
+        self.assertIn("fuse_device", script)
+        self.assertIn("ssh_identity", script)
+        self.assertIn('IMAGE_REQUIRED_PACKAGES="openssh-client sshfs fuse3 ca-certificates"', script)
+        self.assertIn('"runtime_packages":"\'"$IMAGE_REQUIRED_PACKAGES"\'"', script)
+
+        readiness_script = _build_enroot_readiness_script(
+            remote_container_image="~/runtime/enroot/aedt.sqsh",
+            remote_container_ansys_root="/opt/ohpc/pub/Electronics/v252",
+            remote_root="~/aedt_runs",
+        )
+        self.assertIn("fuse_device", readiness_script)
+        self.assertIn("ssh_identity", readiness_script)
+        self.assertIn('IMAGE_REQUIRED_PACKAGES="openssh-client sshfs fuse3 ca-certificates"', readiness_script)
+        self.assertIn('"runtime_packages":"\'"$IMAGE_REQUIRED_PACKAGES"\'"', readiness_script)
 
     def test_effective_slots_uses_max_jobs_per_account(self) -> None:
         slots = calculate_effective_slots(max_jobs_per_account=10)
@@ -281,6 +306,40 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(snapshot.status, "BOOTSTRAP_REQUIRED")
         self.assertEqual(snapshot.reason, "image_stale path=$HOME/runtime/enroot/aedt.sqsh")
 
+    def test_query_account_readiness_in_enroot_mode_requires_fuse_and_ssh_identity(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_readiness(
+            account=account,
+            remote_container_runtime="enroot",
+            remote_container_image="~/runtime/enroot/aedt.sqsh",
+            remote_container_ansys_root="/opt/ohpc/pub/Electronics/v252",
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_READY__:home=1 runtime=1 env=1 python=1 module=1 binaries=1 ansys=1 storage=1 fuse_device=0 ssh_identity=0 sshfs=1 fusermount=1 inode_pct=10 free_mb=8192 fs_type=ext4 container=1 missing= image_path=$HOME/runtime/enroot/aedt.sqsh\n",
+                "",
+            ),
+        )
+        self.assertFalse(snapshot.ready)
+        self.assertEqual(snapshot.status, "BLOCKED")
+        self.assertEqual(snapshot.reason, "fuse_device,ssh_identity")
+
+    def test_query_account_preflight_in_enroot_mode_requires_sshfs_and_fusermount(self) -> None:
+        account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
+        snapshot = query_account_preflight(
+            account=account,
+            remote_container_runtime="enroot",
+            remote_container_image="~/runtime/enroot/aedt.sqsh",
+            remote_container_ansys_root="/opt/ohpc/pub/Electronics/v252",
+            run_command=lambda _cmd: (
+                0,
+                "__PEETSFEA_PREFLIGHT__:home=1 runtime=1 env=1 python=1 module=1 binaries=1 ansys=1 uv=1 pyaedt=1 pandas=1 pyvista=1 fuse_device=1 ssh_identity=1 sshfs=0 fusermount=0 tmpfs=1 storage=1 inode_pct=10 free_mb=8192 fs_type=ext4 container=1 missing= image_path=$HOME/runtime/enroot/aedt.sqsh\n",
+                "",
+            ),
+        )
+        self.assertFalse(snapshot.ready)
+        self.assertEqual(snapshot.status, "PREFLIGHT_FAILED")
+        self.assertEqual(snapshot.reason, "sshfs,fusermount")
+
     def test_query_account_readiness_in_enroot_mode_uses_direct_probe(self) -> None:
         account = _Account(account_id="a1", host_alias="host-1", max_jobs=10)
         seen_commands: list[list[str]] = []
@@ -455,7 +514,7 @@ class TestScheduler(unittest.TestCase):
         self.assertIn("docker://ubuntu:24.04", seen[0][-1])
         self.assertIn("aedt.sqsh.meta.json", seen[0][-1])
         self.assertIn("/ansys_inc/v252", seen[0][-1])
-        self.assertIn("2026-03-18-aedt-sqsh-v2", seen[0][-1])
+        self.assertIn("2026-05-07-aedt-sqsh-v3-sshfs", seen[0][-1])
 
     def test_query_windows_account_capacity_uses_local_max_jobs(self) -> None:
         account = _Account(account_id="w1", host_alias="win-1", max_jobs=2, platform="windows", scheduler="none")

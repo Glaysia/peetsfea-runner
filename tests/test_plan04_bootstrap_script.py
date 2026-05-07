@@ -7,10 +7,25 @@ from pathlib import Path
 SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "remote_bootstrap_install.sh"
 
 
+ENROOT_BOOTSTRAP_SCRIPT_PATH = Path(__file__).resolve().parent.parent / "peetsfea_runner" / "enroot_image_bootstrap.sh"
+
+
 class TestPlan04BootstrapScript(unittest.TestCase):
     def test_script_exists_and_is_executable(self) -> None:
         self.assertTrue(SCRIPT_PATH.exists(), f"Missing script: {SCRIPT_PATH}")
         self.assertTrue(SCRIPT_PATH.stat().st_mode & 0o111, "Script must be executable")
+
+    def test_enroot_bootstrap_script_includes_sshfs_runtime_packages(self) -> None:
+        self.assertTrue(ENROOT_BOOTSTRAP_SCRIPT_PATH.exists(), f"Missing script: {ENROOT_BOOTSTRAP_SCRIPT_PATH}")
+        content = ENROOT_BOOTSTRAP_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("openssh-client", content)
+        self.assertIn("sshfs", content)
+        self.assertIn("fuse3", content)
+        self.assertIn("ca-certificates", content)
+        self.assertIn("runtime_packages\":\"openssh-client sshfs fuse3 ca-certificates\"", content)
+        self.assertIn("command -v ssh >/dev/null", content)
+        self.assertIn("command -v sshfs >/dev/null", content)
+        self.assertIn("command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3", content)
 
     def test_contains_miniconda_install_and_conda_python312(self) -> None:
         content = SCRIPT_PATH.read_text(encoding="utf-8")
@@ -33,6 +48,13 @@ class TestPlan04BootstrapScript(unittest.TestCase):
         self.assertIn("-m pip install --upgrade pip", content)
         self.assertIn("태그 설치 실패. 태그 존재/접근 권한/프록시를 점검하세요.", content)
         self.assertIn("import peetsfea_runner", content)
+
+    def test_enroot_bootstrap_contract_version_bumps(self) -> None:
+        content = ENROOT_BOOTSTRAP_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "CONTRACT_VERSION=\"${CONTRACT_VERSION:-2026-05-07-aedt-sqsh-v3-sshfs}\"",
+            content,
+        )
 
 
 if __name__ == "__main__":

@@ -91,3 +91,35 @@ def test_ingest_candidate_rearm_rules() -> None:
             file_mtime_ns=20,
         )
         assert rearmed is True
+
+
+def test_clear_slot_lease_rejects_stale_token() -> None:
+    with TemporaryDirectory() as tmpdir:
+        store = StateStore(Path(tmpdir) / "runtime.state")
+        store.initialize()
+        store.start_run("run_01")
+        store.create_slot_task(
+            run_id="run_01",
+            slot_id="slot_01",
+            input_path="/tmp/input.aedt",
+            output_path="/tmp/output.aedt.out",
+            account_id=None,
+        )
+
+        store.acquire_slot_lease(
+            run_id="run_01",
+            worker_id="worker_01",
+            job_id="worker_01",
+            account_id="account_01",
+            slurm_job_id="12345",
+            lease_token="live-token",
+            lease_ttl_seconds=120,
+        )
+        assert (
+            store.clear_slot_lease(
+                run_id="run_01",
+                lease_token="stale-token",
+                final_state="SUCCEEDED",
+            )
+            is None
+        )

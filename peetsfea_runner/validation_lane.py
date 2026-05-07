@@ -76,8 +76,8 @@ def build_enroot_validation_lane_config(
 
     if lane_key == "prune":
         accounts = _PRUNE_ACCOUNTS
-        cpus_per_job = 32
-        slots_per_job = 48
+        cpus_per_job = 40
+        slots_per_job = 10
         cores_per_slot = 4
         tasks_per_slot = 1
     else:
@@ -97,14 +97,14 @@ def build_enroot_validation_lane_config(
         partition=partition,
         slurm_partitions_allowlist=_PRUNE_SLURM_PARTITIONS_ALLOWLIST if lane_key == "prune" else (),
         cpus_per_job=cpus_per_job,
-        mem="192G" if lane_key == "prune" and str(mem).strip() == "960G" else mem,
+        mem=mem,
         time_limit=time_limit,
         remote_root=remote_root,
         continuous_mode=False,
         slots_per_job=slots_per_job,
-        worker_payload_slot_limit=slots_per_job,
-        slot_min_concurrency=30 if lane_key == "prune" else 5,
-        slot_max_concurrency=48 if lane_key == "prune" else 2,
+        worker_payload_slot_limit=slots_per_job if lane_key == "prune" else slots_per_job,
+        slot_min_concurrency=1 if lane_key == "prune" else 5,
+        slot_max_concurrency=slots_per_job if lane_key == "prune" else 2,
         slot_memory_pressure_high_watermark_percent=90,
         slot_memory_pressure_resume_watermark_percent=80,
         slot_memory_probe_interval_seconds=5,
@@ -121,4 +121,8 @@ def build_enroot_validation_lane_config(
         remote_container_ansys_root=remote_container_ansys_root,
         remote_ansys_executable=remote_ansys_executable,
         host=accounts[0].host_alias,
+        pull_workspace_user="peets",
+        pull_workspace_host="172.16.165.146",
+        pull_workspace_path=str(resolved_repo_root),
+        pull_workspace_mount_root="/workspace",
     )

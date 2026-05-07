@@ -102,6 +102,10 @@ class AccountReadinessSnapshot:
     free_mb: int | None = None
     scratch_root: str | None = None
     scratch_usage_mb: int | None = None
+    fuse_device_ok: bool = True
+    ssh_identity_ok: bool = True
+    sshfs_binary_ok: bool = True
+    fusermount_ok: bool = True
 
 
 @dataclass(slots=True)
@@ -131,7 +135,9 @@ _BOOTSTRAP_MARKER = "__PEETSFEA_BOOTSTRAP__:ok"
 _DEFAULT_SLURM_PROBE_PARTITION = ""
 _DEFAULT_SLURM_PROBE_IMMEDIATE_SECONDS = 15
 _ENROOT_IMAGE_PYTHON = "/opt/miniconda3/bin/python"
-_ENROOT_IMAGE_CONTRACT_VERSION = "2026-03-18-aedt-sqsh-v2"
+_ENROOT_IMAGE_CONTRACT_VERSION = "2026-05-07-aedt-sqsh-v3-sshfs"
+_ENROOT_IMAGE_REQUIRED_PACKAGES = ("openssh-client", "sshfs", "fuse3", "ca-certificates")
+_ENROOT_IMAGE_REQUIRED_PACKAGES_TEXT = " ".join(_ENROOT_IMAGE_REQUIRED_PACKAGES)
 _ENROOT_IMAGE_METADATA_SUFFIX = ".meta.json"
 _ENROOT_IMAGE_BASE = "docker://ubuntu:24.04"
 _ENROOT_IMAGE_PYTHON_VERSION = "3.12"
@@ -540,6 +546,10 @@ def _parse_readiness_marker(
     module_ok = values.get("module", False)
     binaries_ok = values.get("binaries", False)
     ansys_ok = values.get("ansys", False)
+    fuse_device_ok = raw_values.get("fuse_device", "1").strip() == "1"
+    ssh_identity_ok = raw_values.get("ssh_identity", "1").strip() == "1"
+    sshfs_binary_ok = raw_values.get("sshfs", "1").strip() == "1"
+    fusermount_ok = raw_values.get("fusermount", "1").strip() == "1"
     storage_ready, storage_reason, inode_use_percent, free_mb = _storage_snapshot_from_values(
         values=raw_values,
         remote_storage_inode_block_percent=remote_storage_inode_block_percent,
@@ -563,6 +573,10 @@ def _parse_readiness_marker(
             ("module", module_ok),
             ("binaries", binaries_ok),
             ("ansys", ansys_ok),
+            ("sshfs", sshfs_binary_ok if container_mode else True),
+            ("fusermount", fusermount_ok if container_mode else True),
+            ("fuse_device", fuse_device_ok),
+            ("ssh_identity", ssh_identity_ok),
         )
         if not check_ok
     ]
@@ -608,6 +622,10 @@ def _parse_readiness_marker(
         free_mb=free_mb,
         scratch_root=scratch_root,
         scratch_usage_mb=scratch_usage_mb,
+        fuse_device_ok=fuse_device_ok,
+        ssh_identity_ok=ssh_identity_ok,
+        sshfs_binary_ok=sshfs_binary_ok,
+        fusermount_ok=fusermount_ok,
     )
 
 
@@ -795,6 +813,10 @@ PYTHON_OK=0
 MODULE_OK=0
 BINARIES_OK=0
 ANSYS_OK=0
+FUSE_DEVICE_OK=0
+SSH_IDENTITY_OK=0
+SSHFS_OK=1
+FUSERMOUNT_OK=1
 STORAGE_OK=1
 MISSING=()
 REMOTE_CONTAINER_IMAGE={_double_quoted_shell_value(image_path)}
@@ -803,10 +825,25 @@ REMOTE_CONTAINER_ANSYS_ROOT={_double_quoted_shell_value(ansys_root)}
 REMOTE_CONTAINER_ANSYS_BASE={_double_quoted_shell_value(ansys_base)}
 SCRATCH_ROOT={_double_quoted_shell_value(scratch_root)}
 IMAGE_CONTRACT_VERSION={_double_quoted_shell_value(_ENROOT_IMAGE_CONTRACT_VERSION)}
+IMAGE_REQUIRED_PACKAGES={_double_quoted_shell_value(_ENROOT_IMAGE_REQUIRED_PACKAGES_TEXT)}
 IMAGE_PYTHON={_double_quoted_shell_value(_ENROOT_IMAGE_PYTHON)}
 SCRATCH_USAGE_MB=0
 if [ -n "${{HOME:-}}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
   HOME_OK=1
+  if [ -e /dev/fuse ] && [ -r /dev/fuse ] && [ -w /dev/fuse ]; then
+    FUSE_DEVICE_OK=1
+  else
+    MISSING+=("fuse_device_missing")
+  fi
+  for key in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
+    if [ -r "$key" ]; then
+      SSH_IDENTITY_OK=1
+      break
+    fi
+  done
+  if [ "$SSH_IDENTITY_OK" -ne 1 ]; then
+    MISSING+=("ssh_identity_missing")
+  fi
 fi
 if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 && command -v srun >/dev/null 2>&1 && command -v sbatch >/dev/null 2>&1; then
   BINARIES_OK=1
@@ -816,7 +853,7 @@ else
 fi
 IMAGE_OK=0
 if [ -n "$REMOTE_CONTAINER_IMAGE" ] && [ -f "$REMOTE_CONTAINER_IMAGE" ] && [ -r "$REMOTE_CONTAINER_IMAGE" ]; then
-  if [ -f "$REMOTE_CONTAINER_METADATA" ] && [ -r "$REMOTE_CONTAINER_METADATA" ] && grep -Fq '"contract_version":"'"$IMAGE_CONTRACT_VERSION"'"' "$REMOTE_CONTAINER_METADATA"; then
+  if [ -f "$REMOTE_CONTAINER_METADATA" ] && [ -r "$REMOTE_CONTAINER_METADATA" ] && grep -Fq '"contract_version":"'"$IMAGE_CONTRACT_VERSION"'"' "$REMOTE_CONTAINER_METADATA" && grep -Fq '"runtime_packages":"'"$IMAGE_REQUIRED_PACKAGES"'"' "$REMOTE_CONTAINER_METADATA"; then
     IMAGE_OK=1
   else
     MISSING+=("image_stale")
@@ -846,7 +883,7 @@ INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {{gsub(/%/, "", $5); print $
 FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {{print $4+0}}' || echo 0)
 FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
 MISSING_TEXT=$(IFS=,; printf '%s' "${{MISSING[*]}}")
-printf '__PEETSFEA_READY__:home=%s runtime=%s env=%s python=%s module=%s binaries=%s ansys=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s image_path=%s env_path=%s scratch_root=%s scratch_usage_mb=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$ENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT" "$REMOTE_CONTAINER_IMAGE" "$IMAGE_PYTHON" "$SCRATCH_ROOT" "$SCRATCH_USAGE_MB"
+printf '__PEETSFEA_READY__:home=%s runtime=%s env=%s python=%s module=%s binaries=%s ansys=%s storage=%s fuse_device=%s ssh_identity=%s sshfs=%s fusermount=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s image_path=%s env_path=%s scratch_root=%s scratch_usage_mb=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$ENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$STORAGE_OK" "$FUSE_DEVICE_OK" "$SSH_IDENTITY_OK" "$SSHFS_OK" "$FUSERMOUNT_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT" "$REMOTE_CONTAINER_IMAGE" "$IMAGE_PYTHON" "$SCRATCH_ROOT" "$SCRATCH_USAGE_MB"
 """
 
 
@@ -875,6 +912,8 @@ UV_OK=0
 PYAEDT_OK=0
 PANDAS_OK=0
 PYVISTA_OK=0
+FUSE_DEVICE_OK=0
+SSH_IDENTITY_OK=0
 STORAGE_OK=1
 TMPFS_OK=0
 MISSING=()
@@ -885,12 +924,27 @@ REMOTE_CONTAINER_ANSYS_BASE={_double_quoted_shell_value(ansys_base)}
 SCRATCH_ROOT={_double_quoted_shell_value(scratch_root)}
 RUNTIME_ROOT={_double_quoted_shell_value(runtime_root)}
 IMAGE_CONTRACT_VERSION={_double_quoted_shell_value(_ENROOT_IMAGE_CONTRACT_VERSION)}
+IMAGE_REQUIRED_PACKAGES={_double_quoted_shell_value(_ENROOT_IMAGE_REQUIRED_PACKAGES_TEXT)}
 IMAGE_PYTHON={_double_quoted_shell_value(_ENROOT_IMAGE_PYTHON)}
 BASE_DIR=""
 CONTAINER_NAME="peetsfea-preflight-${{SLURM_JOB_ID:-nojob}}-$$"
 SCRATCH_USAGE_MB=0
 if [ -n "${{HOME:-}}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
   HOME_OK=1
+  if [ -e /dev/fuse ] && [ -r /dev/fuse ] && [ -w /dev/fuse ]; then
+    FUSE_DEVICE_OK=1
+  else
+    MISSING+=("fuse_device_missing")
+  fi
+  for key in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
+    if [ -r "$key" ]; then
+      SSH_IDENTITY_OK=1
+      break
+    fi
+  done
+  if [ "$SSH_IDENTITY_OK" -ne 1 ]; then
+    MISSING+=("ssh_identity_missing")
+  fi
 fi
 if command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 && command -v enroot >/dev/null 2>&1 && command -v srun >/dev/null 2>&1; then
   BINARIES_OK=1
@@ -900,7 +954,7 @@ else
 fi
 IMAGE_OK=0
 if [ -n "$REMOTE_CONTAINER_IMAGE" ] && [ -f "$REMOTE_CONTAINER_IMAGE" ] && [ -r "$REMOTE_CONTAINER_IMAGE" ]; then
-  if [ -f "$REMOTE_CONTAINER_METADATA" ] && [ -r "$REMOTE_CONTAINER_METADATA" ] && grep -Fq '"contract_version":"'"$IMAGE_CONTRACT_VERSION"'"' "$REMOTE_CONTAINER_METADATA"; then
+  if [ -f "$REMOTE_CONTAINER_METADATA" ] && [ -r "$REMOTE_CONTAINER_METADATA" ] && grep -Fq '"contract_version":"'"$IMAGE_CONTRACT_VERSION"'"' "$REMOTE_CONTAINER_METADATA" && grep -Fq '"runtime_packages":"'"$IMAGE_REQUIRED_PACKAGES"'"' "$REMOTE_CONTAINER_METADATA"; then
     IMAGE_OK=1
   else
     MISSING+=("image_stale")
@@ -943,6 +997,8 @@ if [ "$RUNTIME_OK" -eq 1 ]; then
 set +e
 IMAGE_PYTHON="/opt/miniconda3/bin/python"
 TMPFS_OK=0
+SSHFS_OK=0
+FUSERMOUNT_OK=0
 mkdir -p /work/tmp /work/home
 if mount -t tmpfs -o size={JOB_TMPFS_SIZE_GB}G tmpfs /work/tmp >/dev/null 2>&1; then
   TMPFS_OK=1
@@ -965,7 +1021,13 @@ if [ ! -x "$IMAGE_PYTHON" ]; then
   printf '__PEETSFEA_PREFLIGHT_INNER__:tmpfs=1 python=0 uv=0 pyaedt=0 pandas=0 pyvista=0\n'
   exit 0
 fi
-printf '__PEETSFEA_PREFLIGHT_INNER__:tmpfs=1 python=1 '
+if command -v sshfs >/dev/null 2>&1; then
+  SSHFS_OK=1
+fi
+if command -v fusermount >/dev/null 2>&1 || command -v fusermount3 >/dev/null 2>&1; then
+  FUSERMOUNT_OK=1
+fi
+printf '__PEETSFEA_PREFLIGHT_INNER__:tmpfs=1 python=1 sshfs=%s fusermount=%s ' "$SSHFS_OK" "$FUSERMOUNT_OK"
 "$IMAGE_PYTHON" - <<'PY'
 import subprocess
 import sys
@@ -1000,12 +1062,16 @@ INNER
       PYAEDT_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*pyaedt=\([01]\).*/\1/p')
       PANDAS_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*pandas=\([01]\).*/\1/p')
       PYVISTA_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*pyvista=\([01]\).*/\1/p')
+      SSHFS_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*sshfs=\([01]\).*/\1/p')
+      FUSERMOUNT_OK=$(printf '%s\n' "$INNER_MARKER" | sed -n 's/.*fusermount=\([01]\).*/\1/p')
       : "${{TMPFS_OK:=0}}"
       : "${{PYTHON_OK:=0}}"
       : "${{UV_OK:=0}}"
       : "${{PYAEDT_OK:=0}}"
       : "${{PANDAS_OK:=0}}"
       : "${{PYVISTA_OK:=0}}"
+      : "${{SSHFS_OK:=0}}"
+      : "${{FUSERMOUNT_OK:=0}}"
       if [ "$TMPFS_OK" -ne 1 ]; then
         MISSING+=("tmpfs_mount_failed")
       fi
@@ -1020,7 +1086,7 @@ INODE_PCT=$(df -Pi "$HOME" 2>/dev/null | awk 'NR==2 {{gsub(/%/, "", $5); print $
 FREE_MB=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {{print $4+0}}' || echo 0)
 FS_TYPE=$(stat -f -c %T "$HOME" 2>/dev/null || echo unknown)
 MISSING_TEXT=$(IFS=,; printf '%s' "${{MISSING[*]}}")
-printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s env=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s pandas=%s pyvista=%s tmpfs=%s storage=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s image_path=%s env_path=%s scratch_root=%s scratch_usage_mb=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$ENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK" "$PANDAS_OK" "$PYVISTA_OK" "$TMPFS_OK" "$STORAGE_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT" "$REMOTE_CONTAINER_IMAGE" "$IMAGE_PYTHON" "$SCRATCH_ROOT" "$SCRATCH_USAGE_MB"
+printf '__PEETSFEA_PREFLIGHT__:home=%s runtime=%s env=%s python=%s module=%s binaries=%s ansys=%s uv=%s pyaedt=%s pandas=%s pyvista=%s sshfs=%s fusermount=%s tmpfs=%s storage=%s fuse_device=%s ssh_identity=%s inode_pct=%s free_mb=%s fs_type=%s container=1 missing=%s image_path=%s env_path=%s scratch_root=%s scratch_usage_mb=%s\\n' "$HOME_OK" "$RUNTIME_OK" "$ENV_OK" "$PYTHON_OK" "$MODULE_OK" "$BINARIES_OK" "$ANSYS_OK" "$UV_OK" "$PYAEDT_OK" "$PANDAS_OK" "$PYVISTA_OK" "$SSHFS_OK" "$FUSERMOUNT_OK" "$TMPFS_OK" "$STORAGE_OK" "$FUSE_DEVICE_OK" "$SSH_IDENTITY_OK" "$INODE_PCT" "$FREE_MB" "$FS_TYPE" "$MISSING_TEXT" "$REMOTE_CONTAINER_IMAGE" "$IMAGE_PYTHON" "$SCRATCH_ROOT" "$SCRATCH_USAGE_MB"
 """
 
 
@@ -1251,6 +1317,10 @@ def _parse_preflight_marker(
     pyaedt_ok = values.get("pyaedt", False)
     pandas_ok = values.get("pandas", False)
     pyvista_ok = values.get("pyvista", False)
+    fuse_device_ok = raw_values.get("fuse_device", "1").strip() == "1"
+    ssh_identity_ok = raw_values.get("ssh_identity", "1").strip() == "1"
+    sshfs_binary_ok = raw_values.get("sshfs", "1").strip() == "1"
+    fusermount_ok = raw_values.get("fusermount", "1").strip() == "1"
     tmpfs_ok = values.get("tmpfs", True)
     storage_ready, storage_reason, inode_use_percent, free_mb = _storage_snapshot_from_values(
         values=raw_values,
@@ -1277,6 +1347,10 @@ def _parse_preflight_marker(
             ("pyaedt", pyaedt_ok),
             ("pandas", pandas_ok),
             ("pyvista", pyvista_ok),
+            ("sshfs", sshfs_binary_ok),
+            ("fusermount", fusermount_ok),
+            ("fuse_device", fuse_device_ok),
+            ("ssh_identity", ssh_identity_ok),
             ("tmpfs", tmpfs_ok),
         )
         if not check_ok
@@ -1311,6 +1385,10 @@ def _parse_preflight_marker(
         free_mb=free_mb,
         scratch_root=scratch_root,
         scratch_usage_mb=scratch_usage_mb,
+        fuse_device_ok=fuse_device_ok,
+        ssh_identity_ok=ssh_identity_ok,
+        sshfs_binary_ok=sshfs_binary_ok,
+        fusermount_ok=fusermount_ok,
     )
 
 

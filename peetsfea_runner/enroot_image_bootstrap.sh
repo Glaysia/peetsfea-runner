@@ -6,7 +6,7 @@ BOOTSTRAP_MARKER="__PEETSFEA_BOOTSTRAP__:ok"
 TARGET_IMAGE="${TARGET_IMAGE:-${HOME}/runtime/enroot/aedt.sqsh}"
 IMAGE_DIR="${IMAGE_DIR:-$(dirname "${TARGET_IMAGE}")}"
 METADATA_PATH="${METADATA_PATH:-${TARGET_IMAGE}.meta.json}"
-CONTRACT_VERSION="${CONTRACT_VERSION:-2026-03-18-aedt-sqsh-v2}"
+CONTRACT_VERSION="${CONTRACT_VERSION:-2026-05-07-aedt-sqsh-v3-sshfs}"
 BASE_IMAGE="${BASE_IMAGE:-docker://ubuntu:24.04}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 PYAEDT_SPEC="${PYAEDT_SPEC:-pyaedt==0.25.1}"
@@ -32,7 +32,7 @@ image_is_current() {
 
 write_metadata() {
   cat > "${TMP_METADATA}" <<EOF
-{"contract_version":"${CONTRACT_VERSION}","base_image":"${BASE_IMAGE}","python_version":"${PYTHON_VERSION}","pyaedt":"${PYAEDT_SPEC}","pandas":"${PANDAS_SPEC}","pyvista":"${PYVISTA_SPEC}","host_ansys_root":"${HOST_ANSYS_ROOT}","host_ansys_base":"${HOST_ANSYS_BASE}"}
+{"contract_version":"${CONTRACT_VERSION}","base_image":"${BASE_IMAGE}","python_version":"${PYTHON_VERSION}","pyaedt":"${PYAEDT_SPEC}","pandas":"${PANDAS_SPEC}","pyvista":"${PYVISTA_SPEC}","host_ansys_root":"${HOST_ANSYS_ROOT}","host_ansys_base":"${HOST_ANSYS_BASE}","runtime_packages":"openssh-client sshfs fuse3 ca-certificates"}
 EOF
 }
 
@@ -114,6 +114,7 @@ apt-get install -y --no-install-recommends \
   libselinux1 libx11-6 libxau6 libxcb1 libx11-xcb1 libxdamage1 libxext6 \
   libxfixes3 libxft2 libxi6 libxmu6 libxrandr2 libxrender1 libxt6t64 \
   libxtst6 libxxf86vm1 libgl1-mesa-dri libglx-mesa0 libglu1-mesa \
+  openssh-client sshfs fuse3 \
   libsm6 libice6 libopengl0 libnsl2 mesa-utils zlib1g
 rm -rf /var/lib/apt/lists/*
 curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh
@@ -127,6 +128,12 @@ fi
 /opt/miniconda3/bin/python -m pip install --upgrade pip setuptools wheel uv
 /opt/miniconda3/bin/python -m uv pip install "${PYAEDT_SPEC}" "${PANDAS_SPEC}" "${PYVISTA_SPEC}"
 /opt/miniconda3/bin/python -c "import ansys.aedt.core, pandas, pyvista"
+command -v ssh >/dev/null
+command -v sshfs >/dev/null
+if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
+  echo "missing fusermount/fusermount3 after fuse3 install" >&2
+  exit 1
+fi
 EOF
 
 write_metadata
@@ -147,6 +154,12 @@ test -x /mnt/AnsysEM/ansysedt
 test -x /ansys_inc/v252/licensingclient/linx64/ansyscl
 /opt/miniconda3/bin/python -m uv --version >/dev/null
 /opt/miniconda3/bin/python -c "import ansys.aedt.core, pandas, pyvista"
+command -v ssh >/dev/null
+command -v sshfs >/dev/null
+if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
+  echo "missing fusermount/fusermount3 in exported image" >&2
+  exit 1
+fi
 EOF
 
 mv "${TMP_IMAGE}" "${TARGET_IMAGE}"

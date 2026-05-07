@@ -364,11 +364,11 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn("printf 'tool.%s=%s\\n' \"$tool\" \"${resolved_tool:-MISSING}\"", content)
         self.assertNotIn("rm -rf \"$REMOTE_JOB_DIR\" >/dev/null 2>&1 || true", content)
 
-    def test_pull_worker_payload_requests_leases_and_uploads_per_slot_artifacts(self) -> None:
+    def test_pull_worker_payload_uses_single_container_sshfs_slots(self) -> None:
         class _Cfg:
-            slots_per_job = 48
+            slots_per_job = 10
             slot_min_concurrency = 5
-            slot_max_concurrency = 48
+            slot_max_concurrency = 10
             slot_memory_pressure_high_watermark_percent = 90
             slot_memory_pressure_resume_watermark_percent = 80
             slot_memory_probe_interval_seconds = 5
@@ -385,7 +385,7 @@ class TestPlan03Workflow(unittest.TestCase):
             control_plane_return_port = 22
             control_plane_return_user = "peetsmain"
             tunnel_recovery_grace_seconds = 30
-            mem = "288G"
+            mem = "960G"
             remote_container_runtime = "enroot"
             remote_container_image = "~/runtime/enroot/aedt.sqsh"
             remote_container_ansys_root = "/opt/ohpc/pub/Electronics/v252"
@@ -396,14 +396,18 @@ class TestPlan03Workflow(unittest.TestCase):
             slurm_partitions_allowlist = ("cpu2",)
             nodes = 1
             ntasks = 1
-            cpus_per_job = 48
+            cpus_per_job = 40
             time_limit = "05:00:00"
             platform = "linux"
             scheduler = "slurm"
             remote_execution_backend = "slurm_batch"
             remote_ssh_port = 22
             ssh_config_path = ""
-            worker_payload_slot_limit = 48
+            worker_payload_slot_limit = 10
+            pull_workspace_user = "peets"
+            pull_workspace_host = "172.16.165.146"
+            pull_workspace_path = "/home/peets/mnt/8tb/peetsfea-runner"
+            pull_workspace_mount_root = "/workspace"
             slurm_exclude_nodes = ()
 
         content = _build_pull_worker_payload_script_content(
@@ -412,8 +416,16 @@ class TestPlan03Workflow(unittest.TestCase):
             worker_id="worker_01",
         )
         self.assertIn("/internal/leases/request", content)
-        self.assertIn("/internal/leases/input?run_id=${PEETS_CONTROL_RUN_ID}&lease_token=${lease_token}", content)
-        self.assertIn("/internal/leases/artifact?run_id=${PEETS_CONTROL_RUN_ID}&lease_token=${lease_token}", content)
+        self.assertIn("input_relpath", content)
+        self.assertIn("output_relpath", content)
+        self.assertIn("storage_mode", content)
+        self.assertIn('if [ "$storage_mode" = "sshfs_direct" ]', content)
+        self.assertIn('project_path="$PEETS_WORKSPACE_MOUNT_ROOT/$input_relpath"', content)
+        self.assertIn('output_dir="$PEETS_WORKSPACE_MOUNT_ROOT/$output_relpath"', content)
+        self.assertIn("'output_materialized'] = True", content)
+        self.assertIn('lease_control_request /internal/leases/complete "$lease_token" "" "" "$output_relpath" true', content)
+        self.assertNotIn("/internal/leases/input?run_id=${PEETS_CONTROL_RUN_ID}&lease_token=${lease_token}", content)
+        self.assertNotIn("/internal/leases/artifact?run_id=${PEETS_CONTROL_RUN_ID}&lease_token=${lease_token}", content)
         self.assertIn("/internal/leases/complete", content)
         self.assertIn("/internal/leases/fail", content)
         self.assertIn("PEETS_LEASE_HEARTBEAT_INTERVAL=15", content)
@@ -427,13 +439,33 @@ class TestPlan03Workflow(unittest.TestCase):
         self.assertIn('if [ -n "${PEETS_JOB_WORKDIR:-}" ]; then', content)
         self.assertIn('export PEETS_JOB_WORKDIR="$workdir"', content)
         self.assertIn('ENROOT_CREATE_LOCK="$workdir/enroot-create.lock"', content)
-        self.assertIn('enroot_base="$JOB_TMPFS_ROOT/enroot/${SLURM_JOB_ID:-nojob}/${session_id}-$$"', content)
-        self.assertIn('flock 9; ENROOT_RUNTIME_PATH="$enroot_base/runtime"', content)
+        self.assertIn('export PEETS_WORKSPACE_REMOTE="peets@172.16.165.146:/home/peets/mnt/8tb/peetsfea-runner"', content)
+        self.assertIn('export PEETS_WORKSPACE_MOUNT_ROOT="/workspace"', content)
+        self.assertIn('test -f /root/.ssh/id_control', content)
+        self.assertIn('sshfs -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,idmap=user,uid=0,gid=0,umask=000', content)
+        self.assertIn('"$PEETS_WORKSPACE_REMOTE" "$PEETS_WORKSPACE_MOUNT_ROOT"', content)
+        self.assertIn('enroot_base="$JOB_TMPFS_ROOT/enroot/${SLURM_JOB_ID:-nojob}/worker-$$"', content)
+        self.assertIn('container_name="peets-${SLURM_JOB_ID:-nojob}-${PEETS_CONTROL_WORKER_ID}-worker-$$"', content)
+        self.assertEqual(content.count("enroot create -f -n \"$container_name\""), 2)
+        self.assertEqual(content.count("enroot start --root --rw"), 1)
+        self.assertIn('--mount "/dev/fuse:/dev/fuse"', content)
+        self.assertIn('--mount "$ssh_mount_dir:/root/.ssh:ro"', content)
+        self.assertIn('cp -f "$PEETS_CONTROL_SSH_IDENTITY" "$ssh_mount_dir/id_control"', content)
+        self.assertIn('enroot exec "$container_pid" /bin/bash "/work/slots/$case_name/session_case_exec.sh"', content)
+        self.assertIn('unsupported lease storage_mode=${storage_mode:-missing}; single_container_sshfs worker requires sshfs_direct', content)
+        self.assertNotIn("start_slot_session_container()", content)
+        self.assertNotIn("stop_slot_session_container()", content)
+        self.assertNotIn("/home/peetsmain/peetsfea-runner", content)
         self.assertNotIn('REMOTE_RUNTIME_ROOT="$HOME/aedt_runs/_runtime"', content)
-        self.assertIn('export TMP="$PWD/tmp"', content)
-        self.assertIn('export TEMP="$PWD/tmp"', content)
+        self.assertIn('export TMP="\\$case_disk_root/tmp"', content)
+        self.assertIn('export TEMP="\\$case_disk_root/tmp"', content)
         self.assertNotIn("project_01.aedt", content)
         self.assertNotIn("for i in $(seq 1 ", content)
+        with tempfile.TemporaryDirectory(prefix="peets_pull_payload_") as tmpdir:
+            script_path = Path(tmpdir) / "remote_pull_worker_payload.sh"
+            script_path.write_text(content, encoding="utf-8")
+            completed = subprocess.run(["bash", "-n", str(script_path)], check=False, capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_pull_remote_sbatch_only_stages_scripts(self) -> None:
         class _Cfg:

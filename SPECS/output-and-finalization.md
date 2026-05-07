@@ -10,16 +10,25 @@ The existing artifact directory structure is preserved.
 
 ## Artifact Upload Rules
 
-- Workers upload artifacts as tarballs.
-- The control plane untars them into the target `.aedt.out` directory.
-- Partial upload or extraction failure is treated as non-final.
+The default prune-lane worker model is sshfs direct materialization.
+
+- Workers write artifacts directly into the target `.aedt.out` directory through
+  the sshfs-mounted local workspace.
+- The mounted workspace is
+  `peets@172.16.165.146:/home/peets/mnt/8tb/peetsfea-runner`.
+- The control plane validates completion metadata and finalizes the input.
+- Partial output writes are treated as non-final.
+
+Tarball upload through `/internal/leases/artifact` remains a compatibility path
+for non-sshfs workers and diagnostics, but it is not the normal prune-lane data
+path.
 
 ## Success Rules
 
 A slot is considered successful only when:
 
-1. artifact upload succeeds
-2. artifact materialization succeeds
+1. output materialization succeeds
+2. expected output directory exists
 3. the terminal exit code is `0`
 4. input rename to `.done` succeeds
 
@@ -31,6 +40,10 @@ On failure:
 - write failure artifacts there
 - do not rename input to `.done`
 - leave the input eligible for retry or replay after restart
+
+Failure artifacts should be written directly by the worker when sshfs is
+available. If the sshfs mount is unavailable, the worker may report failure
+through the lease API without claiming output materialization.
 
 ## Cleanup Rules
 

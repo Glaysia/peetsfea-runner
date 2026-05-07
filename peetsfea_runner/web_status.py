@@ -33,6 +33,29 @@ def _is_loopback_client(host: str | None) -> bool:
     return host in {"127.0.0.1", "::1", "localhost"}
 
 
+def _safe_relpath(path: Path, base: Path | None) -> str:
+    if base is None:
+        return path.name
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        return path.name
+
+
+def _relpath_under_root(path: Path, root: Path) -> str | None:
+    try:
+        return str(path.expanduser().resolve().relative_to(root.expanduser().resolve()))
+    except ValueError:
+        return None
+
+
+def _to_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "on"}
+
+
 def make_status_handler(
     *,
     state_store: StateStore | None = None,
@@ -174,6 +197,21 @@ def make_status_handler(
                     stage="LEASED",
                     message=f"worker_id={worker_id} slurm_job_id={slot_record.get('slurm_job_id') or 'unknown'}",
                 )
+                storage_mode = str(lease_context.worker_storage.storage_mode).strip() or "payload"
+                input_path = Path(str(slot_record["input_path"]))
+                output_path = Path(str(slot_record["output_path"]))
+                input_relpath = _relpath_under_root(input_path, Path(lease_context.input_queue_dir))
+                output_relpath = _relpath_under_root(output_path, Path(lease_context.output_root_dir))
+                if storage_mode == "sshfs_direct" and (input_relpath is None or output_relpath is None):
+                    store.clear_slot_lease(
+                        run_id=run_id,
+                        lease_token=lease_token,
+                        final_state="RETRY_QUEUED",
+                        failure_reason="lease path outside configured root",
+                    )
+                    store.mark_ingest_state(input_path=str(slot_record["input_path"]), state="RETRY_QUEUED")
+                    self._send_json({"error": "lease_path_outside_root"}, status=409)
+                    return
                 self._send_json(
                     {
                         "ok": True,
@@ -181,7 +219,18 @@ def make_status_handler(
                         "lease_token": lease_token,
                         "slot_id": str(slot_record["slot_id"]),
                         "attempt_no": int(slot_record.get("attempt_no") or 0),
-                        "input_name": Path(str(slot_record["input_path"])).name,
+                        "input_name": input_path.name,
+                        "input_relpath": input_relpath
+                        or _safe_relpath(
+                            input_path.resolve(),
+                            Path(lease_context.input_queue_dir).expanduser().resolve(),
+                        ),
+                        "output_relpath": output_relpath
+                        or _safe_relpath(
+                            output_path.resolve(),
+                            Path(lease_context.output_root_dir).expanduser().resolve(),
+                        ),
+                        "storage_mode": storage_mode,
                     }
                 )
                 return
@@ -277,8 +326,26 @@ def make_status_handler(
                 if slot_record is None:
                     self._send_json({"error": "lease_not_found"}, status=404)
                     return
-                if not slot_record.get("artifact_uploaded_at"):
+                storage_mode = str(lease_context.worker_storage.storage_mode).strip() or "payload"
+                if storage_mode == "payload" and not slot_record.get("artifact_uploaded_at"):
                     self._send_json({"error": "artifact_missing"}, status=409)
+                    return
+                output_dir = Path(str(slot_record["output_path"])).expanduser().resolve()
+                if storage_mode == "sshfs_direct":
+                    output_materialized = _to_bool(payload.get("output_materialized"))
+                    if not output_materialized:
+                        self._send_json({"error": "output_not_materialized"}, status=409)
+                        return
+                    expected_output_relpath = _relpath_under_root(output_dir, Path(lease_context.output_root_dir))
+                    reported_output_relpath = str(payload.get("output_relpath") or "").strip()
+                    if expected_output_relpath is None:
+                        self._send_json({"error": "output_path_outside_root"}, status=409)
+                        return
+                    if reported_output_relpath and reported_output_relpath != expected_output_relpath:
+                        self._send_json({"error": "output_relpath_mismatch"}, status=409)
+                        return
+                if not output_dir.is_dir():
+                    self._send_json({"error": "output_directory_missing"}, status=409)
                     return
                 slot = slot_task_ref_from_record(run_id=run_id, slot_record=slot_record)
                 store.clear_slot_lease(run_id=run_id, lease_token=lease_token, final_state="SUCCEEDED")

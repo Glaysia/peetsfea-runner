@@ -82,6 +82,8 @@ _SAMPLE_CANARY_INPUT_NAMES = frozenset({"sample.aedt", "sample_0318.aedt"})
 _CANARY_REPORT_MANIFEST_COLUMNS = frozenset(
     {"design_name", "reports_dir", "report_count", "native_report_count", "synthetic_report_count", "status", "error_log"}
 )
+_WORKER_STORAGE_MODELS = frozenset({"single_container_sshfs", "legacy_pull"})
+_WORKER_STORAGE_MODES = frozenset({"sshfs_direct", "payload"})
 _DISPATCH_MODE_ALLOWED = frozenset({"run", "drain"})
 _BAD_NODE_COOLDOWN_HOURS = 8
 _BAD_NODE_NO_SPACE_MARKER = "No space left on device"
@@ -288,6 +290,18 @@ class _ReadyArtifactState:
     locked: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class WorkerStorageConfig:
+    model: str = "single_container_sshfs"
+    storage_mode: str = "sshfs_direct"
+
+    def __post_init__(self) -> None:
+        if self.model not in _WORKER_STORAGE_MODELS:
+            raise ValueError(f"worker_storage.model must be in {sorted(_WORKER_STORAGE_MODELS)}")
+        if self.storage_mode not in _WORKER_STORAGE_MODES:
+            raise ValueError(f"worker_storage.storage_mode must be in {sorted(_WORKER_STORAGE_MODES)}")
+
+
 @dataclass(slots=True)
 class _SlurmTruthAccountState:
     last_running_count: int | None = None
@@ -315,6 +329,10 @@ class PipelineConfig:
     mem: str = "960G"
     time_limit: str = "05:00:00"
     remote_root: str = DEFAULT_REMOTE_ROOT
+    pull_workspace_user: str = "peets"
+    pull_workspace_host: str = "172.16.165.146"
+    pull_workspace_path: str = "/home/peets/mnt/8tb/peetsfea-runner"
+    pull_workspace_mount_root: str = "/workspace"
     execute_remote: bool = False
     remote_execution_backend: str = "slurm_batch"
     control_plane_host: str = "127.0.0.1"
@@ -366,6 +384,7 @@ class PipelineConfig:
     pending_buffer_per_account: int = 3
     capacity_scope: str = "all_user_jobs"
     balance_metric: str = _LICENSE_BALANCE_METRIC
+    worker_storage: WorkerStorageConfig = field(default_factory=lambda: WorkerStorageConfig())
     input_source_policy: str = "input_queue_only"
     public_storage_mode: str = "disabled"
     remote_storage_inode_block_percent: int = 98
@@ -457,6 +476,10 @@ class PipelineConfig:
             raise ValueError("input_source_policy must be 'input_queue_only'")
         if self.public_storage_mode not in {"disabled", "private_only", "public_nas"}:
             raise ValueError("public_storage_mode must be 'disabled', 'private_only', or 'public_nas'")
+        if self.worker_storage.model not in _WORKER_STORAGE_MODELS:
+            raise ValueError(f"worker_storage.model must be in {sorted(_WORKER_STORAGE_MODELS)}")
+        if self.worker_storage.storage_mode not in _WORKER_STORAGE_MODES:
+            raise ValueError(f"worker_storage.storage_mode must be in {sorted(_WORKER_STORAGE_MODES)}")
         if self.remote_storage_inode_block_percent < 0 or self.remote_storage_inode_block_percent > 100:
             raise ValueError("remote_storage_inode_block_percent must be in 0..100")
         if self.remote_storage_min_free_mb < 0:
@@ -479,6 +502,10 @@ class PipelineConfig:
             "mem",
             "time_limit",
             "remote_root",
+            "pull_workspace_user",
+            "pull_workspace_host",
+            "pull_workspace_path",
+            "pull_workspace_mount_root",
             "control_plane_host",
             "remote_container_ansys_root",
         ):
@@ -585,6 +612,9 @@ class LeaseServerContext:
     retain_aedtresults: bool
     worker_requeue_limit: int
     lease_ttl_seconds: int
+    input_queue_dir: str
+    output_root_dir: str
+    worker_storage: WorkerStorageConfig
 
 
 @dataclass(slots=True)
@@ -609,6 +639,10 @@ class _RemoteExecutionConfig:
     account_id: str
     host: str
     remote_root: str
+    pull_workspace_user: str
+    pull_workspace_host: str
+    pull_workspace_path: str
+    pull_workspace_mount_root: str
     partition: str
     slurm_partitions_allowlist: tuple[str, ...]
     nodes: int
@@ -836,6 +870,9 @@ def build_lease_server_context(*, config: PipelineConfig) -> LeaseServerContext:
         retain_aedtresults=config.retain_aedtresults,
         worker_requeue_limit=config.worker_requeue_limit,
         lease_ttl_seconds=config.lease_ttl_seconds,
+        input_queue_dir=config.input_queue_dir,
+        output_root_dir=config.output_root_dir,
+        worker_storage=config.worker_storage,
     )
 
 
@@ -1167,6 +1204,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                     account_id=account.account_id,
                     host=account.host_alias,
                     remote_root=config.remote_root,
+                    pull_workspace_user=config.pull_workspace_user,
+                    pull_workspace_host=config.pull_workspace_host,
+                    pull_workspace_path=config.pull_workspace_path,
+                    pull_workspace_mount_root=config.pull_workspace_mount_root,
                     partition=config.partition,
                     slurm_partitions_allowlist=config.slurm_partitions_allowlist,
                     nodes=config.nodes,
@@ -1275,6 +1316,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 account_id=account.account_id,
                 host=account.host_alias,
                 remote_root=config.remote_root,
+                pull_workspace_user=config.pull_workspace_user,
+                pull_workspace_host=config.pull_workspace_host,
+                pull_workspace_path=config.pull_workspace_path,
+                pull_workspace_mount_root=config.pull_workspace_mount_root,
                 partition=config.partition,
                 slurm_partitions_allowlist=config.slurm_partitions_allowlist,
                 nodes=config.nodes,
@@ -1832,6 +1877,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
             account_id=account.account_id,
             host=account.host_alias,
             remote_root=config.remote_root,
+            pull_workspace_user=config.pull_workspace_user,
+            pull_workspace_host=config.pull_workspace_host,
+            pull_workspace_path=config.pull_workspace_path,
+            pull_workspace_mount_root=config.pull_workspace_mount_root,
             partition=config.partition,
             slurm_partitions_allowlist=config.slurm_partitions_allowlist,
             nodes=config.nodes,
@@ -2577,6 +2626,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
                 account_id=account.account_id,
                 host=account.host_alias,
                 remote_root=config.remote_root,
+                pull_workspace_user=config.pull_workspace_user,
+                pull_workspace_host=config.pull_workspace_host,
+                pull_workspace_path=config.pull_workspace_path,
+                pull_workspace_mount_root=config.pull_workspace_mount_root,
                 partition=config.partition,
                 slurm_partitions_allowlist=config.slurm_partitions_allowlist,
                 nodes=config.nodes,
@@ -3004,6 +3057,10 @@ def _run_bundle_with_retry(
         account_id=bundle.account_id,
         host=bundle.host_alias,
         remote_root=config.remote_root,
+        pull_workspace_user=config.pull_workspace_user,
+        pull_workspace_host=config.pull_workspace_host,
+        pull_workspace_path=config.pull_workspace_path,
+        pull_workspace_mount_root=config.pull_workspace_mount_root,
         partition=config.partition,
         slurm_partitions_allowlist=config.slurm_partitions_allowlist,
         nodes=config.nodes,

@@ -40,6 +40,12 @@ class TestRunnerConfig(unittest.TestCase):
             self.assertEqual(config.slots_per_job, 6)
             self.assertEqual(config.cores_per_slot, 4)
             self.assertEqual(config.balance_metric, "license_max_520")
+            self.assertEqual(config.worker_storage.model, "single_container_sshfs")
+            self.assertEqual(config.worker_storage.storage_mode, "sshfs_direct")
+            self.assertEqual(config.pull_workspace_user, "peets")
+            self.assertEqual(config.pull_workspace_host, "172.16.165.146")
+            self.assertEqual(config.pull_workspace_path, "/home/peets/mnt/8tb/peetsfea-runner")
+            self.assertEqual(config.pull_workspace_mount_root, "/workspace")
 
     def test_package_version_uses_date_build_format(self) -> None:
         self.assertRegex(__version__, r"^\d{4}\.\d{2}\.\d{2}\.\d+$")

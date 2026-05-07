@@ -14,7 +14,7 @@ Replace DB tables with a single process-local runtime state object.
 - `leased_by_token`
 - `leased_by_input`
 - `workers_by_id`
-- `slot_sessions_by_worker`
+- `slots_by_worker`
 - `recent_events`
 - `counters`
 
@@ -41,9 +41,12 @@ Each lease stores:
 - slurm job id
 - input path
 - output path
+- input relative path
+- output relative path
+- storage mode
 - started at
 - expires at
-- artifact uploaded flag
+- output materialized flag
 - current state
 
 ## Workers
@@ -55,21 +58,27 @@ Each worker record stores:
 - slurm job id
 - current worker state
 - last heartbeat
+- container state
+- sshfs mount state
 - current active slot count
 - current target slot count
 
-## Slot Sessions
+## Slots
 
-Each slot session stores:
+Each logical slot stores:
 
-- session id
+- slot id
 - worker id
-- ansys pid
-- grpc port
+- optional ansys pid
+- optional grpc port
 - session state
 - current leased input
 - cases processed in session
 - last restart reason
+
+Slots do not imply separate containers. One worker record corresponds to one
+Slurm job and one enroot container; slots are concurrent executions inside that
+container.
 
 ## Event Buffer
 
