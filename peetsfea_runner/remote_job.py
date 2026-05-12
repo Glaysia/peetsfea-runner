@@ -3870,7 +3870,7 @@ def _build_pull_worker_payload_script_content(
         "test -f /etc/peetsfea_ssh/id_control || { echo \"[ERROR] missing container SSH identity: /etc/peetsfea_ssh/id_control\" >&2; exit 1; }",
         "chmod 700 /etc/peetsfea_ssh >/dev/null 2>&1 || true",
         "chmod 600 /etc/peetsfea_ssh/id_control >/dev/null 2>&1 || true",
-        "sshfs -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,idmap=user,uid=0,gid=0,umask=000,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,IdentityFile=/etc/peetsfea_ssh/id_control \"$PEETS_WORKSPACE_REMOTE\" \"$PEETS_WORKSPACE_MOUNT_ROOT\"",
+        "sshfs -o reconnect,follow_symlinks,ServerAliveInterval=15,ServerAliveCountMax=3,idmap=user,uid=0,gid=0,umask=000,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,IdentityFile=/etc/peetsfea_ssh/id_control \"$PEETS_WORKSPACE_REMOTE\" \"$PEETS_WORKSPACE_MOUNT_ROOT\"",
         "touch /work/container.ready",
         "while true; do sleep 3600; done",
         "EOS",

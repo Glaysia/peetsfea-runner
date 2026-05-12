@@ -73,6 +73,10 @@ def _workspace_relative_path(
 
 def _relpath_under_root(path: Path, root: Path) -> str | None:
     try:
+        return str(path.expanduser().relative_to(root.expanduser()))
+    except ValueError:
+        pass
+    try:
         return str(path.expanduser().resolve().relative_to(root.expanduser().resolve()))
     except ValueError:
         return None
