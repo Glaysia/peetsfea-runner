@@ -41,8 +41,8 @@ class TestBuiltInService(unittest.TestCase):
         self.assertTrue(lane_by_id["preserve_results"].retain_aedtresults)
         self.assertTrue(lane_by_id["preserve_results"].rename_input_to_done_on_success)
         self.assertEqual(tuple(lane_by_id["preserve_results"].accounts), ())
-        self.assertEqual(lane_by_id["prune_results"].cpus_per_job, 40)
-        self.assertEqual(lane_by_id["prune_results"].slots_per_job, 10)
+        self.assertEqual(lane_by_id["prune_results"].cpus_per_job, 60)
+        self.assertEqual(lane_by_id["prune_results"].slots_per_job, 15)
         self.assertEqual(lane_by_id["prune_results"].cores_per_slot, 4)
         self.assertEqual(lane_by_id["prune_results"].tasks_per_slot, 1)
         self.assertFalse(lane_by_id["prune_results"].retain_aedtresults)
@@ -51,17 +51,14 @@ class TestBuiltInService(unittest.TestCase):
             [account.host_alias for account in lane_by_id["prune_results"].accounts],
             [
                 "gate1-harry261",
-                "gate1-dhj02",
                 "gate1-jji0930",
-                "gate1-hmlee31",
-                "gate1-dw16",
             ],
         )
         configured_worker_slots = sum(
             sum(account.max_jobs for account in lane.accounts) * lane.slots_per_job
             for lane in profile.lanes
         )
-        self.assertGreater(configured_worker_slots, 350)
+        self.assertEqual(configured_worker_slots, 255)
 
     def test_validate_service_layout_creates_required_output_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -125,18 +122,18 @@ class TestBuiltInService(unittest.TestCase):
         self.assertEqual(prune_cfg.tasks_per_slot, 1)
         self.assertFalse(prune_cfg.retain_aedtresults)
         self.assertTrue(prune_cfg.rename_input_to_done_on_success)
-        self.assertEqual(len(prune_cfg.accounts_registry), 5)
+        self.assertEqual(len(prune_cfg.accounts_registry), 2)
         self.assertEqual(prune_cfg.ssh_config_path, str(root / ".ssh" / "config"))
         self.assertEqual(prune_cfg.remote_root, "~/aedt_runs")
         self.assertEqual(prune_cfg.pull_workspace_user, profile.control_plane_return_user)
         self.assertEqual(prune_cfg.pull_workspace_host, profile.control_plane_return_host)
         self.assertEqual(prune_cfg.pull_workspace_path, str(root))
         self.assertEqual(prune_cfg.pull_workspace_mount_root, "/workspace")
-        self.assertEqual(prune_cfg.slots_per_job, 10)
+        self.assertEqual(prune_cfg.slots_per_job, 15)
         self.assertEqual(prune_cfg.mem, "960G")
         self.assertEqual(prune_cfg.slot_min_concurrency, 1)
-        self.assertEqual(prune_cfg.slot_max_concurrency, 10)
-        self.assertEqual(prune_cfg.worker_payload_slot_limit, 10)
+        self.assertEqual(prune_cfg.slot_max_concurrency, 15)
+        self.assertEqual(prune_cfg.worker_payload_slot_limit, 15)
         self.assertEqual(prune_cfg.worker_bundle_multiplier, 4)
         self.assertEqual(prune_cfg.worker_pool_size, 50)
         self.assertEqual(prune_cfg.lease_ttl_seconds, 600)
@@ -155,10 +152,10 @@ class TestBuiltInService(unittest.TestCase):
             prune_cfg = _lane_pipeline_config(profile, lane_by_id["prune_results"])
             lease_context = build_lease_server_context(config=prune_cfg)
 
-        self.assertEqual(prune_cfg.slots_per_job, 10)
-        self.assertEqual(prune_cfg.slot_max_concurrency, 10)
-        self.assertEqual(prune_cfg.worker_payload_slot_limit, 10)
-        self.assertEqual(prune_cfg.cpus_per_job, 40)
+        self.assertEqual(prune_cfg.slots_per_job, 15)
+        self.assertEqual(prune_cfg.slot_max_concurrency, 15)
+        self.assertEqual(prune_cfg.worker_payload_slot_limit, 15)
+        self.assertEqual(prune_cfg.cpus_per_job, 60)
         self.assertEqual(prune_cfg.cores_per_slot, 4)
         self.assertEqual(prune_cfg.tasks_per_slot, 1)
         self.assertEqual(prune_cfg.mem, "960G")
