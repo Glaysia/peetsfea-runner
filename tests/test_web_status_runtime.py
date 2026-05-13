@@ -10,6 +10,7 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import peetsfea_runner.web_status as web_status
 from peetsfea_runner.pipeline import PipelineConfig, WorkerStorageConfig, build_lease_server_context
 from peetsfea_runner.state_store import StateStore
 from peetsfea_runner.web_status import start_status_server
@@ -104,6 +105,135 @@ def _request_lease(
     )
     assert status == 200
     return body
+
+
+def _setup_lease_runtime(tmpdir: str, *, run_id: str) -> tuple[StateStore, Any, Path]:
+    input_root = Path(tmpdir) / "input_queue"
+    output_root = Path(tmpdir) / "output"
+    input_file = input_root / "lane" / "sample.aedt"
+    output_dir = output_root / "lane" / "sample.aedt.out"
+    input_file.parent.mkdir(parents=True, exist_ok=True)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    input_file.write_text("project", encoding="utf-8")
+
+    store = StateStore(Path(tmpdir) / "runtime.state")
+    store.initialize()
+    store.start_run(run_id)
+    store.create_slot_task(
+        run_id=run_id,
+        slot_id="slot-01",
+        input_path=str(input_file),
+        output_path=str(output_dir),
+        account_id="account_01",
+    )
+    store.upsert_slurm_worker(
+        run_id=run_id,
+        worker_id="worker-01",
+        job_id="job-01",
+        attempt_no=1,
+        account_id="account_01",
+        host_alias="host",
+        slurm_job_id="12345",
+        worker_state="RUNNING",
+        slots_configured=1,
+        backend="slurm_batch",
+    )
+
+    context = build_lease_server_context(
+        config=_build_context(input_queue_dir=input_root, output_root_dir=output_root, storage_mode="payload")
+    )
+    return store, context, input_file
+
+
+def test_hfss_lease_gate_closed_returns_no_lease_and_keeps_slot_queued(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        web_status,
+        "check_hfss_slot_gate",
+        lambda: {"open": False, "hfss_in_use": 530},
+    )
+    with TemporaryDirectory() as tmpdir:
+        store, context, input_file = _setup_lease_runtime(tmpdir, run_id="run-hfss-closed")
+        server, thread = _start_server(store=store, context=context)
+        try:
+            response = _request_lease(
+                server=server,
+                run_id="run-hfss-closed",
+                worker_id="worker-01",
+                account_id="account_01",
+            )
+
+            assert response["ok"] is True
+            assert response["lease_available"] is False
+            assert response["license_gate"] == "hfss_closed"
+            assert response["hfss_in_use"] == 530
+            assert response["license_ceiling"] == 530
+            task = store.get_slot_task(run_id="run-hfss-closed", slot_id="slot-01")
+            assert task is not None
+            assert task["state"] == "QUEUED"
+            assert task["lease_token"] is None
+            assert store.get_slot_task_by_lease_token(run_id="run-hfss-closed", lease_token="missing") is None
+            assert input_file.exists()
+        finally:
+            server.shutdown()
+            thread.join(timeout=1)
+
+
+def test_hfss_lease_gate_open_preserves_lease_allocation(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        web_status,
+        "check_hfss_slot_gate",
+        lambda: {"open": True, "hfss_in_use": 529},
+    )
+    with TemporaryDirectory() as tmpdir:
+        store, context, _input_file = _setup_lease_runtime(tmpdir, run_id="run-hfss-open")
+        server, thread = _start_server(store=store, context=context)
+        try:
+            response = _request_lease(
+                server=server,
+                run_id="run-hfss-open",
+                worker_id="worker-01",
+                account_id="account_01",
+            )
+
+            assert response["lease_available"] is True
+            assert response["slot_id"] == "slot-01"
+            assert "license_gate" not in response
+            task = store.get_slot_task(run_id="run-hfss-open", slot_id="slot-01")
+            assert task is not None
+            assert task["state"] == "LEASED"
+            assert task["lease_token"] == response["lease_token"]
+        finally:
+            server.shutdown()
+            thread.join(timeout=1)
+
+
+def test_hfss_lease_gate_fail_open_preserves_lease_allocation(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        web_status,
+        "check_hfss_slot_gate",
+        lambda: {"open": False, "fail_open": True, "reason": "timeout", "hfss_in_use": None},
+    )
+    with TemporaryDirectory() as tmpdir:
+        store, context, _input_file = _setup_lease_runtime(tmpdir, run_id="run-hfss-fail-open")
+        server, thread = _start_server(store=store, context=context)
+        try:
+            response = _request_lease(
+                server=server,
+                run_id="run-hfss-fail-open",
+                worker_id="worker-01",
+                account_id="account_01",
+            )
+
+            assert response["lease_available"] is True
+            assert response["slot_id"] == "slot-01"
+            assert "license_gate" not in response
+            task = store.get_slot_task(run_id="run-hfss-fail-open", slot_id="slot-01")
+            assert task is not None
+            assert task["state"] == "LEASED"
+            assert task["lease_token"] == response["lease_token"]
+        finally:
+            server.shutdown()
+            thread.join(timeout=1)
 
 
 def test_lease_request_includes_storage_fields() -> None:

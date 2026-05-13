@@ -10,6 +10,9 @@ LICENSE_POLL_SOURCE_HOST: str = "gate1-harry261"
 LICENSE_POLL_INTERVAL_SECONDS: int = 100
 LICENSE_ACCOUNT_STATE_TTL_SECONDS: int = 120
 LICENSE_CEILING: int = 520
+HFSS_LICENSE_FEATURE: str = "elec_solve_hfss"
+HFSS_LICENSE_CEILING: int = 530
+HFSS_LICENSE_POLL_TTL_SECONDS: int = 10
 LICENSE_POLL_ENV: str = "ANSYSLMD_LICENSE_FILE=1055@172.16.10.81"
 LICENSE_POLL_COMMAND: str = (
     "/opt/ohpc/pub/Electronics/v252/licensingclient/linx64/lmutil lmstat -a"
@@ -23,7 +26,11 @@ _LEVEL2_PATTERN = re.compile(
     r"Users of elec_solve_level2:\s+\(Total of \d+ licenses issued;\s+Total of (\d+) licenses in use\)",
     re.IGNORECASE,
 )
-_FEATURE_HEADER_PATTERN = re.compile(r"Users of (elec_solve_level[12]):", re.IGNORECASE)
+_HFSS_PATTERN = re.compile(
+    r"Users of elec_solve_hfss:\s+\(Total of \d+ licenses issued;\s+Total of (\d+) licenses in use\)",
+    re.IGNORECASE,
+)
+_FEATURE_HEADER_PATTERN = re.compile(r"Users of (elec_solve_(?:level[12]|hfss)):", re.IGNORECASE)
 _ROOT_ENTRY_PATTERN = re.compile(r"^\s*root\s+\S+", re.IGNORECASE | re.MULTILINE)
 
 
@@ -39,6 +46,20 @@ class LicenseUsageSnapshot:
     reported_level1_in_use: int | None = None
     reported_level2_in_use: int | None = None
     reported_effective_in_use: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class HfssLicenseGateSnapshot:
+    source_host: str
+    hfss_in_use: int | None
+    ceiling: int
+    gate_state: str
+    poll_status: str
+    error: str | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return self.gate_state in {"open", "fail-open"}
 
 
 @dataclass(slots=True, frozen=True)
@@ -87,6 +108,56 @@ def _extract_feature_section(text: str, feature_name: str) -> str | None:
     if section_start is None:
         return None
     return normalized_text[section_start:section_end]
+
+
+def decide_hfss_license_gate(
+    hfss_in_use: int | None,
+    *,
+    ceiling: int = HFSS_LICENSE_CEILING,
+    error: str | None = None,
+    source_host: str = LICENSE_POLL_SOURCE_HOST,
+) -> HfssLicenseGateSnapshot:
+    if ceiling <= 0:
+        raise ValueError("ceiling must be > 0")
+    if hfss_in_use is None:
+        return HfssLicenseGateSnapshot(
+            source_host=source_host,
+            hfss_in_use=None,
+            ceiling=ceiling,
+            gate_state="fail-open",
+            poll_status="FAILED",
+            error=error or f"missing_license_line={HFSS_LICENSE_FEATURE}",
+        )
+    normalized_in_use = max(0, int(hfss_in_use))
+    return HfssLicenseGateSnapshot(
+        source_host=source_host,
+        hfss_in_use=normalized_in_use,
+        ceiling=ceiling,
+        gate_state="closed" if normalized_in_use >= ceiling else "open",
+        poll_status="OK",
+        error=None,
+    )
+
+
+def parse_hfss_license_usage(
+    text: str,
+    *,
+    source_host: str = LICENSE_POLL_SOURCE_HOST,
+    ceiling: int = HFSS_LICENSE_CEILING,
+) -> HfssLicenseGateSnapshot:
+    hfss_match = _HFSS_PATTERN.search(text or "")
+    if hfss_match is None:
+        return decide_hfss_license_gate(
+            None,
+            ceiling=ceiling,
+            source_host=source_host,
+            error=f"missing_license_line={HFSS_LICENSE_FEATURE}",
+        )
+    return decide_hfss_license_gate(
+        int(hfss_match.group(1)),
+        ceiling=ceiling,
+        source_host=source_host,
+    )
 
 
 def parse_license_usage(text: str, *, source_host: str = LICENSE_POLL_SOURCE_HOST) -> LicenseUsageSnapshot:
@@ -177,6 +248,53 @@ def query_license_usage(*, ssh_config_path: str = "", timeout_seconds: int = 30)
     if snapshot.status != "OK":
         return snapshot
     return snapshot
+
+
+def query_hfss_license_usage(
+    *,
+    ssh_config_path: str = "",
+    timeout_seconds: int = 30,
+    source_host: str = LICENSE_POLL_SOURCE_HOST,
+    poll_env: str = LICENSE_POLL_ENV,
+    poll_command: str = LICENSE_POLL_COMMAND,
+    ceiling: int = HFSS_LICENSE_CEILING,
+) -> HfssLicenseGateSnapshot:
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be > 0")
+    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+    normalized_ssh_config_path = str(ssh_config_path).strip()
+    if normalized_ssh_config_path:
+        command.extend(["-F", normalized_ssh_config_path])
+    command.extend(
+        [
+            source_host,
+            f"{poll_env} {poll_command}".strip(),
+        ]
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return decide_hfss_license_gate(
+            None,
+            ceiling=ceiling,
+            source_host=source_host,
+            error=f"timeout={timeout_seconds}s",
+        )
+    output = "\n".join(part for part in ((completed.stdout or ""), (completed.stderr or "")) if part).strip()
+    if completed.returncode != 0:
+        return decide_hfss_license_gate(
+            None,
+            ceiling=ceiling,
+            source_host=source_host,
+            error=output or f"return code={completed.returncode}",
+        )
+    return parse_hfss_license_usage(output, source_host=source_host, ceiling=ceiling)
 
 
 def next_desired_total_active_slots(

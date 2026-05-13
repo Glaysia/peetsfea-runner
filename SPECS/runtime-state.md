@@ -87,3 +87,21 @@ container.
 - It is not durable.
 - It is not used for recovery.
 - It is safe to lose on restart.
+
+## License Gate Cache
+
+The HFSS slot gate keeps process-local cache only. It is runtime state, not
+durable truth.
+
+Each cached snapshot stores:
+
+- source host
+- reported `elec_solve_hfss` in-use count
+- slot ceiling, currently `530`
+- gate state: open, closed, or fail-open
+- poll status and error text
+- polled timestamp
+
+The cache TTL is `10` seconds. If the cache is stale, the lease server refreshes
+it before allocating a new slot lease. Concurrent refreshes are serialized by an
+in-process lock. Poll failure is fail-open and must not mutate queued slot state.

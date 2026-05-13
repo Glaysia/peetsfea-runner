@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
 
+from peetsfea_runner import web_status
 from peetsfea_runner.built_in_service import (
     EXPECTED_LANE_NAMES,
     build_service_profile,
     validate_service_layout,
     _lane_pipeline_config,
 )
+from peetsfea_runner.pipeline import build_lease_server_context
 
 
 class TestBuiltInService(unittest.TestCase):
@@ -138,6 +141,43 @@ class TestBuiltInService(unittest.TestCase):
         self.assertEqual(prune_cfg.worker_pool_size, 50)
         self.assertEqual(prune_cfg.lease_ttl_seconds, 600)
         self.assertEqual(prune_cfg.lease_heartbeat_seconds, 15)
+
+    def test_prune_lane_keeps_slot_based_worker_contract_outside_submit_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "input_queue" / "preserve_results").mkdir(parents=True, exist_ok=True)
+            (root / "input_queue" / "prune_results").mkdir(parents=True, exist_ok=True)
+            profile = build_service_profile(repo_root=root)
+            lane_by_id = {lane.lane_id: lane for lane in profile.lanes}
+
+            prune_cfg = _lane_pipeline_config(profile, lane_by_id["prune_results"])
+            lease_context = build_lease_server_context(config=prune_cfg)
+
+        self.assertEqual(prune_cfg.slots_per_job, 10)
+        self.assertEqual(prune_cfg.slot_max_concurrency, 10)
+        self.assertEqual(prune_cfg.worker_payload_slot_limit, 10)
+        self.assertEqual(prune_cfg.cpus_per_job, 40)
+        self.assertEqual(prune_cfg.cores_per_slot, 4)
+        self.assertEqual(prune_cfg.tasks_per_slot, 1)
+        self.assertEqual(prune_cfg.mem, "960G")
+        self.assertEqual(prune_cfg.worker_pool_size, 50)
+        self.assertEqual(prune_cfg.capacity_scope, "all_user_jobs")
+        self.assertEqual(prune_cfg.pending_buffer_per_account, 3)
+        self.assertEqual(lease_context.lease_ttl_seconds, 600)
+        self.assertFalse(hasattr(lease_context, "allowed_submit"))
+        self.assertFalse(hasattr(lease_context, "pending_buffer_per_account"))
+        self.assertFalse(hasattr(lease_context, "capacity_scope"))
+
+    def test_lease_request_handler_does_not_use_submit_capacity_as_hfss_gate(self) -> None:
+        source = inspect.getsource(web_status)
+        request_start = source.index('if parsed.path == "/internal/leases/request":')
+        request_end = source.index('if parsed.path == "/internal/leases/heartbeat":')
+        request_handler = source[request_start:request_end]
+
+        self.assertNotIn("query_account_capacity", request_handler)
+        self.assertNotIn("allowed_submit", request_handler)
+        self.assertNotIn("capacity_by_account", request_handler)
+        self.assertNotIn("pending_buffer_per_account", request_handler)
 
 
 if __name__ == "__main__":

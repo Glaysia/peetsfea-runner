@@ -18,6 +18,13 @@ from .pipeline import (
 from .state_store import StateStore
 from .version import get_version
 
+try:
+    from .hfss_license_gate import HFSS_LICENSE_CEILING
+    from .hfss_license_gate import check_hfss_slot_gate
+except ImportError:
+    HFSS_LICENSE_CEILING = 530
+    check_hfss_slot_gate = None
+
 APP_VERSION = get_version()
 
 
@@ -87,6 +94,106 @@ def _to_bool(value: object) -> bool:
         return value
     text = str(value).strip().lower()
     return text in {"1", "true", "yes", "on"}
+
+
+def _gate_value(result: object, key: str) -> object:
+    if isinstance(result, dict):
+        return result.get(key)
+    return getattr(result, key, None)
+
+
+def _context_license_ceiling(lease_context: LeaseServerContext | None) -> int:
+    if lease_context is None:
+        return HFSS_LICENSE_CEILING
+    return int(getattr(lease_context, "hfss_license_ceiling", HFSS_LICENSE_CEILING) or HFSS_LICENSE_CEILING)
+
+
+def _evaluate_hfss_slot_gate(lease_context: LeaseServerContext | None) -> dict[str, object]:
+    license_ceiling = _context_license_ceiling(lease_context)
+    if lease_context is not None and not bool(getattr(lease_context, "hfss_license_gate_enabled", True)):
+        return {
+            "open": True,
+            "fail_open": False,
+            "reason": "hfss_license_gate_disabled",
+            "hfss_in_use": None,
+            "license_ceiling": license_ceiling,
+        }
+    if check_hfss_slot_gate is None:
+        return {
+            "open": True,
+            "fail_open": True,
+            "reason": "hfss_license_gate_helper_unavailable",
+            "hfss_in_use": None,
+            "license_ceiling": license_ceiling,
+        }
+    try:
+        kwargs: dict[str, object] = {}
+        if lease_context is not None:
+            kwargs = {
+                "ssh_config_path": str(getattr(lease_context, "ssh_config_path", "") or ""),
+                "timeout_seconds": int(getattr(lease_context, "hfss_license_query_timeout_seconds", 30) or 30),
+                "ttl_seconds": int(getattr(lease_context, "hfss_license_cache_ttl_seconds", 10) or 10),
+                "ceiling": license_ceiling,
+                "source_host": str(getattr(lease_context, "hfss_license_source_host", "gate1-harry261") or "gate1-harry261"),
+                "poll_env": str(getattr(lease_context, "hfss_license_poll_env", "") or ""),
+                "poll_command": str(getattr(lease_context, "hfss_license_poll_command", "") or ""),
+            }
+        result = check_hfss_slot_gate(**kwargs)
+    except TypeError:
+        result = check_hfss_slot_gate()
+    except Exception as exc:  # noqa: BLE001 - license gate failures are fail-open by design.
+        return {
+            "open": True,
+            "fail_open": True,
+            "reason": f"{type(exc).__name__}: {exc}",
+            "hfss_in_use": None,
+            "license_ceiling": license_ceiling,
+        }
+    if isinstance(result, bool):
+        return {
+            "open": result,
+            "fail_open": False,
+            "reason": None,
+            "hfss_in_use": None,
+            "license_ceiling": license_ceiling,
+        }
+    fail_open = bool(_gate_value(result, "fail_open"))
+    is_open = _gate_value(result, "open")
+    if is_open is None:
+        is_open = _gate_value(result, "is_open")
+    if is_open is None:
+        is_open = _gate_value(result, "lease_allowed")
+    if is_open is None:
+        state = str(_gate_value(result, "license_gate") or _gate_value(result, "gate") or "").strip().lower()
+        is_open = state not in {"hfss_closed", "closed"}
+    return {
+        "open": bool(is_open) or fail_open,
+        "fail_open": fail_open,
+        "reason": _gate_value(result, "reason") or _gate_value(result, "error"),
+        "hfss_in_use": _gate_value(result, "hfss_in_use"),
+        "license_ceiling": _gate_value(result, "license_ceiling") or license_ceiling,
+    }
+
+
+def _append_license_gate_event(
+    store: StateStore,
+    *,
+    run_id: str,
+    worker_id: str,
+    level: str,
+    stage: str,
+    message: str,
+) -> None:
+    append_event = getattr(store, "append_event", None)
+    if append_event is None:
+        return
+    append_event(
+        run_id=run_id,
+        job_id="__license__",
+        level=level,
+        stage=stage,
+        message=f"worker_id={worker_id} {message}",
+    )
 
 
 def make_status_handler(
@@ -209,6 +316,37 @@ def make_status_handler(
                 if not account_id:
                     self._send_json({"error": "account_id_required"}, status=400)
                     return
+                gate = _evaluate_hfss_slot_gate(lease_context)
+                hfss_in_use = gate.get("hfss_in_use")
+                license_ceiling = int(gate.get("license_ceiling") or HFSS_LICENSE_CEILING)
+                if not gate["open"]:
+                    _append_license_gate_event(
+                        store,
+                        run_id=run_id,
+                        worker_id=worker_id,
+                        level="INFO",
+                        stage="HFSS_LICENSE_GATE_CLOSED",
+                        message=f"hfss_in_use={hfss_in_use} license_ceiling={license_ceiling}",
+                    )
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "lease_available": False,
+                            "license_gate": "hfss_closed",
+                            "hfss_in_use": hfss_in_use,
+                            "license_ceiling": license_ceiling,
+                        }
+                    )
+                    return
+                if gate["fail_open"]:
+                    _append_license_gate_event(
+                        store,
+                        run_id=run_id,
+                        worker_id=worker_id,
+                        level="WARN",
+                        stage="HFSS_LICENSE_GATE_FAIL_OPEN",
+                        message=f"reason={gate.get('reason') or 'unknown'}",
+                    )
                 lease_token = secrets.token_urlsafe(24)
                 slot_record = store.acquire_slot_lease(
                     run_id=run_id,
