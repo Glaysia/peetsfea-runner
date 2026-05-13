@@ -54,7 +54,7 @@ def test_build_scancel_command_uses_ssh_config_path() -> None:
     assert "-F" in command
     idx = command.index("-F")
     assert command[idx + 1] == "/tmp/ssh.conf"
-    assert command[-3:] == ["scancel", "123", "456"]
+    assert command[-1] == "scancel 123 456"
 
 
 def test_parse_runner_owned_job_ids() -> None:
@@ -83,13 +83,14 @@ def test_cleanup_slurm_workers_runs_squeue_and_records_failures() -> None:
             if "gate1-harry261" in command:
                 return 0, "777 peetsfea-worker_01\n888 remote_pull_sbatch.sh\n999 external", ""
             return 1, "", "ssh timeout"
-        if "scancel" in command and "123" in command:
+        command_text = " ".join(command)
+        if "scancel" in command_text and "123" in command_text:
             return 0, "", ""
-        if "scancel" in command and "777" in command:
+        if "scancel" in command_text and "777" in command_text:
             return 0, "", ""
-        if "scancel" in command and "888" in command:
+        if "scancel" in command_text and "888" in command_text:
             return 0, "", ""
-        if "scancel" in command and "200" in command:
+        if "scancel" in command_text and "200" in command_text:
             return 0, "", ""
         return 1, "", "unexpected"
 
@@ -112,7 +113,7 @@ def test_cleanup_slurm_workers_runs_squeue_and_records_failures() -> None:
     assert summary["cancelled_hosts"] == ["gate1-harry261"]
     assert summary["failed_hosts"] == ["gate1-jji0930"]
 
-    assert any("scancel" in cmd and "123" in cmd for cmd in commands)
+    assert any("scancel" in " ".join(cmd) and "123" in " ".join(cmd) for cmd in commands)
     assert any("squeue" in " ".join(cmd) for cmd in commands if cmd[0] == "ssh")
 
 

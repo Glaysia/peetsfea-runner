@@ -112,7 +112,7 @@ class TestShutdownScancelContract(unittest.TestCase):
             commands.append(command)
             if command[0] == "ssh" and "squeue" in " ".join(command):
                 return 0, "111 peetsfea-bootstrap\n", ""
-            if "scancel" in command:
+            if "scancel" in " ".join(command):
                 return 0, "", ""
             return 1, "", "unexpected command"
 
@@ -155,7 +155,7 @@ class TestShutdownScancelContract(unittest.TestCase):
             )
 
             self.assertEqual(summary["attempted_count"], 1)
-            scancel_commands = [cmd for cmd in commands if cmd[:2] == ["ssh", "-o"] and "scancel" in cmd]
+            scancel_commands = [cmd for cmd in commands if cmd[:2] == ["ssh", "-o"] and "scancel" in " ".join(cmd)]
             self.assertTrue(any("1001" in " ".join(cmd) for cmd in scancel_commands))
             self.assertFalse(any("9001" in " ".join(cmd) for cmd in scancel_commands))
 

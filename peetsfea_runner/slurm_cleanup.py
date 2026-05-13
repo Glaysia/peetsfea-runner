@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import shlex
 from typing import Mapping, Protocol, Sequence
 
 
@@ -85,7 +86,8 @@ def build_scancel_command(
     ssh_config_path: str = "",
 ) -> list[str]:
     command = _build_ssh_command(host_alias=host_alias, ssh_config_path=ssh_config_path)
-    command.extend(["scancel", *slurm_job_ids])
+    remote_command = "scancel " + " ".join(shlex.quote(job_id) for job_id in slurm_job_ids)
+    command.append(remote_command)
     return command
 
 
@@ -95,7 +97,7 @@ def build_squeue_command(
     ssh_config_path: str = "",
 ) -> list[str]:
     command = _build_ssh_command(host_alias=host_alias, ssh_config_path=ssh_config_path)
-    command.extend(["bash", "-lc", 'squeue -h -u "$USER" -o "%A %j"'])
+    command.append("bash -lc 'squeue -h -u \"$USER\" -o \"%A %j\"'")
     return command
 
 
