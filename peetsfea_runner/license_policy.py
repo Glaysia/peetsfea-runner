@@ -10,9 +10,10 @@ LICENSE_POLL_SOURCE_HOST: str = "gate1-harry261"
 LICENSE_POLL_INTERVAL_SECONDS: int = 100
 LICENSE_ACCOUNT_STATE_TTL_SECONDS: int = 120
 LICENSE_CEILING: int = 520
-HFSS_LICENSE_FEATURE: str = "elec_solve_hfss"
-HFSS_LICENSE_CEILING: int = 530
-HFSS_LICENSE_POLL_TTL_SECONDS: int = 10
+LICENSE_FEATURE: str = "electronics_desktop"
+LICENSE_FEATURE_CEILING: int = 350
+LICENSE_FEATURE_POLL_TTL_SECONDS: int = 10
+LICENSE_FEATURE_QUERY_TIMEOUT_SECONDS: int = 30
 LICENSE_POLL_ENV: str = "ANSYSLMD_LICENSE_FILE=1055@172.16.10.81"
 LICENSE_POLL_COMMAND: str = (
     "/opt/ohpc/pub/Electronics/v252/licensingclient/linx64/lmutil lmstat -a"
@@ -26,11 +27,7 @@ _LEVEL2_PATTERN = re.compile(
     r"Users of elec_solve_level2:\s+\(Total of \d+ licenses issued;\s+Total of (\d+) licenses in use\)",
     re.IGNORECASE,
 )
-_HFSS_PATTERN = re.compile(
-    r"Users of elec_solve_hfss:\s+\(Total of \d+ licenses issued;\s+Total of (\d+) licenses in use\)",
-    re.IGNORECASE,
-)
-_FEATURE_HEADER_PATTERN = re.compile(r"Users of (elec_solve_(?:level[12]|hfss)):", re.IGNORECASE)
+_FEATURE_HEADER_PATTERN = re.compile(r"Users of ([A-Za-z0-9_.-]+):", re.IGNORECASE)
 _ROOT_ENTRY_PATTERN = re.compile(r"^\s*root\s+\S+", re.IGNORECASE | re.MULTILINE)
 
 
@@ -49,9 +46,10 @@ class LicenseUsageSnapshot:
 
 
 @dataclass(slots=True, frozen=True)
-class HfssLicenseGateSnapshot:
+class LicenseGateSnapshot:
     source_host: str
-    hfss_in_use: int | None
+    license_feature: str
+    license_in_use: int | None
     ceiling: int
     gate_state: str
     poll_status: str
@@ -60,7 +58,6 @@ class HfssLicenseGateSnapshot:
     @property
     def is_open(self) -> bool:
         return self.gate_state in {"open", "fail-open"}
-
 
 @dataclass(slots=True, frozen=True)
 class LicenseAccountState:
@@ -110,28 +107,31 @@ def _extract_feature_section(text: str, feature_name: str) -> str | None:
     return normalized_text[section_start:section_end]
 
 
-def decide_hfss_license_gate(
-    hfss_in_use: int | None,
+def decide_license_gate(
+    license_in_use: int | None,
     *,
-    ceiling: int = HFSS_LICENSE_CEILING,
+    ceiling: int = LICENSE_FEATURE_CEILING,
+    license_feature: str = LICENSE_FEATURE,
     error: str | None = None,
     source_host: str = LICENSE_POLL_SOURCE_HOST,
-) -> HfssLicenseGateSnapshot:
+) -> LicenseGateSnapshot:
     if ceiling <= 0:
         raise ValueError("ceiling must be > 0")
-    if hfss_in_use is None:
-        return HfssLicenseGateSnapshot(
+    if license_in_use is None:
+        return LicenseGateSnapshot(
             source_host=source_host,
-            hfss_in_use=None,
+            license_feature=license_feature,
+            license_in_use=None,
             ceiling=ceiling,
             gate_state="fail-open",
             poll_status="FAILED",
-            error=error or f"missing_license_line={HFSS_LICENSE_FEATURE}",
+            error=error or f"missing_license_line={license_feature}",
         )
-    normalized_in_use = max(0, int(hfss_in_use))
-    return HfssLicenseGateSnapshot(
+    normalized_in_use = max(0, int(license_in_use))
+    return LicenseGateSnapshot(
         source_host=source_host,
-        hfss_in_use=normalized_in_use,
+        license_feature=license_feature,
+        license_in_use=normalized_in_use,
         ceiling=ceiling,
         gate_state="closed" if normalized_in_use >= ceiling else "open",
         poll_status="OK",
@@ -139,23 +139,30 @@ def decide_hfss_license_gate(
     )
 
 
-def parse_hfss_license_usage(
+def parse_license_feature_usage(
     text: str,
     *,
     source_host: str = LICENSE_POLL_SOURCE_HOST,
-    ceiling: int = HFSS_LICENSE_CEILING,
-) -> HfssLicenseGateSnapshot:
-    hfss_match = _HFSS_PATTERN.search(text or "")
-    if hfss_match is None:
-        return decide_hfss_license_gate(
+    ceiling: int = LICENSE_FEATURE_CEILING,
+    license_feature: str = LICENSE_FEATURE,
+) -> LicenseGateSnapshot:
+    feature_pattern = re.compile(
+        rf"Users of {re.escape(license_feature)}:\s+\(Total of \d+ licenses issued;\s+Total of (\d+) licenses in use\)",
+        re.IGNORECASE,
+    )
+    license_match = feature_pattern.search(text or "")
+    if license_match is None:
+        return decide_license_gate(
             None,
             ceiling=ceiling,
+            license_feature=license_feature,
             source_host=source_host,
-            error=f"missing_license_line={HFSS_LICENSE_FEATURE}",
+            error=f"missing_license_line={license_feature}",
         )
-    return decide_hfss_license_gate(
-        int(hfss_match.group(1)),
+    return decide_license_gate(
+        int(license_match.group(1)),
         ceiling=ceiling,
+        license_feature=license_feature,
         source_host=source_host,
     )
 
@@ -250,15 +257,16 @@ def query_license_usage(*, ssh_config_path: str = "", timeout_seconds: int = 30)
     return snapshot
 
 
-def query_hfss_license_usage(
+def query_license_feature_usage(
     *,
     ssh_config_path: str = "",
-    timeout_seconds: int = 30,
+    timeout_seconds: int = LICENSE_FEATURE_QUERY_TIMEOUT_SECONDS,
     source_host: str = LICENSE_POLL_SOURCE_HOST,
     poll_env: str = LICENSE_POLL_ENV,
     poll_command: str = LICENSE_POLL_COMMAND,
-    ceiling: int = HFSS_LICENSE_CEILING,
-) -> HfssLicenseGateSnapshot:
+    ceiling: int = LICENSE_FEATURE_CEILING,
+    license_feature: str = LICENSE_FEATURE,
+) -> LicenseGateSnapshot:
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be > 0")
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
@@ -280,21 +288,28 @@ def query_hfss_license_usage(
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired:
-        return decide_hfss_license_gate(
+        return decide_license_gate(
             None,
             ceiling=ceiling,
+            license_feature=license_feature,
             source_host=source_host,
             error=f"timeout={timeout_seconds}s",
         )
     output = "\n".join(part for part in ((completed.stdout or ""), (completed.stderr or "")) if part).strip()
     if completed.returncode != 0:
-        return decide_hfss_license_gate(
+        return decide_license_gate(
             None,
             ceiling=ceiling,
+            license_feature=license_feature,
             source_host=source_host,
             error=output or f"return code={completed.returncode}",
         )
-    return parse_hfss_license_usage(output, source_host=source_host, ceiling=ceiling)
+    return parse_license_feature_usage(
+        output,
+        source_host=source_host,
+        ceiling=ceiling,
+        license_feature=license_feature,
+    )
 
 
 def next_desired_total_active_slots(

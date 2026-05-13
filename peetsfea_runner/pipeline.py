@@ -49,7 +49,13 @@ from .remote_job import (
 from .license_policy import (
     LICENSE_ACCOUNT_STATE_TTL_SECONDS,
     LICENSE_CEILING,
+    LICENSE_FEATURE_CEILING,
+    LICENSE_FEATURE_POLL_TTL_SECONDS,
+    LICENSE_FEATURE_QUERY_TIMEOUT_SECONDS,
+    LICENSE_POLL_COMMAND,
+    LICENSE_POLL_ENV,
     LICENSE_POLL_INTERVAL_SECONDS,
+    LICENSE_POLL_SOURCE_HOST,
     LicenseUsageSnapshot,
     compute_license_target_plan,
     next_desired_total_active_slots,
@@ -88,13 +94,6 @@ _DISPATCH_MODE_ALLOWED = frozenset({"run", "drain"})
 _BAD_NODE_COOLDOWN_HOURS = 8
 _BAD_NODE_NO_SPACE_MARKER = "No space left on device"
 _LICENSE_BALANCE_METRIC = "license_max_520"
-_HFSS_LICENSE_FEATURE_NAME = "elec_solve_hfss"
-_HFSS_LICENSE_CEILING = 530
-_HFSS_LICENSE_CACHE_TTL_SECONDS = 10
-_HFSS_LICENSE_QUERY_TIMEOUT_SECONDS = 30
-_HFSS_LICENSE_POLL_SOURCE_HOST = "gate1-harry261"
-_HFSS_LICENSE_POLL_ENV = "ANSYSLMD_LICENSE_FILE=1055@172.16.10.81"
-_HFSS_LICENSE_POLL_COMMAND = "/opt/ohpc/pub/Electronics/v252/licensingclient/linx64/lmutil lmstat -a"
 
 
 def _log_stage(message: str) -> None:
@@ -377,14 +376,13 @@ class PipelineConfig:
     retain_aedtresults: bool = True
     # License policy
     license_observe_only: bool = True
-    hfss_license_gate_enabled: bool = True
-    hfss_license_source_host: str = _HFSS_LICENSE_POLL_SOURCE_HOST
-    hfss_license_feature_name: str = _HFSS_LICENSE_FEATURE_NAME
-    hfss_license_ceiling: int = _HFSS_LICENSE_CEILING
-    hfss_license_cache_ttl_seconds: int = _HFSS_LICENSE_CACHE_TTL_SECONDS
-    hfss_license_query_timeout_seconds: int = _HFSS_LICENSE_QUERY_TIMEOUT_SECONDS
-    hfss_license_poll_env: str = _HFSS_LICENSE_POLL_ENV
-    hfss_license_poll_command: str = _HFSS_LICENSE_POLL_COMMAND
+    license_gate_enabled: bool = True
+    license_source_host: str = LICENSE_POLL_SOURCE_HOST
+    license_ceiling: int = LICENSE_FEATURE_CEILING
+    license_cache_ttl_seconds: int = LICENSE_FEATURE_POLL_TTL_SECONDS
+    license_query_timeout_seconds: int = LICENSE_FEATURE_QUERY_TIMEOUT_SECONDS
+    license_poll_env: str = LICENSE_POLL_ENV
+    license_poll_command: str = LICENSE_POLL_COMMAND
     # Backward-compatible alias for old callers/docs
     max_jobs_per_account: int = 10
     local_artifacts_dir: str = "./output"
@@ -454,10 +452,10 @@ class PipelineConfig:
             raise ValueError("job_retry_count must be >= 0")
         if self.worker_requeue_limit < 0:
             raise ValueError("worker_requeue_limit must be >= 0")
-        if self.hfss_license_ceiling < 0:
-            raise ValueError("hfss_license_ceiling must be >= 0")
-        _ensure_positive("hfss_license_cache_ttl_seconds", self.hfss_license_cache_ttl_seconds)
-        _ensure_positive("hfss_license_query_timeout_seconds", self.hfss_license_query_timeout_seconds)
+        if self.license_ceiling < 0:
+            raise ValueError("license_ceiling must be >= 0")
+        _ensure_positive("license_cache_ttl_seconds", self.license_cache_ttl_seconds)
+        _ensure_positive("license_query_timeout_seconds", self.license_query_timeout_seconds)
         if self.pending_buffer_per_account < 0:
             raise ValueError("pending_buffer_per_account must be >= 0")
         effective_slot_max = max(1, int(self.slot_max_concurrency or self.slots_per_job))
@@ -531,9 +529,8 @@ class PipelineConfig:
             if not getattr(self, name).strip():
                 raise ValueError(f"{name} must not be empty")
         for name in (
-            "hfss_license_source_host",
-            "hfss_license_feature_name",
-            "hfss_license_poll_command",
+            "license_source_host",
+            "license_poll_command",
         ):
             if not getattr(self, name).strip():
                 raise ValueError(f"{name} must not be empty")
@@ -643,14 +640,13 @@ class LeaseServerContext:
     worker_storage: WorkerStorageConfig
     pull_workspace_path: str
     ssh_config_path: str
-    hfss_license_gate_enabled: bool
-    hfss_license_source_host: str
-    hfss_license_feature_name: str
-    hfss_license_ceiling: int
-    hfss_license_cache_ttl_seconds: int
-    hfss_license_query_timeout_seconds: int
-    hfss_license_poll_env: str
-    hfss_license_poll_command: str
+    license_gate_enabled: bool
+    license_source_host: str
+    license_ceiling: int
+    license_cache_ttl_seconds: int
+    license_query_timeout_seconds: int
+    license_poll_env: str
+    license_poll_command: str
 
 
 @dataclass(slots=True)
@@ -911,14 +907,13 @@ def build_lease_server_context(*, config: PipelineConfig) -> LeaseServerContext:
         worker_storage=config.worker_storage,
         pull_workspace_path=config.pull_workspace_path,
         ssh_config_path=config.ssh_config_path,
-        hfss_license_gate_enabled=config.hfss_license_gate_enabled,
-        hfss_license_source_host=config.hfss_license_source_host,
-        hfss_license_feature_name=config.hfss_license_feature_name,
-        hfss_license_ceiling=config.hfss_license_ceiling,
-        hfss_license_cache_ttl_seconds=config.hfss_license_cache_ttl_seconds,
-        hfss_license_query_timeout_seconds=config.hfss_license_query_timeout_seconds,
-        hfss_license_poll_env=config.hfss_license_poll_env,
-        hfss_license_poll_command=config.hfss_license_poll_command,
+        license_gate_enabled=config.license_gate_enabled,
+        license_source_host=config.license_source_host,
+        license_ceiling=config.license_ceiling,
+        license_cache_ttl_seconds=config.license_cache_ttl_seconds,
+        license_query_timeout_seconds=config.license_query_timeout_seconds,
+        license_poll_env=config.license_poll_env,
+        license_poll_command=config.license_poll_command,
     )
 
 

@@ -145,52 +145,63 @@ def _setup_lease_runtime(tmpdir: str, *, run_id: str) -> tuple[StateStore, Any, 
     return store, context, input_file
 
 
-def test_hfss_lease_gate_closed_returns_no_lease_and_keeps_slot_queued(monkeypatch: Any) -> None:
+def test_license_gate_closed_returns_no_lease_and_keeps_slot_queued(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         web_status,
-        "check_hfss_slot_gate",
-        lambda: {"open": False, "hfss_in_use": 530},
+        "check_license_gate",
+        lambda: {
+            "open": False,
+            "license_feature": "electronics_desktop",
+            "license_in_use": 350,
+            "license_ceiling": 350,
+        },
     )
     with TemporaryDirectory() as tmpdir:
-        store, context, input_file = _setup_lease_runtime(tmpdir, run_id="run-hfss-closed")
+        store, context, input_file = _setup_lease_runtime(tmpdir, run_id="run-license-closed")
         server, thread = _start_server(store=store, context=context)
         try:
             response = _request_lease(
                 server=server,
-                run_id="run-hfss-closed",
+                run_id="run-license-closed",
                 worker_id="worker-01",
                 account_id="account_01",
             )
 
             assert response["ok"] is True
             assert response["lease_available"] is False
-            assert response["license_gate"] == "hfss_closed"
-            assert response["hfss_in_use"] == 530
-            assert response["license_ceiling"] == 530
-            task = store.get_slot_task(run_id="run-hfss-closed", slot_id="slot-01")
+            assert response["license_gate"] == "license_closed"
+            assert response["license_feature"] == "electronics_desktop"
+            assert response["license_in_use"] == 350
+            assert response["license_ceiling"] == 350
+            task = store.get_slot_task(run_id="run-license-closed", slot_id="slot-01")
             assert task is not None
             assert task["state"] == "QUEUED"
             assert task["lease_token"] is None
-            assert store.get_slot_task_by_lease_token(run_id="run-hfss-closed", lease_token="missing") is None
+            assert store.get_slot_task_by_lease_token(run_id="run-license-closed", lease_token="missing") is None
             assert input_file.exists()
         finally:
             server.shutdown()
             thread.join(timeout=1)
 
 
-def test_hfss_lease_gate_open_preserves_lease_allocation(monkeypatch: Any) -> None:
+def test_license_gate_open_preserves_lease_allocation(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         web_status,
-        "check_hfss_slot_gate",
-        lambda: {"open": True, "hfss_in_use": 529},
+        "check_license_gate",
+        lambda: {
+            "open": True,
+            "license_feature": "electronics_desktop",
+            "license_in_use": 349,
+            "license_ceiling": 350,
+        },
     )
     with TemporaryDirectory() as tmpdir:
-        store, context, _input_file = _setup_lease_runtime(tmpdir, run_id="run-hfss-open")
+        store, context, _input_file = _setup_lease_runtime(tmpdir, run_id="run-license-open")
         server, thread = _start_server(store=store, context=context)
         try:
             response = _request_lease(
                 server=server,
-                run_id="run-hfss-open",
+                run_id="run-license-open",
                 worker_id="worker-01",
                 account_id="account_01",
             )
@@ -198,7 +209,7 @@ def test_hfss_lease_gate_open_preserves_lease_allocation(monkeypatch: Any) -> No
             assert response["lease_available"] is True
             assert response["slot_id"] == "slot-01"
             assert "license_gate" not in response
-            task = store.get_slot_task(run_id="run-hfss-open", slot_id="slot-01")
+            task = store.get_slot_task(run_id="run-license-open", slot_id="slot-01")
             assert task is not None
             assert task["state"] == "LEASED"
             assert task["lease_token"] == response["lease_token"]
@@ -207,19 +218,26 @@ def test_hfss_lease_gate_open_preserves_lease_allocation(monkeypatch: Any) -> No
             thread.join(timeout=1)
 
 
-def test_hfss_lease_gate_fail_open_preserves_lease_allocation(monkeypatch: Any) -> None:
+def test_license_gate_fail_open_preserves_lease_allocation(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         web_status,
-        "check_hfss_slot_gate",
-        lambda: {"open": False, "fail_open": True, "reason": "timeout", "hfss_in_use": None},
+        "check_license_gate",
+        lambda: {
+            "open": False,
+            "fail_open": True,
+            "reason": "timeout",
+            "license_feature": "electronics_desktop",
+            "license_in_use": None,
+            "license_ceiling": 350,
+        },
     )
     with TemporaryDirectory() as tmpdir:
-        store, context, _input_file = _setup_lease_runtime(tmpdir, run_id="run-hfss-fail-open")
+        store, context, _input_file = _setup_lease_runtime(tmpdir, run_id="run-license-fail-open")
         server, thread = _start_server(store=store, context=context)
         try:
             response = _request_lease(
                 server=server,
-                run_id="run-hfss-fail-open",
+                run_id="run-license-fail-open",
                 worker_id="worker-01",
                 account_id="account_01",
             )
@@ -227,7 +245,7 @@ def test_hfss_lease_gate_fail_open_preserves_lease_allocation(monkeypatch: Any) 
             assert response["lease_available"] is True
             assert response["slot_id"] == "slot-01"
             assert "license_gate" not in response
-            task = store.get_slot_task(run_id="run-hfss-fail-open", slot_id="slot-01")
+            task = store.get_slot_task(run_id="run-license-fail-open", slot_id="slot-01")
             assert task is not None
             assert task["state"] == "LEASED"
             assert task["lease_token"] == response["lease_token"]

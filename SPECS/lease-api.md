@@ -25,8 +25,8 @@ Behavior:
 - Never double-leases the same input.
 - In sshfs worker mode, returns path metadata instead of requiring file
   transfer through the control plane.
-- Before allocating a lease, applies the HFSS license slot gate. The gate is a
-  slot-start gate, not a Slurm worker-submit gate.
+- Before allocating a lease, applies the Electronics Desktop license slot gate.
+  The gate is a slot-start gate, not a Slurm worker-submit gate.
 
 Response:
 
@@ -39,16 +39,18 @@ Response:
 - `output_relpath`
 - `storage_mode`
 - optional `license_gate`
-- optional `hfss_in_use`
+- optional `license_feature`
+- optional `license_in_use`
 - optional `license_ceiling`
 
 If no input is available, returns `ok=true` with `lease_token=null`.
 
-If the HFSS license slot gate is closed, returns `ok=true` and
+If the Electronics Desktop license slot gate is closed, returns `ok=true` and
 `lease_available=false` without mutating queued input state or assigning a lease
-token. The response includes `license_gate="hfss_closed"`, the most recent
-`hfss_in_use`, and `license_ceiling=530`. Workers must treat this the same as a
-temporary no-input response and retry through their normal idle/backoff loop.
+token. The response includes `license_gate="license_closed"`,
+`license_feature="electronics_desktop"`, the most recent `license_in_use`, and
+`license_ceiling=350`. Workers must treat this the same as a temporary no-input
+response and retry through their normal idle/backoff loop.
 
 For `storage_mode="sshfs_direct"`, the worker joins `input_relpath` and
 `output_relpath` against its configured sshfs mount root. Both relpaths are
@@ -62,10 +64,11 @@ The default prune-lane worker treats non-`sshfs_direct` leases as incompatible
 with the single-container sshfs path and must fail them explicitly rather than
 silently falling back to tar/scp data movement.
 
-## HFSS License Slot Gate
+## Electronics Desktop License Slot Gate
 
 The control plane polls `gate1-harry261` for
-`elec_solve_hfss` license usage by running the `anlic` alias target directly:
+`electronics_desktop` license usage by running the `anlic` alias target
+directly:
 
 ```bash
 ANSYSLMD_LICENSE_FILE=1055@172.16.10.81 /opt/ohpc/pub/Electronics/v252/licensingclient/linx64/lmutil lmstat -a
@@ -74,17 +77,17 @@ ANSYSLMD_LICENSE_FILE=1055@172.16.10.81 /opt/ohpc/pub/Electronics/v252/licensing
 The gate uses the header value from:
 
 ```text
-Users of elec_solve_hfss:  (Total of 550 licenses issued;  Total of N licenses in use)
+Users of electronics_desktop:  (Total of 550 licenses issued;  Total of N licenses in use)
 ```
 
 Rules:
 
-- `N >= 530`: close the slot gate; no new lease is issued.
-- `N <= 529`: open the slot gate; normal lease allocation may continue.
+- `N >= 350`: close the slot gate; no new lease is issued.
+- `N <= 349`: open the slot gate; normal lease allocation may continue.
 - Poll/cache TTL: `10` seconds.
 - Concurrent lease requests share one in-process refresh lock so a worker burst
   does not create a burst of SSH/lmutil calls.
-- Poll failure, SSH failure, timeout, or missing `elec_solve_hfss` line is
+- Poll failure, SSH failure, timeout, or missing `electronics_desktop` line is
   fail-open. The control plane logs the failure and proceeds with normal lease
   allocation.
 - Already leased/running slots are never killed by this gate.

@@ -90,14 +90,15 @@ container.
 
 ## License Gate Cache
 
-The HFSS slot gate keeps process-local cache only. It is runtime state, not
-durable truth.
+The Electronics Desktop slot gate keeps process-local cache only. It is runtime
+state, not durable truth.
 
 Each cached snapshot stores:
 
 - source host
-- reported `elec_solve_hfss` in-use count
-- slot ceiling, currently `530`
+- license feature, currently `electronics_desktop`
+- reported in-use count for that feature
+- slot ceiling, currently `350`
 - gate state: open, closed, or fail-open
 - poll status and error text
 - polled timestamp

@@ -57,11 +57,11 @@ class TestBuiltInService(unittest.TestCase):
                 "gate1-dw16",
             ],
         )
-        total_slots = sum(
+        configured_worker_slots = sum(
             sum(account.max_jobs for account in lane.accounts) * lane.slots_per_job
             for lane in profile.lanes
         )
-        self.assertEqual(total_slots, 470)
+        self.assertGreater(configured_worker_slots, 350)
 
     def test_validate_service_layout_creates_required_output_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -141,6 +141,8 @@ class TestBuiltInService(unittest.TestCase):
         self.assertEqual(prune_cfg.worker_pool_size, 50)
         self.assertEqual(prune_cfg.lease_ttl_seconds, 600)
         self.assertEqual(prune_cfg.lease_heartbeat_seconds, 15)
+        self.assertTrue(prune_cfg.license_gate_enabled)
+        self.assertEqual(prune_cfg.license_ceiling, 350)
 
     def test_prune_lane_keeps_slot_based_worker_contract_outside_submit_capacity(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -164,16 +166,22 @@ class TestBuiltInService(unittest.TestCase):
         self.assertEqual(prune_cfg.capacity_scope, "all_user_jobs")
         self.assertEqual(prune_cfg.pending_buffer_per_account, 3)
         self.assertEqual(lease_context.lease_ttl_seconds, 600)
+        self.assertTrue(lease_context.license_gate_enabled)
+        self.assertEqual(lease_context.license_ceiling, 350)
         self.assertFalse(hasattr(lease_context, "allowed_submit"))
         self.assertFalse(hasattr(lease_context, "pending_buffer_per_account"))
         self.assertFalse(hasattr(lease_context, "capacity_scope"))
 
-    def test_lease_request_handler_does_not_use_submit_capacity_as_hfss_gate(self) -> None:
+    def test_lease_request_handler_uses_electronics_desktop_lease_gate_names(self) -> None:
         source = inspect.getsource(web_status)
         request_start = source.index('if parsed.path == "/internal/leases/request":')
         request_end = source.index('if parsed.path == "/internal/leases/heartbeat":')
         request_handler = source[request_start:request_end]
 
+        self.assertIn("license_closed", request_handler)
+        self.assertIn("license_feature", request_handler)
+        self.assertIn("license_in_use", request_handler)
+        self.assertIn("license_ceiling", request_handler)
         self.assertNotIn("query_account_capacity", request_handler)
         self.assertNotIn("allowed_submit", request_handler)
         self.assertNotIn("capacity_by_account", request_handler)

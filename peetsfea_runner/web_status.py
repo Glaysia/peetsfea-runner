@@ -15,15 +15,20 @@ from .pipeline import (
     materialize_pulled_slot_artifact,
     slot_task_ref_from_record,
 )
+from .license_policy import (
+    LICENSE_FEATURE,
+    LICENSE_FEATURE_CEILING,
+    LICENSE_FEATURE_POLL_TTL_SECONDS,
+    LICENSE_FEATURE_QUERY_TIMEOUT_SECONDS,
+    LICENSE_POLL_SOURCE_HOST,
+)
 from .state_store import StateStore
 from .version import get_version
 
 try:
-    from .hfss_license_gate import HFSS_LICENSE_CEILING
-    from .hfss_license_gate import check_hfss_slot_gate
+    from .license_gate import check_license_gate
 except ImportError:
-    HFSS_LICENSE_CEILING = 530
-    check_hfss_slot_gate = None
+    check_license_gate = None
 
 APP_VERSION = get_version()
 
@@ -104,26 +109,47 @@ def _gate_value(result: object, key: str) -> object:
 
 def _context_license_ceiling(lease_context: LeaseServerContext | None) -> int:
     if lease_context is None:
-        return HFSS_LICENSE_CEILING
-    return int(getattr(lease_context, "hfss_license_ceiling", HFSS_LICENSE_CEILING) or HFSS_LICENSE_CEILING)
+        return LICENSE_FEATURE_CEILING
+    configured = getattr(lease_context, "license_ceiling", LICENSE_FEATURE_CEILING)
+    return int(configured or LICENSE_FEATURE_CEILING)
 
 
-def _evaluate_hfss_slot_gate(lease_context: LeaseServerContext | None) -> dict[str, object]:
+def _context_license_feature(lease_context: LeaseServerContext | None) -> str:
+    return LICENSE_FEATURE
+
+
+def _license_in_use_from_gate(result: object) -> object:
+    for key in ("license_in_use", "electronics_desktop_in_use"):
+        value = _gate_value(result, key)
+        if value is not None:
+            return value
+    return None
+
+
+def _license_feature_from_gate(result: object) -> str:
+    feature = str(_gate_value(result, "license_feature") or "").strip()
+    return feature or LICENSE_FEATURE
+
+
+def _evaluate_license_gate(lease_context: LeaseServerContext | None) -> dict[str, object]:
     license_ceiling = _context_license_ceiling(lease_context)
-    if lease_context is not None and not bool(getattr(lease_context, "hfss_license_gate_enabled", True)):
+    license_feature = _context_license_feature(lease_context)
+    if lease_context is not None and not bool(getattr(lease_context, "license_gate_enabled", True)):
         return {
             "open": True,
             "fail_open": False,
-            "reason": "hfss_license_gate_disabled",
-            "hfss_in_use": None,
+            "reason": "license_gate_disabled",
+            "license_feature": license_feature,
+            "license_in_use": None,
             "license_ceiling": license_ceiling,
         }
-    if check_hfss_slot_gate is None:
+    if check_license_gate is None:
         return {
             "open": True,
             "fail_open": True,
-            "reason": "hfss_license_gate_helper_unavailable",
-            "hfss_in_use": None,
+            "reason": "license_gate_helper_unavailable",
+            "license_feature": license_feature,
+            "license_in_use": None,
             "license_ceiling": license_ceiling,
         }
     try:
@@ -131,22 +157,31 @@ def _evaluate_hfss_slot_gate(lease_context: LeaseServerContext | None) -> dict[s
         if lease_context is not None:
             kwargs = {
                 "ssh_config_path": str(getattr(lease_context, "ssh_config_path", "") or ""),
-                "timeout_seconds": int(getattr(lease_context, "hfss_license_query_timeout_seconds", 30) or 30),
-                "ttl_seconds": int(getattr(lease_context, "hfss_license_cache_ttl_seconds", 10) or 10),
+                "timeout_seconds": int(
+                    getattr(lease_context, "license_query_timeout_seconds", LICENSE_FEATURE_QUERY_TIMEOUT_SECONDS)
+                    or LICENSE_FEATURE_QUERY_TIMEOUT_SECONDS
+                ),
+                "ttl_seconds": int(
+                    getattr(lease_context, "license_cache_ttl_seconds", LICENSE_FEATURE_POLL_TTL_SECONDS)
+                    or LICENSE_FEATURE_POLL_TTL_SECONDS
+                ),
                 "ceiling": license_ceiling,
-                "source_host": str(getattr(lease_context, "hfss_license_source_host", "gate1-harry261") or "gate1-harry261"),
-                "poll_env": str(getattr(lease_context, "hfss_license_poll_env", "") or ""),
-                "poll_command": str(getattr(lease_context, "hfss_license_poll_command", "") or ""),
+                "source_host": str(
+                    getattr(lease_context, "license_source_host", LICENSE_POLL_SOURCE_HOST) or LICENSE_POLL_SOURCE_HOST
+                ),
+                "poll_env": str(getattr(lease_context, "license_poll_env", "") or ""),
+                "poll_command": str(getattr(lease_context, "license_poll_command", "") or ""),
             }
-        result = check_hfss_slot_gate(**kwargs)
+        result = check_license_gate(**kwargs)
     except TypeError:
-        result = check_hfss_slot_gate()
+        result = check_license_gate()
     except Exception as exc:  # noqa: BLE001 - license gate failures are fail-open by design.
         return {
             "open": True,
             "fail_open": True,
             "reason": f"{type(exc).__name__}: {exc}",
-            "hfss_in_use": None,
+            "license_feature": license_feature,
+            "license_in_use": None,
             "license_ceiling": license_ceiling,
         }
     if isinstance(result, bool):
@@ -154,7 +189,8 @@ def _evaluate_hfss_slot_gate(lease_context: LeaseServerContext | None) -> dict[s
             "open": result,
             "fail_open": False,
             "reason": None,
-            "hfss_in_use": None,
+            "license_feature": license_feature,
+            "license_in_use": None,
             "license_ceiling": license_ceiling,
         }
     fail_open = bool(_gate_value(result, "fail_open"))
@@ -165,12 +201,13 @@ def _evaluate_hfss_slot_gate(lease_context: LeaseServerContext | None) -> dict[s
         is_open = _gate_value(result, "lease_allowed")
     if is_open is None:
         state = str(_gate_value(result, "license_gate") or _gate_value(result, "gate") or "").strip().lower()
-        is_open = state not in {"hfss_closed", "closed"}
+        is_open = state not in {"license_closed", "closed"}
     return {
         "open": bool(is_open) or fail_open,
         "fail_open": fail_open,
         "reason": _gate_value(result, "reason") or _gate_value(result, "error"),
-        "hfss_in_use": _gate_value(result, "hfss_in_use"),
+        "license_feature": _license_feature_from_gate(result),
+        "license_in_use": _license_in_use_from_gate(result),
         "license_ceiling": _gate_value(result, "license_ceiling") or license_ceiling,
     }
 
@@ -316,24 +353,29 @@ def make_status_handler(
                 if not account_id:
                     self._send_json({"error": "account_id_required"}, status=400)
                     return
-                gate = _evaluate_hfss_slot_gate(lease_context)
-                hfss_in_use = gate.get("hfss_in_use")
-                license_ceiling = int(gate.get("license_ceiling") or HFSS_LICENSE_CEILING)
+                gate = _evaluate_license_gate(lease_context)
+                license_feature = str(gate.get("license_feature") or LICENSE_FEATURE)
+                license_in_use = gate.get("license_in_use")
+                license_ceiling = int(gate.get("license_ceiling") or LICENSE_FEATURE_CEILING)
                 if not gate["open"]:
                     _append_license_gate_event(
                         store,
                         run_id=run_id,
                         worker_id=worker_id,
                         level="INFO",
-                        stage="HFSS_LICENSE_GATE_CLOSED",
-                        message=f"hfss_in_use={hfss_in_use} license_ceiling={license_ceiling}",
+                        stage="LICENSE_GATE_CLOSED",
+                        message=(
+                            f"license_feature={license_feature} "
+                            f"license_in_use={license_in_use} license_ceiling={license_ceiling}"
+                        ),
                     )
                     self._send_json(
                         {
                             "ok": True,
                             "lease_available": False,
-                            "license_gate": "hfss_closed",
-                            "hfss_in_use": hfss_in_use,
+                            "license_gate": "license_closed",
+                            "license_feature": license_feature,
+                            "license_in_use": license_in_use,
                             "license_ceiling": license_ceiling,
                         }
                     )
@@ -344,7 +386,7 @@ def make_status_handler(
                         run_id=run_id,
                         worker_id=worker_id,
                         level="WARN",
-                        stage="HFSS_LICENSE_GATE_FAIL_OPEN",
+                        stage="LICENSE_GATE_FAIL_OPEN",
                         message=f"reason={gate.get('reason') or 'unknown'}",
                     )
                 lease_token = secrets.token_urlsafe(24)

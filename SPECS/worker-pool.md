@@ -82,10 +82,10 @@ Each worker container maintains:
 When any slot reaches a terminal state, the worker immediately requests another
 lease and reuses the freed slot until no input is available or the job exits.
 
-The HFSS license limit is enforced at lease-request time. Workers remain alive
-when the license gate is closed; they simply receive no new lease and continue
-their normal idle/backoff polling. The gate must not submit or cancel Slurm jobs
-and must not kill already running AEDT slots.
+The Electronics Desktop license limit is enforced at lease-request time.
+Workers remain alive when the license gate is closed; they simply receive no
+new lease and continue their normal idle/backoff polling. The gate must not
+submit or cancel Slurm jobs and must not kill already running AEDT slots.
 
 ## Validation Contract
 
@@ -119,6 +119,6 @@ There is no dynamic scoring or throughput balancing in v1.
 
 Only fixed per-account worker ownership is used.
 
-The HFSS license slot gate is not a balancing layer. It is a global safety gate
-for starting new AEDT slots and does not change account ownership or worker
-distribution.
+The Electronics Desktop license slot gate is not a balancing layer. It is a
+global safety gate for starting new AEDT slots and does not change account
+ownership or worker distribution.

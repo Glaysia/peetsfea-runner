@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from peetsfea_runner.license_policy import (
-    HFSS_LICENSE_CEILING,
-    HFSS_LICENSE_POLL_TTL_SECONDS,
+    LICENSE_FEATURE,
+    LICENSE_FEATURE_CEILING,
+    LICENSE_FEATURE_POLL_TTL_SECONDS,
     LicenseAccountState,
     compute_license_target_plan,
     next_desired_total_active_slots,
-    parse_hfss_license_usage,
+    parse_license_feature_usage,
     parse_license_usage,
+    query_license_feature_usage,
 )
 
 
@@ -36,13 +39,13 @@ class TestLicensePolicy(unittest.TestCase):
         self.assertEqual(snapshot.reported_level2_in_use, 69)
         self.assertEqual(snapshot.reported_effective_in_use, 69)
 
-    def test_parse_license_usage_stops_level_sections_at_hfss_header(self) -> None:
+    def test_parse_license_usage_stops_level_sections_at_intervening_feature_header(self) -> None:
         snapshot = parse_license_usage(
             """
             Users of elec_solve_level1:  (Total of 550 licenses issued;  Total of 67 licenses in use)
               root nib110.hpc n110.hpc 1896957 (v2025.0506) (license-server/1055 6785), start Mon 4/6 19:59, PID: 1896801
-            Users of elec_solve_hfss:  (Total of 550 licenses issued;  Total of 529 licenses in use)
-              root hfss01.hpc hfss01.hpc 12345 (v2025.0506) (license-server/1055 999), start Mon 4/6 20:00, PID: 123
+            Users of electronics_desktop:  (Total of 550 licenses issued;  Total of 350 licenses in use)
+              root ed01.hpc ed01.hpc 12345 (v2025.0506) (license-server/1055 999), start Mon 4/6 20:00, PID: 123
             Users of elec_solve_level2:  (Total of 550 licenses issued;  Total of 69 licenses in use)
               root nib116.hpc n116.hpc 1707934 (v2025.0506) (license-server/1055 87029), start Mon 4/6 20:00, PID: 1707668
             """
@@ -59,42 +62,58 @@ class TestLicensePolicy(unittest.TestCase):
         self.assertEqual(snapshot.status, "FAILED")
         self.assertIn("elec_solve_level2", snapshot.error or "")
 
-    def test_parse_hfss_license_usage_opens_below_ceiling_from_header_count(self) -> None:
-        snapshot = parse_hfss_license_usage(
+    def test_parse_license_feature_usage_opens_at_349_from_header_count(self) -> None:
+        snapshot = parse_license_feature_usage(
             """
-            Users of elec_solve_hfss:  (Total of 550 licenses issued;  Total of 529 licenses in use)
-              root hfss01.hpc hfss01.hpc 12345 (v2025.0506) (license-server/1055 999), start Mon 4/6 20:00, PID: 123
+            Users of electronics_desktop:  (Total of 550 licenses issued;  Total of 349 licenses in use)
+              root ed01.hpc ed01.hpc 12345 (v2025.0506) (license-server/1055 999), start Mon 4/6 20:00, PID: 123
             """
         )
 
-        self.assertEqual(HFSS_LICENSE_CEILING, 530)
-        self.assertEqual(HFSS_LICENSE_POLL_TTL_SECONDS, 10)
+        self.assertEqual(LICENSE_FEATURE, "electronics_desktop")
+        self.assertEqual(LICENSE_FEATURE_CEILING, 350)
+        self.assertEqual(LICENSE_FEATURE_POLL_TTL_SECONDS, 10)
         self.assertEqual(snapshot.poll_status, "OK")
-        self.assertEqual(snapshot.hfss_in_use, 529)
-        self.assertEqual(snapshot.ceiling, 530)
+        self.assertEqual(snapshot.license_feature, "electronics_desktop")
+        self.assertEqual(snapshot.license_in_use, 349)
+        self.assertEqual(snapshot.ceiling, 350)
         self.assertEqual(snapshot.gate_state, "open")
         self.assertTrue(snapshot.is_open)
 
-    def test_parse_hfss_license_usage_closes_at_ceiling_from_header_count(self) -> None:
-        snapshot = parse_hfss_license_usage(
-            "Users of elec_solve_hfss:  (Total of 550 licenses issued;  Total of 530 licenses in use)"
+    def test_parse_license_feature_usage_closes_at_350_from_header_count(self) -> None:
+        snapshot = parse_license_feature_usage(
+            "Users of electronics_desktop:  (Total of 550 licenses issued;  Total of 350 licenses in use)"
         )
 
         self.assertEqual(snapshot.poll_status, "OK")
-        self.assertEqual(snapshot.hfss_in_use, 530)
+        self.assertEqual(snapshot.license_in_use, 350)
         self.assertEqual(snapshot.gate_state, "closed")
         self.assertFalse(snapshot.is_open)
 
-    def test_parse_hfss_license_usage_fail_opens_when_header_missing(self) -> None:
-        snapshot = parse_hfss_license_usage(
+    def test_parse_license_feature_usage_fail_opens_when_header_missing(self) -> None:
+        snapshot = parse_license_feature_usage(
             "Users of elec_solve_level1:  (Total of 550 licenses issued;  Total of 67 licenses in use)"
         )
 
         self.assertEqual(snapshot.poll_status, "FAILED")
-        self.assertIsNone(snapshot.hfss_in_use)
+        self.assertIsNone(snapshot.license_in_use)
         self.assertEqual(snapshot.gate_state, "fail-open")
         self.assertTrue(snapshot.is_open)
-        self.assertIn("elec_solve_hfss", snapshot.error or "")
+        self.assertIn("electronics_desktop", snapshot.error or "")
+
+    def test_query_license_feature_usage_fail_opens_on_query_failure(self) -> None:
+        with patch("peetsfea_runner.license_policy.subprocess.run") as run:
+            run.return_value.returncode = 255
+            run.return_value.stdout = ""
+            run.return_value.stderr = "ssh failed"
+
+            snapshot = query_license_feature_usage()
+
+        self.assertEqual(snapshot.poll_status, "FAILED")
+        self.assertIsNone(snapshot.license_in_use)
+        self.assertEqual(snapshot.gate_state, "fail-open")
+        self.assertTrue(snapshot.is_open)
+        self.assertIn("ssh failed", snapshot.error or "")
 
     def test_next_desired_total_active_slots_increases_by_dispatchable_accounts(self) -> None:
         desired_total = next_desired_total_active_slots(
