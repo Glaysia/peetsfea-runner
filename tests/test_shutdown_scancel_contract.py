@@ -181,7 +181,7 @@ class TestShutdownScancelContract(unittest.TestCase):
             ntasks = 1
             cpus_per_job = 40
             mem = "960G"
-            time_limit = "00:30:00"
+            time_limit = "00:45:00"
             partition = ""
             slurm_partitions_allowlist = ()
             slurm_exclude_nodes = ()
@@ -210,7 +210,7 @@ class TestShutdownScancelContract(unittest.TestCase):
     def test_systemd_unit_declares_scancel_shutdown_hook(self) -> None:
         service_path = Path(__file__).resolve().parent.parent / "systemd" / "peetsfea-runner.service"
         content = service_path.read_text(encoding="utf-8")
-        self.assertIn("RuntimeMaxSec=35min", content)
+        self.assertIn("RuntimeMaxSec=40min", content)
         self.assertIn(
             "ExecStopPost=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -c "
             '"from peetsfea_runner.built_in_service import scancel_service_slurm_jobs; '

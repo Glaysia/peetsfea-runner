@@ -33,7 +33,7 @@ Each worker is submitted with:
 - ntasks: `1`
 - cpus per job: `40`
 - mem: `960G`
-- time limit: `00:30:00`
+- time limit: `00:45:00`
 
 ## Container Contract
 
