@@ -520,7 +520,7 @@ class StateStore:
             record["degraded_reason"] = degraded_reason
             record["last_seen_ts"] = now
 
-    def list_active_slurm_workers(self, *, run_id: str) -> list[dict[str, object]]:
+    def list_active_slurm_workers(self, *, run_id: str | None = None) -> list[dict[str, object]]:
         return self.list_slurm_workers(
             run_id=run_id,
             worker_states=("SUBMITTED", "PENDING", "RUNNING", "IDLE_DRAINING"),
@@ -529,15 +529,19 @@ class StateStore:
     def list_slurm_workers(
         self,
         *,
-        run_id: str,
+        run_id: str | None = None,
         worker_states: tuple[str, ...] | None = None,
     ) -> list[dict[str, object]]:
         with self._lock:
-            rows = [dict(row) for row in self._data.slurm_workers.values() if row["run_id"] == run_id]
+            rows = [
+                dict(row)
+                for row in self._data.slurm_workers.values()
+                if run_id is None or row["run_id"] == run_id
+            ]
         if worker_states:
             wanted = {state.strip().upper() for state in worker_states}
             rows = [row for row in rows if str(row.get("worker_state") or "").upper() in wanted]
-        rows.sort(key=lambda row: (str(row.get("submitted_at") or ""), str(row["worker_id"])))
+        rows.sort(key=lambda row: (str(row.get("run_id") or ""), str(row.get("submitted_at") or ""), str(row["worker_id"])))
         return rows
 
     def list_schedulable_slot_tasks(self, *, run_id: str) -> list[tuple[str, str, str, int]]:

@@ -27,12 +27,13 @@ The logical ID is stable across replacement attempts.
 
 Each worker is submitted with:
 
+- job name: `peetsfea-<worker_id>`
 - partition: `cpu2`
 - nodes: `1`
 - ntasks: `1`
 - cpus per job: `40`
 - mem: `960G`
-- time limit: `05:00:00`
+- time limit: `00:30:00`
 
 ## Container Contract
 
@@ -107,7 +108,13 @@ The control plane continuously reconciles the logical pool.
 
 - If a worker is missing, submit a replacement.
 - If a worker is terminal, submit a replacement for the same logical ID.
-- If the service starts or restarts, existing runner-owned workers are cancelled before new ones are submitted.
+- If the service starts or restarts, existing runner-owned workers are cancelled
+  before new ones are submitted.
+- If the service stops or is restarted by systemd, active runner-owned Slurm
+  jobs are cancelled with `scancel` by account before the process exits.
+- The systemd stop hook also performs a best-effort sweep for runner-owned job
+  names matching `peetsfea-worker_*` or legacy `remote_pull_sbatch.sh`, so
+  orphaned workers do not survive a crashed or timed-out control process.
 
 ## No Balancing Layer
 

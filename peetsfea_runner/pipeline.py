@@ -15,6 +15,7 @@ from tempfile import TemporaryDirectory
 from typing import Callable, Iterator
 
 from .constants import (
+    DEFAULT_SLURM_JOB_TIME_LIMIT,
     EXIT_CODE_DOWNLOAD_FAILURE,
     EXIT_CODE_REMOTE_CLEANUP_FAILURE,
     EXIT_CODE_REMOTE_RUN_FAILURE,
@@ -333,7 +334,7 @@ class PipelineConfig:
     ntasks: int = 1
     cpus_per_job: int = 16
     mem: str = "960G"
-    time_limit: str = "05:00:00"
+    time_limit: str = DEFAULT_SLURM_JOB_TIME_LIMIT
     remote_root: str = DEFAULT_REMOTE_ROOT
     pull_workspace_user: str = "peets"
     pull_workspace_host: str = "172.16.165.146"

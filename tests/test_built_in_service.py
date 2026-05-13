@@ -21,7 +21,14 @@ class TestBuiltInService(unittest.TestCase):
         content = service_path.read_text(encoding="utf-8")
 
         self.assertNotIn("Environment=", content)
-        self.assertNotIn("ExecStopPost=", content)
+        self.assertIn("RuntimeMaxSec=35min", content)
+        self.assertIn("Restart=always", content)
+        self.assertIn("RestartSec=5", content)
+        self.assertIn("TimeoutStopSec=90s", content)
+        self.assertIn(
+            'ExecStopPost=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -c "from peetsfea_runner.built_in_service import scancel_service_slurm_jobs; scancel_service_slurm_jobs()"',
+            content,
+        )
         self.assertIn("WorkingDirectory=%h/mnt/8tb/peetsfea-runner", content)
         self.assertIn(
             'ExecStart=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -c "from peetsfea_runner.built_in_service import run_built_in_service; run_built_in_service()"',
@@ -134,6 +141,7 @@ class TestBuiltInService(unittest.TestCase):
         self.assertEqual(prune_cfg.slot_min_concurrency, 1)
         self.assertEqual(prune_cfg.slot_max_concurrency, 15)
         self.assertEqual(prune_cfg.worker_payload_slot_limit, 15)
+        self.assertEqual(prune_cfg.time_limit, "00:30:00")
         self.assertEqual(prune_cfg.worker_bundle_multiplier, 4)
         self.assertEqual(prune_cfg.worker_pool_size, 50)
         self.assertEqual(prune_cfg.lease_ttl_seconds, 600)

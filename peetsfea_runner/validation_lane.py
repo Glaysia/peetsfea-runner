@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+from .constants import DEFAULT_SLURM_JOB_TIME_LIMIT
 from .pipeline import AccountConfig, PipelineConfig
 from .runtime_policy import DEFAULT_REMOTE_ROOT
 
@@ -41,7 +42,7 @@ def build_enroot_validation_lane_config(
     remote_root: str = DEFAULT_REMOTE_ROOT,
     partition: str = "",
     mem: str = "960G",
-    time_limit: str = "05:00:00",
+    time_limit: str = DEFAULT_SLURM_JOB_TIME_LIMIT,
     remote_container_ansys_root: str = "/opt/ohpc/pub/Electronics/v252",
     remote_ansys_executable: str = "/mnt/AnsysEM/ansysedt",
     ssh_config_path: str = "",

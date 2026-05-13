@@ -3,6 +3,7 @@ import threading
 from pathlib import Path
 
 from peetsfea_runner import AccountConfig, PipelineConfig, __version__, run_pipeline
+from peetsfea_runner.constants import DEFAULT_SLURM_JOB_TIME_LIMIT
 from peetsfea_runner.state_store import StateStore
 from peetsfea_runner.web_status import start_status_server
 
@@ -37,7 +38,7 @@ def _build_config(workspace_root: Path) -> PipelineConfig:
         slurm_partitions_allowlist=_env_csv_tuple("PEETSFEA_SLURM_PARTITIONS_ALLOWLIST"),
         cpus_per_job=int(os.getenv("PEETSFEA_CPUS_PER_JOB", "16")),
         mem=os.getenv("PEETSFEA_MEM", "960G"),
-        time_limit=os.getenv("PEETSFEA_TIME_LIMIT", "05:00:00"),
+        time_limit=os.getenv("PEETSFEA_TIME_LIMIT", DEFAULT_SLURM_JOB_TIME_LIMIT),
         remote_root=os.getenv("PEETSFEA_REMOTE_ROOT", "~/aedt_runs"),
         continuous_mode=_env_bool("PEETSFEA_CONTINUOUS_MODE", True),
         ingest_poll_seconds=int(os.getenv("PEETSFEA_INGEST_POLL_SECONDS", "30")),

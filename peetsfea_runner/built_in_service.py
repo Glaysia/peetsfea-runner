@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import getpass
+import importlib
 import os
 import socket
+import signal
 import threading
 import time
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .constants import DEFAULT_SLURM_JOB_TIME_LIMIT
 from .pipeline import AccountConfig, PipelineConfig, build_lease_server_context
 from .runtime_policy import DEFAULT_REMOTE_ROOT
 from .state_store import StateStore
@@ -145,6 +149,85 @@ def build_service_profile(*, repo_root: Path | None = None) -> ServiceProfile:
     )
 
 
+def _collect_active_worker_rows(*, state_store: StateStore) -> list[dict[str, object]]:
+    list_active = getattr(state_store, "list_active_slurm_workers", None)
+    if not callable(list_active):
+        return []
+    try:
+        rows = list_active()
+    except TypeError:
+        try:
+            rows = list_active(run_id=None)
+        except TypeError:
+            return []
+        except Exception:
+            return []
+    except Exception:
+        return []
+    if rows is None:
+        return []
+    return list(rows)
+
+
+def _build_cleanup_accounts(
+    *, profile: ServiceProfile, active_worker_rows: list[dict[str, object]]
+) -> list[AccountConfig]:
+    accounts: list[AccountConfig] = []
+    seen_host_aliases: set[str] = set()
+
+    for lane in profile.lanes:
+        for account in lane.accounts:
+            host_alias = str(account.host_alias).strip()
+            if not host_alias or host_alias in seen_host_aliases:
+                continue
+            seen_host_aliases.add(host_alias)
+            accounts.append(account)
+
+    for row in active_worker_rows:
+        host_alias = str(row.get("host_alias", "")).strip()
+        if not host_alias or host_alias in seen_host_aliases:
+            continue
+        seen_host_aliases.add(host_alias)
+        account_id = str(row.get("account_id", "")).strip() or "runner"
+        accounts.append(AccountConfig(account_id=account_id, host_alias=host_alias))
+
+    return accounts
+
+
+def _slurm_cleanup_runner(command: list[str]) -> tuple[int, str, str]:
+    process = subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=15,
+    )
+    return process.returncode, process.stdout, process.stderr
+
+
+def scancel_service_slurm_jobs() -> None:
+    try:
+        profile = build_service_profile()
+        state_store = StateStore(profile.state_path)
+        active_worker_rows = _collect_active_worker_rows(state_store=state_store)
+        accounts = _build_cleanup_accounts(profile=profile, active_worker_rows=active_worker_rows)
+        if not accounts:
+            return
+        try:
+            slurm_cleanup = importlib.import_module("peetsfea_runner.slurm_cleanup")
+        except Exception:
+            return
+
+        slurm_cleanup.cleanup_slurm_workers(
+            accounts=accounts,
+            ssh_config_path=str(profile.ssh_config_path) if profile.ssh_config_path is not None else "",
+            active_worker_rows=active_worker_rows,
+            run_command=_slurm_cleanup_runner,
+        )
+    except Exception:
+        return
+
+
 def validate_service_layout(*, profile: ServiceProfile) -> None:
     if not profile.input_queue_root.exists():
         raise FileNotFoundError(f"input_queue root not found: {profile.input_queue_root}")
@@ -190,7 +273,7 @@ def _lane_pipeline_config(profile: ServiceProfile, lane: LaneSpec) -> PipelineCo
         ntasks=1,
         cpus_per_job=lane.cpus_per_job,
         mem="960G" if lane.lane_id == "prune_results" else "192G",
-        time_limit="05:00:00",
+        time_limit=DEFAULT_SLURM_JOB_TIME_LIMIT,
         remote_root=DEFAULT_REMOTE_ROOT,
         execute_remote=True,
         remote_execution_backend="slurm_batch",
@@ -347,6 +430,20 @@ def run_built_in_service() -> None:
     )
 
     stop_event = threading.Event()
+    shutdown_requested = threading.Event()
+
+    def _handle_shutdown_signal(signum: int, frame: object | None) -> None:
+        if shutdown_requested.is_set():
+            return
+        shutdown_requested.set()
+        stop_event.set()
+        scancel_service_slurm_jobs()
+
+    original_signal_handlers: list[tuple[int, signal.Handlers]] = []
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        original_signal_handlers.append((signum, signal.getsignal(signum)))
+        signal.signal(signum, _handle_shutdown_signal)
+
     worker_threads = [
         threading.Thread(
             target=_lane_worker_loop,
@@ -366,3 +463,5 @@ def run_built_in_service() -> None:
         stop_event.set()
         server.shutdown()
         server.server_close()
+        for signum, original_handler in original_signal_handlers:
+            signal.signal(signum, original_handler)

@@ -104,7 +104,13 @@ nodes. The worker uses `IdentityFile=/etc/peetsfea_ssh/id_control`.
 
 Restart is always a cold start.
 
-- Existing runner-owned Slurm workers are cancelled before a new pool is started.
+- Existing runner-owned Slurm workers are cancelled with `scancel` before a new
+  pool is started.
+- Service stop, service restart, and `RuntimeMaxSec` expiry all run the same
+  cancellation path before the process exits.
+- Cancellation targets only runner-owned workers for the configured service
+  accounts. Other Slurm jobs owned by those accounts are not part of the
+  runtime contract.
 - Old lease tokens become invalid immediately.
 - `.done` inputs stay completed.
 - Non-`.done` inputs are re-scanned and become eligible again.

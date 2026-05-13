@@ -566,6 +566,7 @@ class TestPlan03Workflow(unittest.TestCase):
             run_id="run_01",
             worker_id="worker_01",
         )
+        self.assertIn("#SBATCH --job-name=peetsfea-worker_01", content)
         self.assertIn("remote_pull_worker_payload.sh", content)
         self.assertNotIn("project_*.aedt", content)
         self.assertIn('EXEC_ROOT="/tmp/$USER/peetsfea-runner/_submit"', content)

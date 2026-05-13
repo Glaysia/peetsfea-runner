@@ -349,6 +349,14 @@ def _slurm_partition_value(config: RemoteJobConfig) -> str:
     return ",".join(_slurm_partitions_allowlist(config))
 
 
+def _safe_pull_worker_job_name(worker_id: str | None) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", str(worker_id or "").strip())
+    safe = re.sub(r"_+", "_", safe).strip("_")
+    if not safe:
+        safe = "worker_01"
+    return f"peetsfea-{safe[:120]}"
+
+
 def run_remote_job_attempt(
     *,
     config: RemoteJobConfig,
@@ -4322,6 +4330,7 @@ def _build_pull_remote_sbatch_script_content(
             f"#SBATCH -c {config.cpus_per_job}",
             f"#SBATCH --mem={config.mem}",
             f"#SBATCH --time={config.time_limit}",
+            f"#SBATCH --job-name={_safe_pull_worker_job_name(worker_id)}",
             *exclude_lines,
             "#SBATCH -o slurm-%j.out",
             "#SBATCH -e slurm-%j.err",

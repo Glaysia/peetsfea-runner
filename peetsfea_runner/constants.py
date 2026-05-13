@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Final
 
 
+DEFAULT_SLURM_JOB_TIME_LIMIT: Final[str] = "00:30:00"
+
 EXIT_CODE_SUCCESS: Final[int] = 0
 EXIT_CODE_SSH_FAILURE: Final[int] = 10
 EXIT_CODE_SLURM_FAILURE: Final[int] = 11

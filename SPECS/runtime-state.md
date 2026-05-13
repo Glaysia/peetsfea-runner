@@ -55,6 +55,7 @@ Each worker record stores:
 
 - logical worker id
 - account id
+- host alias used for `squeue` and `scancel`
 - slurm job id
 - current worker state
 - last heartbeat
@@ -79,6 +80,23 @@ Each logical slot stores:
 Slots do not imply separate containers. One worker record corresponds to one
 Slurm job and one enroot container; slots are concurrent executions inside that
 container.
+
+## Shutdown Cancellation
+
+Runtime state must expose the active worker records needed to cancel Slurm jobs
+on service shutdown.
+
+Active worker states are:
+
+- `SUBMITTED`
+- `PENDING`
+- `RUNNING`
+- `IDLE_DRAINING`
+
+The shutdown path groups active records by host alias, deduplicates Slurm job
+ids, and calls `scancel` on each configured account host. This state is
+process-local, so the systemd fallback must also be able to discover
+runner-owned jobs from remote `squeue` job names.
 
 ## Event Buffer
 
