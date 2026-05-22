@@ -58,14 +58,14 @@ class TestBuiltInService(unittest.TestCase):
             [account.host_alias for account in lane_by_id["prune_results"].accounts],
             [
                 "gate1-harry261",
-                "gate1-jji0930",
+                "gate1-dhj02",
             ],
         )
         configured_worker_slots = sum(
             sum(account.max_jobs for account in lane.accounts) * lane.slots_per_job
             for lane in profile.lanes
         )
-        self.assertEqual(configured_worker_slots, 255)
+        self.assertEqual(configured_worker_slots, 270)
 
     def test_validate_service_layout_creates_required_output_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

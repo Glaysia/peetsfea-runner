@@ -42,7 +42,7 @@ def _make_test_profile(*, root: Path) -> ServiceProfile:
                 output_root=root / "output" / "prune_results",
                 accounts=(
                     AccountConfig(account_id="acct-a", host_alias="gate1-harry261", max_jobs=1),
-                    AccountConfig(account_id="acct-b", host_alias="gate1-jji0930", max_jobs=1),
+                    AccountConfig(account_id="acct-b", host_alias="gate1-dhj02", max_jobs=1),
                 ),
                 cpus_per_job=60,
                 slots_per_job=15,
@@ -93,7 +93,7 @@ def test_scancel_service_slurm_jobs_uses_active_worker_rows(monkeypatch: pytest.
     assert isinstance(accounts, list)
     assert [acc.host_alias for acc in accounts] == [
         "gate1-harry261",
-        "gate1-jji0930",
+        "gate1-dhj02",
         "row-extra",
     ]
     assert cleanup_calls["rows"] == _FakeStateStore(profile.state_path).list_active_slurm_workers()
