@@ -8,8 +8,13 @@ version = "2026.04.07.3"
 description = "Function-only AEDT Slurm pipeline skeleton"
 requires-python = "==3.12.*"
 dependencies = [
+  "cadquery",
+  "duckdb>=1.5",
+  "ocp-vscode>=3.1.2",
   "pexpect>=4.9",
-  "peetsfea @ git+file:///home/peets/git/peetsfea.git@0.3.1"
+  "peetsfea @ git+file:///home/peets/git/peetsfea.git@0.3.1",
+  "psutil",
+  "pyaedt[graphics]==0.25.1"
 ]
 
 [tool.setuptools.packages.find]

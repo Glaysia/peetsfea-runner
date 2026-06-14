@@ -135,7 +135,7 @@ _BOOTSTRAP_MARKER = "__PEETSFEA_BOOTSTRAP__:ok"
 _DEFAULT_SLURM_PROBE_PARTITION = ""
 _DEFAULT_SLURM_PROBE_IMMEDIATE_SECONDS = 15
 _ENROOT_IMAGE_PYTHON = "/opt/miniconda3/bin/python"
-_ENROOT_IMAGE_CONTRACT_VERSION = "2026-05-07-aedt-sqsh-v3-sshfs"
+_ENROOT_IMAGE_CONTRACT_VERSION = "2026-06-14-aedt-sqsh-v4-peetsfea031"
 _ENROOT_IMAGE_REQUIRED_PACKAGES = ("openssh-client", "sshfs", "fuse3", "ca-certificates")
 _ENROOT_IMAGE_REQUIRED_PACKAGES_TEXT = " ".join(_ENROOT_IMAGE_REQUIRED_PACKAGES)
 _ENROOT_IMAGE_METADATA_SUFFIX = ".meta.json"
@@ -144,6 +144,9 @@ _ENROOT_IMAGE_PYTHON_VERSION = "3.12"
 _ENROOT_IMAGE_PYAEDT_SPEC = "pyaedt==0.25.1"
 _ENROOT_IMAGE_PANDAS_SPEC = "pandas<2.4"
 _ENROOT_IMAGE_PYVISTA_SPEC = "pyvista"
+_ENROOT_IMAGE_CADQUERY_SPEC = "cadquery"
+_ENROOT_IMAGE_OCP_VSCODE_SPEC = "ocp-vscode>=3.1.2"
+_ENROOT_IMAGE_PSUTIL_SPEC = "psutil"
 _SLURM_QUEUE_DELAY_MARKERS = (
     "queued and waiting for resources",
     "unable to allocate resources",
@@ -1652,6 +1655,9 @@ PYTHON_VERSION={_double_quoted_shell_value(_ENROOT_IMAGE_PYTHON_VERSION)} \\
 PYAEDT_SPEC={_double_quoted_shell_value(_ENROOT_IMAGE_PYAEDT_SPEC)} \\
 PANDAS_SPEC={_double_quoted_shell_value(_ENROOT_IMAGE_PANDAS_SPEC)} \\
 PYVISTA_SPEC={_double_quoted_shell_value(_ENROOT_IMAGE_PYVISTA_SPEC)} \\
+CADQUERY_SPEC={_double_quoted_shell_value(_ENROOT_IMAGE_CADQUERY_SPEC)} \\
+OCP_VSCODE_SPEC={_double_quoted_shell_value(_ENROOT_IMAGE_OCP_VSCODE_SPEC)} \\
+PSUTIL_SPEC={_double_quoted_shell_value(_ENROOT_IMAGE_PSUTIL_SPEC)} \\
 HOST_ANSYS_ROOT={_double_quoted_shell_value(host_ansys_root)} \\
 HOST_ANSYS_BASE={_double_quoted_shell_value(host_ansys_base)} \\
 "$SCRIPT_PATH"

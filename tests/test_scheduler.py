@@ -514,7 +514,7 @@ class TestScheduler(unittest.TestCase):
         self.assertIn("docker://ubuntu:24.04", seen[0][-1])
         self.assertIn("aedt.sqsh.meta.json", seen[0][-1])
         self.assertIn("/ansys_inc/v252", seen[0][-1])
-        self.assertIn("2026-05-07-aedt-sqsh-v3-sshfs", seen[0][-1])
+        self.assertIn("2026-06-14-aedt-sqsh-v4-peetsfea031", seen[0][-1])
 
     def test_query_windows_account_capacity_uses_local_max_jobs(self) -> None:
         account = _Account(account_id="w1", host_alias="win-1", max_jobs=2, platform="windows", scheduler="none")

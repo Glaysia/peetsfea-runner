@@ -9,9 +9,9 @@ is stable and observable.
 
 ## Core Goal
 
-Run exactly one simulation remotely through one warm Python/PyAEDT session:
+Run exactly one simulation remotely through one controlled Python API process:
 
-- one supercomputer account
+- one supercomputer account: `account_01` on `gate1-harry261`
 - one Slurm job
 - one Enroot container
 - one PyAEDT slot
@@ -92,6 +92,9 @@ and local DuckDB persistence around this `peetsfea` API.
 Implementation reference while developing locally:
 
 `/home/peets/Projects/PythonProjects/peetsfea`
+
+The first remote account target is fixed to `gate1-harry261`. New code and
+verification for this reset should not fan out to the older multi-account lane.
 
 ## New Execution Model
 
@@ -198,7 +201,7 @@ explicitly retained artifact references.
 
 The reset is working only when all of these are true:
 
-- one configured account launches one Slurm job
+- `account_01` on `gate1-harry261` launches one Slurm job
 - the job starts one Enroot container without using host `/tmp` as runner root
 - one remote API server becomes reachable through the SSH path
 - `GET /health` reports idle and can import `peetsfea` version `0.3.1`

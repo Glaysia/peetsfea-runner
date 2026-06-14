@@ -6,17 +6,22 @@ BOOTSTRAP_MARKER="__PEETSFEA_BOOTSTRAP__:ok"
 TARGET_IMAGE="${TARGET_IMAGE:-${HOME}/runtime/enroot/aedt.sqsh}"
 IMAGE_DIR="${IMAGE_DIR:-$(dirname "${TARGET_IMAGE}")}"
 METADATA_PATH="${METADATA_PATH:-${TARGET_IMAGE}.meta.json}"
-CONTRACT_VERSION="${CONTRACT_VERSION:-2026-05-07-aedt-sqsh-v3-sshfs}"
+CONTRACT_VERSION="${CONTRACT_VERSION:-2026-06-14-aedt-sqsh-v4-peetsfea031}"
 BASE_IMAGE="${BASE_IMAGE:-docker://ubuntu:24.04}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 PYAEDT_SPEC="${PYAEDT_SPEC:-pyaedt==0.25.1}"
 PANDAS_SPEC="${PANDAS_SPEC:-pandas<2.4}"
 PYVISTA_SPEC="${PYVISTA_SPEC:-pyvista}"
+CADQUERY_SPEC="${CADQUERY_SPEC:-cadquery}"
+OCP_VSCODE_SPEC="${OCP_VSCODE_SPEC:-ocp-vscode>=3.1.2}"
+PSUTIL_SPEC="${PSUTIL_SPEC:-psutil}"
 HOST_ANSYS_ROOT="${HOST_ANSYS_ROOT:-/opt/ohpc/pub/Electronics/v252/AnsysEM}"
 HOST_ANSYS_BASE="${HOST_ANSYS_BASE:-/opt/ohpc/pub/Electronics/v252}"
 LOCK_DIR="${LOCK_DIR:-${TARGET_IMAGE}.lockdir}"
+BUILD_TMP_PARENT="${BUILD_TMP_PARENT:-${HOME}/runtime/enroot/build_tmp}"
 
-TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/peetsfea-enroot-build.XXXXXX")"
+mkdir -p "${BUILD_TMP_PARENT}"
+TMP_ROOT="$(mktemp -d "${BUILD_TMP_PARENT}/peetsfea-enroot-build.XXXXXX")"
 BASE_SQSH="${TMP_ROOT}/base.sqsh"
 TMP_IMAGE="${TARGET_IMAGE}.tmp"
 TMP_METADATA="${METADATA_PATH}.tmp"
@@ -32,7 +37,7 @@ image_is_current() {
 
 write_metadata() {
   cat > "${TMP_METADATA}" <<EOF
-{"contract_version":"${CONTRACT_VERSION}","base_image":"${BASE_IMAGE}","python_version":"${PYTHON_VERSION}","pyaedt":"${PYAEDT_SPEC}","pandas":"${PANDAS_SPEC}","pyvista":"${PYVISTA_SPEC}","host_ansys_root":"${HOST_ANSYS_ROOT}","host_ansys_base":"${HOST_ANSYS_BASE}","runtime_packages":"openssh-client sshfs fuse3 ca-certificates"}
+{"contract_version":"${CONTRACT_VERSION}","base_image":"${BASE_IMAGE}","python_version":"${PYTHON_VERSION}","pyaedt":"${PYAEDT_SPEC}","pandas":"${PANDAS_SPEC}","pyvista":"${PYVISTA_SPEC}","cadquery":"${CADQUERY_SPEC}","ocp_vscode":"${OCP_VSCODE_SPEC}","psutil":"${PSUTIL_SPEC}","host_ansys_root":"${HOST_ANSYS_ROOT}","host_ansys_base":"${HOST_ANSYS_BASE}","runtime_packages":"openssh-client sshfs fuse3 ca-certificates"}
 EOF
 }
 
@@ -100,12 +105,15 @@ rm -f "${BASE_SQSH}" "${TMP_IMAGE}" "${TMP_METADATA}"
 enroot import -o "${BASE_SQSH}" "${BASE_IMAGE}"
 enroot create -f -n "${CONTAINER_NAME}" "${BASE_SQSH}" >/dev/null
 enroot start --root --rw "${CONTAINER_NAME}" /bin/bash -s -- \
-  "${PYTHON_VERSION}" "${PYAEDT_SPEC}" "${PANDAS_SPEC}" "${PYVISTA_SPEC}" <<'EOF'
+  "${PYTHON_VERSION}" "${PYAEDT_SPEC}" "${PANDAS_SPEC}" "${PYVISTA_SPEC}" "${CADQUERY_SPEC}" "${OCP_VSCODE_SPEC}" "${PSUTIL_SPEC}" <<'EOF'
 set -euo pipefail
 PYTHON_VERSION="$1"
 PYAEDT_SPEC="$2"
 PANDAS_SPEC="$3"
 PYVISTA_SPEC="$4"
+CADQUERY_SPEC="$5"
+OCP_VSCODE_SPEC="$6"
+PSUTIL_SPEC="$7"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
@@ -126,8 +134,8 @@ if /opt/miniconda3/bin/conda tos --help >/dev/null 2>&1; then
 fi
 /opt/miniconda3/bin/conda install -y "python=${PYTHON_VERSION}" pip
 /opt/miniconda3/bin/python -m pip install --upgrade pip setuptools wheel uv
-/opt/miniconda3/bin/python -m uv pip install "${PYAEDT_SPEC}" "${PANDAS_SPEC}" "${PYVISTA_SPEC}"
-/opt/miniconda3/bin/python -c "import ansys.aedt.core, pandas, pyvista"
+/opt/miniconda3/bin/python -m uv pip install "${PYAEDT_SPEC}" "${PANDAS_SPEC}" "${PYVISTA_SPEC}" "${CADQUERY_SPEC}" "${OCP_VSCODE_SPEC}" "${PSUTIL_SPEC}"
+/opt/miniconda3/bin/python -c "import ansys.aedt.core, pandas, pyvista, cadquery, ocp_vscode, psutil"
 command -v ssh >/dev/null
 command -v sshfs >/dev/null
 if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
@@ -153,7 +161,7 @@ export XDG_CONFIG_HOME=/tmp/peetsfea-home/.config
 test -x /mnt/AnsysEM/ansysedt
 test -x /ansys_inc/v252/licensingclient/linx64/ansyscl
 /opt/miniconda3/bin/python -m uv --version >/dev/null
-/opt/miniconda3/bin/python -c "import ansys.aedt.core, pandas, pyvista"
+/opt/miniconda3/bin/python -c "import ansys.aedt.core, pandas, pyvista, cadquery, ocp_vscode, psutil"
 command -v ssh >/dev/null
 command -v sshfs >/dev/null
 if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then

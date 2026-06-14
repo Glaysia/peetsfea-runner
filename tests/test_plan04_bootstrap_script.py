@@ -26,6 +26,12 @@ class TestPlan04BootstrapScript(unittest.TestCase):
         self.assertIn("command -v ssh >/dev/null", content)
         self.assertIn("command -v sshfs >/dev/null", content)
         self.assertIn("command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3", content)
+        self.assertIn("CADQUERY_SPEC", content)
+        self.assertIn("OCP_VSCODE_SPEC", content)
+        self.assertIn("PSUTIL_SPEC", content)
+        self.assertIn("import ansys.aedt.core, pandas, pyvista, cadquery, ocp_vscode, psutil", content)
+        self.assertIn('BUILD_TMP_PARENT="${BUILD_TMP_PARENT:-${HOME}/runtime/enroot/build_tmp}"', content)
+        self.assertNotIn('${TMPDIR:-/tmp}/peetsfea-enroot-build', content)
 
     def test_contains_miniconda_install_and_conda_python312(self) -> None:
         content = SCRIPT_PATH.read_text(encoding="utf-8")
@@ -52,7 +58,7 @@ class TestPlan04BootstrapScript(unittest.TestCase):
     def test_enroot_bootstrap_contract_version_bumps(self) -> None:
         content = ENROOT_BOOTSTRAP_SCRIPT_PATH.read_text(encoding="utf-8")
         self.assertIn(
-            "CONTRACT_VERSION=\"${CONTRACT_VERSION:-2026-05-07-aedt-sqsh-v3-sshfs}\"",
+            "CONTRACT_VERSION=\"${CONTRACT_VERSION:-2026-06-14-aedt-sqsh-v4-peetsfea031}\"",
             content,
         )
 
