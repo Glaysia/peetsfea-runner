@@ -1,13 +1,15 @@
 # Docs
 
-`PLANS/`는 tonight 운영과 cutover 판단을 위한 active 실행 문서다. `docs/`는 현재 저장소 구현 상태를 설명하는 참조 문서이며, 운영 판단의 우선순위는 항상 `PLANS/`가 가진다.
+문서 단일 기준(SSOT)은 `PLANS/MASTER_PLAN.md`다. 충돌 시 항상 MASTER_PLAN이 우선한다.
 
-## 문서 인덱스
+## 문서 지도
+- `PLANS/MASTER_PLAN.md` — 전체 목표·아키텍처·6단계 (SSOT)
+- `GOAL.md` — 지금 구현할 범위(Phase 1, 1/6)
+- `PLANS/peetsfea_main.md` — peetsfea 0.3.2에 추가할 것 + 일차 이유
+- `PLANS/peetsfea_runner.md` — runner 쪽 peetsfea 연동 책임
+- `AGENTS.md` — 저장소 작업 규칙(실행=systemctl, 타입체킹, 의존성 등)
+- `docs/architecture/new-architecture.html` — 신규 아키텍처 시각화
 
-- [architecture/current-project-overview.md](./architecture/current-project-overview.md): 저장소 구조, `run_pipeline(config)` 런타임 흐름, continuous service와 validation lane 경계를 Mermaid로 정리한 현재 구조 문서
-
-## 현재 문서 원칙
-
-- 파이프라인 공식 시작점은 계속 `run_pipeline(config)` 하나다.
-- 예시는 CLI가 아니라 함수 호출 경로 또는 systemd service 경로만 사용한다.
-- canary 판정은 active `PLANS/`의 CSV schema gate 기준을 따른다.
+## 비고
+- 옛 50-worker lease/worker 아키텍처를 설명하던 `SPECS/*`, roadmap, legacy docs는 혼동 방지를 위해 제거했다.
+- 인프라/환경 사실(호스트·경로·라이선스·파티션 등)은 MASTER_PLAN **부록 A**로 보존했다.

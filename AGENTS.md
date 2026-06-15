@@ -6,8 +6,8 @@
 ## 0. 기준 문서 (Plan Authority)
 1. **단일 기준(SSOT): `PLANS/MASTER_PLAN.md`.** 전체 목표·아키텍처·6단계.
 2. **현재 구현 범위: `GOAL.md`** (= MASTER_PLAN의 Phase 1, 1/6).
-3. **의존 계약: `PLANS/peetsfea_main.md`** (peetsfea → 0.3.2가 충족할 사항).
-4. `PLANS/roadmap-tonight-*`, `PLANS/archives/*`는 **레거시 참고용**이며 실행 기준이 아니다.
+3. **의존 계약:** `PLANS/peetsfea_main.md`(main에 추가할 것+이유), `PLANS/peetsfea_runner.md`(runner 쪽 연동).
+4. **시각화:** `docs/architecture/new-architecture.html`. (옛 `SPECS/*`·roadmap·legacy docs는 제거됨.)
 5. 문서 간 충돌 시 **MASTER_PLAN 우선**.
 
 ## 1. 실행 방법 (가장 중요)

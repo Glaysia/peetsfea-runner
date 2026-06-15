@@ -24,10 +24,10 @@ EDT 라이선스 점유를 유지한다.
 | ansysedt | 컨테이너당 **10개 상시 기동** | warm 유지 |
 | edtmgr | 컨테이너당 **10개 상시 기동** | ansysedt 1개당 1개, **runner에 위치(Q1)** |
 | 동시 시뮬레이션 | 계정당 **90개** (9×10) | 정상상태에서 항상 90개 유지 |
-| 잡 수명 | **5시간** | 만료 시 진행 중 90개 **그냥 폐기**(Q8) |
+| 잡 수명 | **10시간** | 만료 시 진행 중 90개 **그냥 폐기**(Q8) |
 
-- 기존 50-worker lease/worker/bundle 파이프라인은 **레거시(교체 대상)**. 본 토폴로지가
-  새 기준이며 `PLANS/roadmap-tonight-*`, `PLANS/archives/*`는 보류/참고용.
+- 기존 50-worker lease/worker/bundle 파이프라인은 **레거시(교체 대상)**. 본 토폴로지가 새 기준.
+  (옛 `SPECS/*`·roadmap·archives 문서는 혼동 방지를 위해 **제거**했다. 인프라 사실은 부록 A로 보존.)
 
 ---
 
@@ -165,7 +165,7 @@ EDT 라이선스 점유를 유지한다.
 | Q5 | GPU/CPU 테스트는 지금 안 함. 통계 쌓이면 정책화. |
 | Q6 | 라이선스 충분 → 상한 미고려. |
 | Q7 | 다계정은 아주 나중. 지금 단일 계정. |
-| Q8 | 5h 만료 시 진행 중 90개 **폐기**(드레인 로직 없음). 리소스 낭비가 크면 추후 잡을 6~8h로 늘려 대응. |
+| Q8 | 10h 만료 시 진행 중 90개 **폐기**(드레인 로직 없음). 리소스 낭비가 크면 추후 드레인 로직으로 대응. |
 
 ---
 
@@ -183,7 +183,7 @@ EDT 라이선스 점유를 유지한다.
   산출되고, ansysedt가 시뮬 사이에 죽지 않고 라이선스를 유지함을 확인.
 
 ### Phase 2 — 계정 내 9잡/90 동시 오케스트레이션
-- 9잡 제출·생애주기 관리, 잡당 컨테이너 1개, 슬롯 90개 풀, 5h 만료 시 폐기(Q8).
+- 9잡 제출·생애주기 관리, 잡당 컨테이너 1개, 슬롯 90개 풀, 10h 만료 시 폐기(Q8).
 - 잡 단위 `/enroot/{USER}_{SJOB}` 생성/정리, 잡 재기동(드레인 없음).
 - **수용:** 정상상태에서 동시 90개 유지가 관측됨.
 
@@ -208,8 +208,8 @@ EDT 라이선스 점유를 유지한다.
 
 ## 5. peetsfea-runner 변경 계획
 1. 토폴로지/구성 재정의: 단일 계정 / 9잡 / 잡당 컨테이너 1 / 컨테이너당 ansysedt·edtmgr 10 /
-   동시 90 / 잡 수명 5h. 현 `DEFAULT_SLURM_JOB_TIME_LIMIT="00:45:00"`
-   (`peetsfea_runner/constants.py:6`) → 5h. 현 `runner.py:46,60-61`(slots_per_job,
+   동시 90 / 잡 수명 10h. 현 `DEFAULT_SLURM_JOB_TIME_LIMIT="00:45:00"`
+   (`peetsfea_runner/constants.py:6`) → 10h. 현 `runner.py:46,60-61`(slots_per_job,
    account_01 max_jobs) 정비.
 2. **edtmgr(신규 모듈):** 컨테이너 내 10개 관리 서버 + 대여 프로토콜 + 60/65분 타이밍 +
    liveness 재기동. ansysedt grpc 기동/접속 로직은 기존 remote_job의 grpc 런치 패턴 참고.
@@ -245,7 +245,7 @@ EDT 라이선스 점유를 유지한다.
 - `peetsfea_runner/single_simulation_api.py:62,116` — 시뮬 프리미티브 호출(계약 지점)
 - `peetsfea_runner/single_simulation_store.py` — 결과 DB(DuckDB) 확장 기반
 - `runner.py:46,60-61` — 현 토폴로지(slots_per_job, account_01 max_jobs)
-- `peetsfea_runner/constants.py:6` — `DEFAULT_SLURM_JOB_TIME_LIMIT`(→5h)
+- `peetsfea_runner/constants.py:6` — `DEFAULT_SLURM_JOB_TIME_LIMIT`(→10h)
 - `peetsfea_runner/scheduler.py:567` — `bootstrap_needed` 판정(멱등 부트스트랩)
 - `peetsfea_runner/scheduler.py:138` — `_ENROOT_IMAGE_CONTRACT_VERSION`(`peetsfea031`→`peetsfea032`)
 - `peetsfea_runner/enroot_image_bootstrap.sh`, `scripts/remote_bootstrap_install.sh` — sqsh/원격 설치
@@ -280,3 +280,22 @@ EDT 라이선스 점유를 유지한다.
     "$HOME 격리로 자연 해소"는 설정 디렉토리에는 적용되지 않음** — 출력 경로만 분리한다.
   - **연관:** §2.4(파일시스템 규칙), §2.9(Ansoft 유저 설정 공유 마운트),
     §6의 "완료 시 깨끗이 반환", §8(project_dir 명명).
+
+---
+
+## 부록 A. 인프라 / 환경 사실 (현 아키텍처도 사용)
+> 1차 소스는 코드(`constants.py`, `license_policy.py`, `runtime_policy.py`, `scheduler.py`,
+> `remote_job.py`). 본 부록은 빠른 참조용이며, 옛 환경 문서(`docs/working-environment.html` 등)를
+> 대체한다.
+
+| 항목 | 값 |
+|------|----|
+| 제어 호스트(로컬 워크스테이션) | `172.16.165.146` |
+| 게이트 노드 alias | `gate1-harry261` |
+| SLURM 파티션 | `cpu2` |
+| AnsysEM 설치 | `/opt/ohpc/pub/Electronics/v252/AnsysEM` (`ansysedt`) |
+| lmutil | `/opt/ohpc/pub/Electronics/v252/licensingclient/linx64/lmutil` |
+| 라이선스 서버 | `ANSYSLMD_LICENSE_FILE=1055@172.16.10.81` (poll 소스 호스트 `gate1-harry261`) |
+| enroot 이미지(sqsh) | `~/runtime/enroot/aedt.sqsh` (공유 `$HOME`) |
+| 컨테이너 마운트 | `$JOB_DIR:/work`, `/dev/fuse`, 공유 `$HOME/Ansoft`(유저 설정, §2.9), AnsysEM |
+| enroot 버전 | 로컬·계산노드 공통 **3.5.0** (로컬 검증이 잡에 전이, AGENTS.md §6) |

@@ -132,7 +132,7 @@
     <text x="506" y="192" class="svglabel">job_2 … job_9</text>
     <text x="506" y="212" class="svgsub">각 컨테이너 10슬롯</text>
     <text x="506" y="232" class="svgsub">→ 합계 90 동시</text>
-    <text x="506" y="262" class="svgsub">잡 수명 5h</text>
+    <text x="506" y="262" class="svgsub">잡 수명 10h</text>
     <text x="506" y="280" class="svgsub">만료 시 진행 90개 폐기</text>
 
     <!-- Load balancer -->
@@ -180,7 +180,7 @@
   <tr><td>ansysedt</td><td>컨테이너당 10개</td><td>상시 기동 (warm)</td></tr>
   <tr><td>edtmgr</td><td>컨테이너당 10개</td><td>ansysedt 1개당 1개 · <b>runner에 위치</b></td></tr>
   <tr><td>동시 시뮬레이션</td><td>계정당 90개</td><td>정상상태에서 항상 유지</td></tr>
-  <tr><td>잡 수명</td><td>5시간</td><td>만료 시 진행 중 90개 폐기(드레인 없음)</td></tr>
+  <tr><td>잡 수명</td><td>10시간</td><td>만료 시 진행 중 90개 폐기(드레인 없음)</td></tr>
 </table>
 
 <h2>3. edtmgr 동작 & 타이밍</h2>
@@ -244,7 +244,7 @@
     </div>
   </div>
   <div class="phase"><div class="n">2</div><div><h4>9잡 / 90 동시 오케스트레이션</h4>
-    <p class="muted">잡 9개 생애주기, 슬롯 90 풀, 5h 만료 시 폐기.</p></div></div>
+    <p class="muted">잡 9개 생애주기, 슬롯 90 풀, 10h 만료 시 폐기.</p></div></div>
   <div class="phase"><div class="n">3</div><div><h4>로드 밸런서</h4>
     <p class="muted">CPU/mem 피드백 제어(PID/EWMA) + 시작 스태거 + AIMD 백오프, 매시간 재최적화.</p></div></div>
   <div class="phase"><div class="n">4</div><div><h4>Intake :7875</h4>
