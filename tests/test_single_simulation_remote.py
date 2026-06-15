@@ -34,6 +34,7 @@ def test_single_api_sbatch_uses_one_enroot_container_reverse_tunnel_and_no_host_
         control_return_user="peets",
         remote_work_root="~/peetsfea-single-api",
         remote_container_image="~/runtime/enroot/aedt.sqsh",
+        local_sshfs_root=Path("/home/peets/mnt/8tb/peetsfea-runner/build/single_simulation_sshfs"),
     )
     script = build_single_simulation_sbatch_script(
         config=config,
@@ -47,28 +48,42 @@ def test_single_api_sbatch_uses_one_enroot_container_reverse_tunnel_and_no_host_
     assert "PEETS_HOST_ALIAS=gate1-harry261" in script
     assert 'PEETS_REMOTE_SESSION_DIR="$HOME/peetsfea-single-api/sessions/session-001"' in script
     assert "export PEETS_SESSION_ID PEETS_ACCOUNT_ID PEETS_HOST_ALIAS PEETS_REMOTE_SESSION_DIR PEETS_LOCAL_API_PORT PEETS_REMOTE_API_PORT" in script
+    assert 'PEETS_LOCAL_SSHFS_ROOT="/home/peets/mnt/8tb/peetsfea-runner/build/single_simulation_sshfs/session-001"' in script
+    assert 'PEETS_WORKSPACE_MOUNT_ROOT="/workspace"' in script
+    assert "export PEETS_CONTROL_RETURN_HOST PEETS_CONTROL_RETURN_PORT PEETS_CONTROL_RETURN_USER PEETS_LOCAL_SSHFS_ROOT PEETS_WORKSPACE_MOUNT_ROOT" in script
     assert 'JOB_DIR="$PEETS_REMOTE_SESSION_DIR/job-${SLURM_JOB_ID:-manual}"' in script
-    assert 'ENROOT_BASE="$JOB_DIR/enroot"' in script
+    assert 'RAM_JOB_ROOT="/dev/shm/peetsfea-single-api-${SLURM_JOB_ID:-manual}"' in script
+    assert 'ENROOT_BASE="$RAM_JOB_ROOT/enroot"' in script
     assert 'ENROOT_RUNTIME_PATH="$ENROOT_BASE/runtime"' in script
     assert 'ENROOT_CACHE_PATH="$ENROOT_BASE/cache"' in script
     assert 'ENROOT_DATA_PATH="$ENROOT_BASE/data"' in script
     assert 'ENROOT_TEMP_PATH="$ENROOT_BASE/tmp"' in script
     assert script.count("enroot create -f -n \"$CONTAINER_NAME\"") == 1
     assert script.count("enroot start --root --rw") == 1
+    assert '--mount "$ssh_mount_dir:/etc/peetsfea_ssh"' in script
+    assert '--mount "/dev/fuse:/dev/fuse"' in script
     assert '-R "127.0.0.1:${PEETS_LOCAL_API_PORT}:127.0.0.1:${PEETS_REMOTE_API_PORT}"' in script
     assert 'SOCKET_DIR="$HOME/.peetsfea-single-api-sockets"' in script
     assert 'TUNNEL_SOCKET="$SOCKET_DIR/t-${SLURM_JOB_ID:-manual}.sock"' in script
     assert '"$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_ed25519_codex_to_pc" "$HOME/.ssh/id_rsa"' in script
+    assert 'cp -f "$CONTROL_IDENTITY" "$ssh_mount_dir/id_control"' in script
+    assert 'sshfs -p "$PEETS_CONTROL_RETURN_PORT" -o reconnect,follow_symlinks,ServerAliveInterval=15,ServerAliveCountMax=3,idmap=user,uid=0,gid=0,umask=000' in script
+    assert '"$PEETS_WORKSPACE_REMOTE" "$PEETS_WORKSPACE_MOUNT_ROOT"' in script
+    assert 'export PEETS_WORKSPACE_REMOTE="${PEETS_CONTROL_RETURN_USER}@${PEETS_CONTROL_RETURN_HOST}:${PEETS_LOCAL_SSHFS_ROOT}"' in script
     assert "export PYTHONPATH=/work/peetsfea/src:/work/peetsfea:${PYTHONPATH:-}" in script
     assert "source /work/container_env.sh" in script
     assert 'export PEETS_API_PORT="$PEETS_REMOTE_API_PORT"' in script
     assert 'export PEETS_SLURM_JOB_ID="${SLURM_JOB_ID:-}"' in script
-    assert "export UV_CACHE_DIR=/work/uv_cache" in script
+    assert 'export UV_CACHE_DIR="$PEETS_RAM_ROOT/uv_cache"' in script
+    assert "export UV_LINK_MODE=copy" in script
     assert "('cadquery', 'cadquery')" in script
     assert "('ocp_vscode', 'ocp-vscode>=3.1.2')" in script
     assert "[sys.executable, '-m', 'uv', 'pip', 'install', *missing]" in script
     assert "/opt/miniconda3/bin/python /work/remote_single_api_server.py" in script
-    assert 'export TMPDIR=/work/container_tmp' in script
+    assert 'PEETS_RAM_ROOT="/dev/shm/peetsfea-single-api-${PEETS_API_SESSION_ID:-manual}"' in script
+    assert 'export TMPDIR="$PEETS_RAM_ROOT/tmp"' in script
+    assert 'export ANSYS_WORK_DIR="$PEETS_RAM_ROOT/ansys_work"' in script
+    assert 'export PEETS_OUTPUT_ROOT="$PEETS_WORKSPACE_MOUNT_ROOT/output"' in script
     assert "mktemp" not in script
     assert "/tmp/peetsfea" not in script
     assert 'TUNNEL_SOCKET="/tmp' not in script
@@ -97,6 +112,7 @@ def test_start_remote_api_stages_and_submits_with_repo_ssh_config(
         peetsfea_source_path=tmp_path / "peetsfea",
         control_return_user="peets",
         local_api_port=45678,
+        local_sshfs_root=tmp_path / "sshfs",
     )
 
     session = start_single_simulation_remote_api(
@@ -109,6 +125,8 @@ def test_start_remote_api_stages_and_submits_with_repo_ssh_config(
     assert session.slurm_job_id == "12345"
     assert session.local_api_port == 45678
     assert session.remote_session_dir == "~/peetsfea-single-api/sessions/session-001"
+    assert session.local_sshfs_session_root == (tmp_path / "sshfs" / "session-001").resolve()
+    assert (session.local_sshfs_session_root / "output").is_dir()
     assert (session.stage_dir / REMOTE_SERVER_FILENAME).is_file()
     assert (session.stage_dir / SBATCH_FILENAME).is_file()
     assert (session.stage_dir / PEETSFEA_SOURCE_ARCHIVE_NAME).read_bytes() == b"archive"

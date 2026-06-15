@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>peetsfea-runner — 실제 작동 환경 (HEAD: dc6e45e)</title>
+<style>
+  :root {
+    --bg: #0f1116; --panel: #181b22; --panel2: #1f232c; --line: #2c313c;
+    --fg: #e6e9ef; --muted: #9aa3b2; --accent: #5ec2ff; --accent2: #7ee787;
+    --warn: #ffb454; --bad: #ff6b6b; --code: #11141a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.65 -apple-system, "Segoe UI", "Noto Sans KR", Roboto, sans-serif;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 32px 24px 80px; }
+  header { border-bottom: 1px solid var(--line); padding-bottom: 20px; margin-bottom: 28px; }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  h2 { font-size: 19px; margin: 38px 0 12px; border-left: 3px solid var(--accent); padding-left: 10px; }
+  h3 { font-size: 16px; margin: 22px 0 8px; color: var(--accent); }
+  .sub { color: var(--muted); font-size: 14px; }
+  .tag { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 10px;
+         background: var(--panel2); border: 1px solid var(--line); color: var(--muted); margin-right: 6px; }
+  .tag.ok { color: var(--accent2); border-color: #2f5e3a; }
+  .tag.warn { color: var(--warn); border-color: #5e4a2f; }
+  .tag.bad { color: var(--bad); border-color: #5e2f2f; }
+  p { margin: 8px 0; }
+  code { background: var(--code); padding: 1px 6px; border-radius: 4px; font-size: 13px;
+         font-family: "SF Mono", "JetBrains Mono", Consolas, monospace; color: #d6deeb; }
+  pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 16px 18px; margin: 14px 0; }
+  ul { margin: 8px 0; padding-left: 22px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .path { color: var(--accent2); }
+  .muted { color: var(--muted); }
+  .flow { counter-reset: step; list-style: none; padding: 0; }
+  .flow li { position: relative; padding: 10px 0 10px 44px; border-bottom: 1px dashed var(--line); }
+  .flow li::before {
+    counter-increment: step; content: counter(step);
+    position: absolute; left: 0; top: 10px; width: 28px; height: 28px;
+    background: var(--panel2); border: 1px solid var(--accent); border-radius: 50%;
+    color: var(--accent); text-align: center; line-height: 28px; font-size: 13px; font-weight: 700;
+  }
+  .legend span { margin-right: 16px; font-size: 13px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+  footer { margin-top: 50px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>peetsfea-runner — 실제 작동 환경</h1>
+  <p class="sub">
+    기준 커밋 <code>HEAD = dc6e45e</code> · "일단 저장" · 2026-06-15 ·
+    핵심 모듈 <code>peetsfea_runner/single_simulation_remote.py</code>
+  </p>
+  <p class="sub">
+    GOAL.md가 정의한 <b>Single Remote PyAEDT API Runner</b> 경로. 레거시 Slurm 번들/host
+    <code>/tmp</code>/배치 AEDT 경로는 폐기되었으며, 아래 단일 시뮬레이션 경로만 작동 대상입니다.
+  </p>
+</header>
+
+<h2>1. 한눈에 보는 구성</h2>
+<div class="card">
+<p>로컬 컨트롤러가 단일 Slurm 잡을 띄우고 → 그 잡이 단일 Enroot 컨테이너를 띄우고 →
+컨테이너 안의 단일 Python API 서버가 PyAEDT 시뮬레이션 하나를 처리합니다.
+스토리지는 RAM(<code>/dev/shm</code>) 스크래치 + sshfs 역방향 워크스페이스 조합입니다.</p>
+<pre><code>[로컬 PC: 172.16.165.146 / user=peets]
+   │  (1) stage 디렉터리 생성 + scp 업로드
+   │  (2) ssh + sbatch --parsable  ──────────────►  [gate1-harry261 / account_01]
+   │                                                   │ Slurm job (N1 n1 c16 mem=64G 8h)
+   │                                                   │
+   │                                                   ▼
+   │                                          /dev/shm/peetsfea-single-api-$JOBID
+   │                                          (Enroot runtime/cache/data/tmp = RAM)
+   │                                                   │
+   │                                                   ▼  enroot start --root --rw
+   │                                          ┌──────────────────────────────────┐
+   │  (4) 역방향 SSH 터널 ◄────────────────── │ Enroot 컨테이너 (aedt.sqsh)        │
+   │      127.0.0.1:LOCAL ⇄ 127.0.0.1:REMOTE  │  - HTTP API 서버 (single-flight)  │
+   │                                          │  - sshfs → /workspace 마운트       │
+   │  (5) POST /simulate (TOML)  ───────────► │  - PyAEDT/HFSS 1회 solve           │
+   │  (6) 결과 envelope ◄──────────────────── │  - /dev/shm tmp + ANSYS scratch    │
+   │                                          └──────────────────────────────────┘
+   ▼                                                   │
+[로컬 DuckDB: build/single_simulation_results.duckdb]  │ CSV/아티팩트는 sshfs로
+        ▲──────────── sshfs로 output 역전송 ───────────┘ 로컬 워크스페이스에 기록</code></pre>
+</div>
+
+<h2>2. 노드 / 잡 파라미터</h2>
+<table>
+  <tr><th>항목</th><th>값</th><th>소스</th></tr>
+  <tr><td>원격 계정 / 호스트</td><td><code>account_01</code> @ <code>gate1-harry261</code></td><td>SingleSimulationRemoteConfig</td></tr>
+  <tr><td>컨트롤 복귀 호스트</td><td><code>172.16.165.146</code> : 22 (user 기본 <code>peets</code>)</td><td>DEFAULT_CONTROL_RETURN_HOST</td></tr>
+  <tr><td>Slurm 리소스</td><td>N=1, n=1, c=16, mem=64G, time=08:00:00</td><td>build_single_simulation_sbatch_script</td></tr>
+  <tr><td>컨테이너 런타임 / 이미지</td><td>Enroot · <span class="path">~/runtime/enroot/aedt.sqsh</span></td><td>DEFAULT_REMOTE_CONTAINER_IMAGE</td></tr>
+  <tr><td>원격 API 포트 / 로컬 포트</td><td>18888 (remote) · 동적 loopback (local)</td><td>DEFAULT_REMOTE_API_PORT</td></tr>
+  <tr><td>원격 작업 루트</td><td><span class="path">~/peetsfea-single-api/sessions/&lt;id&gt;</span></td><td>DEFAULT_REMOTE_WORK_ROOT</td></tr>
+  <tr><td>peetsfea 계약 버전</td><td><code>0.3.1</code></td><td>EXPECTED_PEETSFEA_VERSION</td></tr>
+  <tr><td>AEDT</td><td>v252 · LICENSE <code>1055@172.16.10.81</code></td><td>container_run.sh 내부</td></tr>
+</table>
+
+<h2>3. 스토리지 정책 — tmp · sshfs · /dev/shm</h2>
+<p class="legend">
+  <span><span class="dot" style="background:var(--accent2)"></span>RAM (/dev/shm)</span>
+  <span><span class="dot" style="background:var(--accent)"></span>sshfs 워크스페이스</span>
+  <span><span class="dot" style="background:var(--warn)"></span>job-local fallback</span>
+  <span><span class="dot" style="background:var(--bad)"></span>레거시(미사용)</span>
+</p>
+
+<h3>/dev/shm — RAM 백엔드 스크래치 <span class="tag ok">활성</span></h3>
+<table>
+  <tr><th>경로</th><th>용도</th><th>위치</th></tr>
+  <tr><td><span class="path">/dev/shm/peetsfea-single-api-$SLURM_JOB_ID/enroot/{runtime,cache,data,tmp}</span></td>
+      <td>Enroot 런타임/캐시/데이터/임시 — host <code>/tmp</code> 대신 RAM</td>
+      <td>single_simulation_remote.py:517–526</td></tr>
+  <tr><td><span class="path">/dev/shm/peetsfea-single-api-$SESSION/{tmp,ansys_work,uv_cache,pip_cache}</span></td>
+      <td>컨테이너 내부 <code>TMP/TEMP/TMPDIR</code>, <code>ANSYS_WORK_DIR</code>, uv/pip 캐시</td>
+      <td>single_simulation_remote.py:573–588</td></tr>
+</table>
+<p class="muted">잡/컨테이너 종료 시 <code>rm -rf</code>로 정리됩니다 (trap cleanup). <code>mkdir -p</code> 실패 시에만 fallback으로 강등.</p>
+
+<h3>sshfs — 로컬 워크스페이스 역방향 마운트 <span class="tag ok">활성</span></h3>
+<ul>
+  <li>로컬 측 루트: <span class="path">build/single_simulation_sshfs/&lt;session&gt;/output</span> (로컬 PC에서 준비) — <code>:60–63, :701</code></li>
+  <li>컨테이너가 컨트롤 호스트로 되돌려 마운트:
+      <code>sshfs … $PEETS_WORKSPACE_REMOTE → /workspace</code> — <code>:596</code></li>
+  <li>마운트 옵션: <code>reconnect, idmap=user, uid=0,gid=0, StrictHostKeyChecking=no, IdentityFile=/etc/peetsfea_ssh/id_control</code></li>
+  <li>출력 루트: <code>PEETS_OUTPUT_ROOT=/workspace/output</code> → CSV/아티팩트가 sshfs로 로컬에 직접 기록 — <code>:598–599</code></li>
+  <li>정리: <code>fusermount3 -u</code> (실패 시 fusermount/umount fallback) — <code>:563</code></li>
+</ul>
+<p class="muted">원격 계정 파일시스템은 용량 제약이 있어 durable 저장소로 쓰지 않음 — 결과는 로컬 DuckDB + sshfs 워크스페이스가 진실.</p>
+
+<h3>tmp — job-local fallback만 사용 <span class="tag warn">제한</span></h3>
+<ul>
+  <li>host <code>/tmp</code>를 runner 런타임 루트로 <b>사용하지 않음</b> (GOAL.md 정책).</li>
+  <li><code>/dev/shm</code> 확보 실패 시에만 컨테이너 내 <span class="path">/work/container_tmp</span>, <span class="path">/work/ansys_work</span>로 강등 — <code>:580–583</code> (이 <code>/work</code>는 sshfs가 아닌 job-local <code>$JOB_DIR</code> 바인드).</li>
+  <li>로컬 측: <code>web_status.py:509</code>의 아티팩트 <code>tempfile.NamedTemporaryFile</code> (패키징 한정).</li>
+</ul>
+
+<h3>이미지 빌드 보조 경로 <span class="tag">빌드 전용</span></h3>
+<p><code>peetsfea_runner/enroot_image_bootstrap.sh</code>: 이미지에 <code>openssh-client sshfs fuse3</code> 설치·검증,
+빌드 임시 <span class="path">$HOME/runtime/enroot/build_tmp</span>, 컨테이너 내 <code>/tmp/miniconda.sh</code> 등. 런타임 경로 아님.</p>
+
+<h3>레거시 — 작동 환경 아님 <span class="tag bad">폐기</span></h3>
+<ul>
+  <li><code>runtime_policy.py:7</code> <span class="path">/tmp/$USER/peetsfea-runner</span>, <code>:14</code> <code>JOB_TMPFS_SIZE_GB</code></li>
+  <li><code>systemd_worker.py:143</code> <code>/tmp</code> disk_usage</li>
+</ul>
+<p class="muted">GOAL.md "Temporary Storage Policy"에서 host <code>/tmp</code> runner 루트, host <code>/tmp</code> 기반 Enroot 경로를 명시적으로 금지.</p>
+
+<h2>4. 실행 흐름 (end-to-end)</h2>
+<ol class="flow">
+  <li><b>stage 준비</b> — <code>build/single_simulation_remote/&lt;session&gt;/</code>에 API 서버 스크립트, sbatch 스크립트, <code>peetsfea_source.tgz</code> 생성. 로컬 sshfs <code>output</code> 디렉터리 준비.</li>
+  <li><b>업로드 + 제출</b> — <code>scp</code>로 stage 전송 → <code>ssh … sbatch --parsable</code>로 잡 제출, job id 파싱.</li>
+  <li><b>잡 기동</b> — <code>/dev/shm</code>에 Enroot RAM 루트 생성, <code>peetsfea_source.tgz</code> 전개, <code>container_run.sh</code>/<code>container_env.sh</code> 생성, 컨트롤 SSH 키를 <code>/etc/peetsfea_ssh/id_control</code>로 마운트.</li>
+  <li><b>컨테이너 시작</b> — <code>enroot start --root --rw</code>로 AnsysEM·라이선스·<code>$JOB_DIR:/work</code>·<code>/dev/fuse</code> 마운트. 컨테이너가 sshfs로 <code>/workspace</code> 마운트.</li>
+  <li><b>API 헬스</b> — 컨테이너 내 <code>:18888/health</code>를 폴링(최대 300s)하여 준비 확인. peetsfea 0.3.1 import 가능 + idle 확인.</li>
+  <li><b>역방향 터널</b> — 컨테이너 → 컨트롤 호스트로 <code>ssh -R 127.0.0.1:LOCAL:127.0.0.1:18888</code> 수립. 로컬 클라이언트는 <code>http://127.0.0.1:LOCAL</code>로 호출.</li>
+  <li><b>시뮬레이션</b> — <code>POST /simulate</code>(TOML 1건) → <code>run_ssw_random_sample_reports_from_toml_text(...)</code> 1회 solve. single-flight: busy 중 요청은 409.</li>
+  <li><b>결과 회수</b> — 결과 envelope 반환 + CSV/아티팩트는 sshfs로 로컬 워크스페이스에 기록 → 로컬 DuckDB에 영속화.</li>
+  <li><b>정리</b> — <code>POST /shutdown</code> 또는 <code>scancel</code>. trap이 터널·컨테이너·<code>/dev/shm</code> RAM 루트·sshfs 마운트를 정리.</li>
+</ol>
+
+<h2>5. HTTP API 계약 (컨테이너 내부 서버)</h2>
+<table>
+  <tr><th>엔드포인트</th><th>동작</th></tr>
+  <tr><td><code>GET /health</code></td><td>status/busy, account/host, peetsfea 버전 및 <code>0.3.1</code> 일치 여부 반환</td></tr>
+  <tr><td><code>POST /simulate</code></td><td>TOML 1건 처리. busy면 409, 잘못된 요청 400, 성공 200 / 실패 500 + 구조화 에러. 단일 flight 락.</td></tr>
+  <tr><td><code>POST /shutdown</code></td><td>서버 graceful 종료 트리거</td></tr>
+</table>
+<p class="muted">서버는 <code>build_remote_single_simulation_server_script()</code>가 생성하는 표준 라이브러리 <code>ThreadingHTTPServer</code> 기반. 준비되면 <code>/work/api.ready</code>에 헬스 스냅샷 기록.</p>
+
+<footer>
+  생성: 2026-06-15 · 기준 <code>HEAD dc6e45e</code> · 출처 <code>peetsfea_runner/single_simulation_remote.py</code>, <code>GOAL.md</code>, <code>enroot_image_bootstrap.sh</code>.
+  레거시 멀티계정/번들/host-tmp 경로는 의도적으로 제외했습니다.
+</footer>
+
+</div>
+</body>
+</html>

@@ -46,6 +46,8 @@ The reset still keeps these pieces:
 - Slurm as the remote resource allocator
 - Enroot as the container runtime
 - the existing bidirectional SSH/control-plane idea
+- sshfs-backed local workspace/output storage, because the remote account
+  filesystem is capacity constrained
 - a pinned container image with Python, PyAEDT, and AEDT runtime support
 - local DuckDB as the durable local result store
 - `peetsfea` `0.3.1` as the geometry/input contract dependency
@@ -105,14 +107,16 @@ verification for this reset should not fan out to the older multi-account lane.
 5. The local runner sends one TOML payload to the API.
 6. The TOML payload is a subset of `peetsfea` tag `0.3.1`:
    `examples/0.3.0_sweep.toml`.
-7. The remote API calls `run_ssw_random_sample_reports_from_toml_text(...)`
-   with a job-local `output_dir`.
-8. The `peetsfea` API validates/samples the TOML, builds AEDT artifacts, runs
+7. The Slurm container mounts a local workspace/output directory through
+   sshfs and exposes it inside the container, initially as `/workspace`.
+8. The remote API calls `run_ssw_random_sample_reports_from_toml_text(...)`
+   with an sshfs-backed `output_dir`, initially `/workspace/output/<request>`.
+9. The `peetsfea` API validates/samples the TOML, builds AEDT artifacts, runs
    exactly one PyAEDT/HFSS solve, exports CSV reports, and returns a terminal
    result dictionary.
-9. The local runner writes the result metadata, point values, solve telemetry,
+10. The local runner writes the result metadata, point values, solve telemetry,
    and CSV report text into the local DuckDB.
-10. The remote Python API process stays alive until terminal result handling
+11. The remote Python API process stays alive until terminal result handling
     and explicit cleanup are complete.
 
 Phase 1 should not attempt to invent a custom long-lived HFSS object lifecycle.
@@ -157,18 +161,28 @@ Do not use the supercomputer host `/tmp` as the runner runtime root.
 Allowed:
 
 - container-internal temporary directories
-- job-local directories under an explicit configured remote work root
-- AEDT/PyAEDT scratch paths inside the container or explicit job work root
+- RAM-backed container scratch, especially `/dev/shm`, for tmp and AEDT/PyAEDT
+  scratch when available
+- RAM-backed Enroot runtime/cache/data/temp paths, initially under
+  `/dev/shm/peetsfea-single-api-<job>`
+- small job-local directories under an explicit configured remote work root for
+  launch metadata and copied control files
+- sshfs-backed local workspace/output directories mounted inside the container
 
 Not allowed:
 
 - `/tmp/$USER/peetsfea-runner` as the default runtime root
 - Enroot runtime/cache/data/temp paths under host `/tmp`
 - unbounded solver scratch under host `/tmp`
+- using the remote account filesystem as the durable artifact/output store
 
 ## Result Storage
 
 The local DuckDB is the durable result sink for the new path.
+Large run artifacts and exported CSV files should be written through sshfs to
+the local workspace/output root, not accumulated on the remote account
+filesystem. DuckDB stores the result envelope, telemetry, CSV text, and retained
+artifact references.
 
 At minimum, each simulation result should record:
 
@@ -203,6 +217,10 @@ The reset is working only when all of these are true:
 
 - `account_01` on `gate1-harry261` launches one Slurm job
 - the job starts one Enroot container without using host `/tmp` as runner root
+- Enroot runtime/cache/data/temp are not placed on the remote account
+  filesystem
+- the container mounts the local output workspace through sshfs
+- tmp and AEDT scratch prefer a RAM-backed container path such as `/dev/shm`
 - one remote API server becomes reachable through the SSH path
 - `GET /health` reports idle and can import `peetsfea` version `0.3.1`
 - `POST /simulate` accepts one valid subset TOML

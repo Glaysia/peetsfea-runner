@@ -24,6 +24,7 @@ DEFAULT_PEETSFEA_SOURCE_PATH = "/home/peets/Projects/PythonProjects/peetsfea"
 DEFAULT_CONTROL_RETURN_HOST = "172.16.165.146"
 DEFAULT_REMOTE_API_PORT = 18888
 DEFAULT_LOCAL_RESULT_DB = "build/single_simulation_results.duckdb"
+DEFAULT_CONTAINER_SSHFS_MOUNT_ROOT = "/workspace"
 REMOTE_SERVER_FILENAME = "remote_single_api_server.py"
 SBATCH_FILENAME = "single_api_sbatch.sh"
 PEETSFEA_SOURCE_ARCHIVE_NAME = "peetsfea_source.tgz"
@@ -56,6 +57,10 @@ class SingleSimulationRemoteConfig:
     stage_root: Path = field(
         default_factory=lambda: Path(__file__).resolve().parent.parent / "build" / "single_simulation_remote"
     )
+    local_sshfs_root: Path = field(
+        default_factory=lambda: Path(__file__).resolve().parent.parent / "build" / "single_simulation_sshfs"
+    )
+    container_sshfs_mount_root: str = DEFAULT_CONTAINER_SSHFS_MOUNT_ROOT
     command_timeout_seconds: int = 120
 
 
@@ -68,6 +73,7 @@ class SingleSimulationRemoteSession:
     remote_api_port: int
     slurm_job_id: str
     stage_dir: Path
+    local_sshfs_session_root: Path
 
     @property
     def client(self) -> SingleSimulationApiClient:
@@ -91,6 +97,10 @@ def start_single_simulation_remote_api(
         resolved_config.remote_work_root,
         "sessions",
         resolved_session_id,
+    )
+    local_sshfs_session_root = _prepare_local_sshfs_session_root(
+        config=resolved_config,
+        session_id=resolved_session_id,
     )
     stage_dir = _prepare_stage_dir(
         config=resolved_config,
@@ -119,6 +129,7 @@ def start_single_simulation_remote_api(
         remote_api_port=resolved_config.remote_api_port,
         slurm_job_id=slurm_job_id,
         stage_dir=stage_dir,
+        local_sshfs_session_root=local_sshfs_session_root,
     )
 
 
@@ -466,6 +477,8 @@ def build_single_simulation_sbatch_script(
     image_path = _remote_shell_path(config.remote_container_image)
     ansys_base = _host_ansys_base_root(config.remote_container_ansys_root)
     ansys_root = _host_ansys_mount_root(config.remote_container_ansys_root)
+    local_sshfs_session_root = _local_sshfs_session_root(config=config, session_id=session_id)
+    workspace_mount_root = _container_sshfs_mount_root(config.container_sshfs_mount_root)
     partition_line = f"#SBATCH -p {config.partition}" if config.partition.strip() else ""
     lines = [
         "#!/usr/bin/env bash",
@@ -493,21 +506,30 @@ def build_single_simulation_sbatch_script(
             f"PEETS_CONTROL_RETURN_HOST={shlex.quote(config.control_return_host)}",
             f"PEETS_CONTROL_RETURN_PORT={int(config.control_return_port)}",
             f"PEETS_CONTROL_RETURN_USER={shlex.quote(config.control_return_user)}",
+            f"PEETS_LOCAL_SSHFS_ROOT={_double_quoted_shell_value(str(local_sshfs_session_root))}",
+            f"PEETS_WORKSPACE_MOUNT_ROOT={_double_quoted_shell_value(workspace_mount_root)}",
             f"REMOTE_CONTAINER_IMAGE={_double_quoted_shell_value(image_path)}",
             f"REMOTE_HOST_ANSYS_ROOT={_double_quoted_shell_value(ansys_root)}",
             f"REMOTE_HOST_ANSYS_BASE={_double_quoted_shell_value(ansys_base)}",
             "export PEETS_SESSION_ID PEETS_ACCOUNT_ID PEETS_HOST_ALIAS PEETS_REMOTE_SESSION_DIR PEETS_LOCAL_API_PORT PEETS_REMOTE_API_PORT",
-            "export PEETS_CONTROL_RETURN_HOST PEETS_CONTROL_RETURN_PORT PEETS_CONTROL_RETURN_USER",
+            "export PEETS_CONTROL_RETURN_HOST PEETS_CONTROL_RETURN_PORT PEETS_CONTROL_RETURN_USER PEETS_LOCAL_SSHFS_ROOT PEETS_WORKSPACE_MOUNT_ROOT",
             "JOB_DIR=\"$PEETS_REMOTE_SESSION_DIR/job-${SLURM_JOB_ID:-manual}\"",
-            "ENROOT_BASE=\"$JOB_DIR/enroot\"",
+            "RAM_JOB_ROOT=\"/dev/shm/peetsfea-single-api-${SLURM_JOB_ID:-manual}\"",
+            "ENROOT_BASE=\"$RAM_JOB_ROOT/enroot\"",
             "CONTAINER_NAME=\"peets-single-api-${SLURM_JOB_ID:-manual}\"",
             "SOCKET_DIR=\"$HOME/.peetsfea-single-api-sockets\"",
             "TUNNEL_SOCKET=\"$SOCKET_DIR/t-${SLURM_JOB_ID:-manual}.sock\"",
             "CONTAINER_PID=\"\"",
             "mkdir -p \"$SOCKET_DIR\"",
-            "mkdir -p \"$JOB_DIR\" \"$JOB_DIR/output\" \"$JOB_DIR/home\" \"$JOB_DIR/container_tmp\" \"$JOB_DIR/ansys_work\"",
+            "mkdir -p \"$JOB_DIR\" \"$JOB_DIR/home\" \"$JOB_DIR/container_tmp\" \"$JOB_DIR/ansys_work\" \"$RAM_JOB_ROOT\"",
             "mkdir -p \"$ENROOT_BASE/runtime\" \"$ENROOT_BASE/cache\" \"$ENROOT_BASE/data\" \"$ENROOT_BASE/tmp\"",
             "chmod 700 \"$ENROOT_BASE/runtime\" \"$ENROOT_BASE/cache\" \"$ENROOT_BASE/data\" \"$ENROOT_BASE/tmp\"",
+            "select_control_identity() {",
+            "  for candidate in \"$HOME/.ssh/id_ed25519\" \"$HOME/.ssh/id_ed25519_codex_to_pc\" \"$HOME/.ssh/id_rsa\"; do",
+            "    if [ -r \"$candidate\" ]; then printf '%s\\n' \"$candidate\"; return 0; fi",
+            "  done",
+            "  return 1",
+            "}",
             "cleanup() {",
             "  rc=$?",
             "  if [ -S \"$TUNNEL_SOCKET\" ]; then",
@@ -516,6 +538,7 @@ def build_single_simulation_sbatch_script(
             "  rm -f \"$TUNNEL_SOCKET\" >/dev/null 2>&1 || true",
             "  if [ -n \"$CONTAINER_PID\" ]; then kill \"$CONTAINER_PID\" >/dev/null 2>&1 || true; wait \"$CONTAINER_PID\" >/dev/null 2>&1 || true; fi",
             "  ENROOT_RUNTIME_PATH=\"$ENROOT_BASE/runtime\" ENROOT_CACHE_PATH=\"$ENROOT_BASE/cache\" ENROOT_DATA_PATH=\"$ENROOT_BASE/data\" ENROOT_TEMP_PATH=\"$ENROOT_BASE/tmp\" enroot remove -f \"$CONTAINER_NAME\" >/dev/null 2>&1 || true",
+            "  rm -rf \"$RAM_JOB_ROOT\" >/dev/null 2>&1 || true",
             "  exit \"$rc\"",
             "}",
             "trap cleanup EXIT",
@@ -524,26 +547,56 @@ def build_single_simulation_sbatch_script(
             "printf 'slurm_job_id=%s\\n' \"${SLURM_JOB_ID:-}\" >> launch_probe.txt",
             "printf 'hostname=%s\\n' \"$(hostname 2>/dev/null || true)\" >> launch_probe.txt",
             "printf 'job_dir=%s\\n' \"$JOB_DIR\" >> launch_probe.txt",
+            "printf 'ram_job_root=%s\\n' \"$RAM_JOB_ROOT\" >> launch_probe.txt",
             "printf 'local_api_port=%s\\n' \"$PEETS_LOCAL_API_PORT\" >> launch_probe.txt",
             "printf 'remote_api_port=%s\\n' \"$PEETS_REMOTE_API_PORT\" >> launch_probe.txt",
+            "printf 'local_sshfs_root=%s\\n' \"$PEETS_LOCAL_SSHFS_ROOT\" >> launch_probe.txt",
             "tar --no-same-owner -xzf \"$PEETS_REMOTE_SESSION_DIR/peetsfea_source.tgz\" -C \"$JOB_DIR\"",
             "cat > \"$JOB_DIR/container_run.sh\" <<'EOS'",
             "#!/usr/bin/env bash",
             "set -euo pipefail",
-            "mkdir -p /work/home /work/container_tmp /work/ansys_work /work/output",
+            "SSHFS_MOUNTED=0",
+            "PEETS_RAM_ROOT=\"\"",
+            "cleanup_container() {",
+            "  rc=$?",
+            "  if [ \"$SSHFS_MOUNTED\" = \"1\" ]; then",
+            "    fusermount3 -u \"$PEETS_WORKSPACE_MOUNT_ROOT\" >/dev/null 2>&1 || fusermount -u \"$PEETS_WORKSPACE_MOUNT_ROOT\" >/dev/null 2>&1 || umount \"$PEETS_WORKSPACE_MOUNT_ROOT\" >/dev/null 2>&1 || true",
+            "  fi",
+            "  if [ -n \"$PEETS_RAM_ROOT\" ] && [ -d \"$PEETS_RAM_ROOT\" ]; then rm -rf \"$PEETS_RAM_ROOT\" >/dev/null 2>&1 || true; fi",
+            "  exit \"$rc\"",
+            "}",
+            "trap cleanup_container EXIT",
+            "mkdir -p /work/home /work/container_tmp /work/ansys_work",
             "export HOME=/work/home",
             "export XDG_CONFIG_HOME=/work/home/.config",
-            "export TMP=/work/container_tmp",
-            "export TEMP=/work/container_tmp",
-            "export TMPDIR=/work/container_tmp",
-            "export ANSYS_WORK_DIR=/work/ansys_work",
-            "export UV_CACHE_DIR=/work/uv_cache",
-            "export PIP_CACHE_DIR=/work/pip_cache",
+            "source /work/container_env.sh",
+            "PEETS_RAM_ROOT=\"/dev/shm/peetsfea-single-api-${PEETS_API_SESSION_ID:-manual}\"",
+            "if mkdir -p \"$PEETS_RAM_ROOT/tmp\" \"$PEETS_RAM_ROOT/ansys_work\" >/dev/null 2>&1; then",
+            "  export TMP=\"$PEETS_RAM_ROOT/tmp\"",
+            "  export TEMP=\"$PEETS_RAM_ROOT/tmp\"",
+            "  export TMPDIR=\"$PEETS_RAM_ROOT/tmp\"",
+            "  export ANSYS_WORK_DIR=\"$PEETS_RAM_ROOT/ansys_work\"",
+            "else",
+            "  export TMP=/work/container_tmp",
+            "  export TEMP=/work/container_tmp",
+            "  export TMPDIR=/work/container_tmp",
+            "  export ANSYS_WORK_DIR=/work/ansys_work",
+            "fi",
+            "export UV_CACHE_DIR=\"$PEETS_RAM_ROOT/uv_cache\"",
+            "export PIP_CACHE_DIR=\"$PEETS_RAM_ROOT/pip_cache\"",
+            "export UV_LINK_MODE=copy",
+            "mkdir -p \"$UV_CACHE_DIR\" \"$PIP_CACHE_DIR\"",
             "export ANSYSLMD_LICENSE_FILE=${ANSYSLMD_LICENSE_FILE:-1055@172.16.10.81}",
             "export ANSYSEM_ROOT252=/mnt/AnsysEM",
             "export ANS_IGNOREOS=1",
-            "export PEETS_OUTPUT_ROOT=/work/output",
-            "source /work/container_env.sh",
+            "mkdir -p \"$PEETS_WORKSPACE_MOUNT_ROOT\" /etc/peetsfea_ssh",
+            "test -f /etc/peetsfea_ssh/id_control || { echo \"[ERROR] missing container SSH identity: /etc/peetsfea_ssh/id_control\" >&2; exit 1; }",
+            "chmod 700 /etc/peetsfea_ssh >/dev/null 2>&1 || true",
+            "chmod 600 /etc/peetsfea_ssh/id_control >/dev/null 2>&1 || true",
+            "sshfs -p \"$PEETS_CONTROL_RETURN_PORT\" -o reconnect,follow_symlinks,ServerAliveInterval=15,ServerAliveCountMax=3,idmap=user,uid=0,gid=0,umask=000,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,IdentityFile=/etc/peetsfea_ssh/id_control \"$PEETS_WORKSPACE_REMOTE\" \"$PEETS_WORKSPACE_MOUNT_ROOT\"",
+            "SSHFS_MOUNTED=1",
+            "mkdir -p \"$PEETS_WORKSPACE_MOUNT_ROOT/output\"",
+            "export PEETS_OUTPUT_ROOT=\"$PEETS_WORKSPACE_MOUNT_ROOT/output\"",
             "export PYTHONPATH=/work/peetsfea/src:/work/peetsfea:${PYTHONPATH:-}",
             "export PATH=/opt/miniconda3/bin:/mnt/AnsysEM:/ansys_inc/v252/AnsysEM:${PATH:-}",
             "BASE_PREFIX=/opt/miniconda3",
@@ -570,12 +623,24 @@ def build_single_simulation_sbatch_script(
             "export PEETS_ACCOUNT_ID=\"$PEETS_ACCOUNT_ID\"",
             "export PEETS_HOST_ALIAS=\"$PEETS_HOST_ALIAS\"",
             "export PEETS_SLURM_JOB_ID=\"${SLURM_JOB_ID:-}\"",
+            "export PEETS_CONTROL_RETURN_HOST=\"$PEETS_CONTROL_RETURN_HOST\"",
+            "export PEETS_CONTROL_RETURN_PORT=\"$PEETS_CONTROL_RETURN_PORT\"",
+            "export PEETS_CONTROL_RETURN_USER=\"$PEETS_CONTROL_RETURN_USER\"",
+            "export PEETS_LOCAL_SSHFS_ROOT=\"$PEETS_LOCAL_SSHFS_ROOT\"",
+            "export PEETS_WORKSPACE_MOUNT_ROOT=\"$PEETS_WORKSPACE_MOUNT_ROOT\"",
+            "export PEETS_WORKSPACE_REMOTE=\"${PEETS_CONTROL_RETURN_USER}@${PEETS_CONTROL_RETURN_HOST}:${PEETS_LOCAL_SSHFS_ROOT}\"",
             "EOS",
+            "CONTROL_IDENTITY=\"$(select_control_identity)\"",
+            "ssh_mount_dir=\"$JOB_DIR/container_ssh\"",
+            "mkdir -p \"$ssh_mount_dir\"",
+            "cp -f \"$CONTROL_IDENTITY\" \"$ssh_mount_dir/id_control\"",
+            "chmod 700 \"$ssh_mount_dir\"",
+            "chmod 600 \"$ssh_mount_dir/id_control\"",
             "cp -f \"$PEETS_REMOTE_SESSION_DIR/remote_single_api_server.py\" \"$JOB_DIR/remote_single_api_server.py\"",
             "ENROOT_RUNTIME_PATH=\"$ENROOT_BASE/runtime\" ENROOT_CACHE_PATH=\"$ENROOT_BASE/cache\" ENROOT_DATA_PATH=\"$ENROOT_BASE/data\" ENROOT_TEMP_PATH=\"$ENROOT_BASE/tmp\" enroot create -f -n \"$CONTAINER_NAME\" \"$REMOTE_CONTAINER_IMAGE\" > enroot.create.stdout 2> enroot.create.stderr",
             "PEETS_API_SESSION_ID=\"$PEETS_SESSION_ID\" PEETS_API_HOST=127.0.0.1 PEETS_API_PORT=\"$PEETS_REMOTE_API_PORT\" PEETS_API_READY_PATH=/work/api.ready PEETS_ACCOUNT_ID=\"$PEETS_ACCOUNT_ID\" PEETS_HOST_ALIAS=\"$PEETS_HOST_ALIAS\" \\",
             "  ENROOT_RUNTIME_PATH=\"$ENROOT_BASE/runtime\" ENROOT_CACHE_PATH=\"$ENROOT_BASE/cache\" ENROOT_DATA_PATH=\"$ENROOT_BASE/data\" ENROOT_TEMP_PATH=\"$ENROOT_BASE/tmp\" \\",
-            "  enroot start --root --rw --mount \"$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM\" --mount \"$REMOTE_HOST_ANSYS_BASE:/ansys_inc/v252\" --mount \"$REMOTE_HOST_ANSYS_BASE/licensingclient:/mnt/licensingclient\" --mount \"$JOB_DIR:/work\" \"$CONTAINER_NAME\" /bin/bash /work/container_run.sh > container.stdout 2> container.stderr &",
+            "  enroot start --root --rw --mount \"$REMOTE_HOST_ANSYS_ROOT:/mnt/AnsysEM\" --mount \"$REMOTE_HOST_ANSYS_BASE:/ansys_inc/v252\" --mount \"$REMOTE_HOST_ANSYS_BASE/licensingclient:/mnt/licensingclient\" --mount \"$JOB_DIR:/work\" --mount \"$ssh_mount_dir:/etc/peetsfea_ssh\" --mount \"/dev/fuse:/dev/fuse\" \"$CONTAINER_NAME\" /bin/bash /work/container_run.sh > container.stdout 2> container.stderr &",
             "CONTAINER_PID=$!",
             "wait_for_container_api() {",
             "  python3 - <<'PY'",
@@ -597,14 +662,7 @@ def build_single_simulation_sbatch_script(
             "PY",
             "}",
             "wait_for_container_api > api.health.json",
-            "select_reverse_identity() {",
-            "  for candidate in \"$HOME/.ssh/id_ed25519\" \"$HOME/.ssh/id_ed25519_codex_to_pc\" \"$HOME/.ssh/id_rsa\"; do",
-            "    if [ -r \"$candidate\" ]; then printf '%s\\n' \"$candidate\"; return 0; fi",
-            "  done",
-            "  return 1",
-            "}",
-            "REVERSE_IDENTITY=\"$(select_reverse_identity)\"",
-            "ssh -F /dev/null -p \"$PEETS_CONTROL_RETURN_PORT\" -o BatchMode=yes -o ExitOnForwardFailure=yes -o IdentitiesOnly=yes -i \"$REVERSE_IDENTITY\" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -M -S \"$TUNNEL_SOCKET\" -fnNT -R \"127.0.0.1:${PEETS_LOCAL_API_PORT}:127.0.0.1:${PEETS_REMOTE_API_PORT}\" \"$PEETS_CONTROL_RETURN_USER@$PEETS_CONTROL_RETURN_HOST\"",
+            "ssh -F /dev/null -p \"$PEETS_CONTROL_RETURN_PORT\" -o BatchMode=yes -o ExitOnForwardFailure=yes -o IdentitiesOnly=yes -i \"$CONTROL_IDENTITY\" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -M -S \"$TUNNEL_SOCKET\" -fnNT -R \"127.0.0.1:${PEETS_LOCAL_API_PORT}:127.0.0.1:${PEETS_REMOTE_API_PORT}\" \"$PEETS_CONTROL_RETURN_USER@$PEETS_CONTROL_RETURN_HOST\"",
             "printf 'reverse_tunnel=ready\\n' >> launch_probe.txt",
             "printf '__PEETSFEA_SINGLE_API_READY__ session=%s job=%s local_port=%s remote_port=%s\\n' \"$PEETS_SESSION_ID\" \"${SLURM_JOB_ID:-}\" \"$PEETS_LOCAL_API_PORT\" \"$PEETS_REMOTE_API_PORT\"",
             "wait \"$CONTAINER_PID\"",
@@ -638,6 +696,16 @@ def _prepare_stage_dir(
         timeout_seconds=config.command_timeout_seconds,
     )
     return stage_dir
+
+
+def _prepare_local_sshfs_session_root(*, config: SingleSimulationRemoteConfig, session_id: str) -> Path:
+    session_root = _local_sshfs_session_root(config=config, session_id=session_id)
+    (session_root / "output").mkdir(parents=True, exist_ok=True)
+    return session_root
+
+
+def _local_sshfs_session_root(*, config: SingleSimulationRemoteConfig, session_id: str) -> Path:
+    return config.local_sshfs_root.expanduser().resolve() / session_id
 
 
 def _create_peetsfea_source_archive(*, source_path: Path, archive_path: Path, timeout_seconds: int) -> None:
@@ -806,6 +874,13 @@ def _host_ansys_base_root(path: str) -> str:
     if normalized.endswith("/AnsysEM"):
         return str(Path(normalized).parent).rstrip("/")
     return normalized
+
+
+def _container_sshfs_mount_root(path: str) -> str:
+    normalized = str(path).strip() or DEFAULT_CONTAINER_SSHFS_MOUNT_ROOT
+    if not normalized.startswith("/"):
+        raise ValueError(f"container_sshfs_mount_root must be absolute: {path!r}")
+    return normalized.rstrip("/") or "/"
 
 
 def _double_quoted_shell_value(value: str) -> str:
