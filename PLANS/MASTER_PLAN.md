@@ -251,6 +251,7 @@ EDT 라이선스 점유를 유지한다.
 - `peetsfea_runner/enroot_image_bootstrap.sh`, `scripts/remote_bootstrap_install.sh` — sqsh/원격 설치
 - `peetsfea_runner/single_simulation_remote.py:21` — sqsh 경로 `~/runtime/enroot/aedt.sqsh`
 - `edtmgr`, Intake(:7875), 대시보드(:8080), 아카이브 — **신규(현재 코드 없음)**
+- `PLANS/local_enroot_aedt.md` — 개발기(25.10) enroot에서 ansysedt 실행/검증, `/opt/ohpc` 경로 일관성
 
 ## 8. 잔여 미정(소소)
 - project_directory(슬롯 디렉토리) 명명 규칙.

@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 DEFAULT_SINGLE_ACCOUNT_ID = "account_01"
 DEFAULT_SINGLE_HOST_ALIAS = "gate1-harry261"
-EXPECTED_PEETSFEA_VERSION = "0.3.1"
+EXPECTED_PEETSFEA_VERSION = "0.3.2"
 
 SimulationPrimitive = Callable[..., Mapping[str, Any]]
 VersionLoader = Callable[[], str]

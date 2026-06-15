@@ -1,0 +1,207 @@
+"""슬롯 디스패처 — 대기 큐의 fixed toml을 슬롯에 순차 디스패치 (Phase 1).
+
+각 슬롯(`EdtManager`)은 자기 스레드에서 큐를 당겨 `acquire` → peetsfea 프리미티브 실행
+(edtmgr가 준 `grpc_port`에 접속) → 결과 기록 → `release` 를 반복한다. 컨테이너 안에서 슬롯 10개가
+동시에 돌아 항상 N개 시뮬이 진행된다.
+
+타이밍: 프리미티브는 60분에 스스로 abort(마지막 패스 리포트)하고, 그 위에 edtmgr 백스톱이
+65분(`backstop_seconds`) 미반환 시 ansysedt를 SIGKILL+재기동한다. 여기서는 프리미티브를
+슬롯별 단일 워커 executor에 제출해 `backstop_seconds` 타임아웃으로 백스톱을 강제한다.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import threading
+import traceback
+from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .constants import EDTMGR_BACKSTOP_KILL_SECONDS
+from .edtmgr import EdtManager
+from .edt_queue import QueueItem, TomlQueue
+
+# (candidate_toml_text, *, output_dir, seed, mode, grpc_port, aedt_pid) -> result mapping
+SimulationPrimitive = Callable[..., Mapping[str, Any]]
+VersionLoader = Callable[[], str]
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _default_version_loader() -> str:
+    import peetsfea
+
+    return str(peetsfea.__version__)
+
+
+@dataclass
+class SlotDispatcher:
+    slots: list[EdtManager]
+    queue: TomlQueue
+    primitive: SimulationPrimitive
+    output_root: Path
+    record: Callable[[Mapping[str, Any]], None]
+    account_id: str = "account_01"
+    host_alias: str = "gate1-harry261"
+    version_loader: VersionLoader = _default_version_loader
+    backstop_seconds: float = float(EDTMGR_BACKSTOP_KILL_SECONDS)
+    now_iso: Callable[[], str] = _utc_now_iso
+    drain: bool = True
+    idle_sleep_seconds: float = 1.0
+    _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _processed: int = field(default=0, init=False)
+    _processed_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.output_root = Path(self.output_root).expanduser().resolve()
+        self.output_root.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def processed(self) -> int:
+        with self._processed_lock:
+            return self._processed
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> int:
+        """모든 슬롯 스레드를 띄워 큐를 처리한다. 반환: 처리한 건수.
+
+        `drain=True`면 큐가 비는 즉시 각 슬롯이 종료한다(Phase 1 수용 테스트).
+        `drain=False`면 stop() 전까지 idle 폴링하며 대기한다.
+        """
+        threads = [
+            threading.Thread(target=self._slot_loop, args=(slot,), name=f"edt-{slot.slot_id}", daemon=True)
+            for slot in self.slots
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return self.processed
+
+    def _slot_loop(self, slot: EdtManager) -> None:
+        # 슬롯 시작 시 ansysedt를 미리 warm으로 띄워 둔다(상시 기동).
+        slot.ensure_warm()
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"sim-{slot.slot_id}") as executor:
+            while not self._stop.is_set():
+                item = self.queue.get()
+                if item is None:
+                    if self.drain:
+                        return
+                    self._stop.wait(self.idle_sleep_seconds)
+                    continue
+                envelope = self._run_one(slot, item, executor)
+                self._safe_record(envelope)
+                with self._processed_lock:
+                    self._processed += 1
+
+    def _run_one(self, slot: EdtManager, item: QueueItem, executor: ThreadPoolExecutor) -> dict[str, Any]:
+        grant = slot.acquire()
+        started_at = self.now_iso()
+        job_output_dir = self.output_root / item.request_id
+        future = executor.submit(
+            self.primitive,
+            item.candidate_toml_text,
+            output_dir=job_output_dir,
+            seed=item.seed,
+            mode=item.mode,
+            grpc_port=grant.grpc_port,
+            aedt_pid=grant.pid,
+        )
+        try:
+            result = future.result(timeout=self.backstop_seconds)
+        except FutureTimeoutError:
+            # 65분 백스톱: 미반환 시뮬을 강제 종료하고 슬롯 재기동.
+            slot.force_restart()
+            return self._envelope(
+                item,
+                slot,
+                grant.grpc_port,
+                started_at,
+                terminal_state="aborted",
+                error={"stage": "backstop", "type": "BackstopTimeout", "message": f"sim exceeded {self.backstop_seconds:.0f}s"},
+            )
+        except Exception as exc:  # 시뮬 실패: 살아있으면 재부착, 아니면 재기동.
+            slot.recover()
+            return self._envelope(
+                item,
+                slot,
+                grant.grpc_port,
+                started_at,
+                terminal_state="failed",
+                error={"stage": "simulate", "type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()},
+            )
+        else:
+            slot.release()
+            return self._envelope(item, slot, grant.grpc_port, started_at, terminal_state="success", result=result)
+
+    def _envelope(
+        self,
+        item: QueueItem,
+        slot: EdtManager,
+        grpc_port: int,
+        started_at: str,
+        *,
+        terminal_state: str,
+        result: Mapping[str, Any] | None = None,
+        error: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "request_id": item.request_id,
+            "terminal_state": terminal_state,
+            "started_at": started_at,
+            "finished_at": self.now_iso(),
+            "account_id": self.account_id,
+            "host_alias": self.host_alias,
+            "remote_job_id": "",
+            "api_session_id": slot.slot_id,
+            "slot_id": slot.slot_id,
+            "grpc_port": grpc_port,
+            "input_toml_hash": item.input_toml_hash(),
+            "peetsfea_version": self._safe_version(),
+            "mode": item.mode,
+            "seed": item.seed,
+            "output_dir": str(self.output_root / item.request_id),
+            "result": _jsonable(result) if result is not None else {},
+            **({"error": dict(error)} if error is not None else {}),
+        }
+
+    def _safe_version(self) -> str:
+        try:
+            return self.version_loader()
+        except Exception:
+            return ""
+
+    def _safe_record(self, envelope: Mapping[str, Any]) -> None:
+        try:
+            self.record(envelope)
+        except Exception:
+            # 기록 실패가 슬롯 루프를 죽이면 안 된다.
+            pass
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+__all__ = ["SimulationPrimitive", "SlotDispatcher", "VersionLoader"]
