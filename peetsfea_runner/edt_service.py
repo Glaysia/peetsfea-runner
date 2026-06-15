@@ -15,8 +15,10 @@ from typing import Any
 from .constants import SLOTS_PER_CONTAINER
 from .edt_aedt_backend import RealEdtBackend, default_ansysedt_executable
 from .edt_dispatcher import SimulationPrimitive, SlotDispatcher
+from .edt_intake import IntakeService, make_baseline_sampler
+from .edt_load import AdmissionController, LoadSampler, psutil_load_sampler
 from .edtmgr import EdtManager
-from .edt_queue import TomlQueue, load_queue_items_from_dir
+from .edt_queue import TomlQueue, TwoLaneQueue, load_queue_items_from_dir
 from .single_simulation_store import SingleSimulationResultStore
 
 
@@ -38,6 +40,10 @@ class EdtServiceConfig:
     host_alias: str = "gate1-harry261"
     work_dir: Path | None = None
     drain: bool = True
+    # Phase 3/4: baseline 샘플러용 기준 sweep 텍스트(없으면 baseline 휴면), 로드밸런서 on/off.
+    reference_sweep_text: str | None = None
+    enable_load_balancer: bool = True
+    baseline_batch_size: int = 1000
 
 
 def build_slots(config: EdtServiceConfig) -> list[EdtManager]:
@@ -86,4 +92,69 @@ def run_edt_service(config: EdtServiceConfig, *, primitive: SimulationPrimitive 
     return dispatcher.run()
 
 
-__all__ = ["EdtServiceConfig", "build_dispatcher", "build_slots", "run_edt_service"]
+@dataclass(slots=True)
+class SteadyStateService:
+    """Phase 3+4 컨테이너-측 서비스: 2-레인 큐 + admission + 디스패처 + intake + 결과 DB."""
+
+    dispatcher: SlotDispatcher
+    queue: TwoLaneQueue
+    store: SingleSimulationResultStore
+    intake: IntakeService
+    admission: AdmissionController | None
+
+
+def build_steady_state_service(
+    config: EdtServiceConfig,
+    *,
+    slots: list[EdtManager] | None = None,
+    primitive: SimulationPrimitive | None = None,
+    load_sampler: LoadSampler | None = None,
+) -> SteadyStateService:
+    """정상상태 컨테이너 서비스(Phase 3+4) 와이어링.
+
+    - **2-레인 큐**: baseline(기준 sweep 풀샘플 리필) + 우선순위(Intake).
+    - **admission(Phase 3)**: CPU/mem 부하 게이트(`enable_load_balancer`면 활성).
+    - **Intake**: 우선순위 레인에 적재(서버 기동은 호출자가 `start_intake_server`로).
+    드레인하지 않고(`drain=False`) stop()까지 상시 가동.
+    """
+    store = SingleSimulationResultStore(db_path=config.db_path)
+    store.initialize()
+
+    baseline = (
+        make_baseline_sampler(config.reference_sweep_text, batch_size=config.baseline_batch_size)
+        if config.reference_sweep_text
+        else None
+    )
+    queue = TwoLaneQueue(baseline_sampler=baseline)
+
+    admission = (
+        AdmissionController(load_sampler=load_sampler or psutil_load_sampler, clock=time.monotonic)
+        if config.enable_load_balancer
+        else None
+    )
+
+    def record(envelope: Mapping[str, Any]) -> None:
+        store.record_envelope(envelope)
+
+    dispatcher = SlotDispatcher(
+        slots=slots if slots is not None else build_slots(config),
+        queue=queue,
+        primitive=primitive if primitive is not None else _default_primitive(),
+        output_root=config.output_root,
+        record=record,
+        account_id=config.account_id,
+        host_alias=config.host_alias,
+        admission=admission,
+        drain=False,
+    )
+    return SteadyStateService(dispatcher=dispatcher, queue=queue, store=store, intake=IntakeService(queue=queue), admission=admission)
+
+
+__all__ = [
+    "EdtServiceConfig",
+    "SteadyStateService",
+    "build_dispatcher",
+    "build_slots",
+    "build_steady_state_service",
+    "run_edt_service",
+]

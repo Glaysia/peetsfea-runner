@@ -23,8 +23,9 @@ from pathlib import Path
 from typing import Any
 
 from .constants import EDTMGR_BACKSTOP_KILL_SECONDS
+from .edt_load import AdmissionController
 from .edtmgr import EdtManager
-from .edt_queue import QueueItem, TomlQueue
+from .edt_queue import QueueItem, QueueLike
 
 # (candidate_toml_text, *, output_dir, seed, mode, grpc_port, aedt_pid) -> result mapping
 SimulationPrimitive = Callable[..., Mapping[str, Any]]
@@ -44,7 +45,7 @@ def _default_version_loader() -> str:
 @dataclass
 class SlotDispatcher:
     slots: list[EdtManager]
-    queue: TomlQueue
+    queue: QueueLike
     primitive: SimulationPrimitive
     output_root: Path
     record: Callable[[Mapping[str, Any]], None]
@@ -55,6 +56,9 @@ class SlotDispatcher:
     now_iso: Callable[[], str] = _utc_now_iso
     drain: bool = True
     idle_sleep_seconds: float = 1.0
+    # 로드밸런서(Phase 3): None이면 게이트 없음(Phase 1 동작). 설정하면 새 시뮬 시작을 부하로 게이팅(ramp-up).
+    admission: AdmissionController | None = None
+    admission_poll_seconds: float = 1.0
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _processed: int = field(default=0, init=False)
     _processed_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -98,10 +102,23 @@ class SlotDispatcher:
                         return
                     self._stop.wait(self.idle_sleep_seconds)
                     continue
+                # ramp-up 게이트: 부하 여유가 생길 때까지 새 시뮬 시작을 보류(item은 손에 쥔 채).
+                if not self._await_admission():
+                    break
                 envelope = self._run_one(slot, item, executor)
                 self._safe_record(envelope)
                 with self._processed_lock:
                     self._processed += 1
+
+    def _await_admission(self) -> bool:
+        """admission이 설정되면 부하 여유가 생길 때까지 대기. 승인 시 True, stop 시 False."""
+        if self.admission is None:
+            return True
+        while not self._stop.is_set():
+            if self.admission.can_admit():
+                return True
+            self._stop.wait(self.admission_poll_seconds)
+        return False
 
     def _run_one(self, slot: EdtManager, item: QueueItem, executor: ThreadPoolExecutor) -> dict[str, Any]:
         grant = slot.acquire()

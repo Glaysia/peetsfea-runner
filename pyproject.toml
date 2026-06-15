@@ -41,5 +41,7 @@ module = [
   "ocp_vscode.*",
   "pexpect.*",
   "peetsfea.*",
+  "psutil",
+  "duckdb",
 ]
 ignore_missing_imports = true

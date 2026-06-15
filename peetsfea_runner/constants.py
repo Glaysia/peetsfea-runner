@@ -15,6 +15,15 @@ SIM_HARD_ABORT_SECONDS: Final[int] = 60 * 60
 # edtmgr 백스톱(65분): 대여한 채 이 시간까지 미반환이면 SIGKILL 후 재기동.
 EDTMGR_BACKSTOP_KILL_SECONDS: Final[int] = 65 * 60
 
+# --- Phase 2: 9잡 / ~100 동시 오케스트레이션 -------------------------------
+# 계정당 SLURM 잡 수(= 컨테이너 수).
+JOBS_PER_ACCOUNT: Final[int] = 9
+# 잡 수명(10h). 만료 시 진행 중 시뮬을 그냥 폐기(드레인 없음, Q8) 후 재기동.
+JOB_MAX_LIFETIME_SECONDS: Final[int] = 10 * 60 * 60
+# 유연 토폴로지(Phase 2/3): edtmgr가 항상 보유하는 warm 하한 / 컨테이너당 슬롯 상한.
+WARM_FLOOR_PER_CONTAINER: Final[int] = 11
+MAX_SLOTS_PER_CONTAINER: Final[int] = 16
+
 EXIT_CODE_SUCCESS: Final[int] = 0
 EXIT_CODE_SSH_FAILURE: Final[int] = 10
 EXIT_CODE_SLURM_FAILURE: Final[int] = 11
