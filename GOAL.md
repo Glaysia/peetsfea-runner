@@ -1,98 +1,83 @@
-# GOAL — Phase 1: 코어 단일 컨테이너 (edtmgr + warm AEDT + 단일 시뮬)
+# GOAL — Phase 2~4: 정상상태 파이프라인 (스케일 ~100 + 로드밸런서 + Intake)
 
-> 이 문서는 [`PLANS/MASTER_PLAN.md`](PLANS/MASTER_PLAN.md) 의 **Phase 1(전체의 1/6)** 만
-> 발췌한 "지금 먼저 구현할 범위" 문서다. 전체 목표·아키텍처·6단계 계획은 MASTER_PLAN 참조.
-> 의존 패키지 계약: [`PLANS/peetsfea_main.md`](PLANS/peetsfea_main.md) (peetsfea → **0.3.2**)
+> 이 문서는 [`PLANS/MASTER_PLAN.md`](PLANS/MASTER_PLAN.md) 의 **Phase 2·3·4** 를 구체화한 구현 범위다.
+> Phase 1(코어 단일 컨테이너 + 실 solve)은 완료. 나머지 절반(Phase 5 DB/대시보드 + Phase 6 아카이브)은 다음 GOAL.
+> 의존: peetsfea **0.3.4** ([`PLANS/peetsfea_main.md`](PLANS/peetsfea_main.md)).
 
-## 0. Phase 1 한 줄 요약
-**단일 잡 / 단일 enroot 컨테이너** 안에서 `edtmgr` 10개 + `ansysedt` 10개를 warm으로 상시
-기동하고, 대기 큐의 fixed toml을 10개 슬롯에 **순차 디스패치**하여 시뮬을 실행한다.
-ansysedt는 시뮬 사이에 죽지 않고 EDT 라이선스를 계속 점유한다. (9잡 확장·LB·서비스·아카이브는 후속 Phase)
+## 0. 한 줄 요약
+Phase 1의 단일 컨테이너를 **9 컨테이너(잡)** 로 확장해 정상상태 **동시 ~100 시뮬**을 유지하고,
+**로드 밸런서**가 ramp-up으로 부하를 균등화하며, **Intake :7875** 가 sweep을 받아
+**2-레인 큐(baseline + 우선순위, 85:15)** 로 슬롯을 끊김 없이 공급한다.
 
 ## 1. 범위 (In Scope)
-| 항목 | 내용 |
+| Phase | 내용 |
 |------|------|
-| 컨테이너 | 잡 1개 = enroot 컨테이너 1개 (runner + peetsfea-main 설치) |
-| ansysedt | 컨테이너당 **10개 상시 기동** (warm) |
-| edtmgr | 컨테이너당 **10개 상시 기동** (ansysedt 1개당 1개, **runner에 위치**) |
-| 슬롯 | 10개, 각 슬롯에서 fixed toml **순차 연속** 실행 |
-| 입력 | 대기 큐(이 단계에선 **수동 시드 허용**)의 fixed candidate toml(0.3.2 스키마) |
-| 결과 | 기존 `single_simulation_store`(DuckDB)에 기록 |
-| 부트스트랩 | 공유 `$HOME` 런타임(sqsh/스크립트) **멱등 준비**(§5) |
+| 2 | 9잡 제출·생애주기 + 컨테이너당 warm ≥11·≤16 / 합 **~100 동시 실행**(유동) |
+| 3 | 로드 밸런서: CPU·메모리 피드백(PID/EWMA) + admission control + ramp-up + 스태거 |
+| 4 | Intake `:7875`(sweep+N→검증→샘플) + **2-레인 가중 큐**(baseline 1000 + 우선순위, 15% 플로어) |
 
-> 7875 sweep toml 인테이크(범위 검증 → 샘플)는 Phase 4. Phase 1은 fixed candidate toml을 큐에 직접 시드한다.
+> 제외(다음 GOAL): 결과 DB 확장 + 대시보드 `:8080` + CSV export(Phase 5), 아카이브 저장소(Phase 6).
+> 단, 시뮬 결과는 이번에도 기존 `single_simulation_store`(DuckDB)에 계속 기록한다(확장은 Phase 5).
 
-## 2. edtmgr (AEDT 매니저)
-- **목적:** ansysedt는 켜고 끄는 비용이 크고 끄면 EDT 라이선스를 놓친다. edtmgr는
-  **별도 시뮬이 아닌 관리용 pyaedt 세션**을 상시 물고 (1) ansysedt warm 유지
-  (2) 라이선스 점유 유지.
-- **구성:** 각 edtmgr가 자신의 ansysedt를 `-ng -grpcsrv <port>` 로 띄우고 관리 세션을
-  `close_on_exit=False` 로 붙여 둔다.
-- **대여 프로토콜(컨테이너 내부 로컬 IPC):**
-  - `acquire`: 관리 세션 점유만 잠깐 놓고(ansysedt는 살려 둠 → 라이선스 유지)
-    `{pid, grpc_port}` 반환 → 시뮬 pyaedt가 같은 ansysedt에 grpc 접속.
-  - `release`/`done`: 시뮬이 성공 반환하면 관리 세션 재부착, 다음 요청 대기.
-- **타임아웃/장애:**
-  - 시뮬 자체 워치독 **60분** abort → 마지막 완료 패스 기준 리포트 산출.
-  - edtmgr 백스톱 **65분** 미반환 → 시뮬 pyaedt + ansysedt `SIGKILL(-9)` → 재기동 → 대기.
-  - 대여 중 ansysedt 사망 감지 시 즉시 재기동(해당 대여 실패 처리).
+## 2. Phase 2 — 9잡 / ~100 동시 오케스트레이션
+- **잡 토폴로지:** 단일 계정에서 **9개 SLURM 잡** 제출. 잡 1개 = enroot 컨테이너 1개 =
+  컨테이너 안에서 Phase 1의 슬롯 서비스(edtmgr 풀 + `SlotDispatcher`) 실행.
+- **컨테이너당 슬롯:** warm 보유 **≥11**, 최대 **16**. 9 컨테이너 합 **목표 ~100 동시 실행**,
+  컨테이너별 동시 실행 ~7–16 **불균형 허용**(합 ~100 근처면 OK).
+- **생애주기:** 제출 → readiness → 실행. **잡 수명 10h**, 만료 시 진행 중 ~100개 **그냥 폐기**
+  (드레인 로직 없음, Q8) 후 재기동. 잡 1개가 죽어도 나머지 8개는 지속.
+- **파일시스템:** 잡 단위 `/enroot/{USER}_{SJOB}` 생성/정리(`job_workspace.py` 재사용),
+  `/dev/shm`·`/tmp` 비사용.
+- **변경/재사용:** `edt_service.build_slots/build_dispatcher`(현 단일 컨테이너) →
+  **9잡 오케스트레이터**(신규)로 확장. 잡 제출/모니터/재기동은 기존 `scheduler.py` sbatch 패턴,
+  컨테이너·grpc 기동은 `remote_job.py` 패턴, `runner.py`의 `accounts_registry`(account_01) 재사용.
+- **수용:** 정상상태에서 동시 ~100 유지가 관측됨; 잡 1개 강제종료해도 전체 지속; 10h 만료 시 폐기·재기동.
 
-## 3. 시뮬레이션 실행 정책
-- 시뮬 1개 목표 ~**40분**(마지막 패스 후 리포트 저장), 하드 abort **60분**, edtmgr 강제종료 **65분**.
-- 실행 진입점은 기존 단일 시뮬 API 계약 재사용:
-  `primitive(candidate_toml_text, output_dir=, seed=, mode=)`
-  (`peetsfea_runner/single_simulation_api.py:62,116`) —
-  단, 자체 ansysedt 기동 대신 edtmgr가 준 grpc 세션에 접속(0.3.2 계약).
+## 3. Phase 3 — 로드 밸런서 (ramp-up)
+- **warm vs 실행 분리:** warm 보유 ≥11(항상) / 동시 실행 7–16(부하 유동). 7개만 돌더라도 11 warm 유지
+  → 부하 풀리면 **슬로 스타트 없이 즉시 11까지**. 12–16 버스트만 추가 기동(지연 무방).
+- **신호:** 노드/컨테이너 **CPU·메모리** 사용률(주기 샘플, `psutil` + `/proc`).
+- **제어 루프:**
+  - **admission control:** 슬롯이 비고 **그리고** 측정 부하 ≤ 목표(watermark)면 다음 fixed toml 디스패치.
+    과부하면 **AIMD 백오프**로 신규 시작 보류.
+  - 측정→목표 수렴 **피드백 제어(PID 또는 EWMA)**, **시작 스태거**(시작 간 최소 간격 + 부하 게이팅),
+    매시간 재최적화.
+  - **ramp-up:** 콜드 스타트는 적게 시작 → 부하 여유 따라 점진 증설. 새 시뮬은 초기(가벼움) 구간으로
+    들어와 기존이 무거워지기 전에 흡수 → 시작 시점 자연 분산(무거운 패스 겹침 방지).
+- **변경/재사용:** `edt_dispatcher.SlotDispatcher`의 슬롯 루프(`_slot_loop`/`_run_one`,
+  `edt_dispatcher.py:95` 디스패치 지점)에 **admission 게이트** 추가. **load telemetry 모듈**(신규,
+  CPU/mem 샘플), `edt_watchdog`와 통합. LB 파라미터는 `constants.py`에 추가.
+- **수용:** 동시 시작(naïve) 대비 노드 부하 스파이크 완화 + 활용률·스루풋 상승이 데이터로 확인됨.
 
-## 4. 자원 / 파일시스템 규칙
-- `/dev/shm`, `/tmp` **사용 금지** → 잡 전용 `job_tmpfs` / `job_disk`.
-- 잡 시작 시 `/enroot/{USERNAME}_{SLURM_JOB_ID}` 생성, 잡 종료 시 삭제.
-- 라이선스는 충분(상한 미고려), edtmgr 관리세션으로 상시 점유만 유지.
+## 4. Phase 4 — Intake `:7875` + 2-레인 큐
+- **Intake `:7875`:** 온전한 **sweep toml + 개수 N** 수신 → peetsfea
+  `validate_sweep_toml_text`(기준 sweep 범위 이내인지, **넓으면 거절**) →
+  `sample_fixed_candidates_from_toml_text(text, N, seed)`로 **fixed × N** → **우선순위 레인** 적재.
+- **2-레인 가중 큐(§2.6.1):**
+  - **baseline 레인(전역 탐색):** 전체 `0.3.x_sweep.toml`을 **풀스페이스 랜덤 샘플**해 **~1000칸 버퍼
+    상시 리필**(저수위 시 다음 배치, **배치마다 seed 롤링**). 슬롯이 놀지 않게 하는 상시 공급원. **휘발**.
+  - **우선순위 레인(어댑티브):** 7875로 들어온 subset sweep을 검증·샘플 후 앞쪽 적재, 먼저 소비. **파일 영속**.
+  - **15% 탐색 플로어:** 디스패처가 두 레인을 **~85:15 결정론적 인터리브**(우선순위 backlog 중에도
+    baseline 15% 하드 플로어). 우선순위 비면 **100% baseline**.
+- **변경/재사용:** `edt_queue.TomlQueue`(단순 FIFO) → **2-레인 가중 스케줄러**로 확장
+  (`get()`이 85:15로 baseline/우선순위 추출). **Intake HTTP 서버**(신규, `:7875`). baseline 샘플러는
+  peetsfea `sample_fixed_candidates_from_toml_text` + seed 롤링. 결과는 `single_simulation_store`에 기록.
+- **수용:** ① baseline만으로 슬롯이 끊김 없이 채워짐, ② sweep 1건 투입 시 N개가 **우선 처리**됨,
+  ③ 우선순위 backlog 중에도 baseline **~15% 유지**가 데이터로 확인됨.
 
-## 5. 부트스트랩 / 런타임 준비 (멱등)
-공유 `$HOME`(게이트노드·계산노드 공통)에는 sqsh 이미지(`~/runtime/enroot/aedt.sqsh`)·
-스크립트·miniconda·repo 정도만 둔다.
-- **멱등 자가복구:** `$HOME`이 `rm -rf ~/*`로 비워져도 **로컬 PC 서비스 재시작만으로
-  부트스트랩이 처음부터 다시 수행되어 정상 복구**되어야 한다(느려도 됨).
-- **웜 캐시 우선:** 평소엔 sqsh·캐시·스크립트가 준비돼 있어 readiness 점검만 하고
-  **재빌드 없이 빠르게** 시작(정상 경로에서 느리면 안 됨).
-- **재사용:** readiness 프로브 `bootstrap_needed`(`scheduler.py:567`) →
-  없을 때만 `enroot_image_bootstrap.sh` / `scripts/remote_bootstrap_install.sh` 수행,
-  `RUNTIME_PROBE_CACHE_TTL`(30분) 캐시. sqsh 계약버전
-  `_ENROOT_IMAGE_CONTRACT_VERSION`(`scheduler.py:138`) `peetsfea031`→`peetsfea032` bump.
+## 5. 변경 대상 (요약)
+- **신규:** 9잡 오케스트레이터, load telemetry/밸런서, Intake `:7875` 서버, 2-레인 가중 큐.
+- **확장:** `edt_dispatcher.py`(admission 게이트), `edt_queue.py`(2-레인), `edt_service.py`(1→9잡),
+  `constants.py`(warm 하한 11·상한 16·LB 파라미터).
+- **재사용:** `scheduler.py`(sbatch/readiness), `remote_job.py`(컨테이너·grpc), `job_workspace.py`,
+  `edtmgr`/`RealEdtBackend`, peetsfea 0.3.4 `validate_sweep_toml_text`/`sample_fixed_candidates_from_toml_text`,
+  `single_simulation_store`(결과 기록).
 
-## 6. Phase 1 변경 계획
-### peetsfea-runner
-1. **edtmgr(신규 모듈):** 컨테이너 내 10개 관리 서버 + 대여 프로토콜 + 60/65분 타이밍 +
-   liveness 재기동. ansysedt grpc 기동/접속은 기존 remote_job grpc 런치 패턴 참고.
-2. **슬롯 디스패처:** 대기 큐 → 슬롯 `acquire` → `single_simulation` primitive 실행 →
-   `release` → 결과 기록. 기존 `single_simulation_*` 경로 재사용.
-3. **파일시스템:** `/enroot/{USER}_{SJOB}` lifecycle, `/dev/shm`·`/tmp` 비사용 보장.
-4. **부트스트랩:** 멱등 자가복구 + 웜캐시 빠른 시작 보장, sqsh 계약버전 `peetsfea032` bump.
-5. peetsfea 기대 버전 `0.3.1` → `0.3.2`
-   (`single_simulation_api.py:19`, `single_simulation_remote.py:194`).
-6. AGENTS.md 준수: 실행은 `systemctl --user start|restart peetsfea-runner`, 엄격 타입체킹,
-   필요한 의존성은 pyproject에 추가, `.venv/bin/python`.
+## 6. 수용 기준 (통합)
+- 정상상태 **동시 ~100** 유지(컨테이너별 7–16 유동), 잡 장애·10h 만료에 견고.
+- 로드밸런서로 **부하 스파이크 완화·활용률 상승** 데이터 확인.
+- Intake sweep → 검증 → 샘플 → 큐 → 시뮬 → 결과 기록 round-trip, **85:15 탐색 플로어** 유지.
 
-### peetsfea-main → 0.3.2 (요약, 상세는 `PLANS/peetsfea_main.md`)
-1. **기존 warm ansysedt 접속:** edtmgr가 준 `(pid, grpc_port)` 세션에 접속해 실행
-   (자체 ansysedt 기동/종료 금지).
-2. **완료 시 깨끗이 반환:** 프로젝트 정리 후 edtmgr에 release 가능 상태로 마무리.
-3. **패스/시간 예산:** ~40분 목표, **60분 하드 abort 시 마지막 완료 패스 리포트 산출**.
-4. **라이선스/AEDT 수명 비소유:** edtmgr가 관리.
-5. 버전 `0.3.1` → `0.3.2`.
-
-## 7. 수용 기준 (Acceptance)
-- 컨테이너 1개에서 fixed toml N개가 **10슬롯으로 순차 처리**되어 각 결과/리포트가 산출됨.
-- 시뮬 사이에 ansysedt가 **죽지 않고** EDT 라이선스를 **유지**함을 확인.
-- 60분 abort 시 마지막 패스 리포트가 남고, 65분 미반환 시 edtmgr가 강제 정리·재기동함.
-- `/dev/shm`·`/tmp` 미사용, `/enroot/{USER}_{SJOB}` 생성·정리 확인.
-- **부트스트랩:** `rm -rf ~/*` 후 서비스 재시작 → 자가복구 성공(느려도 OK); 웜 캐시 상태에선
-  재빌드 없이 빠르게 시작.
-
-## 8. Phase 1 제외(후속 Phase) — 자세히는 MASTER_PLAN
-- Phase 2: 9잡/90 동시 오케스트레이션, 5h 만료 시 폐기.
-- Phase 3: 로드밸런서(CPU/mem 피드백 제어 + 스태거).
-- Phase 4: Intake `:7875`(온전한 sweep toml + N → **기준 범위 이내 검증**(넓으면 실패) → 랜덤 샘플 → 큐).
-- Phase 5: 결과 DB 확장 + 대시보드 `:8080`(read-only).
-- Phase 6: 아카이브 저장소(project_dir 누적 → 20GB 묶음 압축, 2TB 초과 시 오래된 묶음 삭제).
+## 7. 제외 (다음 GOAL = Phase 5+6)
+- 결과 DB 스키마 확장 + 대시보드 `:8080`(read-only) + `curl .../results.csv` CSV export.
+- 아카이브 저장소(project_dir 누적 → 20GB 묶음 압축, 2TB 초과 시 오래된 묶음 FIFO 삭제).
