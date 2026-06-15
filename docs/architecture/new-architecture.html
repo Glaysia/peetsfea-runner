@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>peetsfea-runner — 신규 아키텍처 (edtmgr / 동시 90)</title>
+<title>peetsfea-runner — 신규 아키텍처 (edtmgr / 동시 ~100)</title>
 <style>
   :root {
     --bg: #0f1116; --panel: #181b22; --panel2: #1f232c; --line: #2c313c;
@@ -59,11 +59,11 @@
 
 <header>
   <h1>peetsfea-runner — 신규 아키텍처</h1>
-  <p class="sub">edtmgr 기반 warm AEDT 풀 · 단일 계정 동시 90 시뮬 · 입력→시뮬→DB/대시보드→아카이브</p>
+  <p class="sub">edtmgr 기반 warm AEDT 풀 · 단일 계정 동시 ~100 시뮬 · 입력→시뮬→DB/대시보드→아카이브</p>
   <p style="margin-top:10px">
     <span class="tag new">신규 아키텍처(레거시 대체)</span>
     <span class="tag">peetsfea-main → 0.3.2</span>
-    <span class="tag ok">동시 90 = 잡 9 × 슬롯 10</span>
+    <span class="tag ok">동시 ~100 = 컨테이너 9 × 최대 16 (부하 유동)</span>
   </p>
   <p class="sub">기준 문서: <code>PLANS/MASTER_PLAN.md</code> · 1차 구현 범위: <code>GOAL.md</code>(Phase 1)</p>
 </header>
@@ -101,7 +101,7 @@
 
     <!-- Account box -->
     <rect x="24" y="130" width="700" height="300" rx="12" fill="#15181f" stroke="#2c313c"></rect>
-    <text x="40" y="154" class="svglabel">account_01 · 잡 9개 · 동시 90 슬롯</text>
+    <text x="40" y="154" class="svglabel">account_01 · 컨테이너 9 · 동시 ~100 (유동)</text>
     <line x1="400" y1="94" x2="400" y2="128" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
 
     <!-- job_1 container -->
@@ -116,8 +116,8 @@
       <text x="70" y="266" class="svgsub">관리 pyaedt(warm·license hold)</text>
 
       <rect x="252" y="224" width="200" height="54" rx="7" fill="#1f232c" stroke="#2f5e3a"></rect>
-      <text x="264" y="246" class="svgmono">slot_2 … slot_10</text>
-      <text x="264" y="266" class="svgsub">동일 구조 (컨테이너당 10개)</text>
+      <text x="264" y="246" class="svgmono">slot_2 … slot_N (≤16)</text>
+      <text x="264" y="266" class="svgsub">warm ≥11·≤16 · 실행 7~16</text>
     </g>
 
     <!-- borrow protocol -->
@@ -130,17 +130,17 @@
     <!-- jobs 2..9 -->
     <rect x="492" y="170" width="216" height="240" rx="10" fill="#181b22" stroke="#3a4252"></rect>
     <text x="506" y="192" class="svglabel">job_2 … job_9</text>
-    <text x="506" y="212" class="svgsub">각 컨테이너 10슬롯</text>
-    <text x="506" y="232" class="svgsub">→ 합계 90 동시</text>
+    <text x="506" y="212" class="svgsub">각 컨테이너 ≤16</text>
+    <text x="506" y="232" class="svgsub">→ 합계 ~100 동시</text>
     <text x="506" y="262" class="svgsub">잡 수명 10h</text>
-    <text x="506" y="280" class="svgsub">만료 시 진행 90개 폐기</text>
+    <text x="506" y="280" class="svgsub">만료 시 진행 ~100개 폐기</text>
 
     <!-- Load balancer -->
     <rect x="760" y="170" width="256" height="80" rx="9" fill="#1f232c" stroke="#4b3a6e"></rect>
     <text x="774" y="194" class="svglabel" style="fill:#b392f0">로드 밸런서</text>
-    <text x="774" y="214" class="svgsub">CPU·메모리 피드백 제어(PID/EWMA)</text>
-    <text x="774" y="230" class="svgsub">시작 스태거 + AIMD 백오프</text>
-    <text x="774" y="246" class="svgsub">매시간 재최적화</text>
+    <text x="774" y="212" class="svgsub">ramp-up: 적게→부하 여유 따라 증설</text>
+    <text x="774" y="228" class="svgsub">CPU·메모리 피드백(PID/EWMA)+AIMD</text>
+    <text x="774" y="244" class="svgsub">시작 스태거 · 매시간 재최적화</text>
     <line x1="724" y1="210" x2="758" y2="210" stroke="#7ee787" stroke-width="2" marker-end="url(#arwG)"></line>
 
     <!-- Results DB -->
@@ -177,10 +177,10 @@
   <tr><th>단위</th><th>수량</th><th>비고</th></tr>
   <tr><td>계정(account)</td><td>1개</td><td>다계정은 아주 나중 (지금 안 함)</td></tr>
   <tr><td>잡(SLURM sbatch)</td><td>계정당 9개</td><td>잡당 컨테이너 1개</td></tr>
-  <tr><td>ansysedt</td><td>컨테이너당 10개</td><td>상시 기동 (warm)</td></tr>
-  <tr><td>edtmgr</td><td>컨테이너당 10개</td><td>ansysedt 1개당 1개 · <b>runner에 위치</b></td></tr>
-  <tr><td>동시 시뮬레이션</td><td>계정당 90개</td><td>정상상태에서 항상 유지</td></tr>
-  <tr><td>잡 수명</td><td>10시간</td><td>만료 시 진행 중 90개 폐기(드레인 없음)</td></tr>
+  <tr><td>ansysedt</td><td>warm ≥11, 최대 16</td><td>항상 ≥11 warm 보유 · 12–16 버스트는 추가 기동(느려도 OK)</td></tr>
+  <tr><td>edtmgr</td><td>warm ≥11, ≤16</td><td>ansysedt 1개당 1개 · <b>runner에 위치</b></td></tr>
+  <tr><td>동시 실행(running)</td><td>계정당 ~100개</td><td>컨테이너별 실행 ~7–16 불균형 허용(warm은 ≥11)</td></tr>
+  <tr><td>잡 수명</td><td>10시간</td><td>만료 시 진행 중 ~100개 폐기(드레인 없음)</td></tr>
 </table>
 
 <h2>3. edtmgr 동작 & 타이밍</h2>
@@ -243,8 +243,8 @@
       60/65분 타이밍, /enroot lifecycle, peetsfea 0.3.2 warm-AEDT 접속.</p>
     </div>
   </div>
-  <div class="phase"><div class="n">2</div><div><h4>9잡 / 90 동시 오케스트레이션</h4>
-    <p class="muted">잡 9개 생애주기, 슬롯 90 풀, 10h 만료 시 폐기.</p></div></div>
+  <div class="phase"><div class="n">2</div><div><h4>9잡 / ~100 동시 오케스트레이션</h4>
+    <p class="muted">잡 9개 생애주기, 컨테이너당 ≤16 / 합 ~100 풀(유동), 10h 만료 시 폐기.</p></div></div>
   <div class="phase"><div class="n">3</div><div><h4>로드 밸런서</h4>
     <p class="muted">CPU/mem 피드백 제어(PID/EWMA) + 시작 스태거 + AIMD 백오프, 매시간 재최적화.</p></div></div>
   <div class="phase"><div class="n">4</div><div><h4>Intake :7875</h4>

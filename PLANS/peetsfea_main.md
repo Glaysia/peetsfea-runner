@@ -22,6 +22,28 @@
 - `sample_fixed_candidates_from_toml_text(sweep_text: str, count: int, seed: int) -> list[str]`
 - `peetsfea.__version__ == "0.3.2"`
 
+## 0.3.2 연동 검증 (2026-06-16) — 계약 일치 ✅ / 버그 1개
+runner ↔ peetsfea 0.3.2 점검 결과 계약이 거의 완벽히 맞는다:
+- 프리미티브 `run_ssw_random_sample_reports_from_toml_text(candidate_toml_text, *, output_dir,
+  seed, mode, grpc_port, aedt_pid, ...)` — attach 시 `keep_desktop_alive=True`(AEDT 살림, 프로젝트만
+  닫음) ✅
+- 반환 `SswRandomSampleReportResult`는 **TypedDict**라 키(`setup_pass_counts/solve_telemetry/
+  csv_paths/csv_text_by_report`)가 runner store 스키마와 1:1 ✅
+- `SOLVE_HARD_ABORT_SECONDS=3600`(60분) < runner 백스톱 3900(65분) — Q2 순서 정확 ✅
+- `validate_sweep_toml_text` / `sample_fixed_candidates_from_toml_text` 노출 ✅
+- runner 38 테스트 그린(0.3.2 설치).
+
+### 🔴 수정 필요 (실 solve 차단) — 기준 sweep toml 패키징
+- `DEFAULT_REFERENCE_TOML_PATH = Path(__file__).resolve().parents[2] / "examples" / "0.3.2_sweep.toml"`
+  (`ssw_design_space.py:17`)는 **소스 레이아웃 가정**이라, pip 설치 시
+  `<venv>/lib/python3.12/examples/0.3.2_sweep.toml`(존재 안 함)로 잡힌다. 게다가 pyproject
+  `include=["src","tests","entry"]`에 **`examples`가 빠져** 패키지에 동봉되지 않는다.
+- 이 reference는 run 경로에서 실제로 읽힌다(`build_ssw_aedt_identity(sample.toml_path,
+  reference_toml_path)`) → 설치 환경에서 실 candidate solve가 **FileNotFound로 실패**.
+- **수정(peetsfea):** ① `0.3.2_sweep.toml`(기준 sweep SSOT)을 패키지 데이터로 동봉,
+  ② `DEFAULT_REFERENCE_TOML_PATH`를 `importlib.resources`로 해석(소스/설치 양쪽 동작).
+- 임시 우회(runner): 프리미티브에 `reference_toml_path=<실경로>` 명시 전달 가능(요청 시 디스패처 옵션 추가).
+
 ## 협의 필요
 - grpc 접속에 `pid`까지 필요한지, `grpc_port`만으로 충분한지.
 - 범위 검증 엄밀도: `[start, end]` 상하한만 볼지, `count`·`is_int`(정수/실수 플래그)까지 정합 볼지.

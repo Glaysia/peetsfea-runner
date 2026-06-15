@@ -51,6 +51,8 @@ def test_dispatcher_persists_envelope_to_duckdb_store(tmp_path: Path) -> None:
     assert row is not None
     assert row["terminal_state"] == "success"
     assert row["seed"] == 3
-    assert row["peetsfea_version"] == "0.3.1"  # 로컬 설치 버전(런타임 실측)
+    import peetsfea
+
+    assert row["peetsfea_version"] == peetsfea.__version__  # 런타임 실측(설치 버전)
     assert "0.42" in row["result_json"]
     assert "Setup1" in row["setup_pass_counts_json"]
