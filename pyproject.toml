@@ -17,6 +17,27 @@ dependencies = [
   "pyaedt[graphics]==0.25.1"
 ]
 
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.11",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["peetsfea_runner*"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["peetsfea_runner"]
+# 외부 라이브러리는 타입 스텁이 없으므로 import 누락만 무시(우리 코드 타입은 strict 유지).
+[[tool.mypy.overrides]]
+module = [
+  "pyaedt.*",
+  "ansys.*",
+  "cadquery.*",
+  "ocp_vscode.*",
+  "pexpect.*",
+  "peetsfea.*",
+]
+ignore_missing_imports = true

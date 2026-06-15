@@ -159,8 +159,8 @@
     <!-- Archive -->
     <rect x="300" y="466" width="430" height="74" rx="9" fill="#1f232c" stroke="#5e4a2f"></rect>
     <text x="314" y="490" class="svglabel" style="fill:#ffb454">아카이브 저장소</text>
-    <text x="314" y="510" class="svgsub">project_dir(.aedt/.aedtresults) 압축 저장</text>
-    <text x="314" y="526" class="svgsub">2TB 버퍼 · 초과 시 FIFO 삭제</text>
+    <text x="314" y="510" class="svgsub">project_dir 누적 → 20GB 묶음 압축(solid)</text>
+    <text x="314" y="526" class="svgsub">2TB 초과 시 가장 오래된 묶음파일 1개 삭제</text>
     <line x1="360" y1="410" x2="360" y2="464" stroke="#7ee787" stroke-width="2" marker-end="url(#arwG)"></line>
 
     <!-- DB from account -->
@@ -229,7 +229,7 @@
   </div>
   <div class="card">
     <h3>아카이브 <span class="tag new">신규</span></h3>
-    <p>project_directory를 압축 저장. 2TB 버퍼 초과 시 FIFO 삭제. 복원이 느려도 무방.</p>
+    <p>project_directory를 누적해 <b>20GB 단위 묶음(solid) 압축</b>. 2TB 초과 시 가장 오래된 묶음파일 1개 삭제. 복원이 느려도 무방.</p>
   </div>
 </div>
 
@@ -252,7 +252,7 @@
   <div class="phase"><div class="n">5</div><div><h4>결과 DB + 대시보드 :8080</h4>
     <p class="muted">DuckDB 스키마 확장 + read-only 대시보드.</p></div></div>
   <div class="phase"><div class="n">6</div><div><h4>아카이브 저장소</h4>
-    <p class="muted">압축 저장 + 2TB FIFO eviction + (느린) 복원.</p></div></div>
+    <p class="muted">20GB 묶음 압축(solid) + 2TB 초과 시 오래된 묶음 삭제 + (느린) 복원.</p></div></div>
 </div>
 
 <footer>
