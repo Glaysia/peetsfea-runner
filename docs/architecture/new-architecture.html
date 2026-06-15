@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>peetsfea-runner — 신규 아키텍처 (edtmgr / 동시 90)</title>
+<style>
+  :root {
+    --bg: #0f1116; --panel: #181b22; --panel2: #1f232c; --line: #2c313c;
+    --fg: #e6e9ef; --muted: #9aa3b2; --accent: #5ec2ff; --accent2: #7ee787;
+    --warn: #ffb454; --bad: #ff6b6b; --code: #11141a; --violet: #b392f0;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.65 -apple-system, "Segoe UI", "Noto Sans KR", Roboto, sans-serif; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 24px 80px; }
+  header { border-bottom: 1px solid var(--line); padding-bottom: 20px; margin-bottom: 28px; }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  h2 { font-size: 19px; margin: 40px 0 12px; border-left: 3px solid var(--accent); padding-left: 10px; }
+  h3 { font-size: 16px; margin: 22px 0 8px; color: var(--accent); }
+  .sub { color: var(--muted); font-size: 14px; }
+  .tag { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 10px;
+         background: var(--panel2); border: 1px solid var(--line); color: var(--muted); margin-right: 6px; }
+  .tag.ok { color: var(--accent2); border-color: #2f5e3a; }
+  .tag.warn { color: var(--warn); border-color: #5e4a2f; }
+  .tag.bad { color: var(--bad); border-color: #5e2f2f; }
+  .tag.new { color: var(--violet); border-color: #4b3a6e; }
+  p { margin: 8px 0; }
+  code { background: var(--code); padding: 1px 6px; border-radius: 4px; font-size: 13px;
+         font-family: "SF Mono", "JetBrains Mono", Consolas, monospace; color: #d6deeb; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 16px 18px; margin: 14px 0; }
+  .grid { display: grid; gap: 14px; }
+  .grid.c2 { grid-template-columns: 1fr 1fr; }
+  .grid.c3 { grid-template-columns: 1fr 1fr 1fr; }
+  @media (max-width: 760px){ .grid.c2,.grid.c3{ grid-template-columns:1fr; } }
+  ul { margin: 8px 0; padding-left: 22px; } li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .path { color: var(--accent2); }
+  .muted { color: var(--muted); }
+  .legend span { margin-right: 16px; font-size: 13px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+  .phase { display:flex; align-items:flex-start; gap:12px; padding:12px 0; border-bottom:1px dashed var(--line); }
+  .phase .n { flex:0 0 auto; width:30px; height:30px; border-radius:50%; background:var(--panel2);
+    border:1px solid var(--accent); color:var(--accent); text-align:center; line-height:30px; font-weight:700; font-size:13px; }
+  .phase.now .n { border-color:var(--accent2); color:var(--accent2); }
+  .phase h4 { margin:2px 0 4px; font-size:15px; }
+  svg { width:100%; height:auto; background:var(--code); border:1px solid var(--line); border-radius:10px; }
+  .svglabel { fill:var(--fg); font: 600 13px "Segoe UI","Noto Sans KR",sans-serif; }
+  .svgsub { fill:var(--muted); font: 12px "Segoe UI","Noto Sans KR",sans-serif; }
+  .svgmono { fill:#d6deeb; font: 12px "JetBrains Mono",Consolas,monospace; }
+  footer { margin-top: 50px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>peetsfea-runner — 신규 아키텍처</h1>
+  <p class="sub">edtmgr 기반 warm AEDT 풀 · 단일 계정 동시 90 시뮬 · 입력→시뮬→DB/대시보드→아카이브</p>
+  <p style="margin-top:10px">
+    <span class="tag new">신규 아키텍처(레거시 대체)</span>
+    <span class="tag">peetsfea-main → 0.3.2</span>
+    <span class="tag ok">동시 90 = 잡 9 × 슬롯 10</span>
+  </p>
+  <p class="sub">기준 문서: <code>PLANS/MASTER_PLAN.md</code> · 1차 구현 범위: <code>GOAL.md</code>(Phase 1)</p>
+</header>
+
+<h2>1. 전체 데이터 흐름</h2>
+<div class="card">
+  <p class="legend">
+    <span><i class="dot" style="background:var(--violet)"></i>신규 컴포넌트</span>
+    <span><i class="dot" style="background:var(--accent)"></i>오케스트레이션</span>
+    <span><i class="dot" style="background:var(--accent2)"></i>AEDT/슬롯</span>
+    <span><i class="dot" style="background:var(--warn)"></i>저장/관측</span>
+  </p>
+  <svg viewBox="0 0 1040 560" role="img" aria-label="아키텍처 데이터 흐름도">
+    <defs>
+      <marker id="arw" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#5ec2ff"></path>
+      </marker>
+      <marker id="arwG" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#7ee787"></path>
+      </marker>
+    </defs>
+
+    <!-- Intake -->
+    <rect x="24" y="24" width="220" height="70" rx="9" fill="#1f232c" stroke="#4b3a6e"></rect>
+    <text x="36" y="50" class="svglabel">Intake 서비스 :7875</text>
+    <text x="36" y="70" class="svgsub">sweep toml + 개수 N</text>
+    <text x="36" y="86" class="svgsub">→ 랜덤 샘플 fixed toml × N</text>
+
+    <!-- Queue -->
+    <rect x="300" y="24" width="200" height="70" rx="9" fill="#1f232c" stroke="#2c313c"></rect>
+    <text x="312" y="50" class="svglabel">대기 큐</text>
+    <text x="312" y="70" class="svgsub">fixed toml</text>
+    <text x="312" y="86" class="svgsub">슬롯 가용 시 순차 디스패치</text>
+    <line x1="244" y1="59" x2="298" y2="59" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
+
+    <!-- Account box -->
+    <rect x="24" y="130" width="700" height="300" rx="12" fill="#15181f" stroke="#2c313c"></rect>
+    <text x="40" y="154" class="svglabel">account_01 · 잡 9개 · 동시 90 슬롯</text>
+    <line x1="400" y1="94" x2="400" y2="128" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
+
+    <!-- job_1 container -->
+    <rect x="44" y="170" width="430" height="240" rx="10" fill="#181b22" stroke="#3a4252"></rect>
+    <text x="58" y="192" class="svglabel">job_1 — enroot 컨테이너</text>
+    <text x="58" y="210" class="svgsub">runner + peetsfea-main 설치 · /enroot/{USER}_{SJOB}</text>
+
+    <!-- slots -->
+    <g>
+      <rect x="58" y="224" width="180" height="54" rx="7" fill="#1f232c" stroke="#2f5e3a"></rect>
+      <text x="70" y="246" class="svgmono">slot_1: edtmgr ─ ansysedt</text>
+      <text x="70" y="266" class="svgsub">관리 pyaedt(warm·license hold)</text>
+
+      <rect x="252" y="224" width="200" height="54" rx="7" fill="#1f232c" stroke="#2f5e3a"></rect>
+      <text x="264" y="246" class="svgmono">slot_2 … slot_10</text>
+      <text x="264" y="266" class="svgsub">동일 구조 (컨테이너당 10개)</text>
+    </g>
+
+    <!-- borrow protocol -->
+    <rect x="58" y="296" width="394" height="98" rx="8" fill="#13161c" stroke="#2c313c"></rect>
+    <text x="72" y="318" class="svglabel" style="fill:#b392f0">edtmgr 대여 프로토콜</text>
+    <text x="72" y="338" class="svgmono">acquire → {pid, grpc_port} 반환</text>
+    <text x="72" y="356" class="svgmono">시뮬 pyaedt가 같은 ansysedt grpc 접속·실행</text>
+    <text x="72" y="374" class="svgmono">done/release → 관리세션 재부착 → 다음 toml</text>
+
+    <!-- jobs 2..9 -->
+    <rect x="492" y="170" width="216" height="240" rx="10" fill="#181b22" stroke="#3a4252"></rect>
+    <text x="506" y="192" class="svglabel">job_2 … job_9</text>
+    <text x="506" y="212" class="svgsub">각 컨테이너 10슬롯</text>
+    <text x="506" y="232" class="svgsub">→ 합계 90 동시</text>
+    <text x="506" y="262" class="svgsub">잡 수명 5h</text>
+    <text x="506" y="280" class="svgsub">만료 시 진행 90개 폐기</text>
+
+    <!-- Load balancer -->
+    <rect x="760" y="170" width="256" height="80" rx="9" fill="#1f232c" stroke="#4b3a6e"></rect>
+    <text x="774" y="194" class="svglabel" style="fill:#b392f0">로드 밸런서</text>
+    <text x="774" y="214" class="svgsub">CPU·메모리 피드백 제어(PID/EWMA)</text>
+    <text x="774" y="230" class="svgsub">시작 스태거 + AIMD 백오프</text>
+    <text x="774" y="246" class="svgsub">매시간 재최적화</text>
+    <line x1="724" y1="210" x2="758" y2="210" stroke="#7ee787" stroke-width="2" marker-end="url(#arwG)"></line>
+
+    <!-- Results DB -->
+    <rect x="760" y="276" width="256" height="74" rx="9" fill="#1f232c" stroke="#5e4a2f"></rect>
+    <text x="774" y="300" class="svglabel" style="fill:#ffb454">결과 DB (DuckDB)</text>
+    <text x="774" y="320" class="svgsub">load·시뮬시간·패스·입출력 파라미터</text>
+    <text x="774" y="336" class="svgsub">슬롯/잡/계정·아카이브 참조</text>
+    <line x1="724" y1="300" x2="758" y2="300" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
+
+    <!-- Dashboard -->
+    <rect x="760" y="376" width="256" height="64" rx="9" fill="#1f232c" stroke="#2c313c"></rect>
+    <text x="774" y="400" class="svglabel">대시보드 :8080</text>
+    <text x="774" y="420" class="svgsub">read-only 시각화 (시뮬 영향 없음)</text>
+    <line x1="888" y1="350" x2="888" y2="374" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
+
+    <!-- Archive -->
+    <rect x="300" y="466" width="430" height="74" rx="9" fill="#1f232c" stroke="#5e4a2f"></rect>
+    <text x="314" y="490" class="svglabel" style="fill:#ffb454">아카이브 저장소</text>
+    <text x="314" y="510" class="svgsub">project_dir(.aedt/.aedtresults) 압축 저장</text>
+    <text x="314" y="526" class="svgsub">2TB 버퍼 · 초과 시 FIFO 삭제</text>
+    <line x1="360" y1="410" x2="360" y2="464" stroke="#7ee787" stroke-width="2" marker-end="url(#arwG)"></line>
+
+    <!-- DB from account -->
+    <line x1="724" y1="390" x2="724" y2="312" stroke="#7ee787" stroke-width="0"></line>
+  </svg>
+  <p class="muted" style="font-size:13px">
+    화살표: 보라=신규 서비스 경로, 파랑=제어/조회, 초록=결과/산출물. 단순화를 위해 job_1만
+    슬롯 내부를 펼쳐 표시(job_2~9 동일).
+  </p>
+</div>
+
+<h2>2. 목표 토폴로지</h2>
+<table>
+  <tr><th>단위</th><th>수량</th><th>비고</th></tr>
+  <tr><td>계정(account)</td><td>1개</td><td>다계정은 아주 나중 (지금 안 함)</td></tr>
+  <tr><td>잡(SLURM sbatch)</td><td>계정당 9개</td><td>잡당 컨테이너 1개</td></tr>
+  <tr><td>ansysedt</td><td>컨테이너당 10개</td><td>상시 기동 (warm)</td></tr>
+  <tr><td>edtmgr</td><td>컨테이너당 10개</td><td>ansysedt 1개당 1개 · <b>runner에 위치</b></td></tr>
+  <tr><td>동시 시뮬레이션</td><td>계정당 90개</td><td>정상상태에서 항상 유지</td></tr>
+  <tr><td>잡 수명</td><td>5시간</td><td>만료 시 진행 중 90개 폐기(드레인 없음)</td></tr>
+</table>
+
+<h2>3. edtmgr 동작 & 타이밍</h2>
+<div class="grid c2">
+  <div class="card">
+    <h3>왜 필요한가</h3>
+    <p>ansysedt는 켜고 끄는 비용이 매우 크고, 끄면 EDT 라이선스를 놓친다. edtmgr는
+    <b>별도 시뮬이 아닌 관리용 pyaedt 세션</b>을 상시 물고 있어 ansysedt를 warm으로
+    유지하고 라이선스 점유를 이어 간다.</p>
+    <ul>
+      <li><code>acquire</code> — 관리 점유만 잠깐 놓음(ansysedt는 살림) → <code>{pid, grpc_port}</code> 반환</li>
+      <li>시뮬 pyaedt가 같은 ansysedt grpc에 접속·실행</li>
+      <li><code>done/release</code> — 관리세션 재부착 → 다음 fixed toml 대기</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>시간 임계값</h3>
+    <table>
+      <tr><th>시점</th><th>동작</th></tr>
+      <tr><td><span class="tag ok">~40분</span></td><td>목표 — 마지막 패스 후 리포트 저장</td></tr>
+      <tr><td><span class="tag warn">60분</span></td><td>시뮬 자체 abort → 마지막 완료 패스 리포트</td></tr>
+      <tr><td><span class="tag bad">65분</span></td><td>edtmgr 백스톱 — pyaedt+ansysedt SIGKILL → 재기동</td></tr>
+    </table>
+    <p class="muted">대여 중 ansysedt 사망 시 즉시 감지·재기동(해당 대여 실패 처리).</p>
+  </div>
+</div>
+
+<h2>4. 자원 / 파일시스템 / 라이선스</h2>
+<div class="card">
+  <ul>
+    <li><code>/dev/shm</code>, <code>/tmp</code> <b>사용 금지</b> → 잡 전용 <code>job_tmpfs</code> / <code>job_disk</code></li>
+    <li>잡 시작 시 <code>/enroot/{USERNAME}_{SLURM_JOB_ID}</code> 생성, 잡 종료 시 삭제</li>
+    <li>라이선스는 충분 → 상한 미고려, edtmgr 관리세션으로 상시 점유만 유지</li>
+  </ul>
+</div>
+
+<h2>5. 부가 서비스</h2>
+<div class="grid c3">
+  <div class="card">
+    <h3>Intake :7875 <span class="tag new">신규</span></h3>
+    <p>peetsfea sweep toml + 개수 N 수신 → 랜덤 샘플 fixed toml × N → 대기 큐 적재 → 순차 시뮬 → DB.</p>
+  </div>
+  <div class="card">
+    <h3>대시보드 :8080 <span class="tag new">신규</span></h3>
+    <p>결과 DB(DuckDB)를 <b>읽기 전용</b>으로 시각화. 시뮬에 영향 주는 입력은 받지 않음.</p>
+  </div>
+  <div class="card">
+    <h3>아카이브 <span class="tag new">신규</span></h3>
+    <p>project_directory를 압축 저장. 2TB 버퍼 초과 시 FIFO 삭제. 복원이 느려도 무방.</p>
+  </div>
+</div>
+
+<h2>6. 구현 단계 (각 1/6)</h2>
+<div class="card">
+  <div class="phase now">
+    <div class="n">1</div>
+    <div>
+      <h4>코어 단일 컨테이너 <span class="tag ok">지금 구현 = GOAL.md</span></h4>
+      <p class="muted">단일 잡/컨테이너에서 edtmgr 10 + ansysedt 10 warm + 큐의 fixed toml 순차 실행.
+      60/65분 타이밍, /enroot lifecycle, peetsfea 0.3.2 warm-AEDT 접속.</p>
+    </div>
+  </div>
+  <div class="phase"><div class="n">2</div><div><h4>9잡 / 90 동시 오케스트레이션</h4>
+    <p class="muted">잡 9개 생애주기, 슬롯 90 풀, 5h 만료 시 폐기.</p></div></div>
+  <div class="phase"><div class="n">3</div><div><h4>로드 밸런서</h4>
+    <p class="muted">CPU/mem 피드백 제어(PID/EWMA) + 시작 스태거 + AIMD 백오프, 매시간 재최적화.</p></div></div>
+  <div class="phase"><div class="n">4</div><div><h4>Intake :7875</h4>
+    <p class="muted">sweep toml + N → 랜덤 샘플 → 큐 → 순차 시뮬 → DB.</p></div></div>
+  <div class="phase"><div class="n">5</div><div><h4>결과 DB + 대시보드 :8080</h4>
+    <p class="muted">DuckDB 스키마 확장 + read-only 대시보드.</p></div></div>
+  <div class="phase"><div class="n">6</div><div><h4>아카이브 저장소</h4>
+    <p class="muted">압축 저장 + 2TB FIFO eviction + (느린) 복원.</p></div></div>
+</div>
+
+<footer>
+  기준 문서: <code>PLANS/MASTER_PLAN.md</code> · Phase 1 범위: <code>GOAL.md</code> ·
+  결정 Q1~Q8 반영 · 레거시 lease/worker/bundle 파이프라인 대체.
+</footer>
+
+</div>
+</body>
+</html>
