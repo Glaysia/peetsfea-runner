@@ -225,7 +225,7 @@ EDT 라이선스 점유를 유지한다.
    정식 진입점), 엄격 타입체킹, 필요한 의존성은 pyproject에 추가, `.venv/bin/python`.
 
 ## 6. peetsfea-main 변경 계획 → 0.3.2
-> 상세 계약은 `PLANS/peetsfea_main.md`. 여기서는 요약.
+> main에 추가할 것+일차 이유 = `PLANS/peetsfea_main.md`, runner 쪽 연동 책임 = `PLANS/peetsfea_runner.md`. 여기서는 요약.
 시뮬 프리미티브(`ssw_random_sample_reports.run_ssw_random_sample_reports_from_toml_text`) 기준:
 1. **기존 warm ansysedt 접속:** edtmgr가 준 `(pid, grpc_port)` 세션에 접속해 실행
    (자체 ansysedt 기동/종료 금지).
