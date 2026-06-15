@@ -42,6 +42,7 @@ def _config_from_env() -> tuple[EdtServiceConfig, int]:
         work_dir=work_dir,
         reference_sweep_text=reference_sweep_text,
         enable_load_balancer=os.environ.get("EDT_DISABLE_LB") != "1",
+        baseline_batch_size=int(os.environ.get("EDT_BASELINE_BATCH", "1000")),
     )
     return config, max_sims
 

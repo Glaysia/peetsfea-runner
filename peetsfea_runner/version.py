@@ -41,4 +41,13 @@ def load_version(pyproject_path: Path | None = None) -> str:
 
 @lru_cache(maxsize=1)
 def get_version() -> str:
-    return load_version()
+    try:
+        return load_version()
+    except (FileNotFoundError, ValueError):
+        # 설치 환경(pyproject.toml 없음): 패키지 메타데이터로 폴백.
+        try:
+            from importlib.metadata import version as _meta_version
+
+            return _meta_version("peetsfea-runner")
+        except Exception:
+            return "0.0.0+unknown"
