@@ -40,8 +40,14 @@
   대기 큐 적재 → 슬롯 가용 시 순차 디스패치.
 
 ## 7. 버전 / 타입 기대값 (runner 쪽)
-- `EXPECTED_PEETSFEA_VERSION` = `"0.3.2"`
-  (`peetsfea_runner/single_simulation_api.py:19`, `single_simulation_remote.py:194`).
-- `pyproject.toml`의 peetsfea 핀을 0.3.2 태그가 나오면 `@0.3.2`로 올린다(현재 0.3.1).
-- sqsh 계약 버전 `_ENROOT_IMAGE_CONTRACT_VERSION`(`scheduler.py:138`) `...peetsfea031`→`...peetsfea032`.
+- `EXPECTED_PEETSFEA_VERSION` = `"0.3.3"`
+  (`peetsfea_runner/single_simulation_api.py:19`, `single_simulation_remote.py:194`). `pyproject` 핀 `@0.3.3`.
+- sqsh 계약 버전 `_ENROOT_IMAGE_CONTRACT_VERSION`(`scheduler.py:138`)은 0.3.3 이미지에 맞춰 bump 필요
+  (현 클러스터 이미지는 `2026-05-07-aedt-sqsh-v3-sshfs`로 더 오래됨 — 검증 finding).
 - runner는 strict 타입체킹(AGENTS.md §2)이므로 peetsfea가 `py.typed`를 제공해야 의존 코드 타입이 풀린다.
+
+## 8. enroot 이미지 런타임 의존 (runner/이미지 쪽)
+- peetsfea가 cadquery/OCP로 지오메트리를 빌드하므로 컨테이너에 **`libGL.so.1` 등 GL 라이브러리**가 필요하다
+  (없으면 `import cadquery`가 `ImportError: libGL.so.1`).
+- `enroot_image_bootstrap.sh`의 runtime_packages(현재 `openssh-client sshfs fuse3 ca-certificates`)에
+  **`libgl1`(+ 필요 시 `libglu1-mesa libxrender1 libxext6 libsm6`)** 추가. (로컬 e2e에서 런타임 apt 설치로 우회 확인.)

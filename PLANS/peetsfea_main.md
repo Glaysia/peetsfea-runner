@@ -44,6 +44,23 @@ runner ↔ peetsfea 0.3.2 점검 결과 계약이 거의 완벽히 맞는다:
   ② `DEFAULT_REFERENCE_TOML_PATH`를 `importlib.resources`로 해석(소스/설치 양쪽 동작).
 - 임시 우회(runner): 프리미티브에 `reference_toml_path=<실경로>` 명시 전달 가능(요청 시 디스패처 옵션 추가).
 
+### 0.3.3 실 프리미티브 e2e (2026-06-16) — 거의 통과, 데이터 패키징 2건 잔여
+내 SlotDispatcher가 peetsfea 0.3.3 **진짜 프리미티브**(`run_ssw_random_sample_reports_from_toml_text`)를
+edtmgr가 띄운 **warm ansysedt(grpc)** 에 물려 로컬 enroot 컨테이너에서 실행 → **지오메트리 빌드(cadquery)
+→ STEP export → AEDT import(port 56861) → HFSS 디자인 생성 → fr4 재질 추가까지 성공**. 두 가지에서 막힘:
+- ✅ reference toml 패키징: 0.3.3에서 `peetsfea/data/0.3.3_sweep.toml`로 **해결**(설치 환경 존재 확인).
+- 🔴 **ferrite 데이터셋 패키징(같은 버그 패턴, 미수정)**:
+  `NOTEBOOK_DATASET_IMPORT_PATH = Path(__file__).resolve().parents[4] / "notebooks" / "mu_p.tab"`
+  (`backend/pyaedt/ssw_ports.py:42`) → 설치 시 `<env>/lib/python3.12/notebooks/mu_p.tab`(없음)로 해석.
+  `mu_p.tab`은 repo `./notebooks/`에 있고 `src/` 밖이라 `include=["src","tests","entry"]`에 미동봉 →
+  실 solve 중 `FileNotFoundError`. **수정(peetsfea):** `mu_p.tab`을 패키지 데이터(`peetsfea/data/`)로 옮기고
+  경로를 package-relative/`importlib.resources`로(= 0.3.3의 sweep toml과 동일 처리).
+- 🔴 **cadquery extras 누락**: `[all]`이 `build123d`만 넣는데 코드는 `import cadquery`(`ssw_step.py:10`) →
+  `peetsfea[all]`로도 cadquery 미설치. **수정:** cadquery를 deps(또는 런타임 extra)에 추가. 또한 `[all]`은
+  dev 툴(pytest/ruff/mypy/pyright) 혼입 → 런타임 전용 extra 분리 권장.
+
+> runner/이미지 쪽 finding(libGL 등)은 여기 아님 → `PLANS/peetsfea_runner.md §8`.
+
 ## 협의 필요
 - grpc 접속에 `pid`까지 필요한지, `grpc_port`만으로 충분한지.
 - 범위 검증 엄밀도: `[start, end]` 상하한만 볼지, `count`·`is_int`(정수/실수 플래그)까지 정합 볼지.
