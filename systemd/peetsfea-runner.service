@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# 배포 체크아웃이 원래 위치. WorkingDirectory=cwd → peetsfea_runner를 여기서 import(FF로 최신 유지).
+# venv는 uv로 재생성(duckdb+psutil; 데몬은 control-plane만 돌아 경량이면 충분).
 WorkingDirectory=%h/mnt/8tb/peetsfea-runner
 # 컨트롤 플레인: 9 SLURM 잡 상시 유지 + 대시보드:8080 + Intake:7875 + 잡 재기동/10h 만료.
 ExecStart=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -m peetsfea_runner.edt_control_plane
@@ -22,7 +24,8 @@ RestartSec=10
 TimeoutStopSec=120s
 # 하드 킬 대비: 잔류 peetsfea-edt 잡을 safe-scancel로 정리(raw scancel 금지 — /enroot 잔재 방지).
 # graceful SIGTERM으로 slot_service trap이 /enroot를 청소할 시간을 주고, 끝내 안 죽으면 강제 종료.
-ExecStopPost=/usr/bin/ssh gate1-harry261 bash %h/edt-deploy/safe_scancel.sh
+# ssh가 gate $HOME에 랜딩하므로 상대경로(=gate의 ~/edt-deploy). %h(로컬 home)는 gate에서 무효라 쓰지 않는다.
+ExecStopPost=/usr/bin/ssh gate1-harry261 bash edt-deploy/safe_scancel.sh
 
 [Install]
 WantedBy=default.target
