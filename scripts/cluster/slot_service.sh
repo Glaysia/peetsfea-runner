@@ -13,7 +13,7 @@ echo "[slot] NODE=$(hostname) JOB=$SLURM_JOB_ID PART=$EDT_PARTITION LIC=$ANSYSLM
 ANSB=/opt/ohpc/pub/Electronics/v252
 DEPLOY=$HOME/edt-deploy
 VENVPY=$DEPLOY/venv/bin/python
-REF=$DEPLOY/venv/lib/python3.12/site-packages/peetsfea/data/0.3.4_sweep.toml
+REF=$DEPLOY/venv/lib/python3.12/site-packages/peetsfea/data/0.3.5_sweep.toml
 OUT=$DEPLOY/run_out/$SLURM_JOB_ID
 # compute node가 gate를 부르는 클러스터 내부명(로컬 ssh 별칭 gate1-harry261 아님!). 실측: n043→gate1 OK.
 GATE=${EDT_GATE_HOST:-gate1}

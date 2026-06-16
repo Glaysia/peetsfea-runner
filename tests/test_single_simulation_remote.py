@@ -21,7 +21,7 @@ def test_remote_server_script_calls_peetsfea_031_high_level_api() -> None:
     script = build_remote_single_simulation_server_script()
 
     compile(script, REMOTE_SERVER_FILENAME, "exec")
-    assert 'EXPECTED_PEETSFEA_VERSION = "0.3.4"' in script
+    assert 'EXPECTED_PEETSFEA_VERSION = "0.3.5"' in script
     assert "from peetsfea.ssw_random_sample_reports import run_ssw_random_sample_reports_from_toml_text" in script
     assert "run_ssw_random_sample_reports_from_toml_text" in script
     assert 'os.environ.get("SLURM_JOB_ID", "") or os.environ.get("PEETS_SLURM_JOB_ID", "")' in script

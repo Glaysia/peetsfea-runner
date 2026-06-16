@@ -5,7 +5,7 @@ ANSB=/opt/ohpc/pub/Electronics/v252
 DEPLOY=$HOME/edt-deploy
 VENVPY=$DEPLOY/venv/bin/python
 # 검증용: 고정 후보(우선순위 레인, ~14분 확정 solve). baseline은 끈다(random 무거운 후보 회피).
-FIXED=$DEPLOY/venv/lib/python3.12/site-packages/peetsfea/data/0.3.4_fixed.toml
+FIXED=$DEPLOY/venv/lib/python3.12/site-packages/peetsfea/data/0.3.5_fixed.toml
 OUT=$DEPLOY/run_out/$SLURM_JOB_ID
 mkdir -p "$OUT/work"
 C=edt-job-$SLURM_JOB_ID

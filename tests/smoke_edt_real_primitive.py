@@ -30,7 +30,7 @@ from peetsfea_runner.edtmgr import EdtManager  # noqa: E402
 
 
 def main() -> int:
-    candidate = (Path(peetsfea.__file__).resolve().parent / "data" / "0.3.4_fixed.toml").read_text(encoding="utf-8")
+    candidate = (Path(peetsfea.__file__).resolve().parent / "data" / "0.3.5_fixed.toml").read_text(encoding="utf-8")
     print(f"[real-e2e] peetsfea {peetsfea.__version__}, fixed candidate {len(candidate)} bytes", flush=True)
 
     work = Path(__file__).resolve().parent.parent / "build" / "e2e_real"

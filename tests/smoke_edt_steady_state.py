@@ -25,7 +25,7 @@ from peetsfea_runner.edt_service import EdtServiceConfig, build_steady_state_ser
 
 
 def main() -> int:
-    fixed = (Path(peetsfea.__file__).resolve().parent / "data" / "0.3.4_fixed.toml").read_text(encoding="utf-8")
+    fixed = (Path(peetsfea.__file__).resolve().parent / "data" / "0.3.5_fixed.toml").read_text(encoding="utf-8")
     work = Path(__file__).resolve().parent.parent / "build" / "e2e_steady"
     config = EdtServiceConfig(
         output_root=work / "out",

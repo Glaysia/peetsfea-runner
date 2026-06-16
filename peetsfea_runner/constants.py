@@ -27,8 +27,10 @@ MAX_SLOTS_PER_CONTAINER: Final[int] = 16
 # --- Phase 6: 아카이브 저장소 ------------------------------------------------
 # 묶음 압축 임계(20GB): 완료 project_dir들을 누적하다 이만큼 모이면 한 파일로 압축.
 ARCHIVE_BATCH_BYTES: Final[int] = 20 * 2**30
-# 버퍼 상한(2TB): 초과 시 가장 오래된 묶음 파일부터 FIFO 삭제.
+# 버퍼 상한(2TB): 초과 시 가장 오래된 묶음 파일부터 FIFO 삭제. (로컬 디스크 여유 확인 필요; EDT_BULK_BUFFER로 조정.)
 ARCHIVE_BUFFER_BYTES: Final[int] = 2 * 2**40
+# 7877 대용량 .aedt 백채널 포트(슈퍼컴 전용; 7876=결과 JSON, 7877=project_dir tar 스트림).
+BULK_TRANSFER_PORT: Final[int] = 7877
 
 EXIT_CODE_SUCCESS: Final[int] = 0
 EXIT_CODE_SSH_FAILURE: Final[int] = 10

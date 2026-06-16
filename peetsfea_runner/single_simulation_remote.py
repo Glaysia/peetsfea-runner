@@ -191,7 +191,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-EXPECTED_PEETSFEA_VERSION = "0.3.4"
+EXPECTED_PEETSFEA_VERSION = "0.3.5"
 
 
 class SimulationRequestError(ValueError):
