@@ -25,7 +25,13 @@ CSV=$(echo "$JIDS" | tr ' ' ,)
 echo "[safe-scancel] graceful SIGTERM → $JIDS (grace ${GRACE}s; slot_service trap이 /enroot 청소)"
 # --full: 배치 스크립트(slot_service bash) + 모든 자식(enroot/supervisor/ansysedt)에 SIGTERM.
 # supervisor가 워커를 내리고 enroot가 종료 → bash 포그라운드 복귀 → trap이 rm -rf /enroot/{job}.
-scancel --full --signal=TERM $JIDS 2>/dev/null
+# PENDING 잡은 /enroot 스크래치가 없으므로(아직 안 떴음) 즉시 일반 scancel로 큐에서 뺀다.
+# (scancel --signal=TERM은 프로세스가 없는 PENDING 잡을 큐에서 제거하지 못해 orphan으로 남는다.)
+PEND=$(squeue -h -j "$CSV" -t PD,CF -o "%i" 2>/dev/null | tr '\n' ' ')
+[ -n "${PEND// }" ] && { echo "[safe-scancel] PENDING 즉시 정리: $PEND"; scancel $PEND 2>/dev/null; }
+# RUNNING/COMPLETING 잡만 graceful SIGTERM → slot_service trap이 /enroot 청소.
+RUN=$(squeue -h -j "$CSV" -t R,CG -o "%i" 2>/dev/null | tr '\n' ' ')
+[ -n "${RUN// }" ] && scancel --full --signal=TERM $RUN 2>/dev/null
 
 deadline=$(( $(date +%s) + GRACE ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
