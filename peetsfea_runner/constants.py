@@ -9,12 +9,14 @@ DEFAULT_SLURM_JOB_TIME_LIMIT: Final[str] = "00:45:00"
 # 컨테이너당 상시 기동하는 ansysedt(=슬롯) 수.
 SLOTS_PER_CONTAINER: Final[int] = 10
 # 타이밍은 클러스터 CPU가 로컬 PC 대비 ~1.5배 느린 것을 반영해 모두 ×1.5 (실측: 1h→1.5h).
-# 시뮬 1개 소프트 목표(~60분). 정보용(워치독 강제 아님).
-SIM_SOFT_TARGET_SECONDS: Final[int] = 60 * 60
-# 시뮬 자체 하드 abort(90분). peetsfea가 스스로 마지막 패스 리포트를 남기고 종료해야 함.
-SIM_HARD_ABORT_SECONDS: Final[int] = 90 * 60
-# edtmgr 백스톱(98분): 대여한 채 이 시간까지 미반환이면 SIGKILL 후 재기동(하드 abort 90분 + 여유).
-EDTMGR_BACKSTOP_KILL_SECONDS: Final[int] = 98 * 60
+# 시뮬 1개 소프트 목표(~90분). 정보용(워치독 강제 아님).
+SIM_SOFT_TARGET_SECONDS: Final[int] = 90 * 60
+# 시뮬 자체 하드 abort(140분). peetsfea가 스스로 마지막 패스 리포트를 남기고 종료해야 함.
+# 0.3.6 + 88워커 만재에선 지오메트리+메시+솔브 누적이 90분을 넘는 *유효* 솔브가 많다(성공 평균 53·최대 91분).
+# 90/98분이면 슬로우테일이 BackstopTimeout으로 죽어 데이터가 0이 됐다(실측 실패의 최다 원인). 140/150분으로 올려 살린다.
+SIM_HARD_ABORT_SECONDS: Final[int] = 140 * 60
+# edtmgr 백스톱(150분): 대여한 채 이 시간까지 미반환이면 SIGKILL 후 재기동(하드 abort 140분 + 여유).
+EDTMGR_BACKSTOP_KILL_SECONDS: Final[int] = 150 * 60
 
 # --- Phase 2: 9잡 / ~100 동시 오케스트레이션 -------------------------------
 # 계정당 SLURM 잡 수(= 컨테이너 수).
