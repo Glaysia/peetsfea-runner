@@ -26,8 +26,9 @@ Clock = Callable[[], float]
 _ACTIVE_STATES = frozenset({"RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "RESIZING", "REQUEUED"})
 _SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 
-# 잡을 랜덤 분배하는 전 파티션(MASTER_PLAN §2.10 / Q5: 파티션별 성능 통계 자연 수집).
-DEFAULT_PARTITIONS: tuple[str, ...] = ("cpu1", "cpu2", "gpu1", "gpu2", "gpu3", "gpu4", "gpu5", "gpu6")
+# 잡을 랜덤 분배하는 파티션(MASTER_PLAN §2.10 / Q5: 파티션별 성능 통계 자연 수집).
+# cpu1·gpu5는 제외(포화/문제 파티션).
+DEFAULT_PARTITIONS: tuple[str, ...] = ("cpu2", "gpu1", "gpu2", "gpu3", "gpu4", "gpu6")
 
 
 @dataclass(frozen=True, slots=True)

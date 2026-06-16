@@ -60,12 +60,14 @@ def test_random_partition_distribution() -> None:
     # 전 파티션을 chooser로 순회 — 분배가 파티션 인자로 반영되는지.
     launcher = SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0)
     seen = set()
-    seq = iter(["cpu1", "cpu2", "gpu1", "gpu6"])
+    seq = iter(["cpu2", "gpu1", "gpu2", "gpu6"])
     launcher.partition_chooser = lambda parts: next(seq)
     for _ in range(4):
         launcher.submit(0)
         seen.add(runner.calls[-1][1].split("--partition=")[1].split("\n")[0])  # type: ignore[union-attr]
-    assert {"cpu1", "cpu2", "gpu1", "gpu6"} <= seen
+    assert {"cpu2", "gpu1", "gpu2", "gpu6"} <= seen
+    # 기본 파티션 후보에서 cpu1·gpu5 제외 확인
+    assert "cpu1" not in SlurmJobLauncher().partitions and "gpu5" not in SlurmJobLauncher().partitions
 
 
 def test_submit_failure_raises() -> None:
