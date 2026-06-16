@@ -127,3 +127,18 @@ pass(pass_*)만** 평탄화해 내보내고 **출력 리포트 데이터셋·tel
 - **gate 호스트명:** 로컬→gate 역터널은 ssh 별칭 `gate1-harry261`; **compute node→gate 정터널은 내부명 `gate1`**.
 - **cpu2 QOS:** `cpu2_limit` `MaxTRESPerNode cpu=64` → cpu2 잡은 cpus-per-task=64(>64면 영구 PENDING).
 - **아카이브 FIFO 상한:** 로컬 8TB 마운트 여유(~1.4TB)에 맞춰 `EDT_ARCHIVE_BUFFER_BYTES=1TB`(디스크 늘면 키울 것).
+
+## 7. 향후 추가할 로직 (미구현 — 문서화만)
+### 파티션 cooldown (pending-timeout 블랙리스트)
+**동기:** 잡을 전 파티션에 랜덤 분배하는데, 포화/문제 파티션(예: gpu5·cpu1이 `Resources`/`Priority`로 10분+
+PENDING)에 걸리면 시간만 버린다. 실측 사례: 잡이 제출 후 **10분 넘게 PENDING**으로 안 뜸.
+
+**규칙:**
+- 잡이 어떤 파티션에서 **N분(기본 10분) 넘게 PENDING**이면(못 뜨면) 그 잡을 **scancel**하고 즉시 다른 파티션으로
+  재제출.
+- 그 파티션을 **이후 K라운드(기본 10회 재제출) 동안 후보에서 제외(cooldown)**. cooldown 만료 후 다시 후보 포함.
+- 모든 파티션이 cooldown이면 가장 빨리 풀리는 것부터 완화(데드락 방지).
+
+**구현 위치(후속):** `SlurmJobLauncher`(제출 시각 기록 + `is_pending_too_long(handle)` + `partition_chooser`가
+cooldown 파티션 skip) + `JobOrchestrator.poll()`(pending-age 초과 잡을 kill→재제출, 파티션 cooldown 카운터 갱신).
+파티션별 PENDING/기동 통계는 어차피 자동 벤치마크로 쌓이므로 그걸 cooldown 판단에 활용 가능.
