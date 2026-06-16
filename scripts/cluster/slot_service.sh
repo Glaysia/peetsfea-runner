@@ -22,6 +22,12 @@ BULK=${EDT_BULK_PORT:-7877}          # 대용량 산출물(aedt) 백채널
 INGEST_URL="http://127.0.0.1:$PORT/ingest"
 C=edt-job-$SLURM_JOB_ID
 mkdir -p "$OUT/work"
+# GPU 노출은 gpu* 파티션에서만. cpu2 노드엔 NVIDIA 드라이버가 없어 NVIDIA_VISIBLE_DEVICES=all이면
+# enroot의 98-nvidia.sh가 'nvml driver not loaded'로 실패해 컨테이너가 3초 만에 죽는다(void=훅 비활성).
+case "$EDT_PARTITION" in
+  gpu*) NVD=all ;;
+  *)    NVD=void ;;
+esac
 
 # compute node → gate 정터널(결과 push 백채널 7876 + 산출물 7877). 둘 다 한 ssh로 포워딩.
 # 끊기면 즉시 죽고(ExitOnForwardFailure) 재기동 루프가 살린다.
@@ -42,7 +48,7 @@ enroot create --name "$C" "$HOME/runtime/enroot/aedt.sqsh" >/dev/null 2>&1
 enroot start --root --rw \
   --mount "$ANSB/AnsysEM:/mnt/AnsysEM" --mount "$ANSB:/ansys_inc/v252" \
   --mount "$ANSB/licensingclient:/mnt/licensingclient" --mount "$HOME:$HOME" \
-  --env ANSYSEM_ROOT252=/mnt/AnsysEM --env ANS_IGNOREOS=1 --env NVIDIA_VISIBLE_DEVICES=all \
+  --env ANSYSEM_ROOT252=/mnt/AnsysEM --env ANS_IGNOREOS=1 --env "NVIDIA_VISIBLE_DEVICES=$NVD" \
   --env "ANSYSLMD_LICENSE_FILE=$ANSYSLMD_LICENSE_FILE" \
   --env "EDT_OUTPUT_ROOT=$OUT" --env "EDT_RESULT_INGEST_URL=$INGEST_URL" --env "EDT_WORK_DIR=$OUT/work" \
   --env "EDT_BULK_PORT=$BULK" --env "EDT_BULK_HOST=127.0.0.1" \
