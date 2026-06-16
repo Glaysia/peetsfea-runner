@@ -4,8 +4,10 @@
 받지 않는다.
 - `GET /health` — 상태.
 - `GET /` — 누적 건수·최근 결과 요약(HTML).
-- `GET /results.csv` — 누적 결과 CSV(입력 파라미터 + 시간/패스/상태). 쿼리: `?since=`, `?terminal_state=`,
-  `?limit=`. 한 행 = 한 시뮬.
+- `GET /results.csv` — 누적 결과 CSV. **한 행 = 한 시뮬**이고 **무거운 `.aedt` 바이너리만 빼고 입출력
+  데이터셋 전부**를 담는다: 입력 설계점(`in_*`), 출력 telemetry(`tel_*`)·패스(`pass_*`)·**리포트 출력
+  데이터셋(`reports_json`)**, 설계 식별자·파티션/노드·에러·아카이브 참조. 그대로 분석/서로게이트 학습용
+  데이터셋으로 쓸 수 있다. 쿼리: `?since=`, `?terminal_state=`, `?limit=`.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .single_simulation_store import SingleSimulationResultStore
 
-# CSV 기본(스칼라) 컬럼 — 그 뒤에 입력 파라미터(in_*)/패스(pass_*)가 붙는다.
+# CSV 스칼라 메타 컬럼 — 그 뒤에 입력(in_*)/telemetry(tel_*)/패스(pass_*)/출력 데이터셋 컬럼이 붙는다.
 _BASE_COLUMNS = (
     "request_id",
     "terminal_state",
@@ -36,7 +38,14 @@ _BASE_COLUMNS = (
     "design_id",
     "point_hash",
     "dimension_count",
+    "input_toml_hash",
+    "error_stage",
+    "error_type",
+    "error_message",
 )
+
+# 출력 리포트 데이터셋·아카이브 참조 컬럼(평탄화 컬럼 뒤, 마지막에).
+_TRAILING_COLUMNS = ("reports_json", "csv_paths_json", "artifact_references_json")
 
 
 def _loads(value: Any) -> dict[str, Any]:
@@ -49,22 +58,49 @@ def _loads(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _flatten_scalar(value: Any) -> Any:
+    """스칼라는 그대로, 비스칼라(리스트/딕트)는 JSON 문자열로(셀에 안전하게)."""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
 def rows_to_csv(rows: Sequence[Mapping[str, Any]]) -> str:
-    """결과 행들을 CSV 텍스트로. 입력 파라미터(point_values)는 `in_<key>`, 패스는 `pass_<setup>`로 평탄화."""
+    """결과 행들을 CSV로. **무거운 `.aedt`만 빼고 입출력 데이터셋 전부** 포함(한 행 = 한 시뮬).
+
+    - 입력: `in_<param>`(point_values).
+    - 출력: `tel_<k>`(solve_telemetry: gpu_used/solver_cores/시간 등), `pass_<setup>`(setup_pass_counts),
+      `reports_json`(= csv_text_by_report 출력 리포트 데이터셋, 손실 없이 임베드).
+    - 메타/참조: 설계 식별자·파티션/노드·에러·`csv_paths_json`·`artifact_references_json`(아카이브 위치).
+    """
     in_keys = sorted({k for r in rows for k in _loads(r.get("point_values_json"))})
+    tel_keys = sorted({k for r in rows for k in _loads(r.get("solve_telemetry_json"))})
     pass_keys = sorted({k for r in rows for k in _loads(r.get("setup_pass_counts_json"))})
-    fieldnames = [*_BASE_COLUMNS, *(f"in_{k}" for k in in_keys), *(f"pass_{k}" for k in pass_keys)]
+    fieldnames = [
+        *_BASE_COLUMNS,
+        *(f"in_{k}" for k in in_keys),
+        *(f"tel_{k}" for k in tel_keys),
+        *(f"pass_{k}" for k in pass_keys),
+        *_TRAILING_COLUMNS,
+    ]
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     for r in rows:
         point_values = _loads(r.get("point_values_json"))
+        telemetry = _loads(r.get("solve_telemetry_json"))
         pass_counts = _loads(r.get("setup_pass_counts_json"))
         row: dict[str, Any] = {col: r.get(col) for col in _BASE_COLUMNS}
         for k in in_keys:
-            row[f"in_{k}"] = point_values.get(k)
+            row[f"in_{k}"] = _flatten_scalar(point_values.get(k))
+        for k in tel_keys:
+            row[f"tel_{k}"] = _flatten_scalar(telemetry.get(k))
         for k in pass_keys:
-            row[f"pass_{k}"] = pass_counts.get(k)
+            row[f"pass_{k}"] = _flatten_scalar(pass_counts.get(k))
+        # 출력 리포트 데이터셋: csv_text_by_report 원문을 손실 없이 임베드(.aedt만 제외).
+        row["reports_json"] = r.get("csv_text_by_report_json") or ""
+        row["csv_paths_json"] = r.get("csv_paths_json") or ""
+        row["artifact_references_json"] = r.get("artifact_references_json") or ""
         writer.writerow(row)
     return buffer.getvalue()
 

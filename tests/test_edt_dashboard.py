@@ -24,6 +24,8 @@ def _seed(store: SingleSimulationResultStore, rid: str, k_in: float, passes: int
                 "design_id": f"d_{rid}",
                 "point_values": {"coil_w": k_in, "ferrite": 1},
                 "setup_pass_counts": {"Setup1": passes},
+                "solve_telemetry": {"gpu_used": True, "solver_cores": 4, "solve_seconds": 812.5},
+                "csv_text_by_report": {"S11": f"freq,db\n1e9,-12.3\n2e9,-15.1  # {rid}\n"},
             },
         }
     )
@@ -42,6 +44,22 @@ def test_fetch_rows_and_csv_flattens_inputs(tmp_path: Path) -> None:
     assert "request_id" in header and "in_coil_w" in header and "in_ferrite" in header and "pass_Setup1" in header
     # 값이 행에 들어갔는지
     assert "1.5" in csv_text and "2.5" in csv_text and "r0" in csv_text
+
+
+def test_csv_includes_full_output_dataset(tmp_path: Path) -> None:
+    # 요구사항: 무거운 .aedt만 빼고 입출력 데이터셋 전부 포함(telemetry + 리포트 출력 데이터).
+    store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
+    store.initialize()
+    _seed(store, "r0", 1.5, 12)
+
+    csv_text = rows_to_csv(store.fetch_rows())
+    header = csv_text.splitlines()[0]
+    # 출력 telemetry 컬럼(gpu/solver_cores/시간) — 자동 GPU 벤치마크의 원천.
+    assert "tel_gpu_used" in header and "tel_solver_cores" in header and "tel_solve_seconds" in header
+    # 출력 리포트 데이터셋(csv_text_by_report)이 손실 없이 임베드.
+    assert "reports_json" in header
+    assert "S11" in csv_text and "-12.3" in csv_text  # 실제 리포트 출력값이 CSV에 있음
+    assert "4" in csv_text and "812.5" in csv_text  # solver_cores, solve_seconds
 
 
 def test_fetch_rows_filter_terminal_state(tmp_path: Path) -> None:

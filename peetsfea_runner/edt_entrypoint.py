@@ -53,7 +53,8 @@ def _config_from_env() -> tuple[EdtServiceConfig, int]:
         work_dir=work_dir,
         reference_sweep_text=reference_sweep_text,
         enable_load_balancer=os.environ.get("EDT_DISABLE_LB") != "1",
-        baseline_batch_size=int(os.environ.get("EDT_BASELINE_BATCH", "1000")),
+        baseline_batch_size=int(os.environ.get("EDT_BASELINE_BATCH", "16")),  # 작은 청크(백그라운드 보충)
+        baseline_low_watermark=int(os.environ.get("EDT_BASELINE_WATERMARK", "64")),
         partition=os.environ.get("EDT_PARTITION", ""),  # 자동 벤치마크용 파티션/노드
         node=socket.gethostname(),
     )
@@ -82,6 +83,8 @@ def run_slot_service(service: SteadyStateService, *, max_sims: int = 0) -> int:
         threading.Thread(target=_watch, name="edt-maxsims", daemon=True).start()
 
     processed = dispatcher.run()
+    if service.baseline_refiller is not None:
+        service.baseline_refiller.stop()  # 백그라운드 샘플 워커 정지.
     for slot in dispatcher.slots:
         slot.backend.kill()
     return processed

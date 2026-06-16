@@ -18,7 +18,7 @@ from .edt_dispatcher import SimulationPrimitive, SlotDispatcher
 from .edt_intake import IntakeService, make_baseline_sampler
 from .edt_load import AdmissionController, LoadSampler, psutil_load_sampler
 from .edtmgr import EdtManager
-from .edt_queue import TomlQueue, TwoLaneQueue, load_queue_items_from_dir
+from .edt_queue import BaselineRefiller, TomlQueue, TwoLaneQueue, load_queue_items_from_dir
 from .single_simulation_store import SingleSimulationResultStore
 
 
@@ -43,7 +43,10 @@ class EdtServiceConfig:
     # Phase 3/4: baseline 샘플러용 기준 sweep 텍스트(없으면 baseline 휴면), 로드밸런서 on/off.
     reference_sweep_text: str | None = None
     enable_load_balancer: bool = True
-    baseline_batch_size: int = 1000
+    # baseline 청크 크기(작게! 샘플은 후보마다 geometry를 빌드해 느리다 — 백그라운드 워커가 청크 단위로
+    # 채워 슬롯이 즉시 solve 시작하게 한다)와 저수위 임계.
+    baseline_batch_size: int = 16
+    baseline_low_watermark: int = 64
     partition: str = ""  # 자동 벤치마크용: 잡이 떠 있는 파티션/노드 기록
     node: str = ""
 
@@ -99,7 +102,7 @@ class SteadyStateService:
     """Phase 3+4 컨테이너-측 서비스: 2-레인 큐 + admission + 디스패처 + intake + 결과 sink.
 
     `store`는 로컬 단독 모드에서만 채워진다. 컨테이너에선 결과를 ingest(:7876)로 push하므로
-    DuckDB를 만들지 않고 `store`는 None.
+    DuckDB를 만들지 않고 `store`는 None. `baseline_refiller`는 baseline 레인을 백그라운드로 채운다.
     """
 
     dispatcher: SlotDispatcher
@@ -107,6 +110,7 @@ class SteadyStateService:
     store: SingleSimulationResultStore | None
     intake: IntakeService
     admission: AdmissionController | None
+    baseline_refiller: BaselineRefiller | None = None
 
 
 def build_steady_state_service(
@@ -132,12 +136,16 @@ def build_steady_state_service(
         store.initialize()
         record = store.record_envelope
 
-    baseline = (
-        make_baseline_sampler(config.reference_sweep_text, batch_size=config.baseline_batch_size)
-        if config.reference_sweep_text
-        else None
-    )
-    queue = TwoLaneQueue(baseline_sampler=baseline)
+    queue = TwoLaneQueue()
+    # baseline refill은 **백그라운드 워커**로(디스패치 경로에서 분리). 샘플은 후보마다 geometry를 빌드해
+    # 느리므로 슬롯에서 동기 호출하면 안 된다(문제 1). 청크는 작게, 저수위 때만 채운다.
+    baseline_refiller: BaselineRefiller | None = None
+    if config.reference_sweep_text:
+        sampler = make_baseline_sampler(config.reference_sweep_text, batch_size=config.baseline_batch_size)
+        baseline_refiller = BaselineRefiller(
+            queue=queue, sampler=sampler, low_watermark=config.baseline_low_watermark
+        )
+        baseline_refiller.start()
 
     admission = (
         AdmissionController(load_sampler=load_sampler or psutil_load_sampler, clock=time.monotonic)
@@ -158,7 +166,14 @@ def build_steady_state_service(
         admission=admission,
         drain=False,
     )
-    return SteadyStateService(dispatcher=dispatcher, queue=queue, store=store, intake=IntakeService(queue=queue), admission=admission)
+    return SteadyStateService(
+        dispatcher=dispatcher,
+        queue=queue,
+        store=store,
+        intake=IntakeService(queue=queue),
+        admission=admission,
+        baseline_refiller=baseline_refiller,
+    )
 
 
 __all__ = [

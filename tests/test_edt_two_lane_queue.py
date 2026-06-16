@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from peetsfea_runner.edt_queue import QueueItem, TwoLaneQueue
+import threading
+
+from peetsfea_runner.edt_queue import BaselineRefiller, QueueItem, TwoLaneQueue
 
 
 def _item(rid: str) -> QueueItem:
@@ -45,23 +47,57 @@ def test_baseline_empty_serves_priority_even_on_floor_tick() -> None:
     assert q.get().request_id == "P1"  # type: ignore[union-attr]
 
 
-def test_baseline_refill_when_low() -> None:
+def test_get_never_samples_inline() -> None:
+    # 핵심 회귀: get()은 절대 샘플링하지 않는다(샘플은 느린 geometry 빌드 → 슬롯 기아 유발).
+    q = TwoLaneQueue(baseline_floor_percent=100)
+    assert q.get() is None  # baseline 비어도 인라인 샘플 없이 즉시 None
+
+
+def test_baseline_refiller_tops_up_in_background() -> None:
     calls = {"n": 0}
+    lock = threading.Lock()
 
     def sampler() -> list[QueueItem]:
-        calls["n"] += 1
-        base = calls["n"] * 1000
-        return [_item(f"B{base + i}") for i in range(1000)]
+        with lock:
+            calls["n"] += 1
+            base = calls["n"] * 100
+        return [_item(f"B{base + i}") for i in range(8)]  # 작은 청크
 
-    q = TwoLaneQueue(baseline_sampler=sampler, baseline_low_watermark=200, baseline_floor_percent=100)
-    # 첫 get에서 baseline 0 < 200 → 리필(1000).
-    first = q.get()
-    assert first is not None and first.request_id.startswith("B")
-    assert calls["n"] == 1
-    _prio_depth, base_depth = q.depths()
-    assert base_depth == 999  # 1000 리필 - 1 소비
-    # 800개 더 빼면 199 < 200 → 다음 get에서 재리필.
-    for _ in range(800):
-        q.get()
-    q.get()  # 트리거
-    assert calls["n"] == 2
+    q = TwoLaneQueue(baseline_floor_percent=0)
+    refiller = BaselineRefiller(queue=q, sampler=sampler, low_watermark=16, poll_seconds=0.01)
+    refiller.start()
+    try:
+        # 백그라운드 워커가 저수위(16)까지 채운다(청크 8 → 최소 2회 호출).
+        for _ in range(200):
+            _, depth = q.depths()
+            if depth >= 16:
+                break
+            threading.Event().wait(0.01)
+        _, depth = q.depths()
+        assert depth >= 16
+        assert calls["n"] >= 2
+        assert q.get() is not None  # 슬롯이 즉시 소비 가능
+    finally:
+        refiller.stop()
+
+
+def test_baseline_refiller_survives_sampler_errors() -> None:
+    state = {"n": 0}
+
+    def flaky() -> list[QueueItem]:
+        state["n"] += 1
+        if state["n"] <= 2:
+            raise RuntimeError("sample failed")
+        return [_item(f"B{state['n']}")]
+
+    q = TwoLaneQueue(baseline_floor_percent=0)
+    refiller = BaselineRefiller(queue=q, sampler=flaky, low_watermark=1, poll_seconds=0.01)
+    refiller.start()
+    try:
+        for _ in range(200):
+            if q.depths()[1] >= 1:
+                break
+            threading.Event().wait(0.01)
+        assert q.depths()[1] >= 1  # 초기 실패를 견디고 결국 채움
+    finally:
+        refiller.stop()
