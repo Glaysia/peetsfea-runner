@@ -28,6 +28,7 @@ from .edt_dashboard import start_dashboard_server
 from .edt_intake import IntakeService, start_intake_server
 from .edt_orchestrator import JobLauncher, JobOrchestrator
 from .edt_queue import TwoLaneQueue
+from .edt_resources import ResourcePoller
 from .edt_result_ingest import DEFAULT_INGEST_PORT, start_result_ingest_server
 from .edt_slurm_launcher import SlurmJobLauncher
 from .edt_ssh_tunnel import SshTunnel, reverse_tunnel_argv
@@ -62,6 +63,7 @@ class ControlPlane:
     ssh_host: str = "gate1-harry261"
     ingest_port: int = DEFAULT_INGEST_PORT
     bulk_port: int = DEFAULT_BULK_PORT
+    resource_poller: ResourcePoller | None = None  # 컨테이너별 실시간 부하(대시보드 /api/resources).
     enable_ingest_tunnel: bool = True  # 테스트에선 ssh 역터널 비활성.
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _servers: list[ThreadingHTTPServer] = field(default_factory=list, init=False, repr=False)
@@ -79,7 +81,12 @@ class ControlPlane:
         except ValueError:
             pass
 
-        dashboard = start_dashboard_server(store=self.store, port=self.dashboard_port)
+        # 컨테이너별 실시간 부하 폴러 시작(있으면) → 대시보드 /api/resources.
+        provider = None
+        if self.resource_poller is not None:
+            self.resource_poller.start()
+            provider = self.resource_poller.snapshot
+        dashboard = start_dashboard_server(store=self.store, port=self.dashboard_port, resource_provider=provider)
         intake_server = start_intake_server(service=self.intake, port=self.intake_port)
         # 결과 ingest(:7876): 슈퍼컴 컨테이너가 역터널로 push → 로컬 단일 DB(대시보드와 동일 store).
         ingest_server = start_result_ingest_server(store=self.store, port=self.ingest_port)
@@ -103,6 +110,8 @@ class ControlPlane:
                 self._stop.wait(self.poll_interval_seconds)
         finally:
             self.orchestrator.shutdown()
+            if self.resource_poller is not None:
+                self.resource_poller.stop()
             for tunnel in self._tunnels:
                 tunnel.stop()
             for server in self._servers:
@@ -135,6 +144,7 @@ def build_control_plane(config: ControlPlaneConfig, *, launcher: JobLauncher | N
         ssh_host=config.ssh_host,
         ingest_port=config.ingest_port,
         bulk_port=config.bulk_port,
+        resource_poller=ResourcePoller(ssh_host=config.ssh_host),
     )
 
 

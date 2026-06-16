@@ -154,5 +154,27 @@ class SingleSimulationResultStore:
             columns = [column[0] for column in result.description]
             return dict(zip(columns, row, strict=True))
 
+    def state_counts(self) -> dict[str, int]:
+        """terminal_state별 건수(경량 집계 — 전체 행을 끌어오지 않음). 대시보드 요약용."""
+        self.initialize()
+        with duckdb.connect(str(self.db_path)) as connection:
+            rows = connection.execute(
+                "SELECT terminal_state, count(*) FROM single_simulation_results GROUP BY 1"
+            ).fetchall()
+        return {str(state): int(n) for state, n in rows}
+
+    def count_since(self, since: str, *, terminal_state: str | None = None) -> int:
+        """`finished_at >= since` 건수(처리량 추정용). 선택적으로 상태 필터."""
+        self.initialize()
+        clauses = ["finished_at >= ?"]
+        params: list[Any] = [since]
+        if terminal_state:
+            clauses.append("terminal_state = ?")
+            params.append(terminal_state)
+        sql = "SELECT count(*) FROM single_simulation_results WHERE " + " AND ".join(clauses)
+        with duckdb.connect(str(self.db_path)) as connection:
+            row = connection.execute(sql, params).fetchone()
+        return int(row[0]) if row else 0
+
 
 __all__ = ["SingleSimulationResultStore"]
