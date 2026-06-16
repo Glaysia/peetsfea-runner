@@ -25,8 +25,10 @@ echo '###JOBS'
 squeue --me -h -o '%i|%j|%T|%M|%N|%P|%C' 2>/dev/null | awk -F'|' -v p="$P" '$2 ~ p'
 echo '###NODES'
 for n in $(squeue --me -h -o '%N %T %j' 2>/dev/null | awk -v p="$P" '$2=="RUNNING" && $3 ~ p{print $1}' | sort -u); do
-  scontrol show node "$n" 2>/dev/null | tr '\n' ' ' | \
-    sed -nE 's/.*NodeName=([^ ]+).*CPUAlloc=([0-9]+).*CPUTot=([0-9]+).*CPULoad=([0-9.]+).*RealMemory=([0-9]+).*AllocMem=([0-9]+).*FreeMem=([0-9]+).*/\1|\4|\2|\3|\7|\5/p'
+  # 필드별 독립 추출(순서 무관). 하나의 순서고정 정규식은 노드마다 필드 순서/유무가 달라 대부분 실패했다.
+  L=$(scontrol show node "$n" -o 2>/dev/null)
+  g() { printf '%s' "$L" | grep -oP "$1=\K[^ ]+" | head -1; }
+  echo "$n|$(g CPULoad)|$(g CPUAlloc)|$(g CPUTot)|$(g FreeMem)|$(g RealMemory)"
 done
 echo '###LIC'
 LM=/opt/ohpc/pub/Electronics/v252/licensingclient/linx64/lmutil

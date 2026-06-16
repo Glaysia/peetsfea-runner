@@ -16,10 +16,14 @@ from __future__ import annotations
 import signal
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import FrameType
+
+# 종료 시 아카이브 flush(대용량 tar.gz 압축)에 줄 최대 시간. 초과하면 다음 기동에 위임(systemd 'failed' 방지).
+SHUTDOWN_FLUSH_DEADLINE_SECONDS = 45.0
 
 from .constants import ARCHIVE_BUFFER_BYTES, JOBS_PER_ACCOUNT
 from .edt_archive import ArchiveStore
@@ -109,14 +113,25 @@ class ControlPlane:
                 self.orchestrator.poll()  # 죽은 잡 재기동, 10h 만료 폐기·재기동
                 self._stop.wait(self.poll_interval_seconds)
         finally:
-            self.orchestrator.shutdown()
+            # 각 단계는 독립적으로 best-effort: 하나가 실패/지연해도 나머지 teardown을 막지 않는다.
+            def _safe(label: str, fn: "Callable[[], object]") -> None:
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001 — teardown은 절대 예외로 중단되면 안 된다.
+                    pass
+
+            _safe("orchestrator", self.orchestrator.shutdown)  # 잡 scancel(TERM); ssh ConnectTimeout=10
             if self.resource_poller is not None:
-                self.resource_poller.stop()
+                _safe("poller", self.resource_poller.stop)
             for tunnel in self._tunnels:
-                tunnel.stop()
+                _safe("tunnel", tunnel.stop)
             for server in self._servers:
-                server.shutdown()
-            self.archive_store.flush()  # 종료 시 대기 중인 묶음 강제 압축(유실 방지).
+                _safe("server", server.shutdown)
+            # 아카이브 flush(대기 묶음 tar.gz 압축)는 수 분 걸릴 수 있어 systemd TimeoutStopSec를 넘기면
+            # 서비스가 'failed'로 죽는다. 별도 스레드 + 시한으로 감싸 시한 초과 시 다음 기동에 위임(유실 아님).
+            flusher = threading.Thread(target=lambda: _safe("flush", self.archive_store.flush), daemon=True)
+            flusher.start()
+            flusher.join(timeout=SHUTDOWN_FLUSH_DEADLINE_SECONDS)
 
     def _on_signal(self, signum: int, frame: FrameType | None) -> None:
         self.stop()

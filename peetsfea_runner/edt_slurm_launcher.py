@@ -63,6 +63,9 @@ class SlurmJobLauncher:
     # 48로 운영(여유). 그 외 파티션(QOS normal)은 무제한이라 32.
     cpus_cpu2: int = 48
     cpus_other: int = 32
+    # gpu* 파티션은 노드당 GPU 4개. --gres=gpu:N을 요청해야 컨테이너가 GPU를 보고(peetsfea 0.3.6 자동감지),
+    # 안 그러면 0 GPU 할당 → CPU fallback(느림). cpu2는 GPU 없으니 요청 안 한다.
+    gres_gpu_count: int = 4
     mem: str = "480G"  # 전 파티션 노드 ≥768GB라 적재 가능
     job_name_prefix: str = "peetsfea-edt"
     job_command: str = "echo placeholder-job; sleep 60"  # 실서비스는 enroot+entrypoint로 교체
@@ -77,7 +80,12 @@ class SlurmJobLauncher:
     def _cpus_for(self, partition: str) -> int:
         return self.cpus_cpu2 if partition == "cpu2" else self.cpus_other
 
+    def _gpu_count_for(self, partition: str) -> int:
+        return self.gres_gpu_count if partition.startswith("gpu") else 0
+
     def _sbatch_script(self, job_index: int, partition: str, cpus: int) -> str:
+        gpus = self._gpu_count_for(partition)
+        gres_line = f"#SBATCH --gres=gpu:{gpus}\n" if gpus > 0 else ""
         return (
             "#!/bin/bash\n"
             f"#SBATCH --job-name={self.job_name_prefix}-{job_index}\n"
@@ -85,9 +93,12 @@ class SlurmJobLauncher:
             f"#SBATCH --time={self.time_limit}\n"
             "#SBATCH --nodes=1 --ntasks=1\n"
             f"#SBATCH --cpus-per-task={cpus}\n"
+            f"{gres_line}"
             f"#SBATCH --mem={self.mem}\n"
             f"export EDT_JOB_INDEX={job_index}\n"
             f"export EDT_PARTITION={partition}\n"
+            # EDT_GPU_COUNT: 컨테이너 supervisor가 워커별 CUDA_VISIBLE_DEVICES=index%N 핀닝에 사용(GPU 분산).
+            f"export EDT_GPU_COUNT={gpus}\n"
             f"{self.job_command}\n"
         )
 

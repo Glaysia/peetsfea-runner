@@ -39,3 +39,26 @@ def test_worker_seed_ranges_do_not_overlap() -> None:
     starts = [int(_worker_env({"EDT_OUTPUT_ROOT": "/o"}, i, Path("/o"), stride)["EDT_BASELINE_SEED_START"]) for i in range(11)]
     assert starts == sorted(starts) and len(set(starts)) == 11
     assert all(starts[i + 1] - starts[i] == stride for i in range(len(starts) - 1))
+
+
+def test_seed_base_partitions_jobs_disjoint() -> None:
+    # 고질병 수정: job_index 반영 seed_base로 잡 간 seed 대역이 겹치지 않는다(9배 중복탐색 제거).
+    stride, slots = 1_000_000, 11
+    base = {"EDT_OUTPUT_ROOT": "/o"}
+    seeds_job0 = {int(_worker_env(base, i, Path("/o"), stride, seed_base=0)["EDT_BASELINE_SEED_START"]) for i in range(slots)}
+    seeds_job1 = {
+        int(_worker_env(base, i, Path("/o"), stride, seed_base=1 * slots * stride)["EDT_BASELINE_SEED_START"])
+        for i in range(slots)
+    }
+    assert seeds_job0.isdisjoint(seeds_job1)
+    assert min(seeds_job1) >= max(seeds_job0) + stride  # 잡1 대역이 잡0 대역 위로 분리
+
+
+def test_worker_env_gpu_pinning_round_robin() -> None:
+    base = {"EDT_OUTPUT_ROOT": "/o"}
+    # gpu_count=4 → 워커를 GPU 0..3에 라운드로빈 핀닝(VRAM OOM·GPU0 쏠림 방지).
+    assert _worker_env(base, 0, Path("/o"), 1, gpu_count=4)["CUDA_VISIBLE_DEVICES"] == "0"
+    assert _worker_env(base, 5, Path("/o"), 1, gpu_count=4)["CUDA_VISIBLE_DEVICES"] == "1"
+    assert _worker_env(base, 11, Path("/o"), 1, gpu_count=4)["CUDA_VISIBLE_DEVICES"] == "3"
+    # gpu_count=0(cpu2) → CUDA_VISIBLE_DEVICES 미설정(CPU fallback).
+    assert "CUDA_VISIBLE_DEVICES" not in _worker_env(base, 0, Path("/o"), 1, gpu_count=0)

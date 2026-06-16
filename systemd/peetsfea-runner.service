@@ -21,7 +21,9 @@ Environment=EDT_INTAKE_PORT=7875
 Restart=always
 RestartSec=10
 # 상시 가동: 실행시간 상한 없음(잡 수명 10h는 오케스트레이터가 내부에서 관리).
-TimeoutStopSec=120s
+# teardown은 control_plane이 단계별 best-effort + 아카이브 flush 45s 시한으로 자체 제한(코드).
+# 그래도 'stop→failed'가 안 나게 충분한 여유를 준다(과거 120s 초과로 SIGKILL→failed 발생).
+TimeoutStopSec=200s
 # 하드 킬 대비: 잔류 peetsfea-edt 잡을 safe-scancel로 정리(raw scancel 금지 — /enroot 잔재 방지).
 # graceful SIGTERM으로 slot_service trap이 /enroot를 청소할 시간을 주고, 끝내 안 죽으면 강제 종료.
 # ssh가 gate $HOME에 랜딩하므로 상대경로(=gate의 ~/edt-deploy). %h(로컬 home)는 gate에서 무효라 쓰지 않는다.

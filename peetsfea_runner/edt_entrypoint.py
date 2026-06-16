@@ -23,6 +23,8 @@
   EDT_DISABLE_LB    "1"이면 로드밸런서 끄기
   EDT_WORKER_STAGGER_SECONDS  워커 스폰 간격(기본 15s; AEDT 동시 콜드스타트 회피)
   EDT_WORKER_SEED_STRIDE  워커별 baseline seed 간격(기본 1e6; request_id 충돌 방지)
+  EDT_JOB_INDEX     이 잡의 인덱스(0..N-1). seed 대역을 잡마다 분리(잡 간 중복탐색/덮어쓰기 방지).
+  EDT_GPU_COUNT     이 노드에 할당된 GPU 수(>0이면 워커별 CUDA_VISIBLE_DEVICES=index%N로 GPU 분산 핀닝).
 """
 
 from __future__ import annotations
@@ -102,22 +104,40 @@ def run_slot_service(service: SteadyStateService, *, max_sims: int = 0) -> int:
     return processed
 
 
-def _worker_env(base_env: Mapping[str, str], index: int, output_root: Path, seed_stride: int) -> dict[str, str]:
-    """단일슬롯 워커용 환경: 워커마다 출력 하위디렉토리·seed 범위를 분리(request_id 충돌 방지)."""
+def _worker_env(
+    base_env: Mapping[str, str],
+    index: int,
+    output_root: Path,
+    seed_stride: int,
+    *,
+    seed_base: int = 0,
+    gpu_count: int = 0,
+) -> dict[str, str]:
+    """단일슬롯 워커용 환경: 워커마다 출력 하위디렉토리·seed 대역·GPU를 분리.
+
+    seed 대역 = seed_base + index*seed_stride. seed_base에 잡 인덱스를 반영해(run_supervisor) **잡 간**
+    중복 탐색/덮어쓰기를 막는다. GPU가 있으면 CUDA_VISIBLE_DEVICES로 워커를 GPU에 분산 핀닝한다.
+    """
     env = dict(base_env)
     env["EDT_WORKER_INDEX"] = str(index)
     env["EDT_SLOT_COUNT"] = "1"
     env["EDT_OUTPUT_ROOT"] = str(output_root / f"worker_{index:02d}")  # 워커별 출력 디렉토리
-    env["EDT_BASELINE_SEED_START"] = str(index * seed_stride)  # 워커별 seed 범위 → request_id 충돌 방지
+    env["EDT_BASELINE_SEED_START"] = str(seed_base + index * seed_stride)  # 잡·워커별 disjoint seed 대역
+    if gpu_count > 0:
+        # 워커를 물리 GPU에 라운드로빈 핀닝 → 11워커가 GPU 0..N-1에 분산(GPU0 쏠림·VRAM OOM 방지).
+        # peetsfea는 nvidia-smi로 GPU를 감지하지만, 실제 HFSS solve는 CUDA_VISIBLE_DEVICES에 갇힌다.
+        env["CUDA_VISIBLE_DEVICES"] = str(index % gpu_count)
     env.pop("EDT_WORK_DIR", None)  # 각 워커가 자기 output_root/work를 쓰게(공유 금지)
     env.pop("EDT_PRIORITY_TOML", None)  # 우선순위는 호스트측; 워커는 baseline 자기공급
     env.pop("EDT_MAX_SIMS", None)
     return env
 
 
-def _spawn_worker(index: int, output_root: Path, seed_stride: int) -> subprocess.Popen[bytes]:
+def _spawn_worker(
+    index: int, output_root: Path, seed_stride: int, *, seed_base: int = 0, gpu_count: int = 0
+) -> subprocess.Popen[bytes]:
     """단일슬롯 워커를 별도 OS 프로세스로 spawn. 각 워커 = AEDT 1개 = pyaedt Desktop 1개(충돌 없음)."""
-    env = _worker_env(os.environ, index, output_root, seed_stride)
+    env = _worker_env(os.environ, index, output_root, seed_stride, seed_base=seed_base, gpu_count=gpu_count)
     return subprocess.Popen([sys.executable, "-m", "peetsfea_runner.edt_entrypoint"], env=env)
 
 
@@ -129,6 +149,11 @@ def run_supervisor(slot_count: int) -> int:
     output_root = Path(os.environ["EDT_OUTPUT_ROOT"]).expanduser()
     stagger = float(os.environ.get("EDT_WORKER_STAGGER_SECONDS", "15"))
     seed_stride = int(os.environ.get("EDT_WORKER_SEED_STRIDE", "1000000"))
+    gpu_count = int(os.environ.get("EDT_GPU_COUNT", "0"))
+    # 잡 인덱스로 seed 대역을 잡마다 분리: 잡 j의 워커들은 [j*slot_count*stride, (j+1)*slot_count*stride).
+    # 이게 없으면 모든 잡의 worker i가 같은 seed를 탐색 → N배 중복 계산·서로 덮어씀(고질적 낭비).
+    job_index = int(os.environ.get("EDT_JOB_INDEX", "0"))
+    seed_base = job_index * slot_count * seed_stride
     stop = threading.Event()
 
     def _on_signal(signum: int, frame: FrameType | None) -> None:
@@ -138,11 +163,15 @@ def run_supervisor(slot_count: int) -> int:
         signal.signal(sig, _on_signal)
 
     procs: dict[int, subprocess.Popen[bytes]] = {}
-    print(f"[supervisor] spawning {slot_count} single-slot workers (stagger={stagger:.0f}s)", flush=True)
+    print(
+        f"[supervisor] spawning {slot_count} workers job={job_index} seed_base={seed_base} "
+        f"gpu_count={gpu_count} (stagger={stagger:.0f}s)",
+        flush=True,
+    )
     for i in range(slot_count):
         if stop.is_set():
             break
-        procs[i] = _spawn_worker(i, output_root, seed_stride)
+        procs[i] = _spawn_worker(i, output_root, seed_stride, seed_base=seed_base, gpu_count=gpu_count)
         print(f"[supervisor] worker {i:02d} pid={procs[i].pid}", flush=True)
         stop.wait(stagger)  # 스태거(ramp-up)
 
@@ -150,7 +179,7 @@ def run_supervisor(slot_count: int) -> int:
         for i, p in list(procs.items()):
             if p.poll() is not None and not stop.is_set():
                 print(f"[supervisor] worker {i:02d} exited rc={p.returncode}; restarting", flush=True)
-                procs[i] = _spawn_worker(i, output_root, seed_stride)
+                procs[i] = _spawn_worker(i, output_root, seed_stride, seed_base=seed_base, gpu_count=gpu_count)
         stop.wait(5.0)
 
     print("[supervisor] stopping all workers", flush=True)

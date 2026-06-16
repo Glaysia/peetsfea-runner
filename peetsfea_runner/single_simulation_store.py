@@ -105,6 +105,16 @@ class SingleSimulationResultStore:
         with duckdb.connect(str(self.db_path)) as connection:
             connection.execute("BEGIN TRANSACTION")
             try:
+                # keep-best: 같은 request_id에 이미 'success'가 있으면, 비-success로 덮어쓰지 않는다.
+                # (잡 재시작 시 같은 seed를 재탐색하다 실패하면 누적된 성공 데이터가 유실되는 고질적 버그 방지.)
+                if row["terminal_state"] != "success":
+                    existing = connection.execute(
+                        "SELECT terminal_state FROM single_simulation_results WHERE request_id = ?",
+                        [request_id],
+                    ).fetchone()
+                    if existing is not None and existing[0] == "success":
+                        connection.execute("ROLLBACK")
+                        return
                 connection.execute("DELETE FROM single_simulation_results WHERE request_id = ?", [request_id])
                 connection.execute(
                     f"INSERT INTO single_simulation_results ({', '.join(columns)}) VALUES ({placeholders})",

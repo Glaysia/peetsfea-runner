@@ -67,3 +67,25 @@ def test_single_simulation_result_store_records_structured_failure(tmp_path: Pat
     assert row["error_stage"] == "simulate"
     assert row["error_type"] == "RuntimeError"
     assert row["error_message"] == "boom"
+
+
+def test_keep_best_success_not_overwritten_by_failure(tmp_path: Path) -> None:
+    # 고질병 수정: 잡 재시작이 같은 seed(request_id)를 재탐색하다 실패해도 누적 성공이 유실되면 안 된다.
+    store = SingleSimulationResultStore(tmp_path / "results.duckdb")
+    store.record_envelope({
+        "request_id": "base-7", "terminal_state": "success",
+        "result": {"design_id": "d7", "point_values": {"a": 1}},
+    })
+    # 같은 id로 실패가 들어와도 성공 행을 덮어쓰지 않는다.
+    store.record_envelope({
+        "request_id": "base-7", "terminal_state": "failed",
+        "error": {"stage": "simulate", "type": "GrpcApiError", "message": "boom"}, "result": {},
+    })
+    row = store.fetch_result("base-7")
+    assert row is not None and row["terminal_state"] == "success" and row["design_id"] == "d7"
+    # 단, 성공이 새 성공으로는 갱신된다(최신 데이터 반영).
+    store.record_envelope({
+        "request_id": "base-7", "terminal_state": "success",
+        "result": {"design_id": "d7b", "point_values": {"a": 2}},
+    })
+    assert store.fetch_result("base-7")["design_id"] == "d7b"  # type: ignore[index]
