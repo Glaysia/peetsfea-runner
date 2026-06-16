@@ -18,6 +18,16 @@ REF=$DEPLOY/venv/lib/python3.12/site-packages/peetsfea/data/0.3.5_sweep.toml
 # gpfs $HOME에 쓰면 88 워커 aedt가 per-user 쿼터를 터뜨린다. /enroot는 노드 로컬·대용량·잡 종료 시 삭제.
 JOBDIR=/enroot/${USER}_${SLURM_JOB_ID}
 OUT=$JOBDIR/run_out
+# 시작 시 이 노드의 내 죽은 잡(squeue에 없는) /enroot 잔재 청소 — SIGKILL/노드크래시로 trap을 못 탄 경우 대비.
+# squeue가 비어있으면(명령 실패) 스킵 = 안전(돌고 있는 잡 dir 오삭제 방지). 다른 유저 dir은 prefix로 제외.
+RUNNING_JIDS=$(squeue -h -u "$USER" -o "%i" 2>/dev/null)
+if [ -n "$RUNNING_JIDS" ]; then
+  for d in /enroot/${USER}_*; do
+    [ -d "$d" ] || continue
+    jid=$(basename "$d"); jid=${jid#${USER}_}
+    echo "$RUNNING_JIDS" | grep -qx "$jid" || { echo "[slot] cleaning stale /enroot scratch: $d"; rm -rf "$d" 2>/dev/null || true; }
+  done
+fi
 # compute node가 gate를 부르는 클러스터 내부명(로컬 ssh 별칭 gate1-harry261 아님!). 실측: n043→gate1 OK.
 GATE=${EDT_GATE_HOST:-gate1}
 PORT=${EDT_INGEST_PORT:-7876}        # 결과 JSON ingest 백채널
@@ -45,7 +55,8 @@ keep_tunnel() { while true; do start_tunnel; wait "$TUNNEL_PID"; sleep 5; done; 
 keep_tunnel &
 KEEPER_PID=$!
 cleanup() { kill "$KEEPER_PID" "$TUNNEL_PID" 2>/dev/null || true; enroot remove -f "$C" >/dev/null 2>&1 || true; rm -rf "$JOBDIR" 2>/dev/null || true; }
-trap cleanup EXIT
+# EXIT뿐 아니라 scancel(SIGTERM)/SIGINT도 잡아 /enroot 잔재를 남기지 않는다(공용 공간 청결). rm -rf는 멱등.
+trap cleanup EXIT INT TERM
 
 enroot create --name "$C" "$HOME/runtime/enroot/aedt.sqsh" >/dev/null 2>&1
 enroot start --root --rw \
