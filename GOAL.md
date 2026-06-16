@@ -17,9 +17,9 @@
 | 2 | 9잡/~100 오케스트레이션(잡 lifecycle, 10h 폐기·재기동) | ✅ 완료(실 SLURM e2e) |
 | 3 | 로드 밸런서(ramp-up, CPU/mem 피드백 + admission) | ✅ 완료(실 admission-gated solve) |
 | 4 | Intake :7875 + 2-레인 가중 큐(baseline + 우선순위, 85:15) | ✅ 완료(실 우선순위 solve) |
-| 5 | 결과 DB 확장 + 대시보드 :8080(read-only) + `results.csv` export | ⏳ 남음 |
-| 6 | 아카이브 저장소(20GB 묶음 압축, 2TB FIFO) | ⏳ 남음 |
-| **운영** | **systemctl 상시 가동, 동시 ~100 무한 연속(baseline 자기공급)** | ⏳ 스케일 실가동 |
+| 5 | 결과 DB 확장 + 대시보드 :8080(read-only) + `results.csv` export | ✅ 완료(`edt_dashboard`, 단위테스트) |
+| 6 | 아카이브 저장소(20GB 묶음 압축, 2TB FIFO) | ✅ 완료(`edt_archive`, 단위테스트) |
+| **운영** | **systemctl 상시 가동, 동시 ~100 무한 연속(baseline 자기공급)** | ⏳ 스케일 실가동(control plane 결선됨) |
 
 ## 2. Phase별 (요약·수용)
 - **Phase 1 — 코어:** 컨테이너당 edtmgr/ansysedt warm 풀, 슬롯 순차 실행, 60/65분 타이밍, peetsfea warm-AEDT 접속.
@@ -54,8 +54,11 @@
   (SLURM 잡 → entrypoint → 실 슬롯 서비스 → 실 HFSS solve = SLURM_SLOT_SERVICE_PASS).
 - 신규 13개 모듈, 57+ 단위테스트, mypy strict 클린.
 
-## 6. 남은 것
-- **Phase 5:** 결과 DB 스키마 확장 + 대시보드 `:8080`(read-only) + `results.csv` export.
-- **Phase 6:** 아카이브 저장소(project_dir 누적 → 20GB 묶음 압축, 2TB 초과 시 FIFO 삭제).
-- **운영 실가동:** 9잡 × ~100 동시를 **연속 가동**(systemd 서비스 + baseline 자기공급). 단일 잡/슬롯
-  메커니즘은 검증됐으므로 `job_count=9`·`slot_count≤16` 스케일 + 상시 서비스 결선 + ~100 라이선스 기동.
+## 6. 남은 것 — 운영 실가동만
+Phase 1~6 코드 + 컨트롤 플레인 결선 완료. 남은 것은 **스케일 실가동 한 단계**뿐:
+- **컨트롤 플레인(`edt_control_plane`):** systemd `--user` 진입점. 9 SLURM 잡 상시 유지 +
+  대시보드:8080 + Intake:7875 + 잡 poll/재기동/10h 만료를 SIGTERM까지 돌린다. 단위테스트 통과.
+- **배포·결선:** systemd 유닛 `peetsfea-runner` → `edt_control_plane.main`. 배포 체크아웃
+  (`~/mnt/8tb/peetsfea-runner`)을 이 브랜치로 갱신 + `systemctl --user daemon-reload`.
+- **스케일 기동:** 단일 잡/슬롯·9잡 오케스트레이션 메커니즘은 검증됨(SLURM_SLOT_SERVICE_PASS,
+  CLUSTER_ORCH_PASS). `job_count=9`·`slot_count≤16`로 단계적 실기동 → 동시 ~100 정상상태 관측.

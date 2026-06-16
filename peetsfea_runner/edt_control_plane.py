@@ -58,8 +58,12 @@ class ControlPlane:
 
     def run(self) -> None:
         """서버 기동 + 오케스트레이터 상시 유지 루프. SIGTERM/SIGINT까지."""
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            signal.signal(sig, self._on_signal)
+        # systemd는 메인 스레드에서 돈다. 비메인 스레드(테스트 등)에선 시그널 등록이 불가하므로 무시.
+        try:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                signal.signal(sig, self._on_signal)
+        except ValueError:
+            pass
 
         dashboard = start_dashboard_server(store=self.store, port=self.dashboard_port)
         intake_server = start_intake_server(service=self.intake, port=self.intake_port)

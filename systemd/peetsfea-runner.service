@@ -1,17 +1,24 @@
 [Unit]
-Description=Peets FEA Runner Worker (user service)
+Description=Peets FEA Runner — EDT 컨트롤 플레인 (동시 ~100 정상상태 가동)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=%h/mnt/8tb/peetsfea-runner
-ExecStart=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -c "from peetsfea_runner.built_in_service import run_built_in_service; run_built_in_service()"
+# 컨트롤 플레인: 9 SLURM 잡 상시 유지 + 대시보드:8080 + Intake:7875 + 잡 재기동/10h 만료.
+ExecStart=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -m peetsfea_runner.edt_control_plane
+Environment=EDT_DB_PATH=%h/edt-deploy/results.duckdb
+Environment=EDT_SSH_HOST=gate1-harry261
+Environment=EDT_JOB_COUNT=9
+Environment=EDT_DASHBOARD_PORT=8080
+Environment=EDT_INTAKE_PORT=7875
 Restart=always
-RestartSec=5
-RuntimeMaxSec=40min
-TimeoutStopSec=90s
-ExecStopPost=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -c "from peetsfea_runner.built_in_service import scancel_service_slurm_jobs; scancel_service_slurm_jobs()"
+RestartSec=10
+# 상시 가동: RuntimeMaxSec 없음(잡 수명 10h는 오케스트레이터가 내부에서 관리).
+TimeoutStopSec=120s
+# 하드 킬 대비: 잔류 peetsfea-edt SLURM 잡 정리(정상 SIGTERM 시엔 shutdown()이 이미 scancel).
+ExecStopPost=/usr/bin/ssh gate1-harry261 "squeue -u \\$USER -h -o '%%i %%j' | awk '$2 ~ /^peetsfea-edt/ {print $1}' | xargs -r scancel"
 
 [Install]
 WantedBy=default.target
