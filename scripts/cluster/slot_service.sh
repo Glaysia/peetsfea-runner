@@ -18,6 +18,7 @@ REF=$DEPLOY/venv/lib/python3.12/site-packages/peetsfea/data/0.3.5_sweep.toml
 # gpfs $HOME에 쓰면 88 워커 aedt가 per-user 쿼터를 터뜨린다. /enroot는 노드 로컬·대용량·잡 종료 시 삭제.
 JOBDIR=/enroot/${USER}_${SLURM_JOB_ID}
 OUT=$JOBDIR/run_out
+CHOME=$JOBDIR/home   # 컨테이너 HOME(노드 로컬): AEDT가 ~/.ansys 등을 gpfs $HOME 대신 여기에 쓰게 한다.
 # 시작 시 이 노드의 내 죽은 잡(squeue에 없는) /enroot 잔재 청소 — SIGKILL/노드크래시로 trap을 못 탄 경우 대비.
 # squeue가 비어있으면(명령 실패) 스킵 = 안전(돌고 있는 잡 dir 오삭제 방지). 다른 유저 dir은 prefix로 제외.
 RUNNING_JIDS=$(squeue -h -u "$USER" -o "%i" 2>/dev/null)
@@ -40,7 +41,9 @@ PORT=${EDT_INGEST_PORT:-7876}        # 결과 JSON ingest 백채널
 BULK=${EDT_BULK_PORT:-7877}          # 대용량 산출물(aedt) 백채널
 INGEST_URL="http://127.0.0.1:$PORT/ingest"
 C=edt-job-$SLURM_JOB_ID
-mkdir -p "$OUT/work"
+mkdir -p "$OUT/work" "$CHOME/tmp"
+# AEDT 라이선스 유저 config(작음)만 노드 로컬 HOME에 시드 — 라이선스는 env로 받지만 config 누락 회피.
+cp -rn "$HOME/Ansoft" "$CHOME/" 2>/dev/null || true
 # GPU 노출은 gpu* 파티션에서만. cpu2 노드엔 NVIDIA 드라이버가 없어 NVIDIA_VISIBLE_DEVICES=all이면
 # enroot의 98-nvidia.sh가 'nvml driver not loaded'로 실패해 컨테이너가 3초 만에 죽는다(void=훅 비활성).
 case "$EDT_PARTITION" in
@@ -70,6 +73,7 @@ enroot start --root --rw \
   --mount "$ANSB/licensingclient:/mnt/licensingclient" --mount "$HOME:$HOME" --mount "$JOBDIR:$JOBDIR" \
   --env ANSYSEM_ROOT252=/mnt/AnsysEM --env ANS_IGNOREOS=1 --env "NVIDIA_VISIBLE_DEVICES=$NVD" \
   --env "ANSYSLMD_LICENSE_FILE=$ANSYSLMD_LICENSE_FILE" \
+  --env "HOME=$CHOME" --env "TMPDIR=$CHOME/tmp" \
   --env "EDT_OUTPUT_ROOT=$OUT" --env "EDT_RESULT_INGEST_URL=$INGEST_URL" --env "EDT_WORK_DIR=$OUT/work" \
   --env "EDT_BULK_PORT=$BULK" --env "EDT_BULK_HOST=127.0.0.1" \
   --env "EDT_SLOT_COUNT=${EDT_SLOT_COUNT:-11}" --env "EDT_REFERENCE_SWEEP=$REF" \
