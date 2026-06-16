@@ -70,7 +70,7 @@ trap cleanup EXIT INT TERM
 enroot create --name "$C" "$HOME/runtime/enroot/aedt.sqsh" >/dev/null 2>&1
 enroot start --root --rw \
   --mount "$ANSB/AnsysEM:/mnt/AnsysEM" --mount "$ANSB:/ansys_inc/v252" \
-  --mount "$ANSB/licensingclient:/mnt/licensingclient" --mount "$HOME:$HOME" --mount "$JOBDIR:$JOBDIR" \
+  --mount "$ANSB/licensingclient:/mnt/licensingclient" --mount "$DEPLOY:$DEPLOY" --mount "$JOBDIR:$JOBDIR" \
   --env ANSYSEM_ROOT252=/mnt/AnsysEM --env ANS_IGNOREOS=1 --env "NVIDIA_VISIBLE_DEVICES=$NVD" \
   --env "ANSYSLMD_LICENSE_FILE=$ANSYSLMD_LICENSE_FILE" \
   --env "HOME=$CHOME" --env "TMPDIR=$CHOME/tmp" \
