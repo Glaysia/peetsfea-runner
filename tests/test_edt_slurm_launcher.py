@@ -103,4 +103,5 @@ def test_kill_calls_scancel() -> None:
     runner = FakeRunner()
     launcher = _launcher(runner)
     launcher.kill(JobHandle(job_index=0, slurm_id="99", started_at=0.0))
-    assert any("scancel 99" in r for r in runner.remotes())
+    # graceful SIGTERM(자동 KILL 없음) → trap이 /enroot 청소. raw `scancel 99`(KILL 폴백) 아님.
+    assert any("scancel --full --signal=TERM 99" in r for r in runner.remotes())

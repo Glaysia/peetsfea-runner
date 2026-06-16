@@ -110,7 +110,10 @@ class SlurmJobLauncher:
         return state in _ACTIVE_STATES
 
     def kill(self, handle: JobHandle) -> None:
-        self._ssh(f"scancel {handle.slurm_id}")
+        # graceful SIGTERM만 보낸다(자동 SIGKILL 없음): supervisor/워커가 TERM에 깨끗이 종료하고
+        # slot_service trap이 /enroot 노드 로컬 스크래치를 청소한다. raw `scancel`(KILL 폴백)을 쓰면
+        # SIGKILL이 trap보다 빨라 /enroot 잔재가 남을 수 있다(공용 공간). 강제 종료가 필요하면 safe_scancel.sh.
+        self._ssh(f"scancel --full --signal=TERM {handle.slurm_id}")
 
 
 __all__ = ["CommandResult", "CommandRunner", "SlurmJobLauncher", "SlurmLauncherError", "subprocess_runner"]

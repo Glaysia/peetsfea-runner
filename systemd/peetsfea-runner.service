@@ -20,9 +20,9 @@ Restart=always
 RestartSec=10
 # 상시 가동: 실행시간 상한 없음(잡 수명 10h는 오케스트레이터가 내부에서 관리).
 TimeoutStopSec=120s
-# 하드 킬 대비: 잔류 peetsfea-edt SLURM 잡 정리(정상 SIGTERM 시엔 shutdown()이 이미 scancel).
-# squeue --me --name 으로 9개 잡 이름을 직접 지정($USER 전개·awk 인용 회피).
-ExecStopPost=/usr/bin/ssh gate1-harry261 sh -c "squeue --me -h -o %%i -n peetsfea-edt-0,peetsfea-edt-1,peetsfea-edt-2,peetsfea-edt-3,peetsfea-edt-4,peetsfea-edt-5,peetsfea-edt-6,peetsfea-edt-7,peetsfea-edt-8 | xargs -r scancel"
+# 하드 킬 대비: 잔류 peetsfea-edt 잡을 safe-scancel로 정리(raw scancel 금지 — /enroot 잔재 방지).
+# graceful SIGTERM으로 slot_service trap이 /enroot를 청소할 시간을 주고, 끝내 안 죽으면 강제 종료.
+ExecStopPost=/usr/bin/ssh gate1-harry261 bash %h/edt-deploy/safe_scancel.sh
 
 [Install]
 WantedBy=default.target
