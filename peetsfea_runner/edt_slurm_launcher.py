@@ -27,8 +27,10 @@ _ACTIVE_STATES = frozenset({"RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "
 _SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 
 # 잡을 랜덤 분배하는 파티션(MASTER_PLAN §2.10 / Q5: 파티션별 성능 통계 자연 수집).
-# cpu1·gpu5는 제외(포화/문제 파티션).
-DEFAULT_PARTITIONS: tuple[str, ...] = ("cpu2", "gpu1", "gpu2", "gpu3", "gpu4", "gpu6")
+# cpu2 + gpu1만 사용. 실측(2026-06-17): gpu2/gpu3/gpu4/gpu6은 타 유저 점유로 내 잡 예상시작이 13~36시간 뒤라
+# 사실상 영구 PENDING(처리량 1/3). cpu2(idle+mix 다수)와 gpu1(idle 2+mix 8, RTX3090)은 여유가 있어 즉시 스케줄된다.
+# gpu1으로 GPU 가속도 유지. 다른 파티션이 한가해지면 다시 추가 가능.
+DEFAULT_PARTITIONS: tuple[str, ...] = ("cpu2", "gpu1")
 
 
 @dataclass(frozen=True, slots=True)
