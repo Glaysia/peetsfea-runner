@@ -77,7 +77,14 @@ def run_slot_service(service: SteadyStateService, *, max_sims: int = 0) -> int:
 def main() -> int:
     config, max_sims = _config_from_env()
     service = build_steady_state_service(config)
-    print(f"[entrypoint] slots={config.slot_count} lb={'on' if service.admission else 'off'} max_sims={max_sims or '∞'}", flush=True)
+    # EDT_PRIORITY_TOML: 고정 후보를 우선순위 레인에 시드(검증/단발 처리용; baseline보다 먼저 소비).
+    priority_toml = os.environ.get("EDT_PRIORITY_TOML")
+    if priority_toml:
+        from .edt_queue import QueueItem
+
+        text = Path(priority_toml).expanduser().read_text(encoding="utf-8")
+        service.queue.put_priority(QueueItem(request_id="prio-0", candidate_toml_text=text, mode="full"))
+    print(f"[entrypoint] slots={config.slot_count} lb={'on' if service.admission else 'off'} max_sims={max_sims or '∞'} priority={'1' if priority_toml else '0'}", flush=True)
     processed = run_slot_service(service, max_sims=max_sims)
     print(f"[entrypoint] processed={processed}", flush=True)
     return 0
