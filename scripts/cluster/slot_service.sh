@@ -17,17 +17,19 @@ REF=$DEPLOY/venv/lib/python3.12/site-packages/peetsfea/data/0.3.5_sweep.toml
 OUT=$DEPLOY/run_out/$SLURM_JOB_ID
 # compute node가 gate를 부르는 클러스터 내부명(로컬 ssh 별칭 gate1-harry261 아님!). 실측: n043→gate1 OK.
 GATE=${EDT_GATE_HOST:-gate1}
-PORT=${EDT_INGEST_PORT:-7876}
+PORT=${EDT_INGEST_PORT:-7876}        # 결과 JSON ingest 백채널
+BULK=${EDT_BULK_PORT:-7877}          # 대용량 산출물(aedt) 백채널
 INGEST_URL="http://127.0.0.1:$PORT/ingest"
 C=edt-job-$SLURM_JOB_ID
 mkdir -p "$OUT/work"
 
-# compute node → gate 정터널(결과 push 백채널). 끊기면 즉시 죽고(ExitOnForwardFailure) 재기동 루프가 살린다.
+# compute node → gate 정터널(결과 push 백채널 7876 + 산출물 7877). 둘 다 한 ssh로 포워딩.
+# 끊기면 즉시 죽고(ExitOnForwardFailure) 재기동 루프가 살린다.
 TUNNEL_PID=""
 start_tunnel() {
   ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
       -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-      -L "$PORT:127.0.0.1:$PORT" "$GATE" &
+      -L "$PORT:127.0.0.1:$PORT" -L "$BULK:127.0.0.1:$BULK" "$GATE" &
   TUNNEL_PID=$!
 }
 keep_tunnel() { while true; do start_tunnel; wait "$TUNNEL_PID"; sleep 5; done; }
@@ -43,6 +45,7 @@ enroot start --root --rw \
   --env ANSYSEM_ROOT252=/mnt/AnsysEM --env ANS_IGNOREOS=1 --env NVIDIA_VISIBLE_DEVICES=all \
   --env "ANSYSLMD_LICENSE_FILE=$ANSYSLMD_LICENSE_FILE" \
   --env "EDT_OUTPUT_ROOT=$OUT" --env "EDT_RESULT_INGEST_URL=$INGEST_URL" --env "EDT_WORK_DIR=$OUT/work" \
+  --env "EDT_BULK_PORT=$BULK" --env "EDT_BULK_HOST=127.0.0.1" \
   --env "EDT_SLOT_COUNT=${EDT_SLOT_COUNT:-11}" --env "EDT_REFERENCE_SWEEP=$REF" \
   --env "EDT_PARTITION=$EDT_PARTITION" --env "VENVPY=$VENVPY" \
   "$C" /bin/bash -lc '

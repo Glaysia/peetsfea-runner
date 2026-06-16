@@ -21,7 +21,9 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import FrameType
 
-from .constants import JOBS_PER_ACCOUNT
+from .constants import ARCHIVE_BUFFER_BYTES, JOBS_PER_ACCOUNT
+from .edt_archive import ArchiveStore
+from .edt_bulk_transfer import DEFAULT_BULK_PORT, start_bulk_transfer_server
 from .edt_dashboard import start_dashboard_server
 from .edt_intake import IntakeService, start_intake_server
 from .edt_orchestrator import JobLauncher, JobOrchestrator
@@ -35,6 +37,8 @@ from .single_simulation_store import SingleSimulationResultStore
 @dataclass(slots=True)
 class ControlPlaneConfig:
     db_path: Path
+    archive_root: Path
+    archive_buffer_bytes: int = ARCHIVE_BUFFER_BYTES  # 로컬 디스크에 맞춰 조정(FIFO 상한).
     ssh_host: str = "gate1-harry261"
     job_count: int = JOBS_PER_ACCOUNT
     # 잡 컨테이너가 돌릴 production 슬롯 서비스 스크립트(baseline 자기공급, 무한).
@@ -42,6 +46,7 @@ class ControlPlaneConfig:
     dashboard_port: int = 8080
     intake_port: int = 7875
     ingest_port: int = DEFAULT_INGEST_PORT  # 슈퍼컴 전용 결과 백채널(역터널로만 도달).
+    bulk_port: int = DEFAULT_BULK_PORT  # 슈퍼컴 전용 대용량 산출물 백채널(역터널로만 도달).
     poll_interval_seconds: float = 60.0
 
 
@@ -50,11 +55,13 @@ class ControlPlane:
     orchestrator: JobOrchestrator
     store: SingleSimulationResultStore
     intake: IntakeService
+    archive_store: ArchiveStore
     dashboard_port: int
     intake_port: int
     poll_interval_seconds: float
     ssh_host: str = "gate1-harry261"
     ingest_port: int = DEFAULT_INGEST_PORT
+    bulk_port: int = DEFAULT_BULK_PORT
     enable_ingest_tunnel: bool = True  # 테스트에선 ssh 역터널 비활성.
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _servers: list[ThreadingHTTPServer] = field(default_factory=list, init=False, repr=False)
@@ -76,15 +83,18 @@ class ControlPlane:
         intake_server = start_intake_server(service=self.intake, port=self.intake_port)
         # 결과 ingest(:7876): 슈퍼컴 컨테이너가 역터널로 push → 로컬 단일 DB(대시보드와 동일 store).
         ingest_server = start_result_ingest_server(store=self.store, port=self.ingest_port)
-        for server in (dashboard, intake_server, ingest_server):
+        # 대용량 산출물(:7877): project_dir tar.gz 스트림 수신 → 추출 → ArchiveStore(20GB 묶음/2TB FIFO).
+        bulk_server = start_bulk_transfer_server(archive_store=self.archive_store, port=self.bulk_port)
+        for server in (dashboard, intake_server, ingest_server, bulk_server):
             self._servers.append(server)
             threading.Thread(target=server.serve_forever, daemon=True, name=type(server).__name__).start()
 
-        # gate 경유 역터널 상시 유지: gate loopback:7876 → 로컬 ingest:7876.
+        # gate 경유 역터널 상시 유지: gate loopback:{7876,7877} → 로컬 ingest/bulk. 둘 다 슈퍼컴 전용.
         if self.enable_ingest_tunnel:
-            tunnel = SshTunnel(argv=reverse_tunnel_argv(self.ssh_host, port=self.ingest_port), name="edt-ingest-rtunnel")
-            tunnel.start()
-            self._tunnels.append(tunnel)
+            for port, name in ((self.ingest_port, "edt-ingest-rtunnel"), (self.bulk_port, "edt-bulk-rtunnel")):
+                tunnel = SshTunnel(argv=reverse_tunnel_argv(self.ssh_host, port=port), name=name)
+                tunnel.start()
+                self._tunnels.append(tunnel)
 
         self.orchestrator.ensure_running()
         try:
@@ -97,6 +107,7 @@ class ControlPlane:
                 tunnel.stop()
             for server in self._servers:
                 server.shutdown()
+            self.archive_store.flush()  # 종료 시 대기 중인 묶음 강제 압축(유실 방지).
 
     def _on_signal(self, signum: int, frame: FrameType | None) -> None:
         self.stop()
@@ -105,6 +116,7 @@ class ControlPlane:
 def build_control_plane(config: ControlPlaneConfig, *, launcher: JobLauncher | None = None) -> ControlPlane:
     store = SingleSimulationResultStore(db_path=config.db_path)
     store.initialize()
+    archive_store = ArchiveStore(archive_root=config.archive_root, buffer_limit_bytes=config.archive_buffer_bytes)
     job_launcher = launcher if launcher is not None else SlurmJobLauncher(
         ssh_host=config.ssh_host,
         job_command=config.job_command,
@@ -116,11 +128,13 @@ def build_control_plane(config: ControlPlaneConfig, *, launcher: JobLauncher | N
         orchestrator=orchestrator,
         store=store,
         intake=intake,
+        archive_store=archive_store,
         dashboard_port=config.dashboard_port,
         intake_port=config.intake_port,
         poll_interval_seconds=config.poll_interval_seconds,
         ssh_host=config.ssh_host,
         ingest_port=config.ingest_port,
+        bulk_port=config.bulk_port,
     )
 
 
@@ -134,11 +148,14 @@ def main() -> int:
 
     config = ControlPlaneConfig(
         db_path=Path(os.environ.get("EDT_DB_PATH", "~/edt-deploy/results.duckdb")).expanduser(),
+        archive_root=Path(os.environ.get("EDT_ARCHIVE_ROOT", "~/edt-archive")).expanduser(),
+        archive_buffer_bytes=int(os.environ.get("EDT_ARCHIVE_BUFFER_BYTES", str(ARCHIVE_BUFFER_BYTES))),
         ssh_host=os.environ.get("EDT_SSH_HOST", "gate1-harry261"),
         job_count=int(os.environ.get("EDT_JOB_COUNT", str(JOBS_PER_ACCOUNT))),
         dashboard_port=int(os.environ.get("EDT_DASHBOARD_PORT", "8080")),
         intake_port=int(os.environ.get("EDT_INTAKE_PORT", "7875")),
         ingest_port=int(os.environ.get("EDT_INGEST_PORT", str(DEFAULT_INGEST_PORT))),
+        bulk_port=int(os.environ.get("EDT_BULK_PORT", str(DEFAULT_BULK_PORT))),
     )
     run_control_plane(config)
     return 0

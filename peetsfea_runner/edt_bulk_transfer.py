@@ -1,151 +1,201 @@
-"""7877 대용량 .aedt 전송 — 완료 project_dir를 로컬 아카이브 버퍼로 push (Phase 6 전송).
+"""대용량 산출물 전송 :7877 — project_dir(aedt)를 로컬로 보내 아카이브 + gpfs 절약 (GOAL §6.1).
 
-토폴로지: 7876(결과 JSON)과 같은 gate 허브 경유 push, 단 전송은 **rsync over ssh**(재개·증분).
-컨테이너가 시뮬 성공 직후 project_dir를 로컬 전용 sshd(:7877, rrsync 감금)로 rsync push하고,
-완료를 `.done` 마커로 알린다. 로컬 컨트롤 플레인의 버퍼 스캐너가 `.done`을 보면 `ArchiveStore.add()`로
-넘겨 20GB 묶음 압축 / 2TB(기본 1TB) FIFO를 굴린다.
+토폴로지는 7876(결과 ingest)과 동일: gate 경유 ssh 터널 + loopback 바인딩(외부 도달 불가, 인증 불필요).
+**sshd 변경 불필요 — HTTP tar 스트림.**
 
-    [컨테이너] rsync -e 'ssh -p7877 -i key' project_dir → 127.0.0.1:7877(터널)
-        → [gate] → [로컬 sshd:7877, rrsync -wo incoming] → incoming/<request_id>/
-        → 버퍼 스캐너(.done) → ArchiveStore.add → batch_*.tar.gz
+    [컨테이너] tar czf - project_dir → POST 127.0.0.1:7877/bulk/<rid>
+        --ssh -L--> [gate] 127.0.0.1:7877 <--ssh -R-- [로컬] :7877 (수신 → 스트리밍 추출 → ArchiveStore)
 
-- **컨테이너측 `BulkPushSink`**: `.push(project_dir, request_id)`. rsync 실패해도 raise 안 함(디스패처
-  보호) — 원본은 gpfs에 남으므로 다음에 재시도 가능. rsync runner 주입 가능(테스트).
-- **로컬측 `BufferScanner`**: `incoming/<rid>/.done` 도착분을 ArchiveStore로 흘려보내는 스레드.
+- **로컬(`start_bulk_transfer_server`)**: `POST /bulk/<request_id>`로 tar.gz 스트림을 받아 **상수 메모리로
+  스트리밍 추출**(받는 즉시 raw로 풀어 둔다 — 개별 압축 보관 금지). 추출된 project_dir를 `ArchiveStore`에
+  add → 여러 project_dir가 모여 20GB 묶음 solid 압축, 2TB FIFO. (개별 압축 보관 시 묶음이 "이미 압축된
+  덩어리들의 tar"가 되어 추가 압축이 안 먹으므로 raw로 푼다.)
+- **컨테이너(`BulkPushSink`)**: 시뮬 성공 시 project_dir를 `tar.gz`로 만들어 POST. **성공 시 gpfs 원본 삭제**
+  (무조건 절약), 실패 시 재시도→보존(디스패처 안 죽임). 전송 구간만 압축, 도착하면 raw로 풀린다.
+
+7877도 7875 사용자가 모르는 슈퍼컴 전용 통로.
 """
 
 from __future__ import annotations
 
+import http.client
+import json
+import shutil
 import subprocess
+import tarfile
+import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import IO, Any, cast
+from urllib.parse import urlparse
 
 from .edt_archive import ArchiveStore
 
-DONE_MARKER = ".done"
-
-# (argv) -> 반환코드. 0=성공.
-RsyncRunner = Callable[[Sequence[str]], int]
+DEFAULT_BULK_PORT = 7877
 
 
-def _subprocess_rsync(argv: Sequence[str]) -> int:
-    return subprocess.run(list(argv), stdin=subprocess.DEVNULL).returncode
+class _LimitedReader:
+    """rfile에서 정확히 `limit` 바이트까지만 읽는 래퍼(tar 스트림이 본문 경계를 넘지 않게)."""
+
+    def __init__(self, stream: IO[bytes], limit: int) -> None:
+        self._stream = stream
+        self._remaining = limit
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        want = self._remaining if size < 0 else min(size, self._remaining)
+        chunk = self._stream.read(want)
+        self._remaining -= len(chunk)
+        return chunk
 
 
-def local_sshd_argv(config_path: Path, *, sshd: str = "/usr/sbin/sshd") -> list[str]:
-    """로컬 전용 sshd(7877 수신구) foreground 실행 argv. `SshTunnel`이 감독(죽으면 재기동)."""
-    return [sshd, "-D", "-e", "-f", str(config_path)]
+def start_bulk_transfer_server(
+    *,
+    archive_store: ArchiveStore,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_BULK_PORT,
+) -> ThreadingHTTPServer:
+    """대용량 산출물 수신 서버. `POST /bulk/<rid>`(tar.gz 스트림) → 추출 → ArchiveStore.add. `GET /health`."""
 
+    incoming = archive_store.archive_root / "incoming"
+    incoming.mkdir(parents=True, exist_ok=True)
+    lock = threading.Lock()
 
-def _ssh_transport(port: int, identity: Path | None) -> str:
-    parts = ["ssh", "-p", str(port), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
-    if identity is not None:
-        parts += ["-i", str(identity)]
-    return " ".join(parts)
+    def _ingest(request_id: str, body: IO[bytes]) -> None:
+        # 받는 즉시 raw로 스트리밍 추출(상수 메모리). 같은 fs(archive_root)에 풀어 add()의 move가 빠르게.
+        staging = Path(tempfile.mkdtemp(dir=str(incoming), prefix=f"{request_id}."))
+        project_dir = staging / request_id
+        project_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with tarfile.open(fileobj=body, mode="r|gz") as tar:
+                tar.extractall(project_dir, filter="data")  # filter=data: 경로 탈출/특수파일 차단
+            with lock:  # incoming 정리까지 직렬화(ArchiveStore 자체는 내부 락 보유).
+                archive_store.add(project_dir)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "peetsfea-bulk"
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            return
+
+        def do_GET(self) -> None:
+            if urlparse(self.path).path == "/health":
+                _write_json(self, 200, {"status": "ok", "batches": len(archive_store.archive_files()), "bytes": archive_store.total_bytes()})
+                return
+            _write_json(self, 404, {"error": "not_found"})
+
+        def do_POST(self) -> None:
+            path = urlparse(self.path).path
+            if not path.startswith("/bulk/"):
+                _write_json(self, 404, {"error": "not_found"})
+                return
+            request_id = path[len("/bulk/"):]
+            if not request_id:
+                _write_json(self, 400, {"error": "missing request_id"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                _write_json(self, 400, {"error": "bad Content-Length"})
+                return
+            try:
+                _ingest(request_id, cast("IO[bytes]", _LimitedReader(cast("IO[bytes]", self.rfile), length)))
+            except Exception as exc:  # noqa: BLE001
+                _write_json(self, 500, {"error": type(exc).__name__, "message": str(exc)})
+                return
+            _write_json(self, 200, {"status": "ok", "request_id": request_id})
+
+    return ThreadingHTTPServer((host, port), Handler)
 
 
 @dataclass
 class BulkPushSink:
-    """컨테이너측: 완료 project_dir를 로컬 아카이브 버퍼로 rsync push.
-
-    rrsync write-only 감금 하의 원격 루트 기준 상대경로(`<request_id>/`)로 보낸다. 전송 끝나면
-    빈 `.done` 마커를 2차 rsync(원격 rename이 막혀 있어 완료를 마커로 신호).
-    """
+    """컨테이너측: 성공한 project_dir를 tar.gz로 :7877에 push. 성공 시 gpfs 원본 삭제(무조건 절약)."""
 
     host: str = "127.0.0.1"
-    user: str = "peets"
-    port: int = 7877
-    identity: Path | None = None
+    port: int = DEFAULT_BULK_PORT
+    timeout_seconds: float = 600.0
     retries: int = 3
     retry_sleep_seconds: float = 5.0
-    runner: RsyncRunner = _subprocess_rsync
     sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
+    tar_runner: Callable[[Path, Path], None] = field(default=lambda src, dst: _tar_gz(src, dst), repr=False)
 
-    def _dest(self, rel: str) -> str:
-        return f"{self.user}@{self.host}:{rel}"
-
-    def push(self, project_dir: Path, request_id: str) -> bool:
-        """project_dir → incoming/<request_id>/. 성공 시 .done 마커까지 보내고 True."""
+    def push(self, request_id: str, project_dir: Path) -> bool:
+        """project_dir push. 성공 시 원본 삭제하고 True, 끝내 실패면 원본 보존하고 False(절대 raise 안 함)."""
         project_dir = Path(project_dir)
-        transport = _ssh_transport(self.port, self.identity)
-        data_argv = ["rsync", "-a", "--mkpath", "-e", transport, f"{project_dir}/", self._dest(f"{request_id}/")]
-        if not self._run_with_retries(data_argv):
+        if not project_dir.exists():
             return False
-        # 완료 마커(빈 파일). 데이터가 다 올라간 뒤에만 보내므로 스캐너가 부분전송을 아카이브하지 않는다.
-        marker = project_dir.parent / f"{request_id}{DONE_MARKER}"
+        tmp = project_dir.parent / f".{project_dir.name}.bulk.tar.gz"
         try:
-            marker.write_text("", encoding="utf-8")
-            marker_argv = ["rsync", "-a", "-e", transport, str(marker), self._dest(f"{request_id}/{DONE_MARKER}")]
-            ok = self._run_with_retries(marker_argv)
-        finally:
-            marker.unlink(missing_ok=True)
-        return ok
-
-    def _run_with_retries(self, argv: Sequence[str]) -> bool:
-        for attempt in range(1, self.retries + 1):
-            try:
-                if self.runner(argv) == 0:
+            self.tar_runner(project_dir, tmp)
+        except Exception:  # noqa: BLE001 — tar 실패는 원본 보존.
+            tmp.unlink(missing_ok=True)
+            return False
+        try:
+            for attempt in range(1, self.retries + 1):
+                if self._post(request_id, tmp):
+                    shutil.rmtree(project_dir, ignore_errors=True)  # gpfs 절약: 전송 성공 시 원본 삭제.
                     return True
-            except Exception:  # noqa: BLE001 — ssh/rsync 실행 자체 실패도 디스패처를 죽이지 않는다.
-                pass
-            if attempt < self.retries:
-                self.sleep(self.retry_sleep_seconds)
-        return False
+                if attempt < self.retries:
+                    self.sleep(self.retry_sleep_seconds)
+            return False  # 끝내 실패 → 원본 보존(다음 기회/수동 복구).
+        finally:
+            tmp.unlink(missing_ok=True)
 
-
-def scan_buffer_once(incoming_root: Path, archive: ArchiveStore) -> int:
-    """`incoming/<rid>/.done` 가 있는 완료분을 ArchiveStore로 이관. 반환: 이관 건수."""
-    if not incoming_root.exists():
-        return 0
-    moved = 0
-    for child in sorted(incoming_root.iterdir()):
-        if not child.is_dir():
-            continue
-        if not (child / DONE_MARKER).exists():
-            continue  # 아직 전송중(마커 없음) → 다음 스캔에.
-        archive.add(child)  # 내부에서 pending로 move → 20GB 묶음 / FIFO.
-        moved += 1
-    return moved
-
-
-@dataclass
-class BufferScanner:
-    """로컬측: incoming 버퍼를 주기 스캔해 완료 project_dir를 ArchiveStore로 흘려보내는 스레드."""
-
-    incoming_root: Path
-    archive: ArchiveStore
-    interval_seconds: float = 30.0
-    sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
-    _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
-    _thread: threading.Thread | None = field(default=None, init=False, repr=False)
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        self.incoming_root.mkdir(parents=True, exist_ok=True)
-        self._thread = threading.Thread(target=self._loop, name="edt-bulk-scanner", daemon=True)
-        self._thread.start()
-
-    def _loop(self) -> None:
-        while not self._stop.is_set():
+    def _post(self, request_id: str, tar_path: Path) -> bool:
+        size = tar_path.stat().st_size
+        try:
+            conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout_seconds)
             try:
-                scan_buffer_once(self.incoming_root, self.archive)
-            except Exception:  # noqa: BLE001 — 스캔 실패가 스레드를 죽이면 안 된다.
-                pass
-            self._stop.wait(self.interval_seconds)
+                conn.putrequest("POST", f"/bulk/{request_id}")
+                conn.putheader("Content-Type", "application/gzip")
+                conn.putheader("Content-Length", str(size))
+                conn.endheaders()
+                with tar_path.open("rb") as f:
+                    while True:
+                        chunk = f.read(1 << 20)
+                        if not chunk:
+                            break
+                        conn.send(chunk)
+                resp = conn.getresponse()
+                resp.read()
+                return resp.status == 200
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 — 터널 단절 등.
+            return False
 
-    def stop(self) -> None:
-        self._stop.set()
-        self.archive.flush()  # 종료 시 대기 묶음 강제 압축.
+
+def _tar_gz(src_dir: Path, dst: Path) -> None:
+    """project_dir를 tar.gz로(전송 구간 압축). 외부 `tar`가 있으면 그걸, 없으면 파이썬 tarfile."""
+    if shutil.which("tar") is not None:
+        subprocess.run(
+            ["tar", "czf", str(dst), "-C", str(src_dir.parent), src_dir.name],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return
+    with tarfile.open(dst, "w:gz") as tar:
+        tar.add(str(src_dir), arcname=src_dir.name)
+
+
+def _write_json(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
+    body = json.dumps(payload, sort_keys=True).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
 
 
 __all__ = [
-    "DONE_MARKER",
-    "BufferScanner",
+    "DEFAULT_BULK_PORT",
     "BulkPushSink",
-    "RsyncRunner",
-    "scan_buffer_once",
+    "start_bulk_transfer_server",
 ]

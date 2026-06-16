@@ -68,17 +68,19 @@
 ## 6. 남은 것
 Phase 1~6 코드 + 컨트롤 플레인 결선 + 결과 ingest(:7876) 완료. 남은 것:
 
-### 6.1 대용량 산출물 전송 :7877 (미구현 — 설계 확정, 나중에 구현)
+### 6.1 대용량 산출물 전송 :7877 (✅ 구현 완료 — `edt_bulk_transfer`, 단위테스트)
 **HTTP tar 스트림 push, sshd 불필요.** 7876과 동일한 gate 경유 ssh 터널 인프라 재사용.
 - **로컬 데몬:** `:7877` HTTP 수신 서버(`POST /bulk/<request_id>`, tar.gz 스트림 → 버퍼에 스트리밍 추출,
-  상수 메모리) + 7877 역터널(`reverse_tunnel_argv(port=7877)`) + `ArchiveStore`(20GB 묶음/2TB FIFO) 결선.
+  상수 메모리) + 7877 역터널(`reverse_tunnel_argv(port=7877)`) + `ArchiveStore`(20GB 묶음/FIFO) 결선.
   - **받는 즉시 풀어서 raw로 보관(개별 압축 보관 금지).** 전송 구간만 `tar.gz`(전송 효율)이고, 도착하면
     바로 압축 해제해 raw 파일로 버퍼에 둔다. 그래야 `ArchiveStore`가 **여러 project_dir를 모아 한 번에
     solid 압축**해 압축률이 좋아진다(개별 압축 보관 시 묶음이 "이미 압축된 덩어리들의 tar"가 되어 추가
     압축이 안 먹는다).
-- **컨테이너:** 7877 정터널(`slot_service.sh`, 7876 옆) + 신규 `edt_bulk_transfer.BulkPushSink`:
-  시뮬 성공 시 `tar czf -` 스트림을 `127.0.0.1:7877`로 POST → 성공 시 **gpfs 원본 삭제**(무조건 절약),
-  실패 시 재시도→보존(디스패처 안 죽임).
+  - **FIFO 상한은 로컬 디스크에 맞춤(`EDT_ARCHIVE_BUFFER_BYTES`).** 로컬 8TB 마운트 여유(~1.4TB) 기준
+    현재 1TB. (GOAL의 "2TB"는 디스크 확장 시 목표; 로컬이 2TB를 못 담으므로 env로 조정.)
+- **컨테이너:** 7877 정터널(`slot_service.sh`, 7876과 한 ssh로 `-L` 둘) + `edt_bulk_transfer.BulkPushSink`:
+  시뮬 성공 시 `tar.gz` 스트림을 `127.0.0.1:7877`로 POST → 성공 시 **gpfs 원본 삭제**(무조건 절약),
+  실패 시 재시도→보존(디스패처 안 죽임). entrypoint가 record sink에 합성(성공 envelope → push).
 - **신뢰 모델:** 터널 loopback 바인딩이라 외부 도달 불가 → 별도 인증/키 불필요(7876과 동일).
 - **재사용:** `edt_ssh_tunnel`(터널), `edt_archive.ArchiveStore`(묶음/FIFO), `edt_result_ingest` HTTP 서버 패턴.
 

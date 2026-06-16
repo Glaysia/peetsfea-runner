@@ -9,6 +9,9 @@ WorkingDirectory=%h/mnt/8tb/peetsfea-runner
 # 컨트롤 플레인: 9 SLURM 잡 상시 유지 + 대시보드:8080 + Intake:7875 + 잡 재기동/10h 만료.
 ExecStart=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -m peetsfea_runner.edt_control_plane
 Environment=EDT_DB_PATH=%h/edt-deploy/results.duckdb
+Environment=EDT_ARCHIVE_ROOT=%h/mnt/8tb/edt-archive
+# 로컬 8TB 마운트 여유(~1.4TB)에 맞춘 아카이브 FIFO 상한(1TB). 디스크 늘면 키울 것.
+Environment=EDT_ARCHIVE_BUFFER_BYTES=1099511627776
 Environment=EDT_SSH_HOST=gate1-harry261
 Environment=EDT_JOB_COUNT=9
 Environment=EDT_DASHBOARD_PORT=8080
