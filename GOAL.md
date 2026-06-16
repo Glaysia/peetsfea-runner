@@ -33,7 +33,7 @@
 ## 2. 현재 상태 — 기동됐으나 **완전 작동 불가** (실측 진단)
 9잡 fleet·역터널·포트는 전부 LIVE지만 **DB 적재 0건**. 실측 결과 두 가지 문제가 막고 있다.
 
-### 문제 1 — baseline 샘플링이 슬롯을 굶겨 solve가 0회 (작동 불능의 직접 원인)
+### 문제 1 — baseline 샘플링이 슬롯을 굶겨 solve가 0회 (✅ 수정됨)
 **증상:** 각 컨테이너에서 `build_ssw_body_boxes`가 수백 회 반복되는데 HFSS solve·`.aedt` 생성·결과 envelope는 0.
 출력 디렉토리·spool·DB 전부 비어 있음.
 
@@ -53,7 +53,7 @@
 
 **수용:** 기동 후 **수 분 내 첫 HFSS solve 시작**, 슬롯이 baseline만으로 끊김 없이 채워지고 결과가 DB에 적재된다.
 
-### 문제 2 — `results.csv`에 출력 데이터셋이 빠져 있음
+### 문제 2 — `results.csv`에 출력 데이터셋이 빠져 있음 (✅ 수정됨)
 **요구사항(확정):** `:8080`의 `results.csv`는 **무거운 `.aedt` 파일만 빼고 모든 정보**를 담아야 하고,
 **입력·출력 데이터셋을 반드시 포함**해야 한다(설계점 → 시뮬 리포트 결과).
 
@@ -70,7 +70,30 @@ pass(pass_*)만** 평탄화해 내보내고 **출력 리포트 데이터셋·tel
 - **제외:** 무거운 `.aedt`/`.aedtresults` 바이너리(이건 :7877로 아카이브, CSV엔 아카이브 참조만).
 
 **수용:** `curl localhost:8080/results.csv` 한 방에 **각 시뮬의 설계 입력과 시뮬 출력(리포트 값)** 이 모두 들어 있어
-그대로 분석/서로게이트 학습용 데이터셋으로 쓸 수 있다.
+그대로 분석/서로게이트 학습용 데이터셋으로 쓸 수 있다. (실패 행은 입출력이 비어 컬럼이 안 뜨고, **성공 행이
+들어오면** `in_*`/`tel_*`/`pass_*`/`reports_json` 컬럼이 동적으로 나타난다.)
+
+### 문제 3 — pyaedt Desktop 프로세스 전역 충돌로 solve 100% 실패 (⚠️ 실제 블로커, 우회 적용 중)
+문제 1·2 수정 후 실가동했더니 **모든 solve가 AEDT attach 단계에서 실패**(7/7 `failed`):
+`AssertionError: Raw Hfss.project_name must be str (actual=NoneType)`, `'Desktop' object has no attribute 'grpc_plugin'`.
+
+**원인(양쪽 소스 확인):**
+- 러너 `edt_aedt_backend.py:122-130`: 슬롯마다 pyaedt `Desktop(new_desktop=False, port=port)`를 **한 파이썬
+  프로세스 안에** 생성(슬롯 11개 = Desktop 11개 + 각 primitive의 attach Desktop).
+- peetsfea `ssw_ports.py:528` `_release_keeping_desktop_alive`: 매 시뮬 끝에 **`release_desktop()`**(프로세스 전역).
+- **pyaedt의 Desktop은 프로세스 전역 싱글톤** → 한 프로세스에 Desktop이 여럿 공존하거나 한 슬롯이
+  `release_desktop()`을 부르면 다른 슬롯들의 전역 Desktop 상태가 깨진다(grpc_plugin 소실, project_name None).
+- **0.3.4 검증이 성공한 건 `EDT_SLOT_COUNT=1`(Desktop 1개, 충돌 없음)** 이었음 — 1↔11 차이와 정확히 일치.
+- peetsfea의 attach/release는 단일프로세스 기준으론 옳다. **러너가 "한 프로세스에 슬롯 N개(스레드)"로 pyaedt의
+  one-Desktop-per-process 제약을 위반**한 것이 근본 문제.
+
+**우회(즉시, 적용됨):** `slot_service.sh` `EDT_SLOT_COUNT=1` — 컨테이너당 슬롯 1개 = 프로세스당 Desktop 1개 →
+충돌 없음. 9 컨테이너 × 1 슬롯 = 동시 9 solve로 **실제 데이터부터 쌓는다**.
+
+**정식 수정(후속, ~100 밀도 복원):** pyaedt가 one-Desktop-per-process이므로 슬롯을 **별도 OS 프로세스로 격리**해야
+한다. 후보: ① 컨테이너당 워커 서브프로세스 N개(각 1슬롯=1 Desktop)를 entrypoint가 spawn, 또는 ② `slot_service.sh`가
+1-슬롯 컨테이너를 노드당 N개 띄움(컨테이너=프로세스=Desktop). 어느 쪽이든 디스패처/edtmgr/backend가 슬롯을
+스레드가 아닌 프로세스 경계로 다루도록 바꾼다.
 
 ## 3. 결과 데이터 계약 (results.csv가 담아야 할 것)
 > 리포트 출력 데이터셋(`csv_text_by_report`)의 CSV 내 표현 형식은 구현 시 확정(후보: ① 시뮬당 1행 + 리포트
@@ -89,10 +112,12 @@ pass(pass_*)만** 평탄화해 내보내고 **출력 리포트 데이터셋·tel
 4. 7875로 sweep 투입 시 N개 우선 처리, backlog 중에도 baseline ~15% 유지.
 5. 잡 장애·10h 만료에 견고(폐기·재기동).
 
-## 5. 남은 작업 (위 두 문제 해결 = 완전 작동)
-- [ ] **문제 1:** baseline refill 백그라운드 워커화 + batch_size 축소·점진 보충 (`edt_queue`/`edt_intake`/`edt_service`).
-- [ ] **문제 2:** `edt_dashboard.rows_to_csv` 확장 — 입력+출력(telemetry/pass/리포트 데이터셋) 전부 포함, `.aedt`만 제외.
-- [ ] 재배포(배포 체크아웃 FF + 클러스터 wheel) 후 재기동 → 첫 solve·DB 적재·CSV 데이터셋 실측 확인.
+## 5. 남은 작업
+- [x] **문제 1:** baseline refill 백그라운드 워커화(`BaselineRefiller`) + batch 1000→16·저수위 64. (테스트 통과)
+- [x] **문제 2:** `edt_dashboard.rows_to_csv` 확장 — 입력+출력(tel_*/pass_*/`reports_json`) 전부, `.aedt`만 제외. (테스트 통과)
+- [x] **문제 3 우회:** `EDT_SLOT_COUNT=1`로 pyaedt 충돌 회피 → 9 동시 solve로 실제 데이터 축적 시작.
+- [ ] **문제 3 정식 수정:** 슬롯을 별도 프로세스로 격리(컨테이너당 워커 서브프로세스 N개) → 동시 ~100 밀도 복원.
+- [ ] 1-슬롯 우회로 성공 데이터(`terminal_state=success` + 입출력 데이터셋)가 DB/CSV에 쌓이는지 실측 확인.
 
 ## 6. 운영/배포 메모 (실측)
 - **데몬 코드 출처 = 배포 체크아웃 `~/mnt/8tb/peetsfea-runner`** (systemd `python -m`의 cwd가 sys.path 최상단).
