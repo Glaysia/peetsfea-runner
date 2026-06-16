@@ -31,7 +31,7 @@ class FakeBackend(EdtBackend):
 
 
 def test_dispatcher_persists_envelope_to_duckdb_store(tmp_path: Path) -> None:
-    def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int) -> dict[str, Any]:
+    def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int, **_: Any) -> dict[str, Any]:
         return {"k_ratio": 0.42, "Lrx_uH": 12.5, "setup_pass_counts": {"Setup1": 7}}
 
     config = EdtServiceConfig(

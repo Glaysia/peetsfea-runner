@@ -61,7 +61,7 @@ def _dispatcher(slots: list[EdtManager], queue: TomlQueue, primitive: Any, tmp_p
 def test_processes_all_items_across_slots(tmp_path: Path) -> None:
     seen_ports: list[int] = []
 
-    def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int) -> dict[str, Any]:
+    def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int, **_: Any) -> dict[str, Any]:
         seen_ports.append(grpc_port)
         return {"k_ratio": 1.0, "echo_port": grpc_port}
 
@@ -81,7 +81,7 @@ def test_processes_all_items_across_slots(tmp_path: Path) -> None:
 
 
 def test_failure_records_failed_and_recovers(tmp_path: Path) -> None:
-    def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int) -> dict[str, Any]:
+    def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int, **_: Any) -> dict[str, Any]:
         raise RuntimeError("boom")
 
     queue = TomlQueue()
@@ -102,7 +102,7 @@ def test_failure_records_failed_and_recovers(tmp_path: Path) -> None:
 
 
 def test_backstop_aborts_hung_sim(tmp_path: Path) -> None:
-    def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int) -> dict[str, Any]:
+    def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int, **_: Any) -> dict[str, Any]:
         time.sleep(0.6)  # 백스톱(0.3s)보다 오래 → 미반환
         return {"k_ratio": 0.0}
 

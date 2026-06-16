@@ -8,18 +8,19 @@ DEFAULT_SLURM_JOB_TIME_LIMIT: Final[str] = "00:45:00"
 # --- edtmgr / 슬롯 (Phase 1) -------------------------------------------------
 # 컨테이너당 상시 기동하는 ansysedt(=슬롯) 수.
 SLOTS_PER_CONTAINER: Final[int] = 10
-# 시뮬 1개 소프트 목표(~40분). 정보용(워치독 강제 아님).
-SIM_SOFT_TARGET_SECONDS: Final[int] = 40 * 60
-# 시뮬 자체 하드 abort(60분). peetsfea가 스스로 마지막 패스 리포트를 남기고 종료해야 함.
-SIM_HARD_ABORT_SECONDS: Final[int] = 60 * 60
-# edtmgr 백스톱(65분): 대여한 채 이 시간까지 미반환이면 SIGKILL 후 재기동.
-EDTMGR_BACKSTOP_KILL_SECONDS: Final[int] = 65 * 60
+# 타이밍은 클러스터 CPU가 로컬 PC 대비 ~1.5배 느린 것을 반영해 모두 ×1.5 (실측: 1h→1.5h).
+# 시뮬 1개 소프트 목표(~60분). 정보용(워치독 강제 아님).
+SIM_SOFT_TARGET_SECONDS: Final[int] = 60 * 60
+# 시뮬 자체 하드 abort(90분). peetsfea가 스스로 마지막 패스 리포트를 남기고 종료해야 함.
+SIM_HARD_ABORT_SECONDS: Final[int] = 90 * 60
+# edtmgr 백스톱(98분): 대여한 채 이 시간까지 미반환이면 SIGKILL 후 재기동(하드 abort 90분 + 여유).
+EDTMGR_BACKSTOP_KILL_SECONDS: Final[int] = 98 * 60
 
 # --- Phase 2: 9잡 / ~100 동시 오케스트레이션 -------------------------------
 # 계정당 SLURM 잡 수(= 컨테이너 수).
 JOBS_PER_ACCOUNT: Final[int] = 9
-# 잡 수명(10h). 만료 시 진행 중 시뮬을 그냥 폐기(드레인 없음, Q8) 후 재기동.
-JOB_MAX_LIFETIME_SECONDS: Final[int] = 10 * 60 * 60
+# 잡 수명(15h = 10h×1.5). 만료 시 진행 중 시뮬을 그냥 폐기(드레인 없음, Q8) 후 재기동.
+JOB_MAX_LIFETIME_SECONDS: Final[int] = 15 * 60 * 60
 # 유연 토폴로지(Phase 2/3): edtmgr가 항상 보유하는 warm 하한 / 컨테이너당 슬롯 상한.
 WARM_FLOOR_PER_CONTAINER: Final[int] = 11
 MAX_SLOTS_PER_CONTAINER: Final[int] = 16

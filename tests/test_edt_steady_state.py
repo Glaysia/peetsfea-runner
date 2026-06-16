@@ -46,7 +46,7 @@ def _headroom_admission() -> AdmissionController:
 
 
 def test_two_lane_dispatcher_processes_both_lanes_under_admission(tmp_path: Path) -> None:
-    def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int) -> dict[str, Any]:
+    def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int, **_: Any) -> dict[str, Any]:
         return {"ok": True}
 
     queue = TwoLaneQueue(baseline_floor_percent=15)

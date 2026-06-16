@@ -57,7 +57,7 @@ class RealEdtBackend(EdtBackend):
     slot_id: str = "slot"
     executable: Path = field(default_factory=default_ansysedt_executable)
     non_graphical: bool = True
-    grpc_startup_timeout: float = 180.0
+    grpc_startup_timeout: float = 270.0  # AEDT 기동도 느린 CPU 반영 ×1.5 (180→270s)
     work_dir: Path | None = None
     _proc: subprocess.Popen[bytes] | None = field(default=None, init=False, repr=False)
     _port: int | None = field(default=None, init=False, repr=False)

@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .constants import EDTMGR_BACKSTOP_KILL_SECONDS
+from .constants import EDTMGR_BACKSTOP_KILL_SECONDS, SIM_HARD_ABORT_SECONDS
 from .edt_load import AdmissionController
 from .edtmgr import EdtManager
 from .edt_queue import QueueItem, QueueLike
@@ -55,6 +55,8 @@ class SlotDispatcher:
     node: str = ""  # 잡이 떠 있는 노드 hostname
     version_loader: VersionLoader = _default_version_loader
     backstop_seconds: float = float(EDTMGR_BACKSTOP_KILL_SECONDS)
+    # peetsfea가 스스로 마지막 패스 리포트를 남기고 abort할 한도(90분). backstop(98분)보다 짧아야 함.
+    solve_hard_abort_seconds: float = float(SIM_HARD_ABORT_SECONDS)
     now_iso: Callable[[], str] = _utc_now_iso
     drain: bool = True
     idle_sleep_seconds: float = 1.0
@@ -134,6 +136,7 @@ class SlotDispatcher:
             mode=item.mode,
             grpc_port=grant.grpc_port,
             aedt_pid=grant.pid,
+            solve_hard_abort_seconds=self.solve_hard_abort_seconds,
         )
         try:
             result = future.result(timeout=self.backstop_seconds)
