@@ -14,7 +14,10 @@ ANSB=/opt/ohpc/pub/Electronics/v252
 DEPLOY=$HOME/edt-deploy
 VENVPY=$DEPLOY/venv/bin/python
 REF=$DEPLOY/venv/lib/python3.12/site-packages/peetsfea/data/0.3.5_sweep.toml
-OUT=$DEPLOY/run_out/$SLURM_JOB_ID
+# 무거운 AEDT 산출물은 노드 로컬 스크래치 /enroot/{USER}_{JOB}에 쓴다(gpfs $HOME 쿼터 회피, job_workspace 설계).
+# gpfs $HOME에 쓰면 88 워커 aedt가 per-user 쿼터를 터뜨린다. /enroot는 노드 로컬·대용량·잡 종료 시 삭제.
+JOBDIR=/enroot/${USER}_${SLURM_JOB_ID}
+OUT=$JOBDIR/run_out
 # compute node가 gate를 부르는 클러스터 내부명(로컬 ssh 별칭 gate1-harry261 아님!). 실측: n043→gate1 OK.
 GATE=${EDT_GATE_HOST:-gate1}
 PORT=${EDT_INGEST_PORT:-7876}        # 결과 JSON ingest 백채널
@@ -41,13 +44,13 @@ start_tunnel() {
 keep_tunnel() { while true; do start_tunnel; wait "$TUNNEL_PID"; sleep 5; done; }
 keep_tunnel &
 KEEPER_PID=$!
-cleanup() { kill "$KEEPER_PID" "$TUNNEL_PID" 2>/dev/null || true; enroot remove -f "$C" >/dev/null 2>&1 || true; }
+cleanup() { kill "$KEEPER_PID" "$TUNNEL_PID" 2>/dev/null || true; enroot remove -f "$C" >/dev/null 2>&1 || true; rm -rf "$JOBDIR" 2>/dev/null || true; }
 trap cleanup EXIT
 
 enroot create --name "$C" "$HOME/runtime/enroot/aedt.sqsh" >/dev/null 2>&1
 enroot start --root --rw \
   --mount "$ANSB/AnsysEM:/mnt/AnsysEM" --mount "$ANSB:/ansys_inc/v252" \
-  --mount "$ANSB/licensingclient:/mnt/licensingclient" --mount "$HOME:$HOME" \
+  --mount "$ANSB/licensingclient:/mnt/licensingclient" --mount "$HOME:$HOME" --mount "$JOBDIR:$JOBDIR" \
   --env ANSYSEM_ROOT252=/mnt/AnsysEM --env ANS_IGNOREOS=1 --env "NVIDIA_VISIBLE_DEVICES=$NVD" \
   --env "ANSYSLMD_LICENSE_FILE=$ANSYSLMD_LICENSE_FILE" \
   --env "EDT_OUTPUT_ROOT=$OUT" --env "EDT_RESULT_INGEST_URL=$INGEST_URL" --env "EDT_WORK_DIR=$OUT/work" \
