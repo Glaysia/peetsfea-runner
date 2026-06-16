@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>peetsfea-runner — 0.3.6 운영 진단 · 8080 시계열 대시보드 · 0.3.7 계획</title>
+<style>
+  :root{--bg:#0d1117;--pan:#161b22;--pan2:#1f242d;--ln:#2c313c;--fg:#e6edf3;--mut:#9aa3b2;
+        --acc:#5ec2ff;--ok:#3fb950;--warn:#ffb454;--bad:#ff6b6b;--vi:#b392f0;--code:#11141a;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Segoe UI","Noto Sans KR",Roboto,sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:30px 24px 90px}
+  header{border-bottom:1px solid var(--ln);padding-bottom:18px;margin-bottom:26px}
+  h1{font-size:25px;margin:0 0 6px}
+  h2{font-size:19px;margin:42px 0 12px;border-left:3px solid var(--acc);padding-left:10px}
+  h3{font-size:15.5px;margin:20px 0 8px;color:var(--acc)}
+  .sub{color:var(--mut);font-size:14px}
+  p{margin:8px 0}
+  code{background:var(--code);padding:1px 6px;border-radius:4px;font-size:13px;font-family:"JetBrains Mono",Consolas,monospace;color:#d6deeb}
+  .card{background:var(--pan);border:1px solid var(--ln);border-radius:10px;padding:16px 18px;margin:14px 0}
+  .grid{display:grid;gap:14px}.c2{grid-template-columns:1fr 1fr}.c3{grid-template-columns:1fr 1fr 1fr}.c4{grid-template-columns:repeat(4,1fr)}
+  @media(max-width:820px){.c2,.c3,.c4{grid-template-columns:1fr}}
+  ul{margin:8px 0;padding-left:20px}li{margin:5px 0}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13.5px}
+  th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--ln);vertical-align:top}
+  th{color:var(--mut);font-weight:600}
+  .tag{display:inline-block;font-size:11.5px;padding:2px 8px;border-radius:10px;background:var(--pan2);border:1px solid var(--ln);color:var(--mut);margin-right:5px}
+  .tag.ok{color:var(--ok);border-color:#2f5e3a}.tag.warn{color:var(--warn);border-color:#5e4a2f}
+  .tag.bad{color:var(--bad);border-color:#5e2f2f}.tag.new{color:var(--vi);border-color:#4b3a6e}
+  .kpi{background:var(--pan2);border:1px solid var(--ln);border-radius:10px;padding:12px 14px}
+  .kpi .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+  .kpi .v{font-size:25px;font-weight:700;margin-top:3px}
+  .muted{color:var(--mut)}.bad{color:var(--bad)}.ok{color:var(--ok)}.warn{color:var(--warn)}
+  .bar{height:10px;background:#0d1117;border:1px solid var(--ln);border-radius:6px;overflow:hidden;margin:3px 0}
+  .bar>i{display:block;height:100%}
+  svg{display:block;width:100%;height:auto}
+  .lg span{margin-right:14px;font-size:12.5px;color:var(--mut)}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:4px;vertical-align:middle}
+  .note{font-size:12.5px;color:var(--mut);margin-top:6px}
+  footer{margin-top:50px;padding-top:16px;border-top:1px solid var(--ln);color:var(--mut);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>peetsfea-runner — 운영 진단 · 시계열 대시보드 설계 · 0.3.7 계획</h1>
+  <p class="sub">실측 데이터 기준 (2026-06-17, peetsfea 0.3.6, 표본 264건). 소스 무수정 · HTML 설계 문서.</p>
+  <p style="margin-top:9px">
+    <span class="tag">0.3.6 가동 실측</span>
+    <span class="tag new">8080 시계열 설계(미구현)</span>
+    <span class="tag warn">0.3.7 패치 예정</span>
+  </p>
+</header>
+
+<!-- ============ KPI ============ -->
+<div class="grid c4">
+  <div class="kpi"><div class="k">표본 / 성공률</div><div class="v">264 · <span class="ok">72%</span></div><div class="note">성공 191 / 비성공 73</div></div>
+  <div class="kpi"><div class="k">solve 중앙값</div><div class="v warn">55분</div><div class="note">최대 131 · p90 86분</div></div>
+  <div class="kpi"><div class="k">GPU 가속 비중</div><div class="v">41%</div><div class="note">성공 중 78건 (RTX3090)</div></div>
+  <div class="kpi"><div class="k">라이선스</div><div class="v">86<span class="muted" style="font-size:15px">/131/550</span></div><div class="note">내것/전체/발급 (여유)</div></div>
+</div>
+
+<!-- ============ 1. 진단 ============ -->
+<h2>1. 0.3.6 진단 — 왜 성공률이 낮은가 (실측 73건 실패 분석)</h2>
+
+<div class="card">
+  <h3>실패 유형 분해 — <b>mesh/MaxPass 완화로 잡히는 건 30%뿐</b></h3>
+  <table>
+    <tr><th>유형</th><th style="width:60px">건수</th><th>근본 원인</th><th>0.3.7(mesh4만·pass11)로?</th></tr>
+    <tr><td><b>ValueError</b><br><span class="note">포트 엣지</span></td><td>25 (34%)</td>
+        <td><code>rx_port.edge_vertices_xyz must match exactly one imported edge (matches=[])</code> — 특정 RX 코일 지오메트리가 매칭 가능한 포트 엣지를 생성 못 함. <b>peetsfea 지오메트리/포트 할당</b> 문제.</td>
+        <td class="bad">❌ 무관 (메시 아님)</td></tr>
+    <tr><td><b>BackstopTimeout</b><br><span class="note">느린 솔브</span></td><td>22 (30%)</td>
+        <td><code>sim exceeded 5880s</code> — 솔브가 한도 초과. 0.3.6 솔브 중앙 55·p90 86·최대 131분으로 느려 슬로우테일이 죽음.</td>
+        <td class="ok">✅ 직접 해결 (&lt;30분이면 소멸)</td></tr>
+    <tr><td><b>AssertionError</b><br><span class="note">pyaedt 충돌</span></td><td>16 (22%)</td>
+        <td><code>Hfss.project_name must be str (NoneType)</code> — pyaedt Desktop 전역상태 충돌. 워커 격리(process-per-slot) 레이스로 추정.</td>
+        <td class="bad">❌ 무관</td></tr>
+    <tr><td>PeetsfeaStageError</td><td>5</td><td><code>analyze_setup False</code> — ill-conditioned mesh 등 솔브 단계 실패.</td><td class="warn">⚠️ 일부</td></tr>
+    <tr><td>FileExistsError</td><td>3</td><td>재시작 후 같은 seed 재탐색 → 출력 디렉토리 충돌. 런너 핸들링.</td><td class="bad">❌ (런너)</td></tr>
+    <tr><td>RuntimeError</td><td>2</td><td><code>SSW solve telemetry process did not stop</code>.</td><td class="warn">⚠️</td></tr>
+  </table>
+  <p class="note"><b>결론:</b> 0.3.7의 mesh/MaxPass 완화는 <b>BackstopTimeout(30%)</b>만 잡는다. 최다 실패인 <b class="bad">포트 엣지(34%)</b>와 <b class="bad">pyaedt 충돌(22%)</b>은 그대로 남는다 → 별도 패치 필요(§3).</p>
+</div>
+
+<div class="grid c2">
+  <div class="card">
+    <h3>solve 시간 분포 — 0.3.6은 근본적으로 느림</h3>
+    <svg id="histSvg" viewBox="0 0 520 200"></svg>
+    <p class="note">중앙 55분, p90 86분, 최대 131분. <b>85건(45%)이 60분 초과</b> → 0.3.7의 &lt;30분 목표가 핵심 레버. 백스톱(현 150분)과 무관하게 솔브 자체가 느림.</p>
+  </div>
+  <div class="card">
+    <h3>파티션별 실패율 — cpu2(CPU)가 gpu1보다 높음</h3>
+    <table>
+      <tr><th>파티션</th><th>성공</th><th>실패</th><th>실패율</th></tr>
+      <tr><td>gpu1 (GPU 가속)</td><td>90</td><td>28</td><td><span class="ok">24%</span></td></tr>
+      <tr><td>cpu2 (CPU only)</td><td>101</td><td>45</td><td><span class="warn">31%</span></td></tr>
+    </table>
+    <p class="note">CPU 솔브가 느려 BackstopTimeout이 더 많다. 0.3.7로 솔브가 빨라지면 cpu2 실패율이 크게 떨어질 것. GPU 비중을 늘리는 것도 보조 레버.</p>
+    <h3 style="margin-top:18px">집계</h3>
+    <div class="bar"><i style="width:72%;background:var(--ok)"></i></div><div class="note">성공 72% (191/264)</div>
+    <div class="bar"><i style="width:41%;background:var(--vi)"></i></div><div class="note">성공 중 GPU 사용 41%</div>
+  </div>
+</div>
+
+<!-- ============ 2. 8080 시계열 ============ -->
+<h2>2. 8080 시계열 대시보드 — x축=시간 (설계 + 실데이터)</h2>
+<p class="muted">현재 :8080은 <b>순간 스냅샷</b>만 보여준다(지금 부하·누적 카운트). 운영 추세를 보려면 x축을 시간으로 둔 시계열이 필요하다. 아래는 <b>실측 데이터로 그린 차트</b>와, 각 패널의 데이터 출처/구현 방법(0.3.7 소스 작업)이다.</p>
+
+<div class="card">
+  <h3>① 처리량 / 성공·실패 (실데이터, 15분 버킷)</h3>
+  <p class="lg"><span><i class="dot" style="background:var(--ok)"></i>성공</span><span><i class="dot" style="background:var(--bad)"></i>실패</span><span><i class="dot" style="background:var(--vi)"></i>GPU 사용(성공 중)</span></p>
+  <svg id="tsSvg" viewBox="0 0 1120 280"></svg>
+  <p class="note">실측 33버킷. <span class="bad">18:00·19:00의 실패 급증</span>은 램프업/구 백스톱(98분) 타임아웃 버스트 → 백스톱 150분 상향 후 <span class="ok">21:00~22:45 거의 성공만</span>(21:30 피크 성공22/GPU12). <b>출처:</b> DB <code>finished_at</code>를 서버측 <code>time_bucket</code> 집계 → <code>GET /api/timeseries?metric=throughput&bucket=15m</code>.</p>
+</div>
+
+<div class="grid c2">
+  <div class="card">
+    <h3>② 자원 시계열 — CPU / GPU / RAM <span class="tag new">0.3.7 구현</span></h3>
+    <svg id="resSvg" viewBox="0 0 540 200"></svg>
+    <p class="note">샘플 형태(실데이터 아님 — 자원은 현재 순간값만 캐시). <b>구현:</b> <code>ResourcePoller</code>가 지금은 순간 스냅샷만 → <b>시간순 링버퍼</b>(최근 24h, 메모리)에 누적 → <code>GET /api/resources/history?metric=cpuload|gpu_util|mem</code>. 노드별 CPULoad(잡 할당코어 분모), GPU util(nvidia-smi), RAM 사용.</p>
+  </div>
+  <div class="card">
+    <h3>③ 입력 큐 · 동시 솔브 · 라이선스 <span class="tag new">0.3.7 구현</span></h3>
+    <svg id="queueSvg" viewBox="0 0 540 200"></svg>
+    <p class="note">샘플 형태. <b>입력 큐 깊이</b>(baseline/우선순위 레인 길이) + <b>동시 running 솔브 수</b> + <b>electronics_desktop 라이선스 사용</b>을 한 시간축에. 출처: TwoLaneQueue 길이 스냅샷 + squeue running + lmstat — 모두 링버퍼에 누적.</p>
+  </div>
+</div>
+
+<div class="card">
+  <h3>구현 메모 (0.3.7, 소스 작업 — 지금은 설계만)</h3>
+  <ul>
+    <li><b>결과 시계열</b>: 추가 저장 불필요. 이미 있는 <code>finished_at</code>/<code>solve_telemetry</code>를 DuckDB <code>time_bucket</code>으로 서버측 집계 → <code>/api/timeseries</code>(전체 행 비전송).</li>
+    <li><b>자원 시계열</b>: <code>ResourcePoller</code>에 <b>시간순 링버퍼</b> 추가(20s 간격, 최근 24h ≈ 4320포인트, 경량). → <code>/api/resources/history</code>.</li>
+    <li><b>프론트</b>: "추세" 탭 신설 — 시간축 라인/스택 차트(기존 SVG 렌더러 재사용, 자동 새로고침). 본 HTML의 렌더 함수가 그 프로토타입.</li>
+    <li><b>활용</b>: 처리량 급락=장애 감지, 라이선스 포화 경보, GPU/CPU 효과의 시간적 안정성(자동 벤치마크).</li>
+  </ul>
+</div>
+
+<!-- ============ 3. 0.3.7 ============ -->
+<h2>3. 0.3.7 패치 계획</h2>
+<div class="grid c2">
+  <div class="card">
+    <h3><span class="tag ok">확정</span> 솔브 가속 — 시뮬 &lt;30분</h3>
+    <table>
+      <tr><th>항목</th><th>0.3.6</th><th>0.3.7</th></tr>
+      <tr><td>MESH_MAX_ELEMENTS</td><td>90,000</td><td><b class="ok">40,000</b></td></tr>
+      <tr><td>SETUP_MAXIMUM_PASSES</td><td>18</td><td><b class="ok">11</b></td></tr>
+      <tr><td>목표 solve 시간</td><td>중앙 55·p90 86분</td><td><b class="ok">&lt;30분</b></td></tr>
+    </table>
+    <p class="note">효과: <b>BackstopTimeout(실패의 30%) 소멸</b> + 처리량 ~2배(워커 회전 빨라짐) + cpu2 실패율 급감. 단, 메시↓로 정밀도는 일부 trade-off — 수렴/포트 품질 모니터 필요.</p>
+  </div>
+  <div class="card">
+    <h3><span class="tag bad">권고</span> mesh 외 추가 패치 (실패의 ~60%)</h3>
+    <ul>
+      <li><b class="bad">① 포트 엣지 매칭 (34%, 최다)</b> — peetsfea RX 포트-엣지 매칭에 <b>허용오차/재시도/우아한 스킵</b>. 수율 1순위 레버. <span class="note">(0.3.7 mesh로 안 잡힘)</span></li>
+      <li><b class="bad">② pyaedt project_name=None 충돌 (22%)</b> — process-per-slot 격리의 레이스(워커 재기동·grpc 포트 충돌) 조사. 재시도 시 collision-safe project 이름.</li>
+      <li><b>③ FileExistsError</b> — 재탐색 시 기존 출력 디렉토리 덮어쓰기/스킵.</li>
+      <li><b>④ 0.25um?</b> — <code>MESH_MAX_LENGTH=0.25um</code>(RestrictLength=True)은 0.25mm 오타 의심. ill-conditioned mesh 유발 가능 — 0.3.7에서 확인 권장.</li>
+    </ul>
+    <p class="note">①+②만 잡아도 실패의 56%가 추가로 줄어든다. mesh 완화(30%)와 합치면 성공률이 크게 오를 여지.</p>
+  </div>
+</div>
+
+<footer>
+  데이터: <code>~/edt-deploy/results.duckdb</code> (264건, 2026-06-17 05:0x UTC 기준) · 본 문서는 HTML 설계/진단 전용(소스 무수정).
+  운영 학습은 <code>GOAL.md</code> 및 커밋 01dae59·e3d7cd4·0dba522 참조.
+</footer>
+
+</div>
+
+<script>
+// ===== 실측 데이터 (DB에서 추출) =====
+const TS = [{"t":"06-16 13:30","s":1,"f":0,"g":0},{"t":"06-16 14:00","s":2,"f":0,"g":0},{"t":"06-16 14:15","s":1,"f":0,"g":0},{"t":"06-16 14:30","s":4,"f":0,"g":0},{"t":"06-16 14:45","s":1,"f":0,"g":0},{"t":"06-16 15:00","s":4,"f":2,"g":2},{"t":"06-16 15:15","s":2,"f":0,"g":1},{"t":"06-16 16:00","s":0,"f":1,"g":0},{"t":"06-16 16:45","s":1,"f":0,"g":0},{"t":"06-16 17:00","s":4,"f":0,"g":1},{"t":"06-16 17:15","s":3,"f":0,"g":1},{"t":"06-16 17:30","s":4,"f":0,"g":0},{"t":"06-16 17:45","s":5,"f":0,"g":4},{"t":"06-16 18:00","s":2,"f":8,"g":1},{"t":"06-16 18:15","s":3,"f":1,"g":1},{"t":"06-16 18:30","s":9,"f":2,"g":4},{"t":"06-16 18:45","s":7,"f":1,"g":4},{"t":"06-16 19:00","s":5,"f":20,"g":3},{"t":"06-16 19:15","s":10,"f":3,"g":6},{"t":"06-16 19:30","s":8,"f":10,"g":4},{"t":"06-16 19:45","s":8,"f":5,"g":5},{"t":"06-16 20:00","s":10,"f":5,"g":3},{"t":"06-16 20:15","s":0,"f":4,"g":0},{"t":"06-16 20:30","s":2,"f":0,"g":0},{"t":"06-16 20:45","s":2,"f":0,"g":1},{"t":"06-16 21:00","s":9,"f":0,"g":3},{"t":"06-16 21:15","s":9,"f":1,"g":3},{"t":"06-16 21:30","s":22,"f":1,"g":12},{"t":"06-16 21:45","s":16,"f":0,"g":6},{"t":"06-16 22:00","s":10,"f":0,"g":7},{"t":"06-16 22:15","s":7,"f":8,"g":5},{"t":"06-16 22:30","s":14,"f":1,"g":8},{"t":"06-16 22:45","s":6,"f":0,"g":5}];
+// solve 시간 히스토그램 (실측 요약: 분 구간별 대략 분포, n=191)
+const HIST = [["0-20",6],["20-40",34],["40-60",66],["60-80",55],["80-100",24],["100-131",6]];
+
+function el(t,a){const e=document.createElementNS("http://www.w3.org/2000/svg",t);for(const k in a)e.setAttribute(k,a[k]);return e;}
+function txt(x,y,s,cls,extra){const e=el("text",Object.assign({x:x,y:y},extra||{}));e.setAttribute("class",cls||"");e.textContent=s;return e;}
+const C={mut:"#9aa3b2",ok:"#3fb950",bad:"#ff6b6b",vi:"#b392f0",acc:"#5ec2ff",warn:"#ffb454"};
+function L(x,y,s,fill,size){return txt(x,y,s,"",{fill:fill||C.mut,"font-size":(size||11)+"px","font-family":"Segoe UI,Noto Sans KR,sans-serif"});}
+
+// --- 시계열 스택 바 + GPU 라인 ---
+(function(){const svg=document.getElementById("tsSvg");const W=1120,H=280,pad=34,bw=(W-pad-14)/TS.length;
+  const mx=Math.max(...TS.map(d=>d.s+d.f));const sc=v=>(H-pad-18)*v/mx;
+  [0,.5,1].forEach(fr=>{const y=H-pad-sc(mx*fr);svg.appendChild(el("line",{x1:pad,y1:y,x2:W-8,y2:y,stroke:"#2c313c","stroke-width":1}));svg.appendChild(L(4,y+4,Math.round(mx*fr)));});
+  TS.forEach((d,i)=>{const x=pad+i*bw+2,w=bw-3;const sh=sc(d.s),fh=sc(d.f);
+    svg.appendChild(el("rect",{x:x,y:H-pad-sh,width:w,height:sh,fill:C.ok,opacity:.85}));
+    svg.appendChild(el("rect",{x:x,y:H-pad-sh-fh,width:w,height:fh,fill:C.bad,opacity:.85}));
+    if(i%4===0)svg.appendChild(L(x-2,H-pad+14,d.t.slice(6),C.mut,10));});
+  // GPU 라인
+  let pts=TS.map((d,i)=>(pad+i*bw+bw/2)+","+(H-pad-sc(d.g))).join(" ");
+  svg.appendChild(el("polyline",{points:pts,fill:"none",stroke:C.vi,"stroke-width":2,opacity:.9}));
+  TS.forEach((d,i)=>svg.appendChild(el("circle",{cx:pad+i*bw+bw/2,cy:H-pad-sc(d.g),r:2.2,fill:C.vi})));
+})();
+
+// --- solve 히스토그램 ---
+(function(){const svg=document.getElementById("histSvg");const W=520,H=200,pad=30;const n=HIST.length,bw=(W-pad-10)/n;
+  const mx=Math.max(...HIST.map(h=>h[1]));
+  HIST.forEach((h,i)=>{const x=pad+i*bw+4,hh=(H-pad-20)*h[1]/mx;const col=i>=3?C.warn:C.acc;
+    svg.appendChild(el("rect",{x:x,y:H-pad-hh,width:bw-8,height:hh,rx:3,fill:col,opacity:.85}));
+    svg.appendChild(L(x+bw/2-12,H-pad-hh-4,h[1],"#d6deeb",11));
+    svg.appendChild(L(x-2,H-pad+14,h[0],C.mut,9.5));});
+  svg.appendChild(L(pad,16,"성공 솔브 시간 분포 (분, n=191)",C.mut,11));
+})();
+
+// --- 샘플 자원 시계열(설계용) ---
+function sampleLines(id,series,title){const svg=document.getElementById(id);const W=540,H=200,pad=30;
+  const N=24;svg.appendChild(L(pad,15,title,C.mut,11));
+  [0,.5,1].forEach(fr=>{const y=H-pad-(H-pad-16)*fr;svg.appendChild(el("line",{x1:pad,y1:y,x2:W-8,y2:y,stroke:"#2c313c"}));svg.appendChild(L(6,y+4,Math.round(100*fr),C.mut,9));});
+  series.forEach(s=>{let pts=[];for(let i=0;i<N;i++){const v=s.base+s.amp*Math.sin(i/2.3+s.ph)+s.amp*0.4*Math.sin(i/0.8);const vv=Math.max(4,Math.min(98,v));pts.push((pad+(W-pad-8)*i/(N-1))+","+(H-pad-(H-pad-16)*vv/100));}
+    svg.appendChild(el("polyline",{points:pts.join(" "),fill:"none",stroke:s.c,"stroke-width":2,opacity:.9}));});
+  svg.appendChild(L(pad,H-8,"← 24h (샘플 — 실데이터는 링버퍼 구현 후)",C.mut,9.5));
+}
+sampleLines("resSvg",[{base:62,amp:14,ph:0,c:C.acc},{base:30,amp:20,ph:1.5,c:C.vi},{base:48,amp:8,ph:3,c:C.warn}],"CPU(파랑) · GPU(보라) · RAM(주황) % — 샘플");
+sampleLines("queueSvg",[{base:55,amp:25,ph:.5,c:C.ok},{base:80,amp:10,ph:2,c:C.acc},{base:40,amp:12,ph:4,c:C.warn}],"입력큐(초록) · 동시솔브(파랑) · 라이선스(주황) — 샘플");
+</script>
+</body>
+</html>

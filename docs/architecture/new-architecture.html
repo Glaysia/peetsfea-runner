@@ -62,11 +62,23 @@
   <p class="sub">edtmgr 기반 warm AEDT 풀 · 단일 계정 동시 ~100 시뮬 · 입력→시뮬→DB/대시보드→아카이브</p>
   <p style="margin-top:10px">
     <span class="tag new">신규 아키텍처(레거시 대체)</span>
-    <span class="tag">peetsfea-main → 0.3.2</span>
-    <span class="tag ok">동시 ~100 = 컨테이너 9 × 최대 16 (부하 유동)</span>
+    <span class="tag">peetsfea <b>0.3.6</b> 가동 · 0.3.7 예정</span>
+    <span class="tag ok">동시 ~88 = 컨테이너 8~9 × 슬롯 11</span>
   </p>
-  <p class="sub">기준 문서: <code>PLANS/MASTER_PLAN.md</code> · 1차 구현 범위: <code>GOAL.md</code>(Phase 1)</p>
+  <p class="sub">기준 문서: <code>PLANS/MASTER_PLAN.md</code> · 실측 진단/시계열 설계: <code>PLANS/v037_ops_dashboard.html</code></p>
 </header>
+
+<div class="card" style="border-color:#4b3a6e">
+  <h3 style="margin-top:0;color:var(--violet)">현재 운영 실측 (2026-06-17, peetsfea 0.3.6)</h3>
+  <p class="muted" style="font-size:13.5px">아래 1~6은 최초 설계도다. <b>실가동에서 바뀐 핵심</b>은 다음과 같다(상세·실패진단은 <code>PLANS/v037_ops_dashboard.html</code>):</p>
+  <ul style="font-size:13.5px">
+    <li><b>슬롯 = process-per-slot</b>: edtmgr warm-pool 대여 대신, 컨테이너마다 <b>단일슬롯 워커 11개를 별도 OS 프로세스</b>로 spawn(pyaedt Desktop은 프로세스 전역 싱글톤이라 1프로세스=1AEDT). baseline 전역 샘플링으로 <b>자기공급</b>(Intake 없이도 상시 시뮬).</li>
+    <li><b>단일 로컬 DB 토폴로지</b>: 슈퍼컴엔 DB 없음. 컨테이너가 결과를 gate 경유 <b>역터널(:7876 JSON, :7877 대용량)</b>로 로컬 데몬에 push. 컨트롤 플레인은 로컬 systemd <code>--user</code>.</li>
+    <li><b>GPU 자동 가속</b>: gpu* 파티션에 <code>--gres=gpu:2</code> + 워커별 <code>CUDA_VISIBLE_DEVICES</code> 핀닝. 실측 성공의 41%가 GPU(RTX3090) 사용.</li>
+    <li><b>파티션 = cpu2 + gpu1만</b>: gpu2/3/4/6은 타 유저 점유로 예상시작 13~36h(영구 PENDING) → 여유 있는 두 파티션으로 제한해 8~9잡 즉시 가동.</li>
+    <li><b>잡 수명 15h</b>(10h×1.5), <b>seed 대역 잡별 분리</b>(중복탐색 제거), <b>keep-best</b>(성공 보호).</li>
+  </ul>
+</div>
 
 <h2>1. 전체 데이터 흐름</h2>
 <div class="card">
@@ -176,11 +188,11 @@
 <table>
   <tr><th>단위</th><th>수량</th><th>비고</th></tr>
   <tr><td>계정(account)</td><td>1개</td><td>다계정은 아주 나중 (지금 안 함)</td></tr>
-  <tr><td>잡(SLURM sbatch)</td><td>계정당 9개</td><td>잡당 컨테이너 1개</td></tr>
-  <tr><td>ansysedt</td><td>warm ≥11, 최대 16</td><td>항상 ≥11 warm 보유 · 12–16 버스트는 추가 기동(느려도 OK)</td></tr>
-  <tr><td>edtmgr</td><td>warm ≥11, ≤16</td><td>ansysedt 1개당 1개 · <b>runner에 위치</b></td></tr>
-  <tr><td>동시 실행(running)</td><td>계정당 ~100개</td><td>컨테이너별 실행 ~7–16 불균형 허용(warm은 ≥11)</td></tr>
-  <tr><td>잡 수명</td><td>10시간</td><td>만료 시 진행 중 ~100개 폐기(드레인 없음)</td></tr>
+  <tr><td>잡(SLURM sbatch)</td><td>9개 (cpu2·gpu1)</td><td>잡당 컨테이너 1개 · 여유 파티션만(타 GPU 파티션은 영구 PENDING)</td></tr>
+  <tr><td>ansysedt = 슬롯</td><td>컨테이너당 <b>11</b></td><td>process-per-slot: 단일슬롯 워커 11개를 별도 OS 프로세스로 spawn(1프로세스=1 Desktop). 180s 스태거 램프업.</td></tr>
+  <tr><td>워커 GPU</td><td>gpu1: 2 (gres)</td><td>워커별 <code>CUDA_VISIBLE_DEVICES=idx%2</code> 핀닝 · cpu2는 CPU only</td></tr>
+  <tr><td>동시 실행(running)</td><td>실측 ~88</td><td>8~9잡 × 11워커. baseline 자기공급으로 상시 만재.</td></tr>
+  <tr><td>잡 수명</td><td>15시간</td><td>만료 시 진행 폐기·재기동(드레인 없음)</td></tr>
 </table>
 
 <h2>3. edtmgr 동작 & 타이밍</h2>
@@ -197,14 +209,14 @@
     </ul>
   </div>
   <div class="card">
-    <h3>시간 임계값</h3>
+    <h3>시간 임계값 <span class="tag">0.3.6 실값</span></h3>
     <table>
       <tr><th>시점</th><th>동작</th></tr>
-      <tr><td><span class="tag ok">~40분</span></td><td>목표 — 마지막 패스 후 리포트 저장</td></tr>
-      <tr><td><span class="tag warn">60분</span></td><td>시뮬 자체 abort → 마지막 완료 패스 리포트</td></tr>
-      <tr><td><span class="tag bad">65분</span></td><td>edtmgr 백스톱 — pyaedt+ansysedt SIGKILL → 재기동</td></tr>
+      <tr><td><span class="tag ok">~90분</span></td><td>소프트 목표(정보용). 실측 solve 중앙 55·p90 86분.</td></tr>
+      <tr><td><span class="tag warn">140분</span></td><td>시뮬 자체 hard abort → 마지막 완료 패스 리포트</td></tr>
+      <tr><td><span class="tag bad">150분</span></td><td>백스톱 — ansysedt SIGKILL → 재기동</td></tr>
     </table>
-    <p class="muted">대여 중 ansysedt 사망 시 즉시 감지·재기동(해당 대여 실패 처리).</p>
+    <p class="muted">초기 98분 백스톱에선 슬로우테일이 <b>BackstopTimeout</b>으로 죽어(실패의 30%) 150분으로 상향. <b class="tag warn">0.3.7</b>: mesh 90k→40k·MaxPass 18→11로 <b>solve &lt;30분</b> 목표 → 타임아웃 소멸·임계값 하향 가능.</p>
   </div>
 </div>
 
@@ -224,8 +236,8 @@
     <p>peetsfea sweep toml + 개수 N 수신 → 랜덤 샘플 fixed toml × N → 대기 큐 적재 → 순차 시뮬 → DB.</p>
   </div>
   <div class="card">
-    <h3>대시보드 :8080 <span class="tag new">신규</span></h3>
-    <p>결과 DB(DuckDB)를 <b>읽기 전용</b>으로 시각화. 시뮬에 영향 주는 입력은 받지 않음.</p>
+    <h3>대시보드 :8080 <span class="tag ok">가동</span></h3>
+    <p>결과 DB + <b>컨테이너별 실시간 부하</b>(ResourcePoller: scontrol·lmstat 폴링)를 <b>읽기 전용</b> 시각화(개요·컨테이너 부하·입출력·실패 탭). <b class="tag warn">0.3.7</b>: x축=시간 <b>시계열 탭</b>(처리량·CPU/GPU/RAM·큐·라이선스) — 설계 <code>PLANS/v037_ops_dashboard.html</code>.</p>
   </div>
   <div class="card">
     <h3>아카이브 <span class="tag new">신규</span></h3>

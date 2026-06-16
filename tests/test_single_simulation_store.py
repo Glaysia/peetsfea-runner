@@ -89,3 +89,24 @@ def test_keep_best_success_not_overwritten_by_failure(tmp_path: Path) -> None:
         "result": {"design_id": "d7b", "point_values": {"a": 2}},
     })
     assert store.fetch_result("base-7")["design_id"] == "d7b"  # type: ignore[index]
+
+
+def test_timeseries_buckets_success_fail_gpu(tmp_path: Path) -> None:
+    store = SingleSimulationResultStore(tmp_path / "results.duckdb")
+    def rec(rid: str, fin: str, state: str, gpu: bool) -> None:
+        store.record_envelope({
+            "request_id": rid, "terminal_state": state, "finished_at": fin,
+            "result": {"design_id": rid, "solve_telemetry": {"gpu_used": gpu, "elapsed_ms": 600000}},
+        })
+    # 두 개의 15분 버킷
+    rec("a", "2026-06-16T10:02:00+00:00", "success", True)
+    rec("b", "2026-06-16T10:09:00+00:00", "success", False)
+    rec("c", "2026-06-16T10:11:00+00:00", "failed", False)
+    rec("d", "2026-06-16T10:20:00+00:00", "success", True)
+    ts = store.timeseries(bucket_minutes=15)
+    assert len(ts) == 2
+    b0, b1 = ts
+    assert b0["success"] == 2 and b0["failed"] == 1 and b0["gpu"] == 1 and b0["total"] == 3
+    assert b1["success"] == 1 and b1["gpu"] == 1
+    # since 필터
+    assert len(store.timeseries(bucket_minutes=15, since="2026-06-16T10:15:00+00:00")) == 1

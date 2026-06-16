@@ -11,6 +11,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -106,15 +107,40 @@ def _i(s: str) -> int:
         return 0
 
 
+def _history_point(snap: dict[str, Any]) -> dict[str, Any]:
+    """스냅샷을 시계열 1포인트로 압축: 잡 카운트·라이선스·집계 CPU부하/메모리(우리 노드 합)."""
+    nodes = snap.get("nodes") or {}
+    jobs = snap.get("jobs") or []
+    lic = snap.get("license") or {}
+    counts = snap.get("counts") or {}
+    load = sum(float(n.get("cpuload") or 0) for n in nodes.values())
+    cpus = sum(int(j.get("cpus") or 0) for j in jobs if j.get("state") == "RUNNING")
+    mem_used = sum((int(n.get("memtotal_mb") or 0) - int(n.get("memfree_mb") or 0)) for n in nodes.values())
+    mem_total = sum(int(n.get("memtotal_mb") or 0) for n in nodes.values())
+    return {
+        "ts": snap.get("ts", 0.0),
+        "running": int(counts.get("running") or 0),
+        "pending": int(counts.get("pending") or 0),
+        "lic_mine": int(lic.get("mine") or 0),
+        "lic_inuse": int(lic.get("in_use") or 0),
+        "load": round(load, 1),       # 우리 노드들의 node-wide CPULoad 합
+        "cpus": cpus,                 # 우리 잡 할당 코어 합(부하 분모)
+        "mem_used_mb": mem_used,
+        "mem_total_mb": mem_total,
+    }
+
+
 @dataclass
 class ResourcePoller:
     """gate를 주기 폴링해 컨테이너(잡)별 부하·라이선스 스냅샷을 캐시한다."""
 
     ssh_host: str = "gate1-harry261"
     refresh_seconds: float = 20.0
+    history_maxlen: int = 1080  # 20s × 1080 = 6h 시계열 ring buffer(경량, 대시보드 추세 탭)
     runner: CommandRunner | None = None
     clock: Callable[[], float] = time.time
     _snapshot: dict[str, Any] = field(default_factory=_empty_snapshot, init=False, repr=False)
+    _history: "deque[dict[str, Any]]" = field(default_factory=deque, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
@@ -122,6 +148,7 @@ class ResourcePoller:
     def __post_init__(self) -> None:
         if self.runner is None:
             self.runner = _ssh_runner
+        self._history = deque(maxlen=max(1, self.history_maxlen))
 
     def start(self) -> None:
         if self._thread is not None:
@@ -148,11 +175,17 @@ class ResourcePoller:
         snap["ts"] = self.clock()
         with self._lock:
             self._snapshot = snap
+            self._history.append(_history_point(snap))
         return snap
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._snapshot)
+
+    def history(self) -> list[dict[str, Any]]:
+        """시간순 압축 포인트 목록(대시보드 /api/resources/history). 오래된→최신."""
+        with self._lock:
+            return list(self._history)
 
     def stop(self) -> None:
         self._stop.set()

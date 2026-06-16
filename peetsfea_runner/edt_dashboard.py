@@ -210,6 +210,7 @@ def start_dashboard_server(
     host: str = "127.0.0.1",
     port: int = 8080,
     resource_provider: ResourceProvider | None = None,
+    history_provider: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> ThreadingHTTPServer:
     def _query_rows(query: dict[str, list[str]], default_state: str | None = None) -> list[dict[str, Any]]:
         since = query.get("since", [None])[0]
@@ -236,6 +237,12 @@ def start_dashboard_server(
                 self._json(200, build_summary(store))
             elif path == "/api/resources":
                 self._json(200, dict(resource_provider()) if resource_provider else {"ok": False, "jobs": [], "nodes": {}, "license": {}, "counts": {}})
+            elif path == "/api/resources/history":
+                self._json(200, {"points": history_provider() if history_provider else []})
+            elif path == "/api/timeseries":
+                bucket = int(query.get("bucket", ["15"])[0] or 15)
+                since = query.get("since", [None])[0]
+                self._json(200, {"bucket_minutes": bucket, "points": store.timeseries(bucket_minutes=bucket, since=since)})
             elif path == "/api/results":
                 limit = int(query.get("limit", ["200"])[0] or 200)
                 rows = _query_rows({**query, "limit": [str(limit)]}, default_state="success")
@@ -312,6 +319,7 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
 <div class="tabs">
   <div class="tab on" data-t="overview">개요</div>
   <div class="tab" data-t="containers">컨테이너 부하</div>
+  <div class="tab" data-t="trends">추세</div>
   <div class="tab" data-t="dataset">입출력 데이터셋</div>
   <div class="tab" data-t="failures">실패</div>
 </div>
@@ -325,6 +333,22 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
 <div id="containers" class="page hide">
   <div class="sub" id="contsub"></div>
   <div class="grid" id="contgrid"></div>
+</div>
+
+<div id="trends" class="page hide">
+  <div class="tools">
+    <span class="muted">버킷</span>
+    <select id="tsbucket"><option value="10">10분</option><option value="15" selected>15분</option><option value="30">30분</option><option value="60">60분</option></select>
+    <button onclick="trends()">새로고침</button>
+    <span class="muted" id="tssub"></span>
+  </div>
+  <div class="card"><div class="k">처리량 — 성공 / 실패 (적층) · GPU 사용(선)</div><div id="tsThroughput"></div></div>
+  <div class="grid c2" style="margin-top:10px">
+    <div class="card"><div class="k">CPU 부하 — 우리 노드 합 / 할당 코어 합 (선)</div><div id="tsCpu"></div></div>
+    <div class="card"><div class="k">메모리 — 우리 노드 사용 GB (선)</div><div id="tsMem"></div></div>
+    <div class="card"><div class="k">동시 잡 — RUNNING / PENDING (선)</div><div id="tsJobs"></div></div>
+    <div class="card"><div class="k">라이선스 — 내 점유 / 전체 사용 (선)</div><div id="tsLic"></div></div>
+  </div>
 </div>
 
 <div id="dataset" class="page hide">
@@ -441,9 +465,45 @@ async function loadFailures(){const d=await f('/api/failures?limit=80');
   $('#ftable tbody').innerHTML=d.recent.map(r=>`<tr><td>${esc(r.request_id)}</td><td>${esc(r.partition)}</td>
     <td class="bigbad">${esc(r.error_type)}</td><td>${esc(r.error_message)}</td><td>${esc(r.finished_at)}</td></tr>`).join('');
 }
-function tick(){if(cur==='overview')overview();else if(cur==='containers')containers();}
+function fmtX(t){if(typeof t==='number'){const d=new Date(t*1000);return(''+d.getHours()).padStart(2,'0')+':'+(''+d.getMinutes()).padStart(2,'0');}return String(t).slice(-5);}
+function tsLines(id,points,series,xkey){const e=$('#'+id);
+  if(!points||!points.length){e.innerHTML='<span class="muted">데이터 없음 (가동 후 누적)</span>';return;}
+  const W=560,H=170,P=34,n=points.length;let mx=0;
+  series.forEach(s=>points.forEach(p=>{const v=+p[s.key]||0;if(v>mx)mx=v;}));mx=mx||1;
+  const X=i=>P+(W-P-8)*(n>1?i/(n-1):0.5),Y=v=>H-P-(H-P-14)*v/mx;let g='';
+  [0,.5,1].forEach(fr=>{const y=Y(mx*fr);g+=`<line x1="${P}" y1="${y}" x2="${W-8}" y2="${y}" stroke="#2c313c"/><text x="2" y="${y+4}" fill="#8b949e" font-size="9">${Math.round(mx*fr)}</text>`;});
+  series.forEach(s=>{let d='';points.forEach((p,i)=>{d+=(d?'L':'M')+X(i).toFixed(1)+' '+Y(+p[s.key]||0).toFixed(1);});g+=`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.6"/>`;});
+  [0,Math.floor(n/2),n-1].forEach(i=>{g+=`<text x="${X(i)-14}" y="${H-4}" fill="#8b949e" font-size="9">${fmtX(points[i][xkey])}</text>`;});
+  const lg=series.map(s=>`<span style="color:${s.color}">■ ${s.label}</span>`).join(' &nbsp;');
+  e.innerHTML=`<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${g}</svg><div style="font-size:11px;margin-top:3px">${lg}</div>`;}
+function tsStack(id,points){const e=$('#'+id);
+  if(!points||!points.length){e.innerHTML='<span class="muted">데이터 없음 (가동 후 누적)</span>';return;}
+  const W=1080,H=210,P=30,n=points.length,bw=(W-P-10)/n;
+  const mx=Math.max(1,...points.map(p=>p.success+p.failed)),gmx=Math.max(1,...points.map(p=>p.gpu));
+  const Y=v=>(H-P-16)*v/mx;let g='';
+  [0,.5,1].forEach(fr=>{const y=H-P-Y(mx*fr);g+=`<line x1="${P}" y1="${y}" x2="${W-6}" y2="${y}" stroke="#2c313c"/><text x="2" y="${y+4}" fill="#8b949e" font-size="9">${Math.round(mx*fr)}</text>`;});
+  let gd='';points.forEach((p,i)=>{const x=P+i*bw+1,w=Math.max(1,bw-2),sh=Y(p.success),fh=Y(p.failed);
+    g+=`<rect x="${x}" y="${H-P-sh}" width="${w}" height="${sh}" fill="#3fb950" opacity=".85"/>`;
+    g+=`<rect x="${x}" y="${H-P-sh-fh}" width="${w}" height="${fh}" fill="#f85149" opacity=".85"/>`;
+    gd+=(gd?'L':'M')+(x+w/2).toFixed(1)+' '+(H-P-(H-P-16)*p.gpu/gmx).toFixed(1);});
+  g+=`<path d="${gd}" fill="none" stroke="#b392f0" stroke-width="1.6"/>`;
+  [0,Math.floor(n/2),n-1].forEach(i=>{g+=`<text x="${P+i*bw-14}" y="${H-4}" fill="#8b949e" font-size="9">${fmtX(points[i].t)}</text>`;});
+  e.innerHTML=`<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${g}</svg>
+    <div style="font-size:11px;margin-top:2px"><span style="color:#3fb950">■ 성공</span> <span style="color:#f85149">■ 실패</span> <span style="color:#b392f0">— GPU 사용</span></div>`;}
+async function trends(){const b=$('#tsbucket').value;
+  const ts=await f('/api/timeseries?bucket='+b).catch(()=>({points:[]}));
+  const hist=await f('/api/resources/history').catch(()=>({points:[]}));
+  const tp=ts.points||[],hp=hist.points||[];
+  $('#tssub').textContent=`결과 ${tp.length}버킷 · 자원 ${hp.length}포인트`;
+  tsStack('tsThroughput',tp);
+  tsLines('tsCpu',hp,[{key:'load',color:'#58a6ff',label:'노드부하합'},{key:'cpus',color:'#d29922',label:'할당코어합'}],'ts');
+  tsLines('tsMem',hp.map(p=>({ts:p.ts,gb:Math.round((p.mem_used_mb||0)/1024)})),[{key:'gb',color:'#58a6ff',label:'사용 GB'}],'ts');
+  tsLines('tsJobs',hp,[{key:'running',color:'#3fb950',label:'RUNNING'},{key:'pending',color:'#d29922',label:'PENDING'}],'ts');
+  tsLines('tsLic',hp,[{key:'lic_mine',color:'#b392f0',label:'내 점유'},{key:'lic_inuse',color:'#58a6ff',label:'전체 사용'}],'ts');}
+$('#tsbucket')&&($('#tsbucket').onchange=trends);
+function tick(){if(cur==='overview')overview();else if(cur==='containers')containers();else if(cur==='trends')trends();}
 $('#dsearch').oninput=()=>{if(cur==='dataset')loadDataset()};
-tick();loadDataset();setInterval(()=>{if(cur==='overview'||cur==='containers')tick()},8000);
+tick();loadDataset();setInterval(()=>{if(cur==='overview'||cur==='containers'||cur==='trends')tick()},8000);
 </script></body></html>"""
 
 

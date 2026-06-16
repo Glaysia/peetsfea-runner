@@ -186,5 +186,32 @@ class SingleSimulationResultStore:
             row = connection.execute(sql, params).fetchone()
         return int(row[0]) if row else 0
 
+    def timeseries(self, *, bucket_minutes: int = 15, since: str | None = None) -> list[dict[str, Any]]:
+        """`finished_at` 시간버킷 집계 — 처리량/성공/실패/GPU(대시보드 시계열용, 서버측 집계).
+
+        무거운 행 전송 없이 DuckDB `time_bucket`으로 버킷별 카운트만 반환. 버킷 라벨은 UTC ISO(분).
+        """
+        self.initialize()
+        bm = max(1, int(bucket_minutes))  # SQL 인터폴레이션 전 정수화(인젝션 방지)
+        clauses = ["finished_at != ''"]
+        params: list[Any] = []
+        if since:
+            clauses.append("finished_at >= ?")
+            params.append(since)
+        where = " AND ".join(clauses)
+        sql = (
+            "SELECT strftime(time_bucket(INTERVAL '" + str(bm) + " minutes', finished_at::TIMESTAMP), '%Y-%m-%dT%H:%M') AS b, "
+            "sum(CASE WHEN terminal_state='success' THEN 1 ELSE 0 END), "
+            "sum(CASE WHEN terminal_state!='success' THEN 1 ELSE 0 END), "
+            "sum(CASE WHEN solve_telemetry_json LIKE '%\"gpu_used\": true%' THEN 1 ELSE 0 END), "
+            "count(*) FROM single_simulation_results WHERE " + where + " GROUP BY 1 ORDER BY 1"
+        )
+        with duckdb.connect(str(self.db_path)) as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [
+            {"t": r[0], "success": int(r[1]), "failed": int(r[2]), "gpu": int(r[3]), "total": int(r[4])}
+            for r in rows
+        ]
+
 
 __all__ = ["SingleSimulationResultStore"]

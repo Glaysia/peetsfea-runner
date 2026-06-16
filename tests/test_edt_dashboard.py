@@ -175,3 +175,26 @@ def test_dashboard_api_endpoints_and_resources(tmp_path: Path) -> None:
     finally:
         server.shutdown()
         t.join(timeout=5)
+
+
+def test_dashboard_timeseries_and_history_endpoints(tmp_path: Path) -> None:
+    import json
+    store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
+    store.initialize()
+    _seed(store, "s0", 1.5, 12)  # finished_at 2026-06-16T00:10:00
+    hist = [{"ts": 1.0, "running": 8, "pending": 1, "lic_mine": 80, "lic_inuse": 120,
+             "load": 30.0, "cpus": 320, "mem_used_mb": 1000, "mem_total_mb": 4000}]
+    server = start_dashboard_server(store=store, port=0, history_provider=lambda: hist)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        page = urllib.request.urlopen(base + "/", timeout=3).read().decode()
+        assert "추세" in page  # 시계열 탭 존재
+        ts = json.load(urllib.request.urlopen(base + "/api/timeseries?bucket=30", timeout=3))
+        assert ts["bucket_minutes"] == 30 and ts["points"][0]["success"] == 1
+        h = json.load(urllib.request.urlopen(base + "/api/resources/history", timeout=3))
+        assert h["points"][0]["running"] == 8 and h["points"][0]["lic_mine"] == 80
+    finally:
+        server.shutdown()
+        t.join(timeout=5)

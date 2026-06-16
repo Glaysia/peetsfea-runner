@@ -87,10 +87,14 @@ class ControlPlane:
 
         # 컨테이너별 실시간 부하 폴러 시작(있으면) → 대시보드 /api/resources.
         provider = None
+        history = None
         if self.resource_poller is not None:
             self.resource_poller.start()
             provider = self.resource_poller.snapshot
-        dashboard = start_dashboard_server(store=self.store, port=self.dashboard_port, resource_provider=provider)
+            history = self.resource_poller.history  # 시계열(추세 탭) ring buffer
+        dashboard = start_dashboard_server(
+            store=self.store, port=self.dashboard_port, resource_provider=provider, history_provider=history
+        )
         intake_server = start_intake_server(service=self.intake, port=self.intake_port)
         # 결과 ingest(:7876): 슈퍼컴 컨테이너가 역터널로 push → 로컬 단일 DB(대시보드와 동일 store).
         ingest_server = start_result_ingest_server(store=self.store, port=self.ingest_port)

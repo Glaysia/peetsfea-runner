@@ -54,3 +54,31 @@ def test_poller_ssh_failure_yields_empty_not_crash() -> None:
     poller = ResourcePoller(runner=boom, clock=lambda: 1.0)
     snap = poller.poll_once()  # raise 하지 않아야 함
     assert snap["ok"] is False and snap["jobs"] == []
+
+
+def test_history_ring_buffer_accumulates_compact_points() -> None:
+    ticks = iter([10.0, 20.0, 30.0])
+
+    def fake(argv: list[str]) -> tuple[int, str]:
+        return 0, _SAMPLE
+
+    poller = ResourcePoller(runner=fake, clock=lambda: next(ticks))
+    poller.poll_once()
+    poller.poll_once()
+    hist = poller.history()
+    assert len(hist) == 2
+    p = hist[0]
+    assert p["ts"] == 10.0 and p["running"] == 1 and p["pending"] == 1
+    assert p["lic_mine"] == 31 and p["lic_inuse"] == 78
+    assert p["load"] == 4.6 and p["cpus"] == 32  # n003 부하(round1) / RUNNING 잡 cpus
+    assert p["mem_used_mb"] == 768000 - 682334 and p["mem_total_mb"] == 768000
+
+
+def test_history_respects_maxlen() -> None:
+    def fake(argv: list[str]) -> tuple[int, str]:
+        return 0, _SAMPLE
+
+    poller = ResourcePoller(runner=fake, clock=lambda: 1.0, history_maxlen=3)
+    for _ in range(5):
+        poller.poll_once()
+    assert len(poller.history()) == 3
