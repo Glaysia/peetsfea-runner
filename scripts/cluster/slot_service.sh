@@ -22,10 +22,16 @@ OUT=$JOBDIR/run_out
 # squeue가 비어있으면(명령 실패) 스킵 = 안전(돌고 있는 잡 dir 오삭제 방지). 다른 유저 dir은 prefix로 제외.
 RUNNING_JIDS=$(squeue -h -u "$USER" -o "%i" 2>/dev/null)
 if [ -n "$RUNNING_JIDS" ]; then
+  # (a) /enroot/{USER}_{JOB} 스크래치 디렉토리 잔재
   for d in /enroot/${USER}_*; do
     [ -d "$d" ] || continue
     jid=$(basename "$d"); jid=${jid#${USER}_}
     echo "$RUNNING_JIDS" | grep -qx "$jid" || { echo "[slot] cleaning stale /enroot scratch: $d"; rm -rf "$d" 2>/dev/null || true; }
+  done
+  # (b) 추출된 enroot 컨테이너(edt-job-{JOB}) 잔재 — enroot remove가 하드킬로 안 돈 경우(2.7G/개).
+  for c in $(enroot list 2>/dev/null | grep "^edt-job-"); do
+    cj=${c#edt-job-}
+    echo "$RUNNING_JIDS" | grep -qx "$cj" || { echo "[slot] removing stale container: $c"; enroot remove -f "$c" >/dev/null 2>&1 || true; }
   done
 fi
 # compute node가 gate를 부르는 클러스터 내부명(로컬 ssh 별칭 gate1-harry261 아님!). 실측: n043→gate1 OK.
