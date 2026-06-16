@@ -142,3 +142,15 @@ PENDING)에 걸리면 시간만 버린다. 실측 사례: 잡이 제출 후 **10
 **구현 위치(후속):** `SlurmJobLauncher`(제출 시각 기록 + `is_pending_too_long(handle)` + `partition_chooser`가
 cooldown 파티션 skip) + `JobOrchestrator.poll()`(pending-age 초과 잡을 kill→재제출, 파티션 cooldown 카운터 갱신).
 파티션별 PENDING/기동 통계는 어차피 자동 벤치마크로 쌓이므로 그걸 cooldown 판단에 활용 가능.
+
+### 실시간 자원 사용량 텔레메트리 (미구현)
+**현황:** `psutil_load_sampler()`(`edt_load.py`)가 cpu%/mem%를 재지만 **컨테이너 내부 admission 게이팅 전용**이라
+어디에도 기록·노출되지 않는다. 컨트롤플레인/대시보드에 **실시간 자원 조회 엔드포인트가 없다**. 지금은
+로컬은 그 함수를 직접 호출, 클러스터 노드는 SLURM `scontrol show node`(CPULoad/FreeMem)로 임시 조회만 가능.
+
+**추가할 것:**
+- **컨테이너→데몬:** 각 슬롯 서비스가 주기적으로 노드 cpu%/mem%(+ slot busy 수)를 결과 백채널(:7876 옆)로 push,
+  또는 별도 경량 텔레메트리 채널. (이미 `partition`/`node`를 기록하므로 노드별 집계 가능.)
+- **대시보드 `:8080/resources`:** 노드별/파티션별 실시간 cpu·mem·동시 solve 수, 라이선스 사용량(lmstat),
+  잡 running/pending 집계를 JSON/HTML로. 라이선스·SLURM은 데몬이 `ssh gate`로 주기 조회해 캐시.
+- **활용:** 자동 벤치마크(파티션별 효율) + 1-슬롯 우회의 저활용(노드당 ~10-20%) 가시화 → process-격리 후 밀도 튜닝 근거.
