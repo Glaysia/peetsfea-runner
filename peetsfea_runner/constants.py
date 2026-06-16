@@ -24,6 +24,12 @@ JOB_MAX_LIFETIME_SECONDS: Final[int] = 10 * 60 * 60
 WARM_FLOOR_PER_CONTAINER: Final[int] = 11
 MAX_SLOTS_PER_CONTAINER: Final[int] = 16
 
+# --- Phase 6: 아카이브 저장소 ------------------------------------------------
+# 묶음 압축 임계(20GB): 완료 project_dir들을 누적하다 이만큼 모이면 한 파일로 압축.
+ARCHIVE_BATCH_BYTES: Final[int] = 20 * 2**30
+# 버퍼 상한(2TB): 초과 시 가장 오래된 묶음 파일부터 FIFO 삭제.
+ARCHIVE_BUFFER_BYTES: Final[int] = 2 * 2**40
+
 EXIT_CODE_SUCCESS: Final[int] = 0
 EXIT_CODE_SSH_FAILURE: Final[int] = 10
 EXIT_CODE_SLURM_FAILURE: Final[int] = 11

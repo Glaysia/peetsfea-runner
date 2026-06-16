@@ -15,6 +15,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+import random
+from collections.abc import Sequence
+
 from .edt_orchestrator import JobHandle
 
 Clock = Callable[[], float]
@@ -22,6 +25,9 @@ Clock = Callable[[], float]
 # 활성으로 간주하는 SLURM 상태(squeue -h -o %T).
 _ACTIVE_STATES = frozenset({"RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "RESIZING", "REQUEUED"})
 _SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
+
+# 잡을 랜덤 분배하는 전 파티션(MASTER_PLAN §2.10 / Q5: 파티션별 성능 통계 자연 수집).
+DEFAULT_PARTITIONS: tuple[str, ...] = ("cpu1", "cpu2", "gpu1", "gpu2", "gpu3", "gpu4", "gpu5", "gpu6")
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,12 +55,16 @@ class SlurmJobLauncher:
     """게이트노드 ssh + sbatch/squeue/scancel로 잡 1개를 제출/모니터/종료."""
 
     ssh_host: str = "gate1-harry261"
-    partition: str = "cpu2"
+    # 잡을 무작위 분배할 파티션들(MASTER_PLAN §2.10). partition_chooser로 잡마다 1개 선택.
+    partitions: tuple[str, ...] = DEFAULT_PARTITIONS
     time_limit: str = "10:00:00"
-    cpus_per_task: int = 16
-    mem: str = "64G"
+    # cpus-per-task: cpu2 노드는 100(256코어), 그 외 파티션은 32(48~64코어). (§2.10 확정)
+    cpus_cpu2: int = 100
+    cpus_other: int = 32
+    mem: str = "480G"  # 전 파티션 노드 ≥768GB라 적재 가능
     job_name_prefix: str = "peetsfea-edt"
     job_command: str = "echo placeholder-job; sleep 60"  # 실서비스는 enroot+entrypoint로 교체
+    partition_chooser: Callable[[Sequence[str]], str] = random.choice
     clock: Clock = time.monotonic
     command_runner: CommandRunner = subprocess_runner
 
@@ -62,21 +72,27 @@ class SlurmJobLauncher:
         argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", self.ssh_host, remote]
         return self.command_runner(argv, input_text)
 
-    def _sbatch_script(self, job_index: int) -> str:
+    def _cpus_for(self, partition: str) -> int:
+        return self.cpus_cpu2 if partition == "cpu2" else self.cpus_other
+
+    def _sbatch_script(self, job_index: int, partition: str, cpus: int) -> str:
         return (
             "#!/bin/bash\n"
             f"#SBATCH --job-name={self.job_name_prefix}-{job_index}\n"
-            f"#SBATCH --partition={self.partition}\n"
+            f"#SBATCH --partition={partition}\n"
             f"#SBATCH --time={self.time_limit}\n"
             "#SBATCH --nodes=1 --ntasks=1\n"
-            f"#SBATCH --cpus-per-task={self.cpus_per_task}\n"
+            f"#SBATCH --cpus-per-task={cpus}\n"
             f"#SBATCH --mem={self.mem}\n"
             f"export EDT_JOB_INDEX={job_index}\n"
+            f"export EDT_PARTITION={partition}\n"
             f"{self.job_command}\n"
         )
 
     def submit(self, job_index: int) -> JobHandle:
-        result = self._ssh("sbatch", input_text=self._sbatch_script(job_index))
+        partition = self.partition_chooser(self.partitions)
+        cpus = self._cpus_for(partition)
+        result = self._ssh("sbatch", input_text=self._sbatch_script(job_index, partition, cpus))
         if result.returncode != 0:
             raise SlurmLauncherError(f"sbatch failed (rc={result.returncode}): {result.stderr.strip()}")
         match = _SUBMITTED_RE.search(result.stdout)

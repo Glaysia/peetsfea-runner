@@ -51,6 +51,8 @@ class SlotDispatcher:
     record: Callable[[Mapping[str, Any]], None]
     account_id: str = "account_01"
     host_alias: str = "gate1-harry261"
+    partition: str = ""  # 잡이 떠 있는 SLURM 파티션(자동 벤치마크용 기록)
+    node: str = ""  # 잡이 떠 있는 노드 hostname
     version_loader: VersionLoader = _default_version_loader
     backstop_seconds: float = float(EDTMGR_BACKSTOP_KILL_SECONDS)
     now_iso: Callable[[], str] = _utc_now_iso
@@ -178,6 +180,8 @@ class SlotDispatcher:
             "finished_at": self.now_iso(),
             "account_id": self.account_id,
             "host_alias": self.host_alias,
+            "partition": self.partition,
+            "node": self.node,
             "remote_job_id": "",
             "api_session_id": slot.slot_id,
             "slot_id": slot.slot_id,

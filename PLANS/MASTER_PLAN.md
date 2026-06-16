@@ -210,6 +210,37 @@
 - **핵심:** 부트스트랩은 **존재 검사 → 없으면만 재생성**(idempotent)이라, 와이프=느린 복구 /
   웜=빠른 시작 두 경로를 모두 만족한다.
 
+### 2.10 잡 자원 할당 / 파티션 (랜덤 분배 → 통계, Q5)
+- **파티션: 모든 파티션 랜덤 분배.** 잡마다 `cpu1·cpu2·gpu1·gpu2·gpu3·gpu4·gpu5·gpu6` 중 **무작위**로
+  골라 제출한다. 목적: 파티션(노드 종류)별 성능을 자연 수집해 **추후 정책화**(Q5 GPU vs CPU). AEDT는
+  CPU 솔버지만 GPU 노드도 CPU가 있으므로 동작한다.
+- **잡(컨테이너) 자원 — 확정:**
+  - **메모리: 480 GB** (전 파티션 노드 메모리 ≥768GB라 적재 가능).
+  - **CPU(`--cpus-per-task`): cpu2 노드 = 100, 그 외 파티션 = 32.**
+    (cpu2는 노드당 256코어라 넉넉히 100, 나머지는 48~64코어라 32.)
+- **동시 실행은 LB가 조절:** 자원은 넉넉히 잡고, 로드밸런서(§2.3)가 **실측 CPU/메모리로 컨테이너당
+  동시 solve를 7~16으로 throttle**. 노드가 붐비면 적게, 한가하면 많이.
+- **`/enroot` 전 파티션 확인(2026-06-16 srun):** cpu1·cpu2·gpu1~6 8개 파티션 모두 `/enroot`가
+  `drwxrwxrwt`(1777, 쓰기+sticky) + enroot 3.5.0 → 어느 파티션에 떠도 `/enroot/{USER}_{SJOB}`
+  생성·컨테이너 기동 가능(랜덤 분배 안전).
+
+#### GPU / pyaedt HPC 옵션 (Q5 벤치마크 준비)
+- **GPU 접근 확인(2026-06-16):** GPU 파티션 노드는 GPU 보유(gpu4/n093 = RTX A6000 49GB, 드라이버 595).
+  **enroot 컨테이너도 `--env NVIDIA_VISIBLE_DEVICES=all`로 GPU가 보인다**(컨테이너 `nvidia-smi`→A6000 확인).
+  즉 GPU 파티션에 잡이 떠도 컨테이너에서 GPU 사용은 가능.
+- **pyaedt HPC/GPU 옵션:** `hfss.analyze(setup, cores=, tasks=, gpus=N, acf_file=, use_auto_settings=)`로
+  코어/GPU를 지정한다(`gpus=N` → GPU 가속; **HPC Pack 라이선스 필요**). `set_custom_hpc_options` /
+  `set_hpc_from_file`(ACF)로도 HPC 설정 가능.
+- **현재 peetsfea:** `analyze_setup(name, blocking)`만 호출(`ssw_ports.py`) → **cores/gpus 미지정**(AEDT
+  기본/auto, GPU 미사용). GPU를 실제로 쓰려면 **peetsfea 솔브 래퍼가 `gpus`(+`cores`)를 전달**하도록
+  확장 필요(→ `PLANS/peetsfea_main.md`).
+- **주의(HFSS 주파수영역):** HFSS driven(주파수영역) 직접/반복 솔버는 GPU 가속이 제한적(주로
+  HFSS Transient/SBR+). 코일 HFSS가 GPU로 실제 빨라질지는 **Q5 벤치마크로 실측**해야 한다 — 그래서
+  일단 전 파티션 랜덤 분배로 (CPU·GPU 노드별) 데이터를 모은다.
+- **파티션 스펙(부록 A 참조):** cpu2 256c/~1TB · cpu1 48c/768G · gpu1 48c/768G+RTX3090×4 ·
+  gpu2 56c/1TB+A10×4 · gpu3 56c/1TB+A6000Ada×4 · gpu4 56c/1TB+A6000×4 · gpu5 64c/1TB+A6000×4 ·
+  gpu6 48c/768G+A10×4.
+
 ---
 
 ## 3. 결정 사항 (Q1~Q8, 확정)
@@ -219,7 +250,7 @@
 | Q2 | 시뮬 abort **60분**(리포트), edtmgr 강제종료 **65분**. |
 | Q3 | 부하 신호 = **CPU·메모리**, 검증된 제어공학/알고리즘 LB 기법(피드백+스태거). |
 | Q4 | 상세는 본 **MASTER_PLAN**에 전부, **GOAL.md = Phase 1(1/6)** 먼저 구현. |
-| Q5 | GPU/CPU 테스트는 지금 안 함. 통계 쌓이면 정책화. |
+| Q5 | **모든 파티션(cpu1·cpu2·gpu1~6)에 잡을 랜덤 분배**해 파티션별 성능 통계 수집 → 추후 정책화. 컨테이너 자원: **메모리 480G, CPU cpu2=100·그 외=32** (§2.10). |
 | Q6 | 라이선스 충분 → 상한 미고려. |
 | Q7 | 다계정은 아주 나중. 지금 단일 계정. |
 | Q8 | 10h 만료 시 진행 중 ~100개 **폐기**(드레인 로직 없음). 리소스 낭비가 크면 추후 드레인 로직으로 대응. |
@@ -354,10 +385,23 @@
 |------|----|
 | 제어 호스트(로컬 워크스테이션) | `172.16.165.146` |
 | 게이트 노드 alias | `gate1-harry261` |
-| SLURM 파티션 | `cpu2` |
+| SLURM 파티션 | **랜덤 분배**(§2.10): cpu1·cpu2·gpu1~6 |
+| enroot 버전(게이트) | gate 노드엔 enroot 없음 — 계산노드에만 있음 |
 | AnsysEM 설치 | `/opt/ohpc/pub/Electronics/v252/AnsysEM` (`ansysedt`) |
 | lmutil | `/opt/ohpc/pub/Electronics/v252/licensingclient/linx64/lmutil` |
 | 라이선스 서버 | `ANSYSLMD_LICENSE_FILE=1055@172.16.10.81` (poll 소스 호스트 `gate1-harry261`) |
 | enroot 이미지(sqsh) | `~/runtime/enroot/aedt.sqsh` (공유 `$HOME`) |
 | 컨테이너 마운트 | `$JOB_DIR:/work`, `/dev/fuse`, 공유 `$HOME/Ansoft`(유저 설정, §2.9), AnsysEM |
 | enroot 버전 | 로컬·계산노드 공통 **3.5.0** (로컬 검증이 잡에 전이, AGENTS.md §6) |
+
+### 파티션 스펙 (2026-06-16 sinfo/scontrol)
+| 파티션 | 코어/노드 | 메모리/노드 | GPU | 노드 |
+|--------|----------|------------|-----|------|
+| cpu2 | **256** | ~1.0 TB | 없음 | 10 (n107–116) |
+| cpu1 | 48 | 768 GB | 없음 | 10 (n040–049) |
+| gpu1 | 48 | 768 GB | RTX3090 ×4 | 14 (n001–014) |
+| gpu2 | 56 | 1.0 TB | A10 ×4 | 11 (n051–061) |
+| gpu3 | 56 | 1.0 TB | A6000 Ada ×4 | 10 (n062–071) |
+| gpu4 | 56 | 1.0 TB | A6000 ×4 | 29 (n072–100) |
+| gpu5 | 64 | 1.0 TB | A6000 ×4 | 6 (n101–106) |
+| gpu6 | 48 | 768 GB | A10 ×4 | 25 (n015–039) |

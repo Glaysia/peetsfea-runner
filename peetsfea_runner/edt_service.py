@@ -44,6 +44,8 @@ class EdtServiceConfig:
     reference_sweep_text: str | None = None
     enable_load_balancer: bool = True
     baseline_batch_size: int = 1000
+    partition: str = ""  # 자동 벤치마크용: 잡이 떠 있는 파티션/노드 기록
+    node: str = ""
 
 
 def build_slots(config: EdtServiceConfig) -> list[EdtManager]:
@@ -144,6 +146,8 @@ def build_steady_state_service(
         record=record,
         account_id=config.account_id,
         host_alias=config.host_alias,
+        partition=config.partition,
+        node=config.node,
         admission=admission,
         drain=False,
     )

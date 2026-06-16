@@ -31,9 +31,9 @@ def wait_until(cond: Callable[[], bool], timeout: float, interval: float = 3.0) 
 def main() -> int:
     launcher = SlurmJobLauncher(
         ssh_host="gate1-harry261",
-        partition="cpu2",
+        partitions=("cpu2",),  # 검증은 cpu2 고정(소규모)
         time_limit="00:05:00",
-        cpus_per_task=2,
+        cpus_cpu2=2,
         mem="2G",
         job_name_prefix="peetsfea-orch-verify",
         job_command="echo job $EDT_JOB_INDEX on $(hostname); sleep 180",

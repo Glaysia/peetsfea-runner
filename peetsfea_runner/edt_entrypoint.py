@@ -35,6 +35,8 @@ def _config_from_env() -> tuple[EdtServiceConfig, int]:
     ref_env = os.environ.get("EDT_REFERENCE_SWEEP")
     reference_sweep_text = Path(ref_env).expanduser().read_text(encoding="utf-8") if ref_env else None
     max_sims = int(os.environ.get("EDT_MAX_SIMS", "0"))
+    import socket
+
     config = EdtServiceConfig(
         output_root=output_root,
         db_path=db_path,
@@ -43,6 +45,8 @@ def _config_from_env() -> tuple[EdtServiceConfig, int]:
         reference_sweep_text=reference_sweep_text,
         enable_load_balancer=os.environ.get("EDT_DISABLE_LB") != "1",
         baseline_batch_size=int(os.environ.get("EDT_BASELINE_BATCH", "1000")),
+        partition=os.environ.get("EDT_PARTITION", ""),  # 자동 벤치마크용 파티션/노드
+        node=socket.gethostname(),
     )
     return config, max_sims
 

@@ -34,9 +34,9 @@ def ssh(remote: str, timeout: float = 60) -> str:
 def main() -> int:
     launcher = SlurmJobLauncher(
         ssh_host=SSH_HOST,
-        partition="cpu2",
+        partitions=("cpu2",),  # 검증은 cpu2 고정
         time_limit="00:45:00",
-        cpus_per_task=8,
+        cpus_cpu2=8,
         mem="32G",
         job_name_prefix="peetsfea-slotsvc",
         job_command="bash $HOME/edt-deploy/run_slot_job.sh",

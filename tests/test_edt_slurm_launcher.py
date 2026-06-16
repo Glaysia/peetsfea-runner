@@ -23,8 +23,8 @@ class FakeRunner:
         return [argv[-1] for argv, _ in self.calls]
 
 
-def _launcher(runner: FakeRunner) -> SlurmJobLauncher:
-    return SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0)
+def _launcher(runner: FakeRunner, partitions: tuple[str, ...] = ("cpu2",)) -> SlurmJobLauncher:
+    return SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0, partitions=partitions)
 
 
 def test_submit_parses_slurm_id_and_sends_sbatch_script() -> None:
@@ -36,7 +36,36 @@ def test_submit_parses_slurm_id_and_sends_sbatch_script() -> None:
     argv, script = runner.calls[0]
     assert argv[-1] == "sbatch" and script is not None
     assert "#SBATCH --partition=cpu2" in script
+    assert "#SBATCH --cpus-per-task=100" in script  # cpu2 → 100코어
+    assert "#SBATCH --mem=480G" in script
     assert "export EDT_JOB_INDEX=3" in script
+    assert "export EDT_PARTITION=cpu2" in script
+
+
+def test_cpus_per_partition_cpu2_100_other_32() -> None:
+    runner = FakeRunner()
+    runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")
+    # cpu2 → 100
+    _launcher(runner, partitions=("cpu2",)).submit(0)
+    assert "#SBATCH --cpus-per-task=100" in runner.calls[-1][1]  # type: ignore[operator]
+    # 그 외(gpu4) → 32
+    _launcher(runner, partitions=("gpu4",)).submit(0)
+    assert "#SBATCH --cpus-per-task=32" in runner.calls[-1][1]  # type: ignore[operator]
+    assert "#SBATCH --partition=gpu4" in runner.calls[-1][1]  # type: ignore[operator]
+
+
+def test_random_partition_distribution() -> None:
+    runner = FakeRunner()
+    runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")
+    # 전 파티션을 chooser로 순회 — 분배가 파티션 인자로 반영되는지.
+    launcher = SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0)
+    seen = set()
+    seq = iter(["cpu1", "cpu2", "gpu1", "gpu6"])
+    launcher.partition_chooser = lambda parts: next(seq)
+    for _ in range(4):
+        launcher.submit(0)
+        seen.add(runner.calls[-1][1].split("--partition=")[1].split("\n")[0])  # type: ignore[union-attr]
+    assert {"cpu1", "cpu2", "gpu1", "gpu6"} <= seen
 
 
 def test_submit_failure_raises() -> None:

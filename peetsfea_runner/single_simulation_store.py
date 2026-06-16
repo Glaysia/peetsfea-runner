@@ -32,6 +32,8 @@ class SingleSimulationResultStore:
                     request_id VARCHAR PRIMARY KEY,
                     account_id VARCHAR,
                     host_alias VARCHAR,
+                    partition VARCHAR,
+                    node VARCHAR,
                     remote_job_id VARCHAR,
                     remote_api_session_id VARCHAR,
                     input_toml_hash VARCHAR,
@@ -71,6 +73,8 @@ class SingleSimulationResultStore:
             "request_id": request_id,
             "account_id": str(envelope.get("account_id") or ""),
             "host_alias": str(envelope.get("host_alias") or ""),
+            "partition": str(envelope.get("partition") or ""),
+            "node": str(envelope.get("node") or ""),
             "remote_job_id": str(envelope.get("remote_job_id") or ""),
             "remote_api_session_id": str(envelope.get("api_session_id") or ""),
             "input_toml_hash": str(envelope.get("input_toml_hash") or ""),
@@ -110,6 +114,32 @@ class SingleSimulationResultStore:
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
+
+    def fetch_rows(
+        self,
+        *,
+        since: str | None = None,
+        terminal_state: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """결과 행 조회(대시보드/CSV용, 읽기 전용)."""
+        self.initialize()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if since:
+            clauses.append("started_at >= ?")
+            params.append(since)
+        if terminal_state:
+            clauses.append("terminal_state = ?")
+            params.append(terminal_state)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"SELECT * FROM single_simulation_results{where} ORDER BY finished_at"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        with duckdb.connect(str(self.db_path)) as connection:
+            result = connection.execute(sql, params)
+            columns = [column[0] for column in result.description]
+            return [dict(zip(columns, row, strict=True)) for row in result.fetchall()]
 
     def fetch_result(self, request_id: str) -> dict[str, Any] | None:
         self.initialize()

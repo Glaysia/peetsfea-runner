@@ -1,68 +1,96 @@
-# peetsfea (main) → 0.3.2 — 추가할 것 & 일차 이유
+# peetsfea 0.3.5 — 사양서 (runner 의존 계약)
 
-> peetsfea-runner가 의존 패키지 `peetsfea`(0.3.2)에 **추가로 요구하는 것**과 **그게 필요한 일차 이유**만 적는다.
-> runner 내부 사정(edtmgr 구현·DB·아카이브·부트스트랩 등)은 여기 없다 → `PLANS/peetsfea_runner.md` / `PLANS/MASTER_PLAN.md`.
-> 원칙: **peetsfea는 ansysedt를 직접 켜고/끄거나 라이선스를 관리하지 않는다.**
+> peetsfea-runner가 의존 패키지 `peetsfea`에 요구하는 **계약 사양**이다. 현재 배포본은 **0.3.4**이며,
+> 이 문서는 다음 버전 **0.3.5**의 사양을 정의한다. 0.3.5의 신규 항목은 **§9 자동 GPU 가속** 하나이고,
+> 나머지(§2~§8)는 0.3.4에서 확립돼 **0.3.5도 그대로 유지**해야 하는 계약이다.
+> runner 쪽 연동 책임은 `PLANS/peetsfea_runner.md`, 전체 아키텍처는 `PLANS/MASTER_PLAN.md`.
 
-| # | 0.3.2에 추가할 것 | 일차 이유 |
-|---|------------------|-----------|
-| 1 | `__version__ == "0.3.2"` + `py.typed` 동봉(공개 API 타입) | runner가 0.3.2를 기대하고 의존 코드를 strict 타입체킹함 |
-| 2 | **이미 떠 있는 ansysedt에 접속**해 실행: 프리미티브가 `grpc_port`(필요 시 `pid`)를 받아 그 세션에 attach, **자체 기동/종료 금지**, `close_on_exit=False` | runner가 ansysedt를 warm+라이선스 점유 상태로 띄워 두고 빌려줌 — 매 시뮬마다 켜면 너무 느리고 라이선스를 놓침 |
-| 3 | 끝나면 **프로젝트만 닫고** AEDT는 살린 채 반환 | runner(edtmgr)가 같은 ansysedt를 즉시 재획득해 다음 시뮬에 재사용 |
-| 4 | **60분 하드 abort + 마지막 완료 패스 리포트** 산출(내부 워치독) | runner가 시뮬 시간 상한이 필요; 60분 안에 스스로 리포트를 남겨야 함(못 지키면 외부에서 65분에 강제종료됨) |
-| 5 | **sweep 범위 검증 API** `validate_sweep_toml_text(text)`: 들어온 온전한 sweep toml의 모든 range가 기준 sweep(`examples/0.3.x_sweep.toml`)의 range **이내**인지 확인, 넓으면 예외 | runner의 Intake(:7875)가 기준 범위를 벗어난 입력을 **애초에 거절**해야 함 |
-| 6 | **샘플링 API** `sample_fixed_candidates_from_toml_text(text, count, seed) -> list[str]`(동일 seed면 결정론적) | runner의 Intake가 sweep 1건을 fixed candidate N개로 펼쳐 큐에 넣음 |
-| 7 | **구조화된 결과 반환**: 출력 변수(`k_ratio`, `Lrx_uH` 등)+입력 파라미터 CSV, setup별 pass count·solve 시간, 산출물 디렉토리(`*.aedt`/`*.aedtresults`) 식별자 | runner가 결과를 DB에 적재하고 산출물 디렉토리를 아카이브함 |
-| 8 | **작업 디렉토리/환경변수 준수**(`/dev/shm`·`/tmp` 직접 사용 금지, runner가 주는 경로 사용) | 클러스터 자원 정책(잡 전용 tmpfs/disk만 사용) |
-| 9 | **실패 시 구조화된 예외/반환**(stage·type·message) | runner가 `terminal_state="failed"`로 기록 |
+## 0. 역할 경계 (불변)
+| 소유 | 책임 |
+|------|------|
+| **peetsfea** | 시뮬 자체: toml 스키마·범위검증·샘플링, pyaedt로 설계 빌드/해석/리포트, **솔버 자원(코어/GPU) 결정** |
+| **peetsfea-runner** | 오케스트레이션: edtmgr(ansysedt 수명·라이선스 점유), 큐/디스패치, 시간 백스톱, DB/아카이브, 컨테이너·GPU 노출 |
 
-## 제안 공개 API (시그니처는 협의)
+**원칙:** peetsfea는 ansysedt를 직접 켜고/끄거나 라이선스를 관리하지 않는다. ansysedt 수명은 edtmgr가 소유한다.
+
+## 1. 버전 / 패키징
+1. `peetsfea.__version__ == "0.3.5"`.
+2. 컨테이너에 runner와 함께 설치 가능(Python 3.12). **`py.typed`** 동봉(runner는 strict 타입체킹).
+3. **패키지 데이터 동봉(0.3.4 확립, 유지):** 기준 sweep(`peetsfea/data/0.3.x_sweep.toml`)·fixed 예제·
+   ferrite 데이터셋(`peetsfea/data/mu_p.tab`)을 **패키지 내부에 동봉**하고 경로를 package-relative/
+   `importlib.resources`로 해석(설치 환경에서도 동작). 소스 레이아웃(`parents[N]/...`) 가정 금지.
+
+## 2. Warm AEDT 접속 (핵심, 불변)
+edtmgr가 ansysedt를 warm으로 띄워 두고 라이선스를 점유한다. 시뮬 프리미티브는 **새 ansysedt를 띄우지
+말고** edtmgr가 준 grpc 세션에 attach해 실행한다.
+1. 프리미티브가 `grpc_port`(필요 시 `aedt_pid`)를 받아 그 세션에 attach(`new_desktop=False`,
+   `close_on_exit=False`).
+2. 완료 시 **프로젝트만 닫고** AEDT는 살린 채 반환 → edtmgr가 같은 ansysedt를 재획득해 재사용.
+3. 진입점:
+   `run_ssw_random_sample_reports_from_toml_text(candidate_toml_text, *, output_dir, seed, mode, grpc_port, aedt_pid=None, ...)`.
+
+## 3. 패스 / 시간 예산 & abort (불변)
+1. 목표 ~40분, **60분 하드 abort** 시 마지막 완료 패스 기준 리포트 산출(`solve_hard_abort_seconds`, 기본 3600).
+2. 65분 강제종료는 runner/edtmgr 백스톱(peetsfea는 소유하지 않으나 외부 SIGKILL에 안전해야 함).
+
+## 4. TOML 범위 검증 + 샘플링 (불변)
+1. 기준 sweep 스키마/범위(SSOT) 정의(`examples`/`data`의 `0.3.x_sweep.toml`).
+2. `validate_sweep_toml_text(text) -> None`: 들어온 온전한 sweep toml의 모든 range가 기준 range
+   **이내인지 검증**, 넓으면 예외(정규화·필드 보완 없음 — "subset"은 값 범위의 부분집합).
+3. `sample_fixed_candidates_from_toml_text(text, count, seed) -> list[str]`: 결정론적 N개 fixed candidate.
+
+## 5. 결과 / 리포트 (불변)
+1. 구조화된 **TypedDict 반환**: `setup_pass_counts`, `solve_telemetry`, `csv_paths`, `csv_text_by_report`,
+   `design_id`, `point_hash`, `point_values` 등(runner store 스키마와 1:1).
+2. CSV 스키마: 입력 파라미터 + 출력 변수(`k_ratio`, `Lrx_uH` 등) 유지(축약 금지).
+3. 산출물 디렉토리(`*.aedt`/`*.aedtresults`)를 식별 가능하게 남겨 runner가 아카이브.
+
+## 6. 파일시스템 규율 (불변)
+`/dev/shm`·`/tmp` 직접 사용 금지. runner가 주는 작업 디렉토리/환경변수(`PEETS_RAMDISK_ROOT`,
+`PEETS_DISK_ROOT`, `ANSYS_WORK_DIR` 등; `job_tmpfs`/`job_disk` 기반)만 사용. 전역/홈 잔여물 금지.
+
+## 7. 오류 처리 (불변)
+실패 시 구조화된 예외/반환(stage·type·message). 외부 `SIGKILL`/grpc 끊김에 부분 산출물 보존, 데이터 정합 보장.
+
+## 8. 라이선스 / AEDT 수명 (불변)
+peetsfea는 ansysedt 기동·종료·재기동, EDT 라이선스 획득/반납에 관여하지 않는다(전부 edtmgr). 라이선스는
+충분하므로 peetsfea가 라이선스 가용성을 판단·대기하지 않는다.
+
+---
+
+## 9. 🆕 0.3.5 신규 — 자동 GPU 가속 (API 변경 없음)
+**요지:** runner는 GPU 파티션이든 CPU 파티션이든 **컨테이너에 GPU만 노출**하고(즉
+`NVIDIA_VISIBLE_DEVICES=all`로 GPU가 보이게), **peetsfea가 솔브 시 GPU 접근 가능 여부를 스스로 감지해
+가능하면 GPU 가속을 켠다.** runner가 `gpus=` 같은 인자를 넘기지 않는다 — **API/시그니처 변경 없음.**
+
+### 9.1 동작
+1. **자동 감지:** 솔브 직전 peetsfea가 GPU 가용성을 판정한다(예: CUDA 디바이스/`nvidia-smi` 응답/
+   가시 GPU 수). 가용하면 **AEDT analyze에 GPU 가속을 활성**한다(내부적으로 pyaedt
+   `analyze(..., gpus=N, cores=…)` 또는 `set_custom_hpc_options`/ACF로 설정).
+2. **CPU 폴백:** GPU 미가용, 또는 GPU 활성 실패(HPC Pack 라이선스 부재·드라이버 문제 등)면
+   **조용히 CPU로 폴백**해 기존(0.3.4)대로 솔브한다 — 잡이 실패하면 안 된다.
+3. **코어 자동:** GPU/CPU 모두에서 가용 코어를 적절히 쓴다(현재 `analyze_setup(name)`은 AEDT 기본만
+   쓰므로, 노드 코어 수를 반영하도록 `cores` 자동 설정 권장 — runner는 파티션별로 cpu2=100·그외=32
+   코어를 잡아 주므로 그 안에서 peetsfea가 솔버 코어를 정한다).
+
+### 9.2 결과 기록 (Q5 자동 벤치마크 지원)
+- `solve_telemetry`에 **GPU 사용 여부·디바이스명·솔버 코어 수·솔브 시간**을 포함한다.
+- 그래야 runner가 잡을 전 파티션 랜덤 분배(MASTER_PLAN §2.10)하는 것만으로 **별도 벤치마크 없이**
+  파티션(CPU vs GPU)별 성능 데이터가 결과 DB에 누적되어 **Q5를 나중에 데이터로 결정**할 수 있다.
+
+### 9.3 주의
+- HFSS **주파수영역**(driven terminal/modal) 솔버는 GPU 가속 효과가 제한적일 수 있다(GPU는 주로
+  HFSS Transient/SBR+). 따라서 "켜면 무조건 빨라짐"이 아니라 **켤 수 있으면 켜고, 빨라졌는지는
+  §9.2 텔레메트리로 측정**한다.
+
+## 10. 공개 API (시그니처)
 - `run_ssw_random_sample_reports_from_toml_text(candidate_toml_text, *, output_dir, seed, mode, grpc_port, aedt_pid=None)`
-- `validate_sweep_toml_text(sweep_text: str) -> None`  *(위반 시 예외)*
-- `sample_fixed_candidates_from_toml_text(sweep_text: str, count: int, seed: int) -> list[str]`
-- `peetsfea.__version__ == "0.3.2"`
+  — 내부에서 GPU 자동 감지·활성(§9).
+- `validate_sweep_toml_text(sweep_text) -> None`
+- `sample_fixed_candidates_from_toml_text(sweep_text, count, seed) -> list[str]`
+- `peetsfea.__version__ == "0.3.5"`
 
-## 0.3.2 연동 검증 (2026-06-16) — 계약 일치 ✅ / 버그 1개
-runner ↔ peetsfea 0.3.2 점검 결과 계약이 거의 완벽히 맞는다:
-- 프리미티브 `run_ssw_random_sample_reports_from_toml_text(candidate_toml_text, *, output_dir,
-  seed, mode, grpc_port, aedt_pid, ...)` — attach 시 `keep_desktop_alive=True`(AEDT 살림, 프로젝트만
-  닫음) ✅
-- 반환 `SswRandomSampleReportResult`는 **TypedDict**라 키(`setup_pass_counts/solve_telemetry/
-  csv_paths/csv_text_by_report`)가 runner store 스키마와 1:1 ✅
-- `SOLVE_HARD_ABORT_SECONDS=3600`(60분) < runner 백스톱 3900(65분) — Q2 순서 정확 ✅
-- `validate_sweep_toml_text` / `sample_fixed_candidates_from_toml_text` 노출 ✅
-- runner 38 테스트 그린(0.3.2 설치).
-
-### 🔴 수정 필요 (실 solve 차단) — 기준 sweep toml 패키징
-- `DEFAULT_REFERENCE_TOML_PATH = Path(__file__).resolve().parents[2] / "examples" / "0.3.2_sweep.toml"`
-  (`ssw_design_space.py:17`)는 **소스 레이아웃 가정**이라, pip 설치 시
-  `<venv>/lib/python3.12/examples/0.3.2_sweep.toml`(존재 안 함)로 잡힌다. 게다가 pyproject
-  `include=["src","tests","entry"]`에 **`examples`가 빠져** 패키지에 동봉되지 않는다.
-- 이 reference는 run 경로에서 실제로 읽힌다(`build_ssw_aedt_identity(sample.toml_path,
-  reference_toml_path)`) → 설치 환경에서 실 candidate solve가 **FileNotFound로 실패**.
-- **수정(peetsfea):** ① `0.3.2_sweep.toml`(기준 sweep SSOT)을 패키지 데이터로 동봉,
-  ② `DEFAULT_REFERENCE_TOML_PATH`를 `importlib.resources`로 해석(소스/설치 양쪽 동작).
-- 임시 우회(runner): 프리미티브에 `reference_toml_path=<실경로>` 명시 전달 가능(요청 시 디스패처 옵션 추가).
-
-### 0.3.3 실 프리미티브 e2e (2026-06-16) — 거의 통과, 데이터 패키징 2건 잔여
-내 SlotDispatcher가 peetsfea 0.3.3 **진짜 프리미티브**(`run_ssw_random_sample_reports_from_toml_text`)를
-edtmgr가 띄운 **warm ansysedt(grpc)** 에 물려 로컬 enroot 컨테이너에서 실행 → **지오메트리 빌드(cadquery)
-→ STEP export → AEDT import(port 56861) → HFSS 디자인 생성 → fr4 재질 추가까지 성공**. 두 가지에서 막힘:
-- ✅ reference toml 패키징: 0.3.3에서 `peetsfea/data/0.3.3_sweep.toml`로 **해결**(설치 환경 존재 확인).
-- 🔴 **ferrite 데이터셋 패키징(같은 버그 패턴, 미수정)**:
-  `NOTEBOOK_DATASET_IMPORT_PATH = Path(__file__).resolve().parents[4] / "notebooks" / "mu_p.tab"`
-  (`backend/pyaedt/ssw_ports.py:42`) → 설치 시 `<env>/lib/python3.12/notebooks/mu_p.tab`(없음)로 해석.
-  `mu_p.tab`은 repo `./notebooks/`에 있고 `src/` 밖이라 `include=["src","tests","entry"]`에 미동봉 →
-  실 solve 중 `FileNotFoundError`. **수정(peetsfea):** `mu_p.tab`을 패키지 데이터(`peetsfea/data/`)로 옮기고
-  경로를 package-relative/`importlib.resources`로(= 0.3.3의 sweep toml과 동일 처리).
-- 🔴 **cadquery extras 누락**: `[all]`이 `build123d`만 넣는데 코드는 `import cadquery`(`ssw_step.py:10`) →
-  `peetsfea[all]`로도 cadquery 미설치. **수정:** cadquery를 deps(또는 런타임 extra)에 추가. 또한 `[all]`은
-  dev 툴(pytest/ruff/mypy/pyright) 혼입 → 런타임 전용 extra 분리 권장.
-
-> runner/이미지 쪽 finding(libGL 등)은 여기 아님 → `PLANS/peetsfea_runner.md §8`.
-
-## 협의 필요
-- grpc 접속에 `pid`까지 필요한지, `grpc_port`만으로 충분한지.
-- 범위 검증 엄밀도: `[start, end]` 상하한만 볼지, `count`·`is_int`(정수/실수 플래그)까지 정합 볼지.
-- 결과 dict의 정확한 키 집합(runner DB 스키마와 1:1).
-- 기준 sweep 범위 SSOT의 위치/버전(`examples/0.3.x_sweep.toml`).
+## 11. 잔여 협의
+- GPU 감지 방법(CUDA 런타임 import vs `nvidia-smi` 호출 vs 환경변수)과 폴백 판정 기준.
+- GPU 활성 시 `gpus`/`cores` 자동 산정 규칙(노드 코어/메모리 대비).
+- `solve_telemetry`의 정확한 키 집합(runner store/대시보드와 1:1).
