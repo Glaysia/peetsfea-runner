@@ -98,6 +98,8 @@ class RealEdtBackend(EdtBackend):
         if not Path(self.executable).exists():
             raise EdtBackendError(f"ansysedt not found: {self.executable}")
         cmd = [str(self.executable), "-ng", "-grpcsrv", str(port)]
+        if self.work_dir is not None:
+            Path(self.work_dir).mkdir(parents=True, exist_ok=True)  # cwd 보장(워커별 work 디렉토리)
         cwd = str(self.work_dir) if self.work_dir is not None else None
         # start_new_session=True → 새 프로세스 그룹. ansysedt가 자식들을 띄워도 killpg로 한 번에 정리.
         return subprocess.Popen(
