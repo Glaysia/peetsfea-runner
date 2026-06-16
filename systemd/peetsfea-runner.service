@@ -18,6 +18,8 @@ Environment=EDT_SSH_HOST=gate1-harry261
 Environment=EDT_JOB_COUNT=9
 Environment=EDT_DASHBOARD_PORT=8080
 Environment=EDT_INTAKE_PORT=7875
+# 대시보드에 노출할 결과 버전(빈 값=전 버전). 분리 운영(peetsfea-web/keeper)으로 가면 이 유닛은 대체됨.
+Environment=EDT_DASHBOARD_PEETSFEA_VERSION=0.3.7
 Restart=always
 RestartSec=10
 # 상시 가동: 실행시간 상한 없음(잡 수명 10h는 오케스트레이터가 내부에서 관리).

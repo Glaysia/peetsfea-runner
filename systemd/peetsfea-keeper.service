@@ -1,0 +1,24 @@
+[Unit]
+Description=Peets FEA — 컨테이너 유지 (오케스트레이터: 9 SLURM 잡 상시 유지 + 10h 만료 재기동)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/mnt/8tb/peetsfea-runner
+# EDT_ROLE=keeper: DB/대시보드/터널 없이 오케스트레이터만. ssh로 sbatch/scancel/squeue만 한다(DB 무관).
+# scancel(잡 종료)은 이 서비스에서만 발생 — web 재시작과 분리되어 컨테이너 수명을 단독 관리.
+ExecStart=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -m peetsfea_runner.edt_control_plane
+Environment=EDT_ROLE=keeper
+Environment=EDT_SSH_HOST=gate1-harry261
+Environment=EDT_JOB_COUNT=9
+Restart=always
+RestartSec=10
+# 상시 가동: 실행시간 상한 없음(잡 수명 10h는 오케스트레이터가 내부 관리).
+TimeoutStopSec=200s
+# 하드 킬 대비: 잔류 peetsfea-edt 잡을 safe-scancel로 정리(raw scancel 금지 — /enroot 잔재 방지).
+# graceful SIGTERM으로 slot_service trap이 /enroot를 청소할 시간을 주고, 끝내 안 죽으면 강제 종료.
+ExecStopPost=/usr/bin/ssh gate1-harry261 bash edt-deploy/safe_scancel.sh
+
+[Install]
+WantedBy=default.target

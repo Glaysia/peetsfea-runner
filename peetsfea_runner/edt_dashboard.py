@@ -97,6 +97,7 @@ def _row_to_io(r: Mapping[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {
         "request_id": r.get("request_id"), "terminal_state": r.get("terminal_state"),
         "partition": r.get("partition"), "node": r.get("node"), "finished_at": r.get("finished_at"),
+        "peetsfea_version": r.get("peetsfea_version"),
         "design_id": r.get("design_id"), "seed": r.get("seed"),
         "gpu_used": tel.get("gpu_used"), "solver_cores": tel.get("solver_cores"),
         "elapsed_min": round(tel["elapsed_ms"] / 60000, 1) if isinstance(tel.get("elapsed_ms"), (int, float)) else None,
@@ -121,11 +122,11 @@ def _histogram(values: list[float], bins: int = 12) -> dict[str, Any]:
     return {"edges": edges, "counts": counts}
 
 
-def build_summary(store: SingleSimulationResultStore) -> dict[str, Any]:
-    counts = store.state_counts()
+def build_summary(store: SingleSimulationResultStore, *, peetsfea_version: str | None = None) -> dict[str, Any]:
+    counts = store.state_counts(peetsfea_version=peetsfea_version)
     total = sum(counts.values())
     success = counts.get("success", 0)
-    srows = store.fetch_rows(terminal_state="success", limit=5000)
+    srows = store.fetch_rows(terminal_state="success", peetsfea_version=peetsfea_version, limit=5000)
     mins: list[float] = []
     gpu = 0
     by_partition: dict[str, list[float]] = {}
@@ -146,14 +147,15 @@ def build_summary(store: SingleSimulationResultStore) -> dict[str, Any]:
         "success_rate": round(success / total * 100, 1) if total else 0.0,
         "avg_solve_min": round(sum(mins) / len(mins), 1) if mins else None,
         "gpu_used_count": gpu, "gpu_used_pct": round(gpu / len(srows) * 100, 1) if srows else 0.0,
-        "throughput_1h": store.count_since(since_1h),
+        "throughput_1h": store.count_since(since_1h, peetsfea_version=peetsfea_version),
         "solve_min_hist": _histogram(mins),
         "by_partition_avg_min": {p: round(sum(v) / len(v), 1) for p, v in by_partition.items() if v},
+        "version_filter": peetsfea_version or "",
     }
 
 
-def build_sim_detail(store: SingleSimulationResultStore, request_id: str) -> dict[str, Any] | None:
-    r = store.fetch_result(request_id)
+def build_sim_detail(store: SingleSimulationResultStore, request_id: str, *, peetsfea_version: str | None = None) -> dict[str, Any] | None:
+    r = store.fetch_result(request_id, peetsfea_version=peetsfea_version)
     if r is None:
         return None
     reports_raw = _loads(r.get("csv_text_by_report_json"))
@@ -181,8 +183,8 @@ def build_sim_detail(store: SingleSimulationResultStore, request_id: str) -> dic
     }
 
 
-def build_failures(store: SingleSimulationResultStore, limit: int = 50) -> dict[str, Any]:
-    rows = store.fetch_rows(terminal_state="failed", limit=limit)
+def build_failures(store: SingleSimulationResultStore, limit: int = 50, *, peetsfea_version: str | None = None) -> dict[str, Any]:
+    rows = store.fetch_rows(terminal_state="failed", peetsfea_version=peetsfea_version, limit=limit)
     by_type: dict[str, int] = {}
     recent: list[dict[str, Any]] = []
     for r in rows:
@@ -211,13 +213,17 @@ def start_dashboard_server(
     port: int = 8080,
     resource_provider: ResourceProvider | None = None,
     history_provider: Callable[[], list[dict[str, Any]]] | None = None,
+    peetsfea_version: str | None = None,
 ) -> ThreadingHTTPServer:
+    # 표시 버전 필터(설정 시 모든 결과 뷰가 이 버전만 노출). 빈 값이면 전 버전. `/api/versions`는 항상 전 분포.
+    version_filter = (peetsfea_version or "").strip() or None
+
     def _query_rows(query: dict[str, list[str]], default_state: str | None = None) -> list[dict[str, Any]]:
         since = query.get("since", [None])[0]
         state = query.get("state", query.get("terminal_state", [default_state]))[0]
         limit_raw = query.get("limit", [None])[0]
         limit = int(limit_raw) if limit_raw and limit_raw.isdigit() else None
-        return store.fetch_rows(since=since, terminal_state=state, limit=limit)
+        return store.fetch_rows(since=since, terminal_state=state, peetsfea_version=version_filter, limit=limit)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "peetsfea-dashboard"
@@ -230,11 +236,14 @@ def start_dashboard_server(
             path = parsed.path
             query = parse_qs(parsed.query)
             if path == "/health":
-                self._json(200, {"status": "ok", "count": sum(store.state_counts().values())})
+                self._json(200, {"status": "ok", "count": sum(store.state_counts(peetsfea_version=version_filter).values()), "version_filter": version_filter or ""})
             elif path == "/" or path == "/index.html":
                 self._send(200, "text/html; charset=utf-8", _PAGE.encode("utf-8"))
+            elif path == "/api/versions":
+                # 전 버전 분포(필터 무관) + 현재 적용 중인 표시 필터.
+                self._json(200, {"counts": store.version_counts(), "filter": version_filter or ""})
             elif path == "/api/summary":
-                self._json(200, build_summary(store))
+                self._json(200, build_summary(store, peetsfea_version=version_filter))
             elif path == "/api/resources":
                 self._json(200, dict(resource_provider()) if resource_provider else {"ok": False, "jobs": [], "nodes": {}, "license": {}, "counts": {}})
             elif path == "/api/resources/history":
@@ -242,15 +251,15 @@ def start_dashboard_server(
             elif path == "/api/timeseries":
                 bucket = int(query.get("bucket", ["15"])[0] or 15)
                 since = query.get("since", [None])[0]
-                self._json(200, {"bucket_minutes": bucket, "points": store.timeseries(bucket_minutes=bucket, since=since)})
+                self._json(200, {"bucket_minutes": bucket, "points": store.timeseries(bucket_minutes=bucket, since=since, peetsfea_version=version_filter)})
             elif path == "/api/results":
                 limit = int(query.get("limit", ["200"])[0] or 200)
                 rows = _query_rows({**query, "limit": [str(limit)]}, default_state="success")
                 self._json(200, {"rows": [_row_to_io(r) for r in rows]})
             elif path == "/api/failures":
-                self._json(200, build_failures(store, limit=int(query.get("limit", ["60"])[0] or 60)))
+                self._json(200, build_failures(store, limit=int(query.get("limit", ["60"])[0] or 60), peetsfea_version=version_filter))
             elif path.startswith("/api/sim/"):
-                detail = build_sim_detail(store, path[len("/api/sim/"):])
+                detail = build_sim_detail(store, path[len("/api/sim/"):], peetsfea_version=version_filter)
                 self._json(200 if detail else 404, detail or {"error": "not_found"})
             elif path == "/results.csv":
                 self._csv(rows_to_csv(_query_rows(query)))
@@ -384,6 +393,7 @@ function bar(v,max,col){const p=max>0?Math.min(100,v/max*100):0;
 function esc(s){return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}
 
 async function overview(){const s=await f('/api/summary');
+  $('#sub').textContent='read-only · 자동 새로고침'+(s.version_filter?(' · 버전 '+s.version_filter+'만 표시'):'');
   const c=[['총 시뮬',s.total],['성공',s.success],['성공률',s.success_rate+'%'],
     ['평균 solve',s.avg_solve_min!=null?s.avg_solve_min+'분':'—'],['최근1h 처리량',s.throughput_1h],
     ['GPU 사용',s.gpu_used_pct+'%'],['실패(보존)',s.failed]];

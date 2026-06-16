@@ -130,9 +130,10 @@ class SingleSimulationResultStore:
         *,
         since: str | None = None,
         terminal_state: str | None = None,
+        peetsfea_version: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """결과 행 조회(대시보드/CSV용, 읽기 전용)."""
+        """결과 행 조회(대시보드/CSV용, 읽기 전용). `peetsfea_version`은 표시용 버전 필터."""
         self.initialize()
         clauses: list[str] = []
         params: list[Any] = []
@@ -142,6 +143,9 @@ class SingleSimulationResultStore:
         if terminal_state:
             clauses.append("terminal_state = ?")
             params.append(terminal_state)
+        if peetsfea_version:
+            clauses.append("peetsfea_version = ?")
+            params.append(peetsfea_version)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT * FROM single_simulation_results{where} ORDER BY finished_at"
         if limit is not None:
@@ -151,42 +155,60 @@ class SingleSimulationResultStore:
             columns = [column[0] for column in result.description]
             return [dict(zip(columns, row, strict=True)) for row in result.fetchall()]
 
-    def fetch_result(self, request_id: str) -> dict[str, Any] | None:
+    def fetch_result(self, request_id: str, *, peetsfea_version: str | None = None) -> dict[str, Any] | None:
         self.initialize()
+        sql = "SELECT * FROM single_simulation_results WHERE request_id = ?"
+        params: list[Any] = [request_id]
+        if peetsfea_version:
+            sql += " AND peetsfea_version = ?"
+            params.append(peetsfea_version)
         with duckdb.connect(str(self.db_path)) as connection:
-            result = connection.execute(
-                "SELECT * FROM single_simulation_results WHERE request_id = ?",
-                [request_id],
-            )
+            result = connection.execute(sql, params)
             row = result.fetchone()
             if row is None:
                 return None
             columns = [column[0] for column in result.description]
             return dict(zip(columns, row, strict=True))
 
-    def state_counts(self) -> dict[str, int]:
+    def state_counts(self, *, peetsfea_version: str | None = None) -> dict[str, int]:
         """terminal_state별 건수(경량 집계 — 전체 행을 끌어오지 않음). 대시보드 요약용."""
         self.initialize()
+        where = " WHERE peetsfea_version = ?" if peetsfea_version else ""
+        params: list[Any] = [peetsfea_version] if peetsfea_version else []
         with duckdb.connect(str(self.db_path)) as connection:
             rows = connection.execute(
-                "SELECT terminal_state, count(*) FROM single_simulation_results GROUP BY 1"
+                "SELECT terminal_state, count(*) FROM single_simulation_results" + where + " GROUP BY 1",
+                params,
             ).fetchall()
         return {str(state): int(n) for state, n in rows}
 
-    def count_since(self, since: str, *, terminal_state: str | None = None) -> int:
-        """`finished_at >= since` 건수(처리량 추정용). 선택적으로 상태 필터."""
+    def version_counts(self) -> dict[str, int]:
+        """peetsfea_version별 건수(경량 집계). 대시보드 `/api/versions`용 — 전 버전 분포 노출."""
+        self.initialize()
+        with duckdb.connect(str(self.db_path)) as connection:
+            rows = connection.execute(
+                "SELECT COALESCE(NULLIF(peetsfea_version,''),'(unknown)'), count(*) "
+                "FROM single_simulation_results GROUP BY 1 ORDER BY 1"
+            ).fetchall()
+        return {str(v): int(n) for v, n in rows}
+
+    def count_since(self, since: str, *, terminal_state: str | None = None, peetsfea_version: str | None = None) -> int:
+        """`finished_at >= since` 건수(처리량 추정용). 선택적으로 상태/버전 필터."""
         self.initialize()
         clauses = ["finished_at >= ?"]
         params: list[Any] = [since]
         if terminal_state:
             clauses.append("terminal_state = ?")
             params.append(terminal_state)
+        if peetsfea_version:
+            clauses.append("peetsfea_version = ?")
+            params.append(peetsfea_version)
         sql = "SELECT count(*) FROM single_simulation_results WHERE " + " AND ".join(clauses)
         with duckdb.connect(str(self.db_path)) as connection:
             row = connection.execute(sql, params).fetchone()
         return int(row[0]) if row else 0
 
-    def timeseries(self, *, bucket_minutes: int = 15, since: str | None = None) -> list[dict[str, Any]]:
+    def timeseries(self, *, bucket_minutes: int = 15, since: str | None = None, peetsfea_version: str | None = None) -> list[dict[str, Any]]:
         """`finished_at` 시간버킷 집계 — 처리량/성공/실패/GPU(대시보드 시계열용, 서버측 집계).
 
         무거운 행 전송 없이 DuckDB `time_bucket`으로 버킷별 카운트만 반환. 버킷 라벨은 UTC ISO(분).
@@ -198,6 +220,9 @@ class SingleSimulationResultStore:
         if since:
             clauses.append("finished_at >= ?")
             params.append(since)
+        if peetsfea_version:
+            clauses.append("peetsfea_version = ?")
+            params.append(peetsfea_version)
         where = " AND ".join(clauses)
         sql = (
             "SELECT strftime(time_bucket(INTERVAL '" + str(bm) + " minutes', finished_at::TIMESTAMP), '%Y-%m-%dT%H:%M') AS b, "

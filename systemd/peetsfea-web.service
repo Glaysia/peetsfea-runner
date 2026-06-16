@@ -1,0 +1,29 @@
+[Unit]
+Description=Peets FEA — web/데이터 플레인 (대시보드:8080 + intake:7875 + ingest:7876 + bulk:7877)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 배포 체크아웃이 원래 위치. WorkingDirectory=cwd → peetsfea_runner를 여기서 import(FF로 최신 유지).
+WorkingDirectory=%h/mnt/8tb/peetsfea-runner
+# EDT_ROLE=web: DB 보유(ingest writer + 대시보드 reader는 DuckDB 단일 writer 락 때문에 한 프로세스 필수).
+# 오케스트레이터는 안 돌린다 → 이 서비스를 재시작/정지해도 컨테이너(9잡)는 그대로 산다(scancel 없음).
+ExecStart=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -m peetsfea_runner.edt_control_plane
+Environment=EDT_ROLE=web
+Environment=EDT_DB_PATH=%h/edt-deploy/results.duckdb
+Environment=EDT_ARCHIVE_ROOT=%h/mnt/8tb/edt-archive
+Environment=EDT_ARCHIVE_BUFFER_BYTES=1099511627776
+Environment=EDT_SSH_HOST=gate1-harry261
+Environment=EDT_DASHBOARD_PORT=8080
+Environment=EDT_INTAKE_PORT=7875
+# 대시보드에 노출할 결과 버전(빈 값=전 버전). 버전 채택 바뀌면 여기만 고치고 web만 재시작.
+Environment=EDT_DASHBOARD_PEETSFEA_VERSION=0.3.7
+Restart=always
+RestartSec=10
+# web teardown은 터널/서버 정지 + 아카이브 flush(45s 시한). scancel 없음 → 짧게 끝난다.
+TimeoutStopSec=120s
+# ExecStopPost 없음: 컨테이너 정리(safe_scancel)는 keeper 유닛 책임. web 정지로 잡을 죽이면 안 된다.
+
+[Install]
+WantedBy=default.target
