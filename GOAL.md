@@ -22,7 +22,7 @@
 | 4 | Intake :7875 + 2-레인 가중 큐(baseline + 우선순위, 85:15) | ✅ 완료(실 우선순위 solve) |
 | 5 | 결과 DB 확장 + 대시보드 :8080(read-only) + `results.csv` export | ✅ 완료(`edt_dashboard`, 단위테스트) |
 | 6 | 아카이브 저장소(20GB 묶음 압축, 2TB FIFO) | ✅ 완료(`edt_archive`, 단위테스트) |
-| **운영** | **systemctl 상시 가동, 동시 ~100 무한 연속(baseline 자기공급)** | ⏳ 스케일 실가동(control plane 결선됨) |
+| **운영** | **systemctl 상시 가동, 동시 ~100 무한 연속(baseline 자기공급)** | ✅ 실가동 중(9잡 LIVE, 0.3.5, 7876/7877 백채널) |
 
 ## 2. Phase별 (요약·수용)
 - **Phase 1 — 코어:** 컨테이너당 edtmgr/ansysedt warm 풀, 슬롯 순차 실행, 60/65분 타이밍, peetsfea warm-AEDT 접속.
@@ -84,8 +84,13 @@ Phase 1~6 코드 + 컨트롤 플레인 결선 + 결과 ingest(:7876) 완료. 남
 - **신뢰 모델:** 터널 loopback 바인딩이라 외부 도달 불가 → 별도 인증/키 불필요(7876과 동일).
 - **재사용:** `edt_ssh_tunnel`(터널), `edt_archive.ArchiveStore`(묶음/FIFO), `edt_result_ingest` HTTP 서버 패턴.
 
-### 6.2 운영 실가동
-- **배포·결선:** systemd 유닛 `peetsfea-runner` → `edt_control_plane`. 배포 체크아웃
-  (`~/mnt/8tb/peetsfea-runner`)을 이 브랜치로 갱신 + `systemctl --user daemon-reload`.
-- **스케일 기동:** 단일 잡/슬롯·9잡 오케스트레이션 메커니즘 검증됨(SLURM_SLOT_SERVICE_PASS,
-  CLUSTER_ORCH_PASS). `job_count=9`·`slot_count≤16`로 단계적 실기동 → 동시 ~100 정상상태 관측.
+### 6.2 운영 실가동 (✅ 가동됨)
+- **배포·결선 완료:** systemd `peetsfea-runner` → `edt_control_plane` 가동 중. 배포 체크아웃
+  (`~/mnt/8tb/peetsfea-runner`)을 이 브랜치 HEAD로 FF(데몬 `python -m` cwd가 거기) + 배포 venv에
+  peetsfea 0.3.5 + 갱신 entrypoint 설치. 클러스터 venv도 0.3.5 + 7877 entrypoint, `slot_service.sh`에
+  7876/7877 정터널.
+- **스케일 기동됨:** 9 SLURM 잡(edt-0..8) 상시 유지. cpu2 잡 = 64 cpus(QOS cpu2_limit cap), 그 외 32.
+  컨테이너당 warm 11 AEDT(gRPC 연결 확인), baseline 전역 샘플링 자기공급.
+- **백채널 검증:** 역터널 7876/7877 상시, gate→로컬 ingest 도달 실측. 결과→로컬 단일 DB→대시보드:8080,
+  산출물→ArchiveStore. (운영 튜닝: cpu2 QOS 64 cap, 로컬 아카이브 FIFO 1TB는 8TB 마운트 여유에 맞춤.)
+- **참고:** baseline 랜덤 후보는 fixed보다 무거워 첫 결과까지 geometry 빌드+solve 시간이 길다(정상).
