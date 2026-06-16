@@ -143,14 +143,29 @@ PENDING)에 걸리면 시간만 버린다. 실측 사례: 잡이 제출 후 **10
 cooldown 파티션 skip) + `JobOrchestrator.poll()`(pending-age 초과 잡을 kill→재제출, 파티션 cooldown 카운터 갱신).
 파티션별 PENDING/기동 통계는 어차피 자동 벤치마크로 쌓이므로 그걸 cooldown 판단에 활용 가능.
 
-### 실시간 자원 사용량 텔레메트리 (미구현)
-**현황:** `psutil_load_sampler()`(`edt_load.py`)가 cpu%/mem%를 재지만 **컨테이너 내부 admission 게이팅 전용**이라
-어디에도 기록·노출되지 않는다. 컨트롤플레인/대시보드에 **실시간 자원 조회 엔드포인트가 없다**. 지금은
-로컬은 그 함수를 직접 호출, 클러스터 노드는 SLURM `scontrol show node`(CPULoad/FreeMem)로 임시 조회만 가능.
+### 실시간 자원 사용량 텔레메트리 (✅ 구현됨 — 순간값)
+`edt_resources.ResourcePoller`가 데몬에서 `ssh gate`로 `squeue`+`scontrol show node`+`lmstat`를 주기 폴링(20s)해
+**컨테이너(=잡=노드)별 실시간 CPULoad·메모리 + 라이선스 + 잡 상태**를 캐시하고, 대시보드 `:8080/api/resources` +
+"컨테이너 부하" 탭으로 노출(8s 자동 새로고침). 이미 기록 중인 `partition`/`node`/`gpu_used`로 파티션별 자동 벤치마크.
+→ **남은 것은 "순간값"을 "시계열"로 확장**(아래).
 
-**추가할 것:**
-- **컨테이너→데몬:** 각 슬롯 서비스가 주기적으로 노드 cpu%/mem%(+ slot busy 수)를 결과 백채널(:7876 옆)로 push,
-  또는 별도 경량 텔레메트리 채널. (이미 `partition`/`node`를 기록하므로 노드별 집계 가능.)
-- **대시보드 `:8080/resources`:** 노드별/파티션별 실시간 cpu·mem·동시 solve 수, 라이선스 사용량(lmstat),
-  잡 running/pending 집계를 JSON/HTML로. 라이선스·SLURM은 데몬이 `ssh gate`로 주기 조회해 캐시.
-- **활용:** 자동 벤치마크(파티션별 효율) + 1-슬롯 우회의 저활용(노드당 ~10-20%) 가시화 → process-격리 후 밀도 튜닝 근거.
+### 시계열 메트릭 뷰 — x축 = 시간 (미구현, 문서화)
+**동기:** 현재 대시보드는 **순간 스냅샷**(지금 부하·누적 카운트)만 보여준다. 운영 추세를 보려면 **x축을 시간**으로 두고
+주요 지표의 변화를 봐야 한다.
+
+**볼 지표(시간축):**
+- **처리량** — 시간당 완료 시뮬 수(success/failed/aborted 적층), 성공률 추이.
+- **동시 solve 수 · 라이선스 사용량**(electronics_desktop) 추이 — 가동 수준 한눈에.
+- **평균 solve 시간** 추이 — 무거운/가벼운 후보 구간, 성능 변화.
+- **노드/파티션별 부하**(CPULoad) 추이 + **GPU vs CPU 비율** 추이 — 자동 벤치마크의 시간적 분포.
+- 잡 running/pending 추이 — 스케줄 압박·cooldown 효과.
+
+**데이터 출처 / 구현:**
+- **결과 시계열:** 이미 있는 `finished_at`을 시간 버킷팅. `store`에 집계 쿼리 추가
+  → `GET /api/timeseries?metric=throughput|success_rate|avg_solve&bucket=5m&since=`.
+  DuckDB `time_bucket`/`date_trunc`로 서버측 집계(전체 행 비전송).
+- **리소스 시계열:** `ResourcePoller`는 지금 **순간값만** 캐시 → 시계열 보려면 스냅샷을 **시간순 링버퍼**(메모리, 예: 최근 24h)
+  또는 경량 테이블에 누적. `GET /api/resources/history?metric=concurrent|license|cpuload&since=`.
+- **프론트엔드:** "추세" 탭 신설 — 시간축 라인 차트(기존 SVG 렌더러 재사용, 다계열). 자동 새로고침.
+- **활용:** 가동률·처리량·라이선스를 시간으로 추적해 **운영 이상 감지**(처리량 급락=장애, 라이선스 포화 등)와
+  **장기 벤치마크**(파티션/ GPU 효과의 시간적 안정성)에 사용.
