@@ -42,8 +42,9 @@ BULK=${EDT_BULK_PORT:-7877}          # 대용량 산출물(aedt) 백채널
 INGEST_URL="http://127.0.0.1:$PORT/ingest"
 C=edt-job-$SLURM_JOB_ID
 mkdir -p "$OUT/work" "$CHOME/tmp"
-# AEDT 라이선스 유저 config(작음)만 노드 로컬 HOME에 시드 — 라이선스는 env로 받지만 config 누락 회피.
-cp -rn "$HOME/Ansoft" "$CHOME/" 2>/dev/null || true
+# Ansoft(계정 initialization)는 **비휘발성**이어야 한다 — AEDT가 추가 init하면 persist돼 누적되어야 함.
+# 그래서 노드 로컬에 copy(잡 종료 시 롤백)하지 않고, 실 gpfs $HOME/Ansoft를 컨테이너 홈에 그대로 bind-mount(RW)한다.
+# (Ansoft는 6.2M로 작아 쿼터 무관. 휘발성 ~/.ansys·temp는 위 CHOME=노드 로컬로 빠진다.)
 # GPU 노출은 gpu* 파티션에서만. cpu2 노드엔 NVIDIA 드라이버가 없어 NVIDIA_VISIBLE_DEVICES=all이면
 # enroot의 98-nvidia.sh가 'nvml driver not loaded'로 실패해 컨테이너가 3초 만에 죽는다(void=훅 비활성).
 case "$EDT_PARTITION" in
@@ -71,6 +72,7 @@ enroot create --name "$C" "$HOME/runtime/enroot/aedt.sqsh" >/dev/null 2>&1
 enroot start --root --rw \
   --mount "$ANSB/AnsysEM:/mnt/AnsysEM" --mount "$ANSB:/ansys_inc/v252" \
   --mount "$ANSB/licensingclient:/mnt/licensingclient" --mount "$DEPLOY:$DEPLOY" --mount "$JOBDIR:$JOBDIR" \
+  --mount "$HOME/Ansoft:$CHOME/Ansoft" \
   --env ANSYSEM_ROOT252=/mnt/AnsysEM --env ANS_IGNOREOS=1 --env "NVIDIA_VISIBLE_DEVICES=$NVD" \
   --env "ANSYSLMD_LICENSE_FILE=$ANSYSLMD_LICENSE_FILE" \
   --env "HOME=$CHOME" --env "TMPDIR=$CHOME/tmp" \
