@@ -60,8 +60,8 @@ class SlurmJobLauncher:
     partitions: tuple[str, ...] = DEFAULT_PARTITIONS
     time_limit: str = "10:00:00"
     # cpus-per-task: cpu2 노드는 256코어지만 QOS cpu2_limit이 노드당 cpu=64로 하드캡(MaxTRESPerNode).
-    # 그 외 파티션(QOS normal)은 무제한이라 32. 0.3.5는 solve당 코어 고정=4 → 64면 동시 ~16 solve에 정합.
-    cpus_cpu2: int = 64
+    # 48로 운영(여유). 그 외 파티션(QOS normal)은 무제한이라 32.
+    cpus_cpu2: int = 48
     cpus_other: int = 32
     mem: str = "480G"  # 전 파티션 노드 ≥768GB라 적재 가능
     job_name_prefix: str = "peetsfea-edt"

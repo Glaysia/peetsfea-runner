@@ -36,18 +36,18 @@ def test_submit_parses_slurm_id_and_sends_sbatch_script() -> None:
     argv, script = runner.calls[0]
     assert argv[-1] == "sbatch" and script is not None
     assert "#SBATCH --partition=cpu2" in script
-    assert "#SBATCH --cpus-per-task=64" in script  # cpu2 → QOS 캡 64코어
+    assert "#SBATCH --cpus-per-task=48" in script  # cpu2 → 48코어
     assert "#SBATCH --mem=480G" in script
     assert "export EDT_JOB_INDEX=3" in script
     assert "export EDT_PARTITION=cpu2" in script
 
 
-def test_cpus_per_partition_cpu2_64_other_32() -> None:
+def test_cpus_per_partition_cpu2_48_other_32() -> None:
     runner = FakeRunner()
     runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")
-    # cpu2 → 64 (QOS cpu2_limit 캡)
+    # cpu2 → 48
     _launcher(runner, partitions=("cpu2",)).submit(0)
-    assert "#SBATCH --cpus-per-task=64" in runner.calls[-1][1]  # type: ignore[operator]
+    assert "#SBATCH --cpus-per-task=48" in runner.calls[-1][1]  # type: ignore[operator]
     # 그 외(gpu4) → 32
     _launcher(runner, partitions=("gpu4",)).submit(0)
     assert "#SBATCH --cpus-per-task=32" in runner.calls[-1][1]  # type: ignore[operator]
