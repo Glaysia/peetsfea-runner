@@ -57,11 +57,11 @@ def test_cpus_per_partition_cpu2_48_other_32() -> None:
 def test_gpu_partition_requests_gres_cpu2_does_not() -> None:
     runner = FakeRunner()
     runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")
-    # gpu* → --gres=gpu:4 요청 + EDT_GPU_COUNT=4 (peetsfea 자동 GPU + 워커 핀닝 활성화)
+    # gpu* → --gres=gpu:2 요청 + EDT_GPU_COUNT=2 (백필 가능 + 워커 GPU 핀닝)
     _launcher(runner, partitions=("gpu1",)).submit(0)
     gpu_script = runner.calls[-1][1]
-    assert "#SBATCH --gres=gpu:4" in gpu_script  # type: ignore[operator]
-    assert "export EDT_GPU_COUNT=4" in gpu_script  # type: ignore[operator]
+    assert "#SBATCH --gres=gpu:2" in gpu_script  # type: ignore[operator]
+    assert "export EDT_GPU_COUNT=2" in gpu_script  # type: ignore[operator]
     # cpu2 → gres 없음(GPU 없는 노드), EDT_GPU_COUNT=0
     _launcher(runner, partitions=("cpu2",)).submit(0)
     cpu_script = runner.calls[-1][1]

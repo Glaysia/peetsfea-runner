@@ -65,7 +65,9 @@ class SlurmJobLauncher:
     cpus_other: int = 32
     # gpu* 파티션은 노드당 GPU 4개. --gres=gpu:N을 요청해야 컨테이너가 GPU를 보고(peetsfea 0.3.6 자동감지),
     # 안 그러면 0 GPU 할당 → CPU fallback(느림). cpu2는 GPU 없으니 요청 안 한다.
-    gres_gpu_count: int = 4
+    # 2로 둔다: gpu:4를 요구하면 공유 클러스터에서 한 노드에 GPU 4개 동시확보가 어려워 잡이 무한 PENDING(백필 불가).
+    # gpu:2면 mix 노드의 빈 GPU에 백필돼 잡이 실제로 뜬다. 워커는 CUDA_VISIBLE_DEVICES=idx%2로 두 GPU에 분산.
+    gres_gpu_count: int = 2
     mem: str = "480G"  # 전 파티션 노드 ≥768GB라 적재 가능
     job_name_prefix: str = "peetsfea-edt"
     job_command: str = "echo placeholder-job; sleep 60"  # 실서비스는 enroot+entrypoint로 교체
