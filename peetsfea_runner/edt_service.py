@@ -47,6 +47,8 @@ class EdtServiceConfig:
     # 채워 슬롯이 즉시 solve 시작하게 한다)와 저수위 임계.
     baseline_batch_size: int = 16
     baseline_low_watermark: int = 64
+    # 워커별 seed 시작값(process-per-slot): 워커마다 다른 seed 범위 → request_id 충돌 방지 + 설계공간 분산.
+    baseline_seed_start: int = 0
     partition: str = ""  # 자동 벤치마크용: 잡이 떠 있는 파티션/노드 기록
     node: str = ""
 
@@ -141,7 +143,11 @@ def build_steady_state_service(
     # 느리므로 슬롯에서 동기 호출하면 안 된다(문제 1). 청크는 작게, 저수위 때만 채운다.
     baseline_refiller: BaselineRefiller | None = None
     if config.reference_sweep_text:
-        sampler = make_baseline_sampler(config.reference_sweep_text, batch_size=config.baseline_batch_size)
+        sampler = make_baseline_sampler(
+            config.reference_sweep_text,
+            batch_size=config.baseline_batch_size,
+            seed_start=config.baseline_seed_start,
+        )
         baseline_refiller = BaselineRefiller(
             queue=queue, sampler=sampler, low_watermark=config.baseline_low_watermark
         )

@@ -4,24 +4,35 @@
 자기공급) + admission + edtmgr 슬롯 풀을 띄우고, peetsfea 진짜 프리미티브로 시뮬을 돌려 공유 DB에
 기록한다. SIGTERM(=scancel)에 깨끗이 멈추고, 테스트용으로 `EDT_MAX_SIMS`만큼만 돌고 종료할 수 있다.
 
+**process-per-slot (문제 3 정식 수정):** pyaedt의 Desktop은 프로세스 전역 싱글톤이라 한 프로세스에 슬롯이
+여럿이면 `release_desktop()`이 서로의 전역 상태를 깨뜨린다. 그래서 `EDT_SLOT_COUNT=N`이면 entrypoint는
+**supervisor**가 되어 단일슬롯 워커를 **N개 별도 OS 프로세스로 spawn**한다(각 프로세스 = AEDT 1개 = Desktop 1개,
+충돌 없음). 워커는 `EDT_WORKER_INDEX`가 박힌 같은 entrypoint로, 자기 baseline seed 범위·출력 하위디렉토리를 갖는다.
+
 설정은 환경변수로 받는다(컨테이너 친화):
   EDT_OUTPUT_ROOT   결과 산출 루트(필수)
   EDT_RESULT_INGEST_URL  결과 push 대상(기본 http://127.0.0.1:7876/ingest = gate 경유 로컬 데몬).
                     설정/기본값이면 결과를 로컬 단일 DB로 push(슈퍼컴엔 DB 없음).
   EDT_DB_PATH       (단독 모드 전용) 로컬 DuckDB 경로. ingest를 끄려면 EDT_RESULT_INGEST_URL=""로.
   EDT_WORK_DIR      잡 작업 디렉토리(job_disk; 미설정 시 OUTPUT_ROOT/work)
-  EDT_SLOT_COUNT    슬롯 수(기본 SLOTS_PER_CONTAINER)
+  EDT_SLOT_COUNT    슬롯 수 = spawn할 워커 프로세스 수(>1이면 supervisor 모드)
+  EDT_WORKER_INDEX  (내부) 설정돼 있으면 단일슬롯 워커로 동작(supervisor가 주입)
   EDT_REFERENCE_SWEEP  baseline용 기준 sweep toml 경로(없으면 baseline 휴면)
   EDT_PARTITION     이 잡이 뜬 SLURM 파티션(자동 벤치마크 기록용)
   EDT_MAX_SIMS      이만큼 처리 후 종료(테스트용; 0/미설정이면 무한)
   EDT_DISABLE_LB    "1"이면 로드밸런서 끄기
+  EDT_WORKER_STAGGER_SECONDS  워커 스폰 간격(기본 15s; AEDT 동시 콜드스타트 회피)
+  EDT_WORKER_SEED_STRIDE  워커별 baseline seed 간격(기본 1e6; request_id 충돌 방지)
 """
 
 from __future__ import annotations
 
 import os
 import signal
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 from types import FrameType
 
@@ -55,6 +66,7 @@ def _config_from_env() -> tuple[EdtServiceConfig, int]:
         enable_load_balancer=os.environ.get("EDT_DISABLE_LB") != "1",
         baseline_batch_size=int(os.environ.get("EDT_BASELINE_BATCH", "16")),  # 작은 청크(백그라운드 보충)
         baseline_low_watermark=int(os.environ.get("EDT_BASELINE_WATERMARK", "64")),
+        baseline_seed_start=int(os.environ.get("EDT_BASELINE_SEED_START", "0")),  # 워커별 seed 범위
         partition=os.environ.get("EDT_PARTITION", ""),  # 자동 벤치마크용 파티션/노드
         node=socket.gethostname(),
     )
@@ -90,7 +102,76 @@ def run_slot_service(service: SteadyStateService, *, max_sims: int = 0) -> int:
     return processed
 
 
+def _worker_env(base_env: Mapping[str, str], index: int, output_root: Path, seed_stride: int) -> dict[str, str]:
+    """단일슬롯 워커용 환경: 워커마다 출력 하위디렉토리·seed 범위를 분리(request_id 충돌 방지)."""
+    env = dict(base_env)
+    env["EDT_WORKER_INDEX"] = str(index)
+    env["EDT_SLOT_COUNT"] = "1"
+    env["EDT_OUTPUT_ROOT"] = str(output_root / f"worker_{index:02d}")  # 워커별 출력 디렉토리
+    env["EDT_BASELINE_SEED_START"] = str(index * seed_stride)  # 워커별 seed 범위 → request_id 충돌 방지
+    env.pop("EDT_WORK_DIR", None)  # 각 워커가 자기 output_root/work를 쓰게(공유 금지)
+    env.pop("EDT_PRIORITY_TOML", None)  # 우선순위는 호스트측; 워커는 baseline 자기공급
+    env.pop("EDT_MAX_SIMS", None)
+    return env
+
+
+def _spawn_worker(index: int, output_root: Path, seed_stride: int) -> subprocess.Popen[bytes]:
+    """단일슬롯 워커를 별도 OS 프로세스로 spawn. 각 워커 = AEDT 1개 = pyaedt Desktop 1개(충돌 없음)."""
+    env = _worker_env(os.environ, index, output_root, seed_stride)
+    return subprocess.Popen([sys.executable, "-m", "peetsfea_runner.edt_entrypoint"], env=env)
+
+
+def run_supervisor(slot_count: int) -> int:
+    """`EDT_SLOT_COUNT=N`이면 단일슬롯 워커 N개를 별도 프로세스로 띄우고 감독한다(process-per-slot).
+
+    스태거 기동으로 AEDT 동시 콜드스타트를 피하고, 죽은 워커는 재기동, SIGTERM에 전부 정리한다.
+    """
+    output_root = Path(os.environ["EDT_OUTPUT_ROOT"]).expanduser()
+    stagger = float(os.environ.get("EDT_WORKER_STAGGER_SECONDS", "15"))
+    seed_stride = int(os.environ.get("EDT_WORKER_SEED_STRIDE", "1000000"))
+    stop = threading.Event()
+
+    def _on_signal(signum: int, frame: FrameType | None) -> None:
+        stop.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _on_signal)
+
+    procs: dict[int, subprocess.Popen[bytes]] = {}
+    print(f"[supervisor] spawning {slot_count} single-slot workers (stagger={stagger:.0f}s)", flush=True)
+    for i in range(slot_count):
+        if stop.is_set():
+            break
+        procs[i] = _spawn_worker(i, output_root, seed_stride)
+        print(f"[supervisor] worker {i:02d} pid={procs[i].pid}", flush=True)
+        stop.wait(stagger)  # 스태거(ramp-up)
+
+    while not stop.is_set():  # 감독 루프: 죽은 워커 재기동
+        for i, p in list(procs.items()):
+            if p.poll() is not None and not stop.is_set():
+                print(f"[supervisor] worker {i:02d} exited rc={p.returncode}; restarting", flush=True)
+                procs[i] = _spawn_worker(i, output_root, seed_stride)
+        stop.wait(5.0)
+
+    print("[supervisor] stopping all workers", flush=True)
+    for p in procs.values():
+        if p.poll() is None:
+            p.terminate()
+    deadline = time.monotonic() + 120.0
+    for p in procs.values():
+        try:
+            p.wait(timeout=max(1.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            p.kill()
+    return 0
+
+
 def main() -> int:
+    # supervisor 분기: EDT_SLOT_COUNT>1 이고 워커가 아니면 N개 워커 프로세스로 분리(pyaedt one-Desktop-per-process).
+    slot_count = int(os.environ.get("EDT_SLOT_COUNT", str(SLOTS_PER_CONTAINER)))
+    if slot_count > 1 and os.environ.get("EDT_WORKER_INDEX") is None:
+        return run_supervisor(slot_count)
+
     config, max_sims = _config_from_env()
     # 결과 sink: 기본은 ingest push(:7876, gate 경유 로컬 단일 DB). EDT_RESULT_INGEST_URL=""면 로컬 DuckDB 단독.
     ingest_url = os.environ.get("EDT_RESULT_INGEST_URL", f"http://127.0.0.1:{DEFAULT_INGEST_PORT}/ingest")
@@ -119,7 +200,8 @@ def main() -> int:
 
         text = Path(priority_toml).expanduser().read_text(encoding="utf-8")
         service.queue.put_priority(QueueItem(request_id="prio-0", candidate_toml_text=text, mode="full"))
-    print(f"[entrypoint] slots={config.slot_count} lb={'on' if service.admission else 'off'} ingest={'on' if ingest_url else 'off'} max_sims={max_sims or '∞'} priority={'1' if priority_toml else '0'}", flush=True)
+    worker = os.environ.get("EDT_WORKER_INDEX", "-")
+    print(f"[entrypoint] worker={worker} slots={config.slot_count} seed_start={config.baseline_seed_start} lb={'on' if service.admission else 'off'} ingest={'on' if ingest_url else 'off'} max_sims={max_sims or '∞'} priority={'1' if priority_toml else '0'}", flush=True)
     processed = run_slot_service(service, max_sims=max_sims)
     print(f"[entrypoint] processed={processed}", flush=True)
     return 0
