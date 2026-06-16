@@ -7,7 +7,7 @@ systemd user 서비스(또는 컨테이너 진입점)가 호출하는 빌더. �
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -96,11 +96,15 @@ def run_edt_service(config: EdtServiceConfig, *, primitive: SimulationPrimitive 
 
 @dataclass(slots=True)
 class SteadyStateService:
-    """Phase 3+4 컨테이너-측 서비스: 2-레인 큐 + admission + 디스패처 + intake + 결과 DB."""
+    """Phase 3+4 컨테이너-측 서비스: 2-레인 큐 + admission + 디스패처 + intake + 결과 sink.
+
+    `store`는 로컬 단독 모드에서만 채워진다. 컨테이너에선 결과를 ingest(:7876)로 push하므로
+    DuckDB를 만들지 않고 `store`는 None.
+    """
 
     dispatcher: SlotDispatcher
     queue: TwoLaneQueue
-    store: SingleSimulationResultStore
+    store: SingleSimulationResultStore | None
     intake: IntakeService
     admission: AdmissionController | None
 
@@ -111,16 +115,22 @@ def build_steady_state_service(
     slots: list[EdtManager] | None = None,
     primitive: SimulationPrimitive | None = None,
     load_sampler: LoadSampler | None = None,
+    record: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> SteadyStateService:
     """정상상태 컨테이너 서비스(Phase 3+4) 와이어링.
 
     - **2-레인 큐**: baseline(기준 sweep 풀샘플 리필) + 우선순위(Intake).
     - **admission(Phase 3)**: CPU/mem 부하 게이트(`enable_load_balancer`면 활성).
     - **Intake**: 우선순위 레인에 적재(서버 기동은 호출자가 `start_intake_server`로).
+    - **record sink**: 외부 `record`가 주어지면(컨테이너=ingest push) DuckDB를 만들지 않는다.
+      없으면 로컬 DuckDB에 직접 기록(단독/테스트).
     드레인하지 않고(`drain=False`) stop()까지 상시 가동.
     """
-    store = SingleSimulationResultStore(db_path=config.db_path)
-    store.initialize()
+    store: SingleSimulationResultStore | None = None
+    if record is None:
+        store = SingleSimulationResultStore(db_path=config.db_path)
+        store.initialize()
+        record = store.record_envelope
 
     baseline = (
         make_baseline_sampler(config.reference_sweep_text, batch_size=config.baseline_batch_size)
@@ -134,9 +144,6 @@ def build_steady_state_service(
         if config.enable_load_balancer
         else None
     )
-
-    def record(envelope: Mapping[str, Any]) -> None:
-        store.record_envelope(envelope)
 
     dispatcher = SlotDispatcher(
         slots=slots if slots is not None else build_slots(config),

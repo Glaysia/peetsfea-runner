@@ -26,7 +26,9 @@ from .edt_dashboard import start_dashboard_server
 from .edt_intake import IntakeService, start_intake_server
 from .edt_orchestrator import JobLauncher, JobOrchestrator
 from .edt_queue import TwoLaneQueue
+from .edt_result_ingest import DEFAULT_INGEST_PORT, start_result_ingest_server
 from .edt_slurm_launcher import SlurmJobLauncher
+from .edt_ssh_tunnel import SshTunnel, reverse_tunnel_argv
 from .single_simulation_store import SingleSimulationResultStore
 
 
@@ -39,6 +41,7 @@ class ControlPlaneConfig:
     job_command: str = "bash $HOME/edt-deploy/slot_service.sh"
     dashboard_port: int = 8080
     intake_port: int = 7875
+    ingest_port: int = DEFAULT_INGEST_PORT  # 슈퍼컴 전용 결과 백채널(역터널로만 도달).
     poll_interval_seconds: float = 60.0
 
 
@@ -50,8 +53,12 @@ class ControlPlane:
     dashboard_port: int
     intake_port: int
     poll_interval_seconds: float
+    ssh_host: str = "gate1-harry261"
+    ingest_port: int = DEFAULT_INGEST_PORT
+    enable_ingest_tunnel: bool = True  # 테스트에선 ssh 역터널 비활성.
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _servers: list[ThreadingHTTPServer] = field(default_factory=list, init=False, repr=False)
+    _tunnels: list[SshTunnel] = field(default_factory=list, init=False, repr=False)
 
     def stop(self) -> None:
         self._stop.set()
@@ -67,9 +74,17 @@ class ControlPlane:
 
         dashboard = start_dashboard_server(store=self.store, port=self.dashboard_port)
         intake_server = start_intake_server(service=self.intake, port=self.intake_port)
-        for server in (dashboard, intake_server):
+        # 결과 ingest(:7876): 슈퍼컴 컨테이너가 역터널로 push → 로컬 단일 DB(대시보드와 동일 store).
+        ingest_server = start_result_ingest_server(store=self.store, port=self.ingest_port)
+        for server in (dashboard, intake_server, ingest_server):
             self._servers.append(server)
             threading.Thread(target=server.serve_forever, daemon=True, name=type(server).__name__).start()
+
+        # gate 경유 역터널 상시 유지: gate loopback:7876 → 로컬 ingest:7876.
+        if self.enable_ingest_tunnel:
+            tunnel = SshTunnel(argv=reverse_tunnel_argv(self.ssh_host, port=self.ingest_port), name="edt-ingest-rtunnel")
+            tunnel.start()
+            self._tunnels.append(tunnel)
 
         self.orchestrator.ensure_running()
         try:
@@ -78,6 +93,8 @@ class ControlPlane:
                 self._stop.wait(self.poll_interval_seconds)
         finally:
             self.orchestrator.shutdown()
+            for tunnel in self._tunnels:
+                tunnel.stop()
             for server in self._servers:
                 server.shutdown()
 
@@ -102,6 +119,8 @@ def build_control_plane(config: ControlPlaneConfig, *, launcher: JobLauncher | N
         dashboard_port=config.dashboard_port,
         intake_port=config.intake_port,
         poll_interval_seconds=config.poll_interval_seconds,
+        ssh_host=config.ssh_host,
+        ingest_port=config.ingest_port,
     )
 
 
@@ -119,6 +138,7 @@ def main() -> int:
         job_count=int(os.environ.get("EDT_JOB_COUNT", str(JOBS_PER_ACCOUNT))),
         dashboard_port=int(os.environ.get("EDT_DASHBOARD_PORT", "8080")),
         intake_port=int(os.environ.get("EDT_INTAKE_PORT", "7875")),
+        ingest_port=int(os.environ.get("EDT_INGEST_PORT", str(DEFAULT_INGEST_PORT))),
     )
     run_control_plane(config)
     return 0

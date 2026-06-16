@@ -16,24 +16,19 @@ from peetsfea_runner.pipeline import build_lease_server_context
 
 
 class TestBuiltInService(unittest.TestCase):
-    def test_systemd_unit_uses_built_in_service_without_environment_overrides(self) -> None:
+    def test_systemd_unit_runs_edt_control_plane(self) -> None:
+        # GOAL.md: peetsfea-runner = EDT 컨트롤 플레인(동시 ~100 정상상태). 레거시 built_in_service는
+        # 더 이상 systemd ExecStart가 아니다(코드는 유지).
         service_path = Path(__file__).resolve().parent.parent / "systemd" / "peetsfea-runner.service"
         content = service_path.read_text(encoding="utf-8")
 
-        self.assertNotIn("Environment=", content)
-        self.assertIn("RuntimeMaxSec=40min", content)
+        self.assertIn("-m peetsfea_runner.edt_control_plane", content)
+        self.assertNotIn("run_built_in_service", content)
+        self.assertNotIn("RuntimeMaxSec", content)  # 상시 가동(40분 제한 없음)
         self.assertIn("Restart=always", content)
-        self.assertIn("RestartSec=5", content)
-        self.assertIn("TimeoutStopSec=90s", content)
-        self.assertIn(
-            'ExecStopPost=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -c "from peetsfea_runner.built_in_service import scancel_service_slurm_jobs; scancel_service_slurm_jobs()"',
-            content,
-        )
         self.assertIn("WorkingDirectory=%h/mnt/8tb/peetsfea-runner", content)
-        self.assertIn(
-            'ExecStart=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -c "from peetsfea_runner.built_in_service import run_built_in_service; run_built_in_service()"',
-            content,
-        )
+        self.assertIn("EDT_DB_PATH=", content)
+        self.assertIn("EDT_SSH_HOST=gate1-harry261", content)
 
     def test_build_service_profile_hardcodes_preserve_and_prune_result_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

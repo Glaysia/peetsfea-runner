@@ -208,15 +208,13 @@ class TestShutdownScancelContract(unittest.TestCase):
         self.assertIn("PEETS_CONTROL_WORKER_ID=worker_01", script)
 
     def test_systemd_unit_declares_scancel_shutdown_hook(self) -> None:
+        # 컨트롤 플레인 유닛: 정상 SIGTERM 시엔 orchestrator.shutdown()이 잡을 scancel하고,
+        # 하드 킬 대비로 ExecStopPost가 잔류 peetsfea-edt 잡을 정리한다.
         service_path = Path(__file__).resolve().parent.parent / "systemd" / "peetsfea-runner.service"
         content = service_path.read_text(encoding="utf-8")
-        self.assertIn("RuntimeMaxSec=40min", content)
-        self.assertIn(
-            "ExecStopPost=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -c "
-            '"from peetsfea_runner.built_in_service import scancel_service_slurm_jobs; '
-            "scancel_service_slurm_jobs()\"",
-            content,
-        )
+        self.assertIn("ExecStopPost=", content)
+        self.assertIn("scancel", content)
+        self.assertIn("peetsfea-edt", content)
 
 
 if __name__ == "__main__":
