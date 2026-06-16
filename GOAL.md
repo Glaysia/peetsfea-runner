@@ -1,96 +1,104 @@
 # GOAL — 전체 production 시스템 + 정상상태 동시 ~100 연속 가동
 
-> [`PLANS/MASTER_PLAN.md`](PLANS/MASTER_PLAN.md) **전체(Phase 1~6)** 를 구현하고,
-> 정상상태에서 **동시 ~100개 시뮬을 끊김 없이 무한 연속** 가동하는 것이 최종 목표.
+> [`PLANS/MASTER_PLAN.md`](PLANS/MASTER_PLAN.md) **전체(Phase 1~6)** 를 구현하고, 정상상태에서
+> **동시 ~100개 시뮬을 끊김 없이 무한 연속** 가동해 **입출력 데이터셋을 축적**하는 것이 최종 목표.
 > 요청(:7875)이 없을 땐 **전역 설계공간 baseline 랜덤 샘플링**으로 슬롯을 채워 계속 시뮬한다.
-> 실행은 `systemctl --user start|restart peetsfea-runner`. 의존: peetsfea **0.3.5**([`PLANS/peetsfea_main.md`](PLANS/peetsfea_main.md)).
-> 0.3.5 = **GPU 자동 가속**(solve 시점 `nvidia-smi`로 GPU 탐지 → 있으면 켜고 없으면 CPU 폴백, API 변경 없음) +
-> solver cores 고정(=4) + `solve_telemetry`에 `gpu_used`/`gpu_device_name`/`solver_cores` 기록.
-> 러너는 컨테이너에 GPU만 노출(`NVIDIA_VISIBLE_DEVICES=all`)하고 파티션/노드를 기록 → 자동 GPU vs CPU 벤치마크.
+> 실행: `systemctl --user start|restart peetsfea-runner`. 의존: peetsfea **0.3.5**(자동 GPU + CPU 폴백,
+> solver cores 고정=4, `solve_telemetry`에 `gpu_used`/`gpu_device_name`/`solver_cores`).
 
 ## 0. 한 줄 요약
-단일 계정에서 **동시 ~100개 AEDT 시뮬을 정상상태로 무한 연속** 가동한다. Intake(:7875)로 들어온
-우선순위 sweep을 먼저 처리하되, 비어 있으면 `0.3.x_sweep.toml` 전체 설계공간을 **baseline 랜덤
-샘플링**해 슬롯을 끊김 없이 채운다(요청 없이도 계속 돈다). 결과는 DB+대시보드+아카이브로.
+단일 계정에서 **동시 ~100개 AEDT 시뮬을 정상상태로 무한 연속** 가동한다. Intake(:7875) 우선순위 sweep을
+먼저 처리하되 비면 `0.3.5_sweep.toml` 전역 설계공간을 baseline 랜덤 샘플링해 슬롯을 끊김 없이 채운다.
+**각 시뮬의 입력(설계점)→출력(리포트 데이터셋)** 을 로컬 단일 DB에 적재하고, 무거운 `.aedt` 산출물은 따로
+아카이브한다. 결과는 대시보드(:8080)와 `results.csv`로 조회.
 
-## 1. 전체 구성과 현황 (Phase 1~6 + 운영)
+## 1. 아키텍처 (구현 완료된 골격)
 | Phase | 내용 | 상태 |
 |------|------|------|
-| 1 | 코어 단일 컨테이너: edtmgr warm 풀 + 슬롯 디스패처 + 실 solve | ✅ 완료(로컬·클러스터 실 AEDT) |
-| 2 | 9잡/~100 오케스트레이션(잡 lifecycle, 10h 폐기·재기동) | ✅ 완료(실 SLURM e2e) |
-| 3 | 로드 밸런서(ramp-up, CPU/mem 피드백 + admission) | ✅ 완료(실 admission-gated solve) |
-| 4 | Intake :7875 + 2-레인 가중 큐(baseline + 우선순위, 85:15) | ✅ 완료(실 우선순위 solve) |
-| 5 | 결과 DB 확장 + 대시보드 :8080(read-only) + `results.csv` export | ✅ 완료(`edt_dashboard`, 단위테스트) |
-| 6 | 아카이브 저장소(20GB 묶음 압축, 2TB FIFO) | ✅ 완료(`edt_archive`, 단위테스트) |
-| **운영** | **systemctl 상시 가동, 동시 ~100 무한 연속(baseline 자기공급)** | ✅ 실가동 중(9잡 LIVE, 0.3.5, 7876/7877 백채널) |
+| 1 | 코어 컨테이너: edtmgr warm 풀 + 슬롯 디스패처 + 실 HFSS solve | ✅ (로컬·클러스터 실 AEDT) |
+| 2 | 9잡/~100 오케스트레이션(잡 lifecycle, 10h 폐기·재기동) | ✅ (실 SLURM) |
+| 3 | 로드 밸런서(ramp-up, CPU/mem EWMA + admission) | ✅ |
+| 4 | Intake :7875 + 2-레인 가중 큐(baseline + 우선순위, 85:15) | ✅ (큐/인테이크) |
+| 5 | 결과 DB + 대시보드 :8080 + `results.csv` | ⚠️ DB 적재는 OK, **CSV 출력 데이터셋 누락(문제 2)** |
+| 6 | 아카이브(:7877 tar 스트림 → 20GB 묶음/FIFO) | ✅ (`edt_bulk_transfer`) |
+| 운영 | systemctl 상시 가동, 동시 ~100 무한 연속 | ⚠️ **기동은 됐으나 데이터 미생산(문제 1)** |
 
-## 2. Phase별 (요약·수용)
-- **Phase 1 — 코어:** 컨테이너당 edtmgr/ansysedt warm 풀, 슬롯 순차 실행, 60/65분 타이밍, peetsfea warm-AEDT 접속.
-- **Phase 2 — 9잡/~100:** 9개 SLURM 잡(=컨테이너) 상시 유지, 컨테이너당 warm ≥11·≤16, 합 ~100 동시(불균형 허용), 죽으면 재기동·10h 만료 폐기. 잡당 컨테이너가 entrypoint로 슬롯 서비스 실행.
-- **Phase 3 — 로드밸런서:** CPU·메모리 EWMA 피드백 + AIMD + 시작 스태거. **새 시뮬은 부하 여유 시에만 시작**(ramp-up) → 무거운 패스 구간 시간축 분산.
-- **Phase 4 — Intake + 2-레인 큐:** :7875가 sweep+N 수신 → peetsfea 범위검증(넓으면 거절) → 샘플 → 우선순위 레인. baseline 레인은 전역 풀샘플 ~1000 버퍼 상시 리필. **85:15**(우선순위 backlog에도 baseline 15% 플로어, 우선순위 비면 100% baseline).
-- **Phase 5 — DB + 대시보드:** 모든 누적 데이터(load·timing·패스·입출력 파라미터·아카이브 ref)를 DuckDB 확장. `localhost:8080` read-only 대시보드 + `curl localhost:8080/results.csv`(입출력 파라미터 누적). 시뮬에 영향 없음.
-- **Phase 6 — 아카이브:** 시뮬 종료 시 project_directory를 누적 → **20GB 묶음 압축(solid)**, 2TB 초과 시 가장 오래된 묶음 파일 삭제(FIFO).
+**백채널 토폴로지(전부 결선·기동됨):** 로컬 systemd `--user` 데몬이 단일 두뇌. 슈퍼컴엔 DB 없음.
+- **:7875** 공개 sweep intake(우선순위 요청 수신).
+- **:7876** 슈퍼컴 전용 결과 ingest — 컨테이너가 결과 envelope를 gate 경유 ssh 역터널로 push → **로컬 단일 DuckDB**.
+- **:7877** 슈퍼컴 전용 대용량 산출물 — `.aedt` project_dir를 tar.gz 스트림으로 push → `ArchiveStore`(20GB 묶음, FIFO) + **gpfs 원본 삭제**.
+- **:8080** 로컬 read-only 대시보드 + `results.csv`.
+- 9 SLURM 잡(edt-0..8), cpu2 잡=64 cpus(QOS `cpu2_limit` cap), 그 외 32. 컨테이너당 warm 11 AEDT(gRPC 연결 확인).
 
-## 3. 운영 목표 — 정상상태 동시 ~100 무한 연속 (최종 수용)
-- **상시 가동:** `systemctl --user start|restart peetsfea-runner`. 콜드 스타트(진행분 복구 없음).
-- **동시 ~100 유지:** 9 컨테이너 × warm ≥11(합 99) ~ ≤16. 슬롯이 비면 즉시 다음 후보 디스패치.
-- **요청 없이도 계속 돈다:** 우선순위(7875)가 비면 **baseline이 전역 설계공간을 랜덤 샘플링**(배치마다
-  seed 롤링, ~1000 버퍼 리필)해 슬롯을 끊김 없이 채운다 → **무한 연속 시뮬**, 전역 커버리지 축적.
-- **요청 오면 우선:** 7875로 들어온 subset sweep을 **85% 우선** 소비(단 baseline 15% 탐색 플로어 유지).
-- **부하 균등:** 로드밸런서가 ramp-up으로 동시 시작을 분산해 노드 부하 스파이크를 막는다.
-- **잡 재활용:** 10h 만료 잡은 진행 중 시뮬을 폐기하고 재기동(드레인 없음, 단순).
-- **결과 흐름(단일 로컬 DB):** 슈퍼컴엔 DB 없음. 각 시뮬 결과 envelope를 **gate 경유 ssh 터널로 로컬
-  데몬:7876에 push** → 로컬 단일 DuckDB 적재 → 대시보드:8080/`results.csv` 조회.
-  (7875=공개 sweep intake, 7876=7875 사용자가 모르는 슈퍼컴 전용 결과 백채널. 다계정이면 계정마다
-  정터널 하나씩, 전부 같은 로컬 :7876로 모여 `account_id`로 합산.)
-- **대용량 산출물 전송 + gpfs 절약(:7877):** 시뮬 성공 시 컨테이너가 project_dir(aedt)를 **`tar` 스트림으로
-  로컬 데몬:7877에 HTTP POST**(7876과 동일한 gate 경유 ssh 터널, **sshd 불필요** — HTTP tar 스트림).
-  로컬은 스트리밍으로 버퍼에 추출 → **`ArchiveStore`(20GB 묶음 압축, 2TB FIFO)**. 전송 성공 시 **gpfs 원본을
-  즉시 삭제**해 슈퍼컴 디스크를 항상 비운다(무조건 절약). 7877도 7875 사용자가 모르는 슈퍼컴 전용 통로.
+## 2. 현재 상태 — 기동됐으나 **완전 작동 불가** (실측 진단)
+9잡 fleet·역터널·포트는 전부 LIVE지만 **DB 적재 0건**. 실측 결과 두 가지 문제가 막고 있다.
+
+### 문제 1 — baseline 샘플링이 슬롯을 굶겨 solve가 0회 (작동 불능의 직접 원인)
+**증상:** 각 컨테이너에서 `build_ssw_body_boxes`가 수백 회 반복되는데 HFSS solve·`.aedt` 생성·결과 envelope는 0.
+출력 디렉토리·spool·DB 전부 비어 있음.
+
+**원인(소스 확인):** baseline 자기공급은 `make_baseline_sampler(..., batch_size=1000)` →
+`sample_fixed_candidates_from_toml_text(count=1000)` → `sample_ssw_fixed_tomls`의 **rejection sampling 루프**
+(`ssw_design_space.py` 575-600): 후보마다 `load_ssw_fixed_spec()` + `build_ssw_body_boxes()`로 **cadquery geometry를
+빌드해 유효성 검사**(실패 시 재시도). 즉 후보 1000개를 뽑으려면 **geometry를 1000+회**(거부분 포함 더) 빌드해야 하고,
+1회 ~5초 → **첫 배치 한 개 채우는 데만 ~80분+**. 게다가 이 refill이 **슬롯 디스패치 경로(`queue.get()`)에서 동기로**
+실행돼 그 동안 모든 슬롯이 새 후보를 못 받아 **단 한 건도 HFSS solve에 도달하지 못한다.**
+
+**수정 방향(러너 측):**
+1. **baseline refill을 백그라운드 워커 스레드로 분리** — 디스패치 경로(`queue.get()`)에서 절대 샘플링이 일어나지
+   않게 한다. 슬롯은 버퍼에 후보가 있으면 즉시 가져가 solve를 시작.
+2. **batch_size 축소 + 점진 보충** — 1000 → 작은 값(예: 슬롯 수의 1~2배)으로 저수위 때마다 조금씩 채워, 시작 즉시
+   슬롯이 돌고 버퍼는 백그라운드로 천천히 채워진다.
+3. (선택) 샘플 후보를 미리 디스크에 풀로 비축해 두고 거기서 당겨오는 방식도 가능(geometry 재빌드 회피).
+
+**수용:** 기동 후 **수 분 내 첫 HFSS solve 시작**, 슬롯이 baseline만으로 끊김 없이 채워지고 결과가 DB에 적재된다.
+
+### 문제 2 — `results.csv`에 출력 데이터셋이 빠져 있음
+**요구사항(확정):** `:8080`의 `results.csv`는 **무거운 `.aedt` 파일만 빼고 모든 정보**를 담아야 하고,
+**입력·출력 데이터셋을 반드시 포함**해야 한다(설계점 → 시뮬 리포트 결과).
+
+**증상/원인:** 결과 DB(`single_simulation_store`)는 이미 입출력 전부 보관한다 —
+`point_values_json`(입력), `solve_telemetry_json`·`setup_pass_counts_json`·**`csv_text_by_report_json`(출력 리포트
+데이터셋)**·`csv_paths_json`·`result_json`·`envelope_json`. 그러나 대시보드의 `rows_to_csv`는 **입력(in_*)과
+pass(pass_*)만** 평탄화해 내보내고 **출력 리포트 데이터셋·telemetry를 누락**한다.
+
+**수정 방향(`edt_dashboard.rows_to_csv`):** 한 행 = 한 시뮬로, 다음을 **모두 포함**:
+- **입력:** `in_<param>`(point_values), `design_id`, `point_hash`, `seed`, 차원 수.
+- **출력:** `tel_<k>`(solve_telemetry: gpu_used/solver_cores/시간 등), `pass_<setup>`(setup_pass_counts),
+  그리고 **출력 리포트 데이터셋**(`csv_text_by_report`). 리포트는 다행(주파수 스윕 곡선)이므로 표현 방식은 §3에서 확정.
+- **메타:** request_id, terminal_state, started/finished_at, account/host/**partition/node**, peetsfea_version.
+- **제외:** 무거운 `.aedt`/`.aedtresults` 바이너리(이건 :7877로 아카이브, CSV엔 아카이브 참조만).
+
+**수용:** `curl localhost:8080/results.csv` 한 방에 **각 시뮬의 설계 입력과 시뮬 출력(리포트 값)** 이 모두 들어 있어
+그대로 분석/서로게이트 학습용 데이터셋으로 쓸 수 있다.
+
+## 3. 결과 데이터 계약 (results.csv가 담아야 할 것)
+> 리포트 출력 데이터셋(`csv_text_by_report`)의 CSV 내 표현 형식은 구현 시 확정(후보: ① 시뮬당 1행 + 리포트
+> 원문을 JSON 컬럼으로 임베드, ② 시뮬×리포트행 long-format, ③ 핵심 출력 스칼라만 추출 컬럼화). 어느 쪽이든
+> **데이터 손실 없이**(무거운 `.aedt` 제외) 입력→출력 전체가 복원 가능해야 한다.
+- 한 시뮬의 **입력 설계점 + 출력 리포트**가 같은 레코드로 연결돼야 함(자동 벤치마크/서로게이트의 원천).
+- partition/node 기록으로 **GPU vs CPU·파티션별 성능 자동 벤치마크**가 데이터로 쌓임(0.3.5 `gpu_used` 포함).
 
 ## 4. 최종 수용 기준
-`systemctl --user start peetsfea-runner`로 띄우면:
-1. **동시 ~100 시뮬이 정상상태로 무한 유지**(요청이 없어도 baseline으로 계속 채워짐).
-2. 7875로 sweep 투입 시 N개가 **우선 처리**되고, backlog 중에도 baseline **~15%** 유지.
-3. 모든 결과 envelope가 **로컬 단일 DB에 적재 → 대시보드/`results.csv`로 조회**되고, project_dir(aedt)은
-   **:7877 HTTP tar 스트림으로 로컬에 전송 → 아카이브(20GB 묶음, 2TB FIFO)** 되며 **gpfs 원본은 삭제**된다.
-4. 로드밸런서로 동시 시작 대비 **부하 스파이크 완화·활용률 상승**이 데이터로 확인된다.
+`systemctl --user start peetsfea-runner` 후:
+1. **수 분 내 첫 solve 시작**, 동시 ~100 시뮬이 정상상태로 무한 유지(요청 없어도 baseline 자기공급, **슬롯이
+   샘플링에 막히지 않음**).
+2. 모든 시뮬의 **입력→출력 데이터셋이 로컬 단일 DB에 적재** → `:8080`/`results.csv`로 조회, CSV가 무거운 `.aedt`만
+   빼고 입출력 전부 포함.
+3. `.aedt` project_dir은 :7877로 아카이브(20GB 묶음, FIFO)되고 gpfs 원본 삭제.
+4. 7875로 sweep 투입 시 N개 우선 처리, backlog 중에도 baseline ~15% 유지.
 5. 잡 장애·10h 만료에 견고(폐기·재기동).
 
-## 5. 현재까지 검증된 것 (Phase 1~4)
-실 AEDT(로컬·클러스터)로 end-to-end 검증 완료:
-- 로컬: `smoke_edt_real_primitive`(실 solve), `smoke_edt_steady_state`(2-레인+admission+실 solve).
-- 클러스터: `verify_slurm_orchestration`(CLUSTER_ORCH_PASS), `verify_slurm_slot_service`
-  (SLURM 잡 → entrypoint → 실 슬롯 서비스 → 실 HFSS solve = SLURM_SLOT_SERVICE_PASS).
-- 신규 13개 모듈, 57+ 단위테스트, mypy strict 클린.
+## 5. 남은 작업 (위 두 문제 해결 = 완전 작동)
+- [ ] **문제 1:** baseline refill 백그라운드 워커화 + batch_size 축소·점진 보충 (`edt_queue`/`edt_intake`/`edt_service`).
+- [ ] **문제 2:** `edt_dashboard.rows_to_csv` 확장 — 입력+출력(telemetry/pass/리포트 데이터셋) 전부 포함, `.aedt`만 제외.
+- [ ] 재배포(배포 체크아웃 FF + 클러스터 wheel) 후 재기동 → 첫 solve·DB 적재·CSV 데이터셋 실측 확인.
 
-## 6. 남은 것
-Phase 1~6 코드 + 컨트롤 플레인 결선 + 결과 ingest(:7876) 완료. 남은 것:
-
-### 6.1 대용량 산출물 전송 :7877 (✅ 구현 완료 — `edt_bulk_transfer`, 단위테스트)
-**HTTP tar 스트림 push, sshd 불필요.** 7876과 동일한 gate 경유 ssh 터널 인프라 재사용.
-- **로컬 데몬:** `:7877` HTTP 수신 서버(`POST /bulk/<request_id>`, tar.gz 스트림 → 버퍼에 스트리밍 추출,
-  상수 메모리) + 7877 역터널(`reverse_tunnel_argv(port=7877)`) + `ArchiveStore`(20GB 묶음/FIFO) 결선.
-  - **받는 즉시 풀어서 raw로 보관(개별 압축 보관 금지).** 전송 구간만 `tar.gz`(전송 효율)이고, 도착하면
-    바로 압축 해제해 raw 파일로 버퍼에 둔다. 그래야 `ArchiveStore`가 **여러 project_dir를 모아 한 번에
-    solid 압축**해 압축률이 좋아진다(개별 압축 보관 시 묶음이 "이미 압축된 덩어리들의 tar"가 되어 추가
-    압축이 안 먹는다).
-  - **FIFO 상한은 로컬 디스크에 맞춤(`EDT_ARCHIVE_BUFFER_BYTES`).** 로컬 8TB 마운트 여유(~1.4TB) 기준
-    현재 1TB. (GOAL의 "2TB"는 디스크 확장 시 목표; 로컬이 2TB를 못 담으므로 env로 조정.)
-- **컨테이너:** 7877 정터널(`slot_service.sh`, 7876과 한 ssh로 `-L` 둘) + `edt_bulk_transfer.BulkPushSink`:
-  시뮬 성공 시 `tar.gz` 스트림을 `127.0.0.1:7877`로 POST → 성공 시 **gpfs 원본 삭제**(무조건 절약),
-  실패 시 재시도→보존(디스패처 안 죽임). entrypoint가 record sink에 합성(성공 envelope → push).
-- **신뢰 모델:** 터널 loopback 바인딩이라 외부 도달 불가 → 별도 인증/키 불필요(7876과 동일).
-- **재사용:** `edt_ssh_tunnel`(터널), `edt_archive.ArchiveStore`(묶음/FIFO), `edt_result_ingest` HTTP 서버 패턴.
-
-### 6.2 운영 실가동 (✅ 가동됨)
-- **배포·결선 완료:** systemd `peetsfea-runner` → `edt_control_plane` 가동 중. 배포 체크아웃
-  (`~/mnt/8tb/peetsfea-runner`)을 이 브랜치 HEAD로 FF(데몬 `python -m` cwd가 거기) + 배포 venv에
-  peetsfea 0.3.5 + 갱신 entrypoint 설치. 클러스터 venv도 0.3.5 + 7877 entrypoint, `slot_service.sh`에
-  7876/7877 정터널.
-- **스케일 기동됨:** 9 SLURM 잡(edt-0..8) 상시 유지. cpu2 잡 = 64 cpus(QOS cpu2_limit cap), 그 외 32.
-  컨테이너당 warm 11 AEDT(gRPC 연결 확인), baseline 전역 샘플링 자기공급.
-- **백채널 검증:** 역터널 7876/7877 상시, gate→로컬 ingest 도달 실측. 결과→로컬 단일 DB→대시보드:8080,
-  산출물→ArchiveStore. (운영 튜닝: cpu2 QOS 64 cap, 로컬 아카이브 FIFO 1TB는 8TB 마운트 여유에 맞춤.)
-- **참고:** baseline 랜덤 후보는 fixed보다 무거워 첫 결과까지 geometry 빌드+solve 시간이 길다(정상).
+## 6. 운영/배포 메모 (실측)
+- **데몬 코드 출처 = 배포 체크아웃 `~/mnt/8tb/peetsfea-runner`** (systemd `python -m`의 cwd가 sys.path 최상단).
+  배포하려면 그 체크아웃을 브랜치 HEAD로 `git merge --ff-only` 해야 함(안 하면 구코드 실행).
+- **클러스터 배포:** `~/.basenv/bin/uv pip install --python ./venv/bin/python --no-deps --reinstall <wheel>`
+  (venv에 pip 없음). peetsfea 0.3.5 + peetsfea_runner wheel + `slot_service.sh`를 `/home1/harry261/edt-deploy/`.
+- **gate 호스트명:** 로컬→gate 역터널은 ssh 별칭 `gate1-harry261`; **compute node→gate 정터널은 내부명 `gate1`**.
+- **cpu2 QOS:** `cpu2_limit` `MaxTRESPerNode cpu=64` → cpu2 잡은 cpus-per-task=64(>64면 영구 PENDING).
+- **아카이브 FIFO 상한:** 로컬 8TB 마운트 여유(~1.4TB)에 맞춰 `EDT_ARCHIVE_BUFFER_BYTES=1TB`(디스크 늘면 키울 것).
