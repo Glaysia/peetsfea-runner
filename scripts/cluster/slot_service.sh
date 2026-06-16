@@ -15,7 +15,8 @@ DEPLOY=$HOME/edt-deploy
 VENVPY=$DEPLOY/venv/bin/python
 REF=$DEPLOY/venv/lib/python3.12/site-packages/peetsfea/data/0.3.4_sweep.toml
 OUT=$DEPLOY/run_out/$SLURM_JOB_ID
-GATE=${EDT_GATE_HOST:-gate1-harry261}
+# compute node가 gate를 부르는 클러스터 내부명(로컬 ssh 별칭 gate1-harry261 아님!). 실측: n043→gate1 OK.
+GATE=${EDT_GATE_HOST:-gate1}
 PORT=${EDT_INGEST_PORT:-7876}
 INGEST_URL="http://127.0.0.1:$PORT/ingest"
 C=edt-job-$SLURM_JOB_ID
