@@ -58,8 +58,9 @@ class SlurmJobLauncher:
     # 잡을 무작위 분배할 파티션들(MASTER_PLAN §2.10). partition_chooser로 잡마다 1개 선택.
     partitions: tuple[str, ...] = DEFAULT_PARTITIONS
     time_limit: str = "10:00:00"
-    # cpus-per-task: cpu2 노드는 100(256코어), 그 외 파티션은 32(48~64코어). (§2.10 확정)
-    cpus_cpu2: int = 100
+    # cpus-per-task: cpu2 노드는 256코어지만 QOS cpu2_limit이 노드당 cpu=64로 하드캡(MaxTRESPerNode).
+    # 그 외 파티션(QOS normal)은 무제한이라 32. 0.3.5는 solve당 코어 고정=4 → 64면 동시 ~16 solve에 정합.
+    cpus_cpu2: int = 64
     cpus_other: int = 32
     mem: str = "480G"  # 전 파티션 노드 ≥768GB라 적재 가능
     job_name_prefix: str = "peetsfea-edt"
