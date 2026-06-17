@@ -31,7 +31,24 @@ class IntakeRequestError(ValueError):
     pass
 
 
+def _light_validator(sweep_text: str) -> None:
+    """가벼운 검증 — toml 파싱만(geometry 빌드 없음). web 메모리 정상화의 핵심.
+
+    범위/기하 타당성은 워커 샘플러의 rejection sampling이 어차피 거른다(불가능 설계는 후보가 안 나옴).
+    무거운 `validate_sweep_toml_text`(cadquery geometry 빌드 → web 메모리 누수)는 요청 경로에서 뺀다.
+    """
+    import tomllib
+
+    try:
+        parsed = tomllib.loads(sweep_text)
+    except Exception as exc:  # noqa: BLE001 — 파싱 실패는 입력 오류.
+        raise IntakeRequestError(f"sweep_toml parse failed: {exc}") from exc
+    if not isinstance(parsed, dict) or not parsed:
+        raise IntakeRequestError("sweep_toml must be a non-empty TOML table")
+
+
 def _peetsfea_validator(sweep_text: str) -> None:
+    """무거운 geometry 기반 범위 검증(cadquery 빌드). web 핫패스엔 부적합 — 기본 아님."""
     from peetsfea.ssw_design_space import validate_sweep_toml_text
 
     validate_sweep_toml_text(sweep_text)
@@ -76,7 +93,7 @@ class IntakeService:
     """
 
     queue: Any  # enqueue_sweep(...)를 가진 큐(DbPriorityQueue)
-    validator: SweepValidator = _peetsfea_validator
+    validator: SweepValidator = _light_validator  # 기본은 경량(toml 파싱). geometry 검증은 워커가 함
     _seq: int = field(default=0, init=False)
     _seq_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
