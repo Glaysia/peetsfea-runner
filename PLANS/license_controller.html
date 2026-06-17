@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="ko"><head><meta charset="utf-8">
+<title>계획서 — 라이선스 피드백 제어기 (목표 ~100, 밴드 100~150)</title>
+<style>
+:root{--bg:#0d1117;--pan:#161b22;--ln:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--vio:#b392f0}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14.5px/1.65 -apple-system,"Noto Sans KR",Segoe UI,sans-serif}
+.wrap{max-width:1040px;margin:0 auto;padding:32px 22px 90px}
+h1{font-size:23px;margin:0 0 4px}h2{font-size:18px;margin:30px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--ln)}
+h3{font-size:15px;margin:18px 0 6px;color:var(--acc)}
+.sub{color:var(--mut);font-size:13px;margin-bottom:8px}
+code{background:#0b0f14;border:1px solid var(--ln);border-radius:5px;padding:1px 6px;font:12.5px ui-monospace,Menlo,monospace}
+pre{background:#0b0f14;border:1px solid var(--ln);border-radius:9px;padding:13px 15px;overflow:auto;font:12.5px/1.55 ui-monospace,Menlo,monospace;white-space:pre}
+table{width:100%;border-collapse:collapse;margin:8px 0;font-size:13.5px}
+th,td{border:1px solid var(--ln);padding:7px 10px;text-align:left;vertical-align:top}
+th{background:var(--pan);color:var(--mut);font-weight:600}
+.card{background:var(--pan);border:1px solid var(--ln);border-radius:11px;padding:14px 18px;margin:12px 0}
+.pill{display:inline-block;font-size:11px;padding:1px 9px;border-radius:11px;font-weight:700}
+.p-warn{background:rgba(210,153,34,.16);color:var(--warn)}.p-new{background:rgba(63,185,80,.16);color:var(--ok)}
+.bad{color:var(--bad)}.ok{color:var(--ok)}.warn{color:var(--warn)}.mut{color:var(--mut)}.vio{color:var(--vio)}
+ul{margin:6px 0 6px 4px;padding-left:20px}li{margin:3px 0}
+</style></head><body><div class="wrap">
+
+<h1>계획서 — 라이선스 피드백 제어기</h1>
+<div class="sub">상태: <b class="warn">계획(미구현)</b> · 작성 2026-06-17 · 대상 <code>peetsfea-web</code>(중앙 제어) + 컨테이너 워커(게이트) · main 배포·컨테이너 사이클 동반</div>
+
+<div class="card">
+<b>목표.</b> 지금 동시 라이선스가 <b class="bad">~20개만</b> 돌아 클러스터가 놀고 있다. 컨테이너당 슬롯을 50으로 열고, <b>전역 라이선스 사용수를 피드백 제어</b>해 <b class="ok">목표 100</b>으로 끌어올린다. 100 미만이면 솔브를 더 시작, 150 초과면 가장 최근 시작한 솔브를 끈다 → <b>수렴값이 매 시간 100~150 안에</b> 들게 한다. 솔브 안 도는 idle AEDT는 CPU·라이선스를 안 먹으므로 슬롯은 여유롭게(50×9=450) 열어둬도 된다.
+</div>
+
+<h2>1. 요구사항 (그대로)</h2>
+<table>
+<tr><th>요구</th><th>설계 반영</th></tr>
+<tr><td>로드밸런싱은 그대로(CPU 여유로운 데 admit)</td><td>워커 로컬 <code>AdmissionController</code>(CPU/mem AIMD) <b>유지</b> + 라이선스 게이트 추가</td></tr>
+<tr><td>컨테이너당 최대 50, 여유롭게</td><td><code>EDT_SLOT_COUNT 11→50</code>. idle AEDT는 라이선스 안 먹음(50×9=450 OK)</td></tr>
+<tr><td>제어 지령 = 라이선스 사용수 <b>100</b></td><td>중앙 제어기 TARGET=100. <code>lic_mine &lt; 100</code>이면 permit 발급</td></tr>
+<tr><td>폴링 주기 줄이기</td><td>ResourcePoller <code>refresh 20s→5s</code> + 제어 루프 5s</td></tr>
+<tr><td>150 초과 → 가장 적게 시뮬한 ansys 끔</td><td><code>lic_mine &gt; 150</code>이면 in-flight 중 <b>youngest(가장 최근 시작)</b> 솔브 abort</td></tr>
+<tr><td>&lt;100 많이, &gt;150 적게, 수렴 100~150</td><td>permit(상한) + youngest-kill(하한 안전) 이중 피드백 → 밴드 수렴</td></tr>
+</table>
+
+<h2>2. 현재 구조 (왜 중앙 제어가 필요한가)</h2>
+<ul>
+<li>컨테이너 = SLURM 잡 = supervisor → <b>워커 프로세스 N개</b>(process-per-slot). 워커 1개 = <code>SlotDispatcher</code> 1슬롯 = <b>AEDT 1개</b>.</li>
+<li>현행 admission(<code>edt_load.AdmissionController</code>)은 <b>워커마다 로컬</b> — 노드 CPU/mem watermark + AIMD. 전역 라이선스는 모른다.</li>
+<li>라이선스 사용수는 <b>전역 신호</b>(9컨테이너×슬롯 합산, lmstat). 솔브 시작 결정은 각 워커가 함 → <b>전역 카운트를 워커가 물어볼 중앙 권위</b>가 필요.</li>
+<li><b>왜 20개만 도나(추정):</b> 로컬 mem watermark admission이 보수적이라 솔브를 묶고 있음. 라이선스를 1차 신호로 올리면 ~100까지 열림.</li>
+</ul>
+
+<h2>3. 설계 — 중앙 라이선스 제어기</h2>
+<div class="sub"><code>peetsfea-web</code> 안에 제어기 + 슈퍼컴 전용 백채널 <code>:7879</code>(역터널, 7876/7878과 동일 토폴로지). 워커가 솔브 직전/도중에 질의.</div>
+
+<h3>3.1 신호와 상태</h3>
+<ul>
+<li><b>lic_mine</b>: ResourcePoller가 lmstat로 빠르게(5s) 폴링하는 <b>내 라이선스 사용수(진실)</b>. 단 측정 지연 있음.</li>
+<li><b>active_permits</b>: 제어기가 발급했고 아직 release 안 된 솔브 집합 <code>{worker_id: (granted_at, last_seen)}</code>. ≈ 내 실제 동시 솔브수.</li>
+<li><b>effective = max(lic_mine, len(active_permits))</b>: 측정 지연(lmstat 늦음)과 드리프트(lmstat가 높음) 양쪽에 안전하게 더 큰 값을 쓴다.</li>
+</ul>
+
+<h3>3.2 admission (상한 — 오버슈트 차단)</h3>
+<pre>워커: 솔브 직전 → POST /permit {worker_id}
+제어기: effective &lt; TARGET(100) 이면  → {grant:true}, active_permits[worker]=now
+                                   아니면 → {grant:false}  (워커는 backoff 후 재시도)
+워커: 솔브 끝 → POST /release {worker_id}  → active_permits.pop(worker)
+TTL: heartbeat 끊긴 permit은 만료 제거(워커 사망 등 누수 방지)</pre>
+<ul>
+<li><b>thundering-herd 차단이 핵심:</b> 450 idle 슬롯이 동시에 <code>lic_mine&lt;100</code>을 보고 우르르 시작하면 폴링 지연 때문에 한참 초과한다. <code>active_permits</code>를 같이 세서 발급 즉시 effective가 오르므로 <b>중앙에서 원자적으로 100에 묶인다</b>.</li>
+<li>그래서 <code>lic_mine</code>만이 아니라 <code>max(lic_mine, 발급수)</code>로 게이트.</li>
+</ul>
+
+<h3>3.3 youngest-kill (하한 안전 — 150 초과)</h3>
+<pre>워커: 솔브 도중 주기 heartbeat → POST /heartbeat {worker_id, solve_started_at}
+제어기: lic_mine &gt; CEILING(150) 이면
+   → in-flight 중 solve_started_at 최댓값(youngest) 워커를 abort 대상으로 표시
+   → 그 워커의 다음 heartbeat 응답에 {abort:true}
+   → 하나 끄고 재측정, 여전히 &gt;150이면 다음 youngest (한 번에 하나씩)
+워커: abort=true 받으면 현재 솔브 중단</pre>
+<ul>
+<li><b>youngest를 끄는 이유:</b> 가장 최근 시작 = 가장 적게 진행 = <b>버리는 컴퓨트 최소</b>(요구사항 그대로).</li>
+<li>드리프트/타 유저 급증으로 lmstat가 일시 초과해도 우리 쪽을 줄여 빠르게 150 아래로.</li>
+</ul>
+
+<h3>3.4 수렴 (왜 100~150에 드나)</h3>
+<ul>
+<li>permit 상한 100 → 평상시 발급은 100에서 멈춤 → in-flight ≈ 100 유지(솔브 끝나면 새로 발급, 다시 100). <b>수렴값 ≈ 100(밴드 하단)</b>.</li>
+<li>지연/herd로 일시 초과해도 effective 회계가 즉시 묶고, lmstat가 150을 넘기면 youngest-kill이 끌어내림. → <b>거의 항상 [100,150]</b>.</li>
+<li>밴드 폭(100→150)이 히스테리시스라 경계에서 진동(켰다 껐다)을 막는다.</li>
+</ul>
+
+<h2>4. 워커 측 변경</h2>
+<ul>
+<li><code>edt_dispatcher._await_admission</code>: 기존 <b>CPU admission 유지</b> + 라이선스 게이트 추가 → <b>(CPU.can_admit() AND 제어기.permit())</b> 일 때만 솔브 시작.</li>
+<li>솔브 완료 후 <code>/release</code>. 솔브 도중 워커 watcher 스레드가 <code>/heartbeat</code> → abort 지령 수신.</li>
+<li>제어기 URL은 env <code>EDT_LICENSE_CTRL_URL</code>(슬롯서비스가 주입, lease와 동일 정터널 경유).</li>
+</ul>
+
+<h2>5. abort 메커니즘 <span class="pill p-warn">위험</span></h2>
+<ul>
+<li>pyaedt 솔브는 executor에서 블로킹 C 콜이라 <b>스레드 인터럽트로 깔끔히 못 끊는다</b>. 현실적 abort:</li>
+<li><b>옵션 A(권장): 워커 프로세스 종료</b> → supervisor가 <b>cold 재기동</b>. youngest라 손실 적음. 단 AEDT cold-start 비용 + <code>slot.backend.kill()</code>로 /enroot·orphan 정리 필요(safe_scancel 백스톱).</li>
+<li>옵션 B: <code>slot.backend.kill()</code>만 호출(AEDT 죽임) 후 워커는 다음 루프 — pyaedt 상태가 깨질 수 있어 비권장.</li>
+<li><b>가드:</b> abort는 드물어야 함(상한 회계가 평상시 막음). 분당 abort 횟수 상한 + 로그.</li>
+</ul>
+
+<h2>6. 슬롯 50 + 폴링 <span class="pill p-warn">주의</span></h2>
+<ul>
+<li><code>EDT_SLOT_COUNT 50</code>: 노드당 워커 50 → AEDT 50개 상주. 라이선스는 안 먹어도 <b>RAM은 먹는다</b>(idle AEDT도 수백 MB). 노드 768GB라 가능하나 측정 권장.</li>
+<li><b>warm 전략:</b> 현행은 슬롯 시작 시 <code>ensure_warm</code>(AEDT 미리 띄움). 50개를 다 warm하면 RAM·스폰 부담 → <b>lazy warm(첫 솔브 직전 기동)</b> 고려. 단 솔브당 cold-start 지연 추가.</li>
+<li><b>스태거:</b> 50개를 180s 간격이면 2.5h. 줄여야(예 30~60s) 합리적 램프. 단 동시 AEDT cold-start 폭주 회피 균형 필요.</li>
+<li>ResourcePoller <code>refresh 20s→5s</code> + lmstat 호출 빈도↑(gate 부하 확인).</li>
+</ul>
+
+<h2>7. 변경 파일</h2>
+<table>
+<tr><th>파일</th><th>변경</th></tr>
+<tr><td>(신규) <code>edt_license_ctrl.py</code></td><td>중앙 제어기 + <code>:7879</code> 서버(/permit·/release·/heartbeat) + 워커측 <code>LicensePermitClient</code></td></tr>
+<tr><td><code>edt_resources.py</code></td><td>poll refresh 20→5s. lic_mine 빠른 노출</td></tr>
+<tr><td><code>edt_dispatcher.py</code></td><td><code>_await_admission</code>에 라이선스 게이트 + 솔브 watcher(heartbeat/abort)</td></tr>
+<tr><td><code>edt_control_plane.py</code></td><td>제어기 기동 + 역터널 :7879. ResourcePoller 빠른 폴 wiring</td></tr>
+<tr><td><code>edt_entrypoint.py</code></td><td>워커에 permit client 주입(EDT_LICENSE_CTRL_URL)</td></tr>
+<tr><td><code>scripts/cluster/slot_service.sh</code></td><td><code>EDT_SLOT_COUNT 50</code>, 스태거↓, 정터널 7879 + EDT_LICENSE_CTRL_URL</td></tr>
+<tr><td><code>edt_dashboard.py</code></td><td>(선택) 제어기 상태(effective/permit/abort수) 추세·카드</td></tr>
+</table>
+
+<h2>8. 테스트</h2>
+<ul>
+<li>제어기 단위: effective 회계(permit/release/TTL), TARGET 상한에서 grant 멈춤, lic&gt;150에서 youngest 선택.</li>
+<li>오버슈트: 동시 N permit 요청에도 발급이 TARGET을 안 넘는지(herd 차단).</li>
+<li>수렴 시뮬: lic 신호를 fake로 주고 발급/abort가 100~150에 수렴하는지.</li>
+<li>워커 게이트: CPU admission AND permit 둘 다일 때만 솔브. abort 지령 시 중단 경로.</li>
+</ul>
+
+<h2>9. 롤아웃</h2>
+<ul>
+<li>제어기/폴링/대시보드 = <code>peetsfea-web</code> 재시작.</li>
+<li>워커 게이트/슬롯50/스태거 = gate venv 동기 + <b>keeper 재시작(잡 사이클)</b>. <span class="mut">[[teardown-order-containers-first]] 순서.</span></li>
+<li>단계적 권장: ① admission(상한 100)만 먼저 → 라이선스 20→~100 확인 → ② youngest-kill(위험) 활성. (이번 계획서는 전체 설계, 구현 범위는 별도 합의)</li>
+</ul>
+
+<h2>10. 비목표 / 리스크</h2>
+<ul>
+<li><b>타 유저 라이선스 비제어:</b> issued 550, 우리 100~150이면 충분. 타 유저 급증으로 총 in_use가 차면 우리 grant가 자연 보류(effective↑) → 안전.</li>
+<li>abort는 running 솔브를 죽이는 유일한 위험 지점 — 상한 회계로 평상시 발생 0에 가깝게, 발생 시 youngest라 손실 최소 + 로그.</li>
+<li>50 idle AEDT RAM·cold-start는 측정 후 lazy-warm/스태거로 조정.</li>
+<li>관련 후속: spill replay 미배선(blip 결과 유실)은 별개.</li>
+</ul>
+
+</div></body></html>
