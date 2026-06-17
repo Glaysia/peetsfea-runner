@@ -80,3 +80,81 @@ def test_shutdown_kills_all() -> None:
     orch.shutdown()
     assert launcher.kills == 4
     assert orch.running_count() == 0
+
+
+# --- 순차 램프(sequential_ramp): 한 잡이 RUNNING 된 뒤에야 다음 제출 ---------------
+
+class SeqFakeLauncher(JobLauncher):
+    """RUNNING/PENDING을 구분하는 fake. 새 잡은 PENDING으로 시작, mark_running()으로 RUNNING 전환."""
+
+    def __init__(self) -> None:
+        self.alive: dict[str, bool] = {}
+        self.running: dict[str, bool] = {}
+        self.submits = 0
+        self.kills = 0
+        self.fail_submit = False
+
+    def submit(self, job_index: int) -> JobHandle:
+        if self.fail_submit:
+            raise RuntimeError("no available node")
+        self.submits += 1
+        sid = f"s-{job_index}-{self.submits}"
+        self.alive[sid] = True
+        self.running[sid] = False  # 처음엔 PENDING
+        return JobHandle(job_index=job_index, slurm_id=sid, started_at=0.0)
+
+    def is_alive(self, handle: JobHandle) -> bool:
+        return self.alive.get(handle.slurm_id, False)
+
+    def is_running(self, handle: JobHandle) -> bool:
+        return self.running.get(handle.slurm_id, False)
+
+    def kill(self, handle: JobHandle) -> None:
+        self.kills += 1
+        self.alive[handle.slurm_id] = False
+
+    def mark_running(self) -> None:
+        for sid, alive in self.alive.items():
+            if alive:
+                self.running[sid] = True
+
+
+def test_sequential_ramp_one_at_a_time() -> None:
+    launcher = SeqFakeLauncher()
+    orch = JobOrchestrator(launcher=launcher, clock=FakeClock(), job_count=3, sequential_ramp=True)
+    orch.ensure_running()
+    assert launcher.submits == 1  # 한 개만 제출
+    orch.poll()
+    assert launcher.submits == 1  # 직전 잡 아직 PENDING → 다음 제출 안 함
+    launcher.mark_running()  # 잡0 RUNNING
+    orch.poll()
+    assert launcher.submits == 2  # 이제 다음 제출
+    launcher.mark_running()
+    orch.poll()
+    assert launcher.submits == 3
+    launcher.mark_running()
+    orch.poll()
+    assert launcher.submits == 3  # 목표 도달 → 더 제출 안 함
+    assert orch.running_count() == 3
+
+
+def test_sequential_ramp_waits_when_no_node() -> None:
+    launcher = SeqFakeLauncher()
+    launcher.fail_submit = True  # 가용 노드 없음(submit 예외)
+    orch = JobOrchestrator(launcher=launcher, clock=FakeClock(), job_count=2, sequential_ramp=True)
+    orch.ensure_running()
+    assert launcher.submits == 0 and orch.running_count() == 0  # 예외 삼키고 대기
+
+
+def test_sequential_ramp_refills_after_death() -> None:
+    launcher = SeqFakeLauncher()
+    orch = JobOrchestrator(launcher=launcher, clock=FakeClock(), job_count=2, sequential_ramp=True)
+    orch.ensure_running(); launcher.mark_running()
+    orch.poll(); launcher.mark_running()
+    orch.poll()
+    assert orch.running_count() == 2
+    dead = orch.handles()[0]
+    launcher.alive[dead.slurm_id] = False  # 잡 1개 사망
+    orch.poll()  # 죽은 잡 drop + 새로 1개 제출
+    assert orch.restarts == 1
+    assert launcher.submits == 3

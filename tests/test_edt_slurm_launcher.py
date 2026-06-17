@@ -120,3 +120,82 @@ def test_kill_calls_scancel() -> None:
     launcher.kill(JobHandle(job_index=0, slurm_id="99", started_at=0.0))
     # graceful SIGTERM(자동 KILL 없음) → trap이 /enroot 청소. raw `scancel 99`(KILL 폴백) 아님.
     assert any("scancel --full --signal=TERM 99" in r for r in runner.remotes())
+
+
+# --- node_based 제출 (특정 노드 핀 + 빈 노드 발견 + 가중 파티션) ---------------------
+
+def _node_runner(sinfo_out: str, *, busy: str = "", sbatch_id: str = "500") -> FakeRunner:
+    runner = FakeRunner()
+    runner.responses["sinfo"] = CommandResult(0, sinfo_out, "")
+    runner.responses["squeue -h --me"] = CommandResult(0, busy, "")  # busy nodes
+    runner.responses["sbatch"] = CommandResult(0, f"Submitted batch job {sbatch_id}\n", "")
+    return runner
+
+
+def _last_script(runner: FakeRunner) -> str:
+    return [s for a, s in runner.calls if a[-1] == "sbatch" and s][-1]
+
+
+def test_node_based_pins_nodelist_and_excludes_busy() -> None:
+    sinfo = "n001 cpu2 idle\nn002 cpu2 idle\nn010 gpu1 idle\n"
+    runner = _node_runner(sinfo, busy="n001\n")  # n001은 내 잡이 점유 → 제외
+    launcher = SlurmJobLauncher(
+        command_runner=runner, clock=lambda: 0.0, partitions=("cpu2", "gpu1"),
+        node_based=True, cpu2_weight=1.0,  # cpu2 강제
+    )
+    handle = launcher.submit(2)
+    assert handle.slurm_id == "500"
+    script = _last_script(runner)
+    assert "#SBATCH --nodelist=n002" in script  # n001 busy 제외 → 다음 idle cpu2 노드
+    assert "#SBATCH --partition=cpu2" in script
+    assert "--nodelist=n001" not in script
+
+
+def test_node_based_weighted_cpu2_vs_gpu() -> None:
+    sinfo = "n001 cpu2 idle\nn010 gpu1 idle\n"
+    # rng<cpu2_weight → cpu2
+    r1 = _node_runner(sinfo)
+    SlurmJobLauncher(command_runner=r1, clock=lambda: 0.0, partitions=("cpu2", "gpu1"),
+                     node_based=True, cpu2_weight=0.7, rng=lambda: 0.1).submit(0)
+    assert "--nodelist=n001" in _last_script(r1) and "--partition=cpu2" in _last_script(r1)
+    # rng>=cpu2_weight → gpu (gres 포함)
+    r2 = _node_runner(sinfo)
+    SlurmJobLauncher(command_runner=r2, clock=lambda: 0.0, partitions=("cpu2", "gpu1"),
+                     node_based=True, cpu2_weight=0.7, rng=lambda: 0.9).submit(0)
+    s2 = _last_script(r2)
+    assert "--nodelist=n010" in s2 and "--partition=gpu1" in s2 and "--gres=gpu:2" in s2
+
+
+def test_node_based_prefers_idle_over_mix() -> None:
+    sinfo = "n001 cpu2 mix\nn002 cpu2 idle\n"  # idle 우선
+    runner = _node_runner(sinfo)
+    SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0, partitions=("cpu2",),
+                     node_based=True, cpu2_weight=1.0).submit(0)
+    assert "--nodelist=n002" in _last_script(runner)
+
+
+def test_node_based_no_available_node_raises() -> None:
+    runner = _node_runner("", busy="")  # sinfo 빈 결과 = 가용 노드 없음
+    launcher = SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0,
+                                partitions=("cpu2", "gpu1"), node_based=True)
+    with pytest.raises(SlurmLauncherError):
+        launcher.submit(0)
+
+
+def test_node_based_all_busy_raises() -> None:
+    runner = _node_runner("n001 cpu2 idle\n", busy="n001\n")  # 유일 후보가 busy
+    launcher = SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0,
+                                partitions=("cpu2",), node_based=True)
+    with pytest.raises(SlurmLauncherError):
+        launcher.submit(0)
+
+
+def test_is_running_only_true_for_running() -> None:
+    runner = FakeRunner()
+    launcher = _launcher(runner)
+    handle = JobHandle(job_index=0, slurm_id="42", started_at=0.0)
+    runner.responses["squeue -j"] = CommandResult(0, "RUNNING\n", "")
+    assert launcher.is_running(handle) is True
+    runner.responses["squeue -j"] = CommandResult(0, "PENDING\n", "")
+    assert launcher.is_running(handle) is False  # PENDING은 아직 아님
+    assert launcher.is_alive(handle) is True     # 단 살아있음

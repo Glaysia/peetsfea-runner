@@ -56,6 +56,9 @@ class ControlPlaneConfig:
     priority_lease_port: int = DEFAULT_PRIORITY_LEASE_PORT  # 슈퍼컴 전용 우선순위 분배 백채널(역터널로만 도달).
     poll_interval_seconds: float = 60.0
     dashboard_peetsfea_version: str = ""  # 대시보드 표시 버전 필터(빈 값=전 버전). 예: "0.3.7".
+    # 잡 제출 전략: 노드 기반(빈 노드에 --nodelist 핀, 내 잡 도는 노드 제외) + 순차 램프(한 잡 RUNNING 후 다음).
+    node_based_jobs: bool = True
+    sequential_ramp: bool = True
 
 
 @dataclass
@@ -180,8 +183,14 @@ def build_control_plane(
     job_launcher = launcher if launcher is not None else SlurmJobLauncher(
         ssh_host=config.ssh_host,
         job_command=config.job_command,
+        node_based=config.node_based_jobs,
     )
-    orchestrator = JobOrchestrator(launcher=job_launcher, clock=time.monotonic, job_count=config.job_count)
+    orchestrator = JobOrchestrator(
+        launcher=job_launcher,
+        clock=time.monotonic,
+        job_count=config.job_count,
+        sequential_ramp=config.sequential_ramp,
+    )
     # 호스트측 Intake 큐(우선순위 분배는 후속; 여기선 수신·검증·샘플까지).
     intake = IntakeService(queue=TwoLaneQueue())
     return ControlPlane(

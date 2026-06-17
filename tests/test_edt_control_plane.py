@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from peetsfea_runner.edt_control_plane import ControlPlaneConfig, build_control_plane
@@ -16,7 +17,8 @@ class FakeLauncher(JobLauncher):
         self.submits += 1
         sid = f"j{job_index}-{self.submits}"
         self.alive[sid] = True
-        return JobHandle(job_index=job_index, slurm_id=sid, started_at=0.0)
+        # 컨트롤플레인 오케스트레이터는 time.monotonic을 쓰므로 started_at도 현재 monotonic(만료 오판 방지).
+        return JobHandle(job_index=job_index, slurm_id=sid, started_at=time.monotonic())
 
     def is_alive(self, handle: JobHandle) -> bool:
         return self.alive.get(handle.slurm_id, False)
@@ -34,8 +36,12 @@ def test_build_control_plane_wires_orchestrator_store_intake(tmp_path: Path) -> 
     assert isinstance(cp.intake, IntakeService)
     assert cp.dashboard_port == 8080 and cp.intake_port == 7875
 
-    # 오케스트레이터가 9잡을 띄운다(연속 가동 시작점).
+    # 순차 램프(기본): 한 번에 하나씩 — 직전 잡이 RUNNING 된 뒤 다음. FakeLauncher는 제출 즉시 alive(=running 폴백).
+    assert cp.orchestrator.sequential_ramp is True
     cp.orchestrator.ensure_running()
+    assert launcher.submits == 1  # 처음엔 한 개만
+    for _ in range(8):
+        cp.orchestrator.poll()  # 하나씩 차근차근 올림
     assert launcher.submits == 9
     assert cp.orchestrator.running_count() == 9
 

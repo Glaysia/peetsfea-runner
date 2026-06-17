@@ -74,6 +74,12 @@ class SlurmJobLauncher:
     job_name_prefix: str = "peetsfea-edt"
     job_command: str = "echo placeholder-job; sleep 60"  # 실서비스는 enroot+entrypoint로 교체
     partition_chooser: Callable[[Sequence[str]], str] = random.choice
+    # node_based=True면 파티션에 던지지 않고 **빈 노드를 골라 --nodelist로 핀**한다. sinfo로 idle/mix 노드를
+    # 찾고, 이미 내 잡이 도는 노드는 제외(노드당 1잡 = 과적재 방지). 오케스트레이터의 순차 램프와 짝.
+    node_based: bool = False
+    # 노드 선택 시 파티션 가중: cpu2와 gpu가 둘 다 가용이면 cpu2를 이 확률로 고른다(나머지는 gpu).
+    cpu2_weight: float = 0.7
+    rng: Callable[[], float] = random.random  # 가중 선택용(테스트 주입 가능)
     clock: Clock = time.monotonic
     command_runner: CommandRunner = subprocess_runner
 
@@ -87,13 +93,16 @@ class SlurmJobLauncher:
     def _gpu_count_for(self, partition: str) -> int:
         return self.gres_gpu_count if partition.startswith("gpu") else 0
 
-    def _sbatch_script(self, job_index: int, partition: str, cpus: int) -> str:
+    def _sbatch_script(self, job_index: int, partition: str, cpus: int, *, node: str | None = None) -> str:
         gpus = self._gpu_count_for(partition)
         gres_line = f"#SBATCH --gres=gpu:{gpus}\n" if gpus > 0 else ""
+        # node_based: 특정 노드에 핀(과적재 방지). 파티션은 노드가 속한 파티션으로 함께 지정.
+        nodelist_line = f"#SBATCH --nodelist={node}\n" if node else ""
         return (
             "#!/bin/bash\n"
             f"#SBATCH --job-name={self.job_name_prefix}-{job_index}\n"
             f"#SBATCH --partition={partition}\n"
+            f"{nodelist_line}"
             f"#SBATCH --time={self.time_limit}\n"
             "#SBATCH --nodes=1 --ntasks=1\n"
             f"#SBATCH --cpus-per-task={cpus}\n"
@@ -106,10 +115,84 @@ class SlurmJobLauncher:
             f"{self.job_command}\n"
         )
 
+    def _busy_nodes(self) -> set[str]:
+        """내 잡(RUNNING/PENDING)이 이미 점유한 노드 — 노드당 1잡을 위해 제외 대상."""
+        result = self._ssh("squeue -h --me -t RUNNING,PENDING -o '%N'")
+        if result.returncode != 0:
+            return set()
+        nodes: set[str] = set()
+        for line in result.stdout.splitlines():
+            name = line.strip()
+            if name and not name.startswith("("):  # PENDING 사유는 '(Resources)' 형태 → 제외
+                nodes.add(name)
+        return nodes
+
+    def _candidate_nodes(self) -> list[tuple[str, str]]:
+        """대상 파티션의 가용 노드 (node, partition). idle 우선, 그다음 mix."""
+        result = self._ssh(f"sinfo -h -N -p {','.join(self.partitions)} -o '%N %P %t'")
+        if result.returncode != 0:
+            return []
+        idle: list[tuple[str, str]] = []
+        mixed: list[tuple[str, str]] = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            node, partition, state = parts[0], parts[1].rstrip("*"), parts[2].lower()
+            if partition not in self.partitions:
+                continue
+            if state == "idle":
+                idle.append((node, partition))
+            elif state in ("mix", "mixed"):
+                mixed.append((node, partition))
+        return idle + mixed
+
+    def _select_partition(self, available: set[str]) -> str:
+        """가용 파티션 중 가중 선택: cpu2/gpu 둘 다면 cpu2를 cpu2_weight 확률로."""
+        has_cpu2 = "cpu2" in available
+        gpus = sorted(p for p in available if p.startswith("gpu"))
+        if has_cpu2 and gpus:
+            return "cpu2" if self.rng() < self.cpu2_weight else self.partition_chooser(gpus)
+        if has_cpu2:
+            return "cpu2"
+        if gpus:
+            return self.partition_chooser(gpus)
+        return self.partition_chooser(sorted(available))
+
+    def _ordered_candidates(self) -> list[tuple[str, str]]:
+        """제출 후보 노드 순서: 빈 노드 중 가중 선택된 파티션을 앞에(나머지는 fallback). busy 노드 제외."""
+        busy = self._busy_nodes()
+        cands = [(n, p) for (n, p) in self._candidate_nodes() if n not in busy]
+        if not cands:
+            return []
+        by_part: dict[str, list[tuple[str, str]]] = {}
+        for n, p in cands:
+            by_part.setdefault(p, []).append((n, p))
+        chosen = self._select_partition(set(by_part))
+        head = by_part.pop(chosen, [])
+        rest = [c for lst in by_part.values() for c in lst]
+        return head + rest
+
     def submit(self, job_index: int) -> JobHandle:
-        partition = self.partition_chooser(self.partitions)
-        cpus = self._cpus_for(partition)
-        result = self._ssh("sbatch", input_text=self._sbatch_script(job_index, partition, cpus))
+        if not self.node_based:
+            partition = self.partition_chooser(self.partitions)
+            cpus = self._cpus_for(partition)
+            result = self._ssh("sbatch", input_text=self._sbatch_script(job_index, partition, cpus))
+            return self._parse_submit(result, job_index)
+        # node_based: 빈 노드(가중 선택)에 핀. 레이스로 한 노드 제출이 실패하면 다음 후보로.
+        candidates = self._ordered_candidates()
+        if not candidates:
+            raise SlurmLauncherError(f"no available node in {self.partitions} (job {job_index})")
+        last_err = ""
+        for node, partition in candidates:
+            cpus = self._cpus_for(partition)
+            result = self._ssh("sbatch", input_text=self._sbatch_script(job_index, partition, cpus, node=node))
+            if result.returncode == 0 and _SUBMITTED_RE.search(result.stdout):
+                return self._parse_submit(result, job_index)
+            last_err = result.stderr.strip() or result.stdout.strip()
+        raise SlurmLauncherError(f"sbatch failed on all candidate nodes (job {job_index}): {last_err}")
+
+    def _parse_submit(self, result: CommandResult, job_index: int) -> JobHandle:
         if result.returncode != 0:
             raise SlurmLauncherError(f"sbatch failed (rc={result.returncode}): {result.stderr.strip()}")
         match = _SUBMITTED_RE.search(result.stdout)
@@ -123,6 +206,14 @@ class SlurmJobLauncher:
             return False
         state = result.stdout.strip().splitlines()[0].strip() if result.stdout.strip() else ""
         return state in _ACTIVE_STATES
+
+    def is_running(self, handle: JobHandle) -> bool:
+        """RUNNING 상태인지(순차 램프 게이트용). PENDING/CONFIGURING은 False."""
+        result = self._ssh(f"squeue -j {handle.slurm_id} -h -o %T")
+        if result.returncode != 0:
+            return False
+        state = result.stdout.strip().splitlines()[0].strip() if result.stdout.strip() else ""
+        return state == "RUNNING"
 
     def kill(self, handle: JobHandle) -> None:
         # graceful SIGTERM만 보낸다(자동 SIGKILL 없음): supervisor/워커가 TERM에 깨끗이 종료하고

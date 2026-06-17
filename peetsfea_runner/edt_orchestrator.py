@@ -34,6 +34,8 @@ class JobLauncher(Protocol):
     def submit(self, job_index: int) -> JobHandle: ...
     def is_alive(self, handle: JobHandle) -> bool: ...
     def kill(self, handle: JobHandle) -> None: ...
+    # 선택: 순차 램프(sequential_ramp)는 `is_running`(RUNNING/PENDING 구분)을 쓴다. 구현이 없으면 is_alive로
+    # 폴백하므로 Protocol에 필수로 선언하지 않는다(스텁 상속 시 None 반환 폴백이 깨지는 것을 피함).
 
 
 @dataclass
@@ -44,6 +46,9 @@ class JobOrchestrator:
     clock: Clock
     job_count: int = JOBS_PER_ACCOUNT
     max_lifetime_seconds: float = float(JOB_MAX_LIFETIME_SECONDS)
+    # sequential_ramp=True면 **한 번에 한 잡씩**: 직전 잡이 RUNNING 된 뒤에야 다음 잡을 제출(노드 과적재·동시
+    # 콜드스타트 폭주 방지). poll/ensure_running 호출당 최대 1개 제출, 가용 노드 없으면 그냥 대기.
+    sequential_ramp: bool = False
     submitted: int = field(default=0, init=False)
     restarts: int = field(default=0, init=False)  # 죽어서 재기동한 횟수
     expiries: int = field(default=0, init=False)  # 10h 만료로 폐기·재기동한 횟수
@@ -56,6 +61,9 @@ class JobOrchestrator:
 
     def ensure_running(self) -> None:
         """비어 있는 잡 슬롯을 채운다(콜드 스타트/누락 보충)."""
+        if self.sequential_ramp:
+            self._ramp_poll()
+            return
         with self._lock:
             for i in range(self.job_count):
                 if i not in self._jobs:
@@ -63,6 +71,9 @@ class JobOrchestrator:
 
     def poll(self) -> None:
         """전 잡 1회 점검: 죽었으면 재기동, 10h 만료면 폐기 후 재기동."""
+        if self.sequential_ramp:
+            self._ramp_poll()
+            return
         with self._lock:
             now = self.clock()
             for i in range(self.job_count):
@@ -77,6 +88,36 @@ class JobOrchestrator:
                     self.launcher.kill(handle)
                     self._submit(i)
                     self.expiries += 1
+
+    def _is_running(self, handle: JobHandle) -> bool:
+        fn = getattr(self.launcher, "is_running", None)
+        return fn(handle) if callable(fn) else self.launcher.is_alive(handle)
+
+    def _ramp_poll(self) -> None:
+        """순차 램프 1회: 죽은/만료 잡 정리 후, 대기(PENDING) 잡이 없고 목표 미달이면 **한 개만** 제출."""
+        with self._lock:
+            now = self.clock()
+            for i in list(self._jobs):
+                handle = self._jobs[i]
+                if not self.launcher.is_alive(handle):
+                    del self._jobs[i]
+                    self.restarts += 1  # 죽음 → 다음 램프에서 재제출
+                elif (now - handle.started_at) >= self.max_lifetime_seconds:
+                    self.launcher.kill(handle)
+                    del self._jobs[i]
+                    self.expiries += 1
+            if len(self._jobs) >= self.job_count:
+                return
+            # 아직 RUNNING 안 된 잡(=직전 제출분)이 있으면 그게 뜰 때까지 대기 — 한 번에 하나씩.
+            if any(self.launcher.is_alive(h) and not self._is_running(h) for h in self._jobs.values()):
+                return
+            for i in range(self.job_count):
+                if i not in self._jobs:
+                    try:
+                        self._submit(i)
+                    except Exception:  # noqa: BLE001 — 가용 노드 없음 등: 이번 사이클은 건너뛰고 다음에 재시도.
+                        pass
+                    return
 
     def running_count(self) -> int:
         with self._lock:
