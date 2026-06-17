@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 import traceback
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -63,6 +64,10 @@ class SlotDispatcher:
     # 로드밸런서(Phase 3): None이면 게이트 없음(Phase 1 동작). 설정하면 새 시뮬 시작을 부하로 게이팅(ramp-up).
     admission: AdmissionController | None = None
     admission_poll_seconds: float = 1.0
+    # 라이선스 제어(전역): None이면 게이트 없음. 설정하면 솔브 직전 permit 획득(상한 100), 솔브 중 heartbeat로
+    # abort 지령(150 초과 시 youngest kill) 수신. acquire()/release()/heartbeat(started_epoch)를 가진 클라이언트.
+    permit_client: Any = None
+    heartbeat_seconds: float = 20.0
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _processed: int = field(default=0, init=False)
     _processed_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -106,27 +111,43 @@ class SlotDispatcher:
                         return
                     self._stop.wait(self.idle_sleep_seconds)
                     continue
-                # ramp-up 게이트: 부하 여유가 생길 때까지 새 시뮬 시작을 보류(item은 손에 쥔 채).
+                # ramp-up 게이트: (라이선스 permit AND CPU 여유)일 때까지 새 시뮬 시작을 보류(item은 손에 쥔 채).
                 if not self._await_admission():
                     break
-                envelope = self._run_one(slot, item, executor)
+                try:
+                    envelope = self._run_one(slot, item, executor)
+                finally:
+                    if self.permit_client is not None:
+                        self.permit_client.release()  # 솔브 1건 끝 → 라이선스 자리 반납
                 self._safe_record(envelope)
                 with self._processed_lock:
                     self._processed += 1
 
     def _await_admission(self) -> bool:
-        """admission이 설정되면 부하 여유가 생길 때까지 대기. 승인 시 True, stop 시 False."""
-        if self.admission is None:
-            return True
+        """(라이선스 permit AND CPU admission) 둘 다일 때 승인. permit은 전역 상한, CPU는 로컬 로드밸런싱.
+
+        permit을 먼저 잡고 CPU가 아직이면 permit을 반납하고 재시도(permit 누수 방지). stop 시 False.
+        """
         while not self._stop.is_set():
-            if self.admission.can_admit():
-                return True
-            self._stop.wait(self.admission_poll_seconds)
+            # 1) 라이선스 permit (전역 상한 100)
+            if self.permit_client is not None and not self.permit_client.acquire():
+                self._stop.wait(self.admission_poll_seconds)
+                continue
+            # 2) CPU 로드밸런싱 (로컬 — 그대로 유지)
+            if self.admission is not None and not self.admission.can_admit():
+                if self.permit_client is not None:
+                    self.permit_client.release()  # CPU 아직 → 잡은 permit 반납
+                self._stop.wait(self.admission_poll_seconds)
+                continue
+            return True
+        if self.permit_client is not None:
+            self.permit_client.release()  # stop: 혹시 잡은 permit 반납(멱등)
         return False
 
     def _run_one(self, slot: EdtManager, item: QueueItem, executor: ThreadPoolExecutor) -> dict[str, Any]:
         grant = slot.acquire()
         started_at = self.now_iso()
+        started_epoch = time.time()
         job_output_dir = self.output_root / item.request_id
         future = executor.submit(
             self.primitive,
@@ -138,6 +159,15 @@ class SlotDispatcher:
             aedt_pid=grant.pid,
             solve_hard_abort_seconds=self.solve_hard_abort_seconds,
         )
+        # 라이선스 제어 watcher: 솔브 중 heartbeat → abort 지령(youngest kill) 시 AEDT를 죽여 솔브 중단.
+        aborted = {"v": False}
+        watch_stop = threading.Event()
+        watcher: threading.Thread | None = None
+        if self.permit_client is not None:
+            watcher = threading.Thread(
+                target=self._heartbeat_watch, args=(slot, started_epoch, watch_stop, aborted), daemon=True
+            )
+            watcher.start()
         try:
             result = future.result(timeout=self.backstop_seconds)
         except FutureTimeoutError:
@@ -151,8 +181,13 @@ class SlotDispatcher:
                 terminal_state="aborted",
                 error={"stage": "backstop", "type": "BackstopTimeout", "message": f"sim exceeded {self.backstop_seconds:.0f}s"},
             )
-        except Exception as exc:  # 시뮬 실패: 살아있으면 재부착, 아니면 재기동.
+        except Exception as exc:  # 시뮬 실패(또는 라이선스 abort로 AEDT kill): 살아있으면 재부착, 아니면 재기동.
             slot.recover()
+            if aborted["v"]:
+                return self._envelope(
+                    item, slot, grant.grpc_port, started_at, terminal_state="aborted",
+                    error={"stage": "license_abort", "type": "LicenseAbort", "message": "killed by license controller (youngest, lic>ceiling)"},
+                )
             return self._envelope(
                 item,
                 slot,
@@ -164,6 +199,23 @@ class SlotDispatcher:
         else:
             slot.release()
             return self._envelope(item, slot, grant.grpc_port, started_at, terminal_state="success", result=result)
+        finally:
+            watch_stop.set()
+
+    def _heartbeat_watch(
+        self, slot: EdtManager, started_epoch: float, watch_stop: threading.Event, aborted: dict[str, bool]
+    ) -> None:
+        """솔브 중 제어기에 heartbeat. abort 지령이면 AEDT를 죽여(grpc 끊김) 솔브를 중단시킨다."""
+        while not watch_stop.is_set() and not self._stop.is_set():
+            try:
+                if self.permit_client is not None and self.permit_client.heartbeat(started_epoch):
+                    aborted["v"] = True
+                    slot.backend.kill()  # AEDT 죽임 → primitive grpc 실패 → future 예외 → except에서 'aborted' 기록
+                    return
+            except Exception:  # noqa: BLE001 — watcher가 솔브를 죽이면 안 된다.
+                pass
+            if watch_stop.wait(self.heartbeat_seconds):
+                return
 
     def _envelope(
         self,

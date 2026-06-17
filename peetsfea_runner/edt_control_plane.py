@@ -30,6 +30,7 @@ from .edt_archive import ArchiveStore
 from .edt_bulk_transfer import DEFAULT_BULK_PORT, start_bulk_transfer_server
 from .edt_dashboard import start_dashboard_server
 from .edt_intake import IntakeService, start_intake_server
+from .edt_license_ctrl import DEFAULT_LICENSE_CTRL_PORT, LicenseController, start_license_ctrl_server
 from .edt_orchestrator import JobLauncher, JobOrchestrator
 from .edt_priority_lease import DEFAULT_PRIORITY_LEASE_PORT, start_priority_lease_server
 from .edt_resources import ResourcePoller
@@ -58,6 +59,11 @@ class ControlPlaneConfig:
     # 잡 제출 전략: 노드 기반(빈 노드에 --nodelist 핀, 내 잡 도는 노드 제외) + 순차 램프(한 잡 RUNNING 후 다음).
     node_based_jobs: bool = True
     sequential_ramp: bool = True
+    # 라이선스 피드백 제어(:7879): 전역 동시 솔브를 target~ceiling 밴드로. lic_mine은 poller에서.
+    license_ctrl_port: int = DEFAULT_LICENSE_CTRL_PORT
+    license_target: int = 100  # permit 상한(<100이면 더 솔브)
+    license_ceiling: int = 150  # 초과 시 youngest abort
+    license_poll_seconds: float = 60.0  # 솔브 ~14분이라 1분이면 충분
 
 
 @dataclass
@@ -73,6 +79,10 @@ class ControlPlane:
     ingest_port: int = DEFAULT_INGEST_PORT
     bulk_port: int = DEFAULT_BULK_PORT
     priority_lease_port: int = DEFAULT_PRIORITY_LEASE_PORT
+    license_ctrl_port: int = DEFAULT_LICENSE_CTRL_PORT
+    license_target: int = 100
+    license_ceiling: int = 150
+    license_poll_seconds: float = 60.0
     dashboard_peetsfea_version: str = ""  # 대시보드 표시 버전 필터(빈 값=전 버전).
     resource_poller: ResourcePoller | None = None  # 컨테이너별 실시간 부하(대시보드 /api/resources).
     enable_ingest_tunnel: bool = True  # 테스트에선 ssh 역터널 비활성.
@@ -80,12 +90,32 @@ class ControlPlane:
     # 둘 다 True면 단일 프로세스(기존 동작). 분리 운영 시 web 재시작이 컨테이너를 건드리지 않는다(scancel은 keeper만).
     run_web: bool = True
     run_keeper: bool = True
+    license_controller: LicenseController | None = field(default=None, init=False, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _servers: list[ThreadingHTTPServer] = field(default_factory=list, init=False, repr=False)
     _tunnels: list[SshTunnel] = field(default_factory=list, init=False, repr=False)
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _lic_mine(self) -> int:
+        """현재 내 라이선스 사용수(lic_mine) — poller 스냅샷에서. 제어기 lic_provider."""
+        if self.resource_poller is None:
+            return 0
+        lic = self.resource_poller.snapshot().get("license") or {}
+        try:
+            return int(lic.get("mine") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _license_poll_loop(self) -> None:
+        while not self._stop.is_set():
+            if self.license_controller is not None:
+                try:
+                    self.license_controller.poll()
+                except Exception:  # noqa: BLE001 — 제어 루프가 데몬을 죽이면 안 된다.
+                    pass
+            self._stop.wait(self.license_poll_seconds)
 
     def run(self) -> None:
         """서버 기동 + 오케스트레이터 상시 유지 루프. SIGTERM/SIGINT까지."""
@@ -116,16 +146,25 @@ class ControlPlane:
             bulk_server = start_bulk_transfer_server(archive_store=self.archive_store, port=self.bulk_port)
             # 우선순위 분배(:7878): intake(:7875)가 채운 우선순위 레인을 슈퍼컴 워커들에 lease로 분배.
             lease_server = start_priority_lease_server(queue=self.intake.queue, port=self.priority_lease_port)
-            for server in (dashboard, intake_server, ingest_server, bulk_server, lease_server):
+            # 라이선스 제어(:7879): lic_mine을 읽어 전역 동시 솔브를 target~ceiling 밴드로. 워커가 permit/heartbeat.
+            controller = LicenseController(
+                lic_provider=self._lic_mine, target=self.license_target, ceiling=self.license_ceiling,
+            )
+            self.license_controller = controller
+            license_server = start_license_ctrl_server(controller=controller, port=self.license_ctrl_port)
+            for server in (dashboard, intake_server, ingest_server, bulk_server, lease_server, license_server):
                 self._servers.append(server)
                 threading.Thread(target=server.serve_forever, daemon=True, name=type(server).__name__).start()
+            # 제어 루프(1분): lic_mine 갱신 + ceiling 초과 시 youngest abort 표시.
+            threading.Thread(target=self._license_poll_loop, daemon=True, name="license-ctrl-poll").start()
 
-            # gate 경유 역터널 상시 유지: gate loopback:{7876,7877,7878} → 로컬 ingest/bulk/lease. 전부 슈퍼컴 전용.
+            # gate 경유 역터널 상시 유지: gate loopback:{7876,7877,7878,7879} → 로컬 ingest/bulk/lease/lic. 전부 슈퍼컴 전용.
             if self.enable_ingest_tunnel:
                 for port, name in (
                     (self.ingest_port, "edt-ingest-rtunnel"),
                     (self.bulk_port, "edt-bulk-rtunnel"),
                     (self.priority_lease_port, "edt-priority-rtunnel"),
+                    (self.license_ctrl_port, "edt-license-rtunnel"),
                 ):
                     tunnel = SshTunnel(argv=reverse_tunnel_argv(self.ssh_host, port=port), name=name)
                     tunnel.start()
@@ -204,6 +243,10 @@ def build_control_plane(
         ingest_port=config.ingest_port,
         bulk_port=config.bulk_port,
         priority_lease_port=config.priority_lease_port,
+        license_ctrl_port=config.license_ctrl_port,
+        license_target=config.license_target,
+        license_ceiling=config.license_ceiling,
+        license_poll_seconds=config.license_poll_seconds,
         dashboard_peetsfea_version=config.dashboard_peetsfea_version,
         # 라이선스/자원 시계열을 DB에 영속(web 재시작·12h ring buffer 넘어 보존) + 7일 넘은 건 자동 prune.
         resource_poller=ResourcePoller(
@@ -245,6 +288,10 @@ def main() -> int:
         ingest_port=int(os.environ.get("EDT_INGEST_PORT", str(DEFAULT_INGEST_PORT))),
         bulk_port=int(os.environ.get("EDT_BULK_PORT", str(DEFAULT_BULK_PORT))),
         priority_lease_port=int(os.environ.get("EDT_PRIORITY_LEASE_PORT", str(DEFAULT_PRIORITY_LEASE_PORT))),
+        license_ctrl_port=int(os.environ.get("EDT_LICENSE_CTRL_PORT", str(DEFAULT_LICENSE_CTRL_PORT))),
+        license_target=int(os.environ.get("EDT_LICENSE_TARGET", "100")),
+        license_ceiling=int(os.environ.get("EDT_LICENSE_CEILING", "150")),
+        license_poll_seconds=float(os.environ.get("EDT_LICENSE_POLL_SECONDS", "60")),
         dashboard_peetsfea_version=os.environ.get("EDT_DASHBOARD_PEETSFEA_VERSION", "").strip(),
     )
     run_control_plane(config, run_web=run_web, run_keeper=run_keeper)

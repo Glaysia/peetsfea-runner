@@ -44,6 +44,8 @@ BULK=${EDT_BULK_PORT:-7877}          # 대용량 산출물(aedt) 백채널
 LEASE=${EDT_PRIORITY_LEASE_PORT:-7878}  # 우선순위 분배 백채널(컨트롤플레인 → 워커)
 INGEST_URL="http://127.0.0.1:$PORT/ingest"
 LEASE_URL="http://127.0.0.1:$LEASE/lease"
+LIC=${EDT_LICENSE_CTRL_PORT:-7879}    # 라이선스 제어 백채널(permit/heartbeat)
+LIC_URL="http://127.0.0.1:$LIC"
 C=edt-job-$SLURM_JOB_ID
 mkdir -p "$OUT/work" "$CHOME/tmp"
 # Ansoft(계정 initialization)는 **비휘발성**이어야 한다 — AEDT가 추가 init하면 persist돼 누적되어야 함.
@@ -63,7 +65,7 @@ TUNNEL_PID=""
 start_tunnel() {
   ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
       -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-      -L "$PORT:127.0.0.1:$PORT" -L "$BULK:127.0.0.1:$BULK" -L "$LEASE:127.0.0.1:$LEASE" "$GATE" &
+      -L "$PORT:127.0.0.1:$PORT" -L "$BULK:127.0.0.1:$BULK" -L "$LEASE:127.0.0.1:$LEASE" -L "$LIC:127.0.0.1:$LIC" "$GATE" &
   TUNNEL_PID=$!
 }
 keep_tunnel() { while true; do start_tunnel; wait "$TUNNEL_PID"; sleep 5; done; }
@@ -83,9 +85,9 @@ enroot start --root --rw \
   --env "HOME=$CHOME" --env "TMPDIR=$CHOME/tmp" \
   --env "EDT_OUTPUT_ROOT=$OUT" --env "EDT_RESULT_INGEST_URL=$INGEST_URL" --env "EDT_WORK_DIR=$OUT/work" \
   --env "EDT_BULK_PORT=$BULK" --env "EDT_BULK_HOST=127.0.0.1" \
-  --env "EDT_PRIORITY_LEASE_URL=$LEASE_URL" \
-  --env "EDT_SLOT_COUNT=${EDT_SLOT_COUNT:-11}" --env "EDT_REFERENCE_SWEEP=$REF" \
-  --env "EDT_WORKER_STAGGER_SECONDS=${EDT_WORKER_STAGGER_SECONDS:-180}" \
+  --env "EDT_PRIORITY_LEASE_URL=$LEASE_URL" --env "EDT_LICENSE_CTRL_URL=$LIC_URL" \
+  --env "EDT_SLOT_COUNT=${EDT_SLOT_COUNT:-50}" --env "EDT_REFERENCE_SWEEP=$REF" \
+  --env "EDT_WORKER_STAGGER_SECONDS=${EDT_WORKER_STAGGER_SECONDS:-30}" \
   --env "EDT_JOB_INDEX=${EDT_JOB_INDEX:-0}" --env "EDT_GPU_COUNT=${EDT_GPU_COUNT:-0}" \
   --env "EDT_PARTITION=$EDT_PARTITION" --env "VENVPY=$VENVPY" \
   "$C" /bin/bash -lc '

@@ -251,8 +251,19 @@ def main() -> int:
         )
         puller.start()
         service.priority_puller = puller
+    # EDT_LICENSE_CTRL_URL: 중앙 라이선스 제어기(:7879). 솔브 직전 permit 획득(전역 상한), 솔브 중 abort 수신.
+    ctrl_url = os.environ.get("EDT_LICENSE_CTRL_URL")
+    if ctrl_url:
+        import socket as _socket
+
+        from .edt_license_ctrl import LicensePermitClient
+
+        widx = os.environ.get("EDT_WORKER_INDEX", "0")
+        jidx = os.environ.get("EDT_JOB_INDEX", "0")
+        worker_id = f"j{jidx}-w{widx}-{_socket.gethostname()}-{os.getpid()}"  # 워커 프로세스마다 고유
+        service.dispatcher.permit_client = LicensePermitClient(ctrl_url=ctrl_url, worker_id=worker_id)
     worker = os.environ.get("EDT_WORKER_INDEX", "-")
-    print(f"[entrypoint] worker={worker} slots={config.slot_count} seed_start={config.baseline_seed_start} lb={'on' if service.admission else 'off'} ingest={'on' if ingest_url else 'off'} max_sims={max_sims or '∞'} priority={'1' if priority_toml else '0'} lease={'on' if lease_url else 'off'}", flush=True)
+    print(f"[entrypoint] worker={worker} slots={config.slot_count} seed_start={config.baseline_seed_start} lb={'on' if service.admission else 'off'} ingest={'on' if ingest_url else 'off'} max_sims={max_sims or '∞'} priority={'1' if priority_toml else '0'} lease={'on' if lease_url else 'off'} lic_ctrl={'on' if ctrl_url else 'off'}", flush=True)
     processed = run_slot_service(service, max_sims=max_sims)
     print(f"[entrypoint] processed={processed}", flush=True)
     return 0
