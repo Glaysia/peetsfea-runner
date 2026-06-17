@@ -15,6 +15,7 @@ from .edt_queue import QueueItem
 # DuckDB는 한 프로세스에서 같은 파일을 동시에 두 번 connect하면 "Unique file handle conflict"로 죽는다.
 # web은 멀티스레드(ingest 쓰기 + 대시보드 읽기 + lease + 자원기록)라 파일별 lock으로 모든 접근을 직렬화한다.
 _DB_LOCKS: dict[str, threading.RLock] = {}
+_DB_CONNS: dict[str, "duckdb.DuckDBPyConnection"] = {}  # 경로별 단일 영속 연결(프로세스당 파일당 1개)
 _DB_LOCKS_GUARD = threading.Lock()
 
 
@@ -46,10 +47,16 @@ class SingleSimulationResultStore:
 
     @contextmanager
     def _locked_connect(self) -> "Iterator[duckdb.DuckDBPyConnection]":
-        """파일별 lock으로 직렬화된 연결(동시 connect 시 DuckDB file-handle 충돌 방지)."""
+        """파일별 lock으로 직렬화된 **경로별 단일 영속 연결**. 매 호출 open/close churn은 고부하에서
+        DuckDB를 크래시(NULL unique_ptr)시키므로, 프로세스당 파일당 연결 1개를 열어 재사용한다
+        (직렬 접근은 lock이 보장; 같은 경로 store 다중 인스턴스도 연결을 공유해 'already attached' 방지)."""
+        key = str(self.db_path)
         with _db_lock(self.db_path):
-            with duckdb.connect(str(self.db_path)) as connection:
-                yield connection
+            conn = _DB_CONNS.get(key)
+            if conn is None:
+                conn = duckdb.connect(key)
+                _DB_CONNS[key] = conn
+            yield conn
 
     def initialize(self) -> None:
         with self._locked_connect() as connection:
