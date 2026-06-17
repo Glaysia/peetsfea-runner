@@ -26,7 +26,7 @@ ul{margin:6px 0 6px 4px;padding-left:20px}li{margin:3px 0}
 <div class="sub">상태: <b class="warn">계획(미구현)</b> · 작성 2026-06-17 · 대상 <code>peetsfea-web</code> 프로세스 · 컨테이너 솔버 무관(일부 puller 변경만)</div>
 
 <div class="card">
-<b>한 줄 요약.</b> 무거운 <b>cadquery 샘플링을 read-only 웹 프로세스에서 제거</b>하고(인테이크는 sweep+개수만 받아 큐에 저장, 샘플링은 컨테이너가 baseline처럼 수행), <b><code>/results.csv</code>를 폐기</b>한다(CSV는 비효율·중복, 데이터는 이미 DuckDB/jsonl). web 메모리 8~11GB → <b>1GB 미만</b> 기대.
+<b>한 줄 요약.</b> 무거운 <b>cadquery 샘플링을 read-only 웹 프로세스에서 제거</b>하고(인테이크는 sweep+개수만 받아 큐에 저장, 샘플링은 컨테이너가 baseline처럼 수행), <b><code>/results.csv</code>를 폐기</b>하고 다운로드를 <b>서버측 DuckDB <code>COPY</code> 기반 Parquet(추천)/jsonl/tar.zstd</b>로 교체한다(CSV는 비효율·중복; 전 행 메모리 빌드도 제거). web 메모리 8~11GB → <b>1GB 미만</b> 기대.
 </div>
 
 <h2>1. 문제</h2>
@@ -87,12 +87,28 @@ ul{margin:6px 0 6px 4px;padding-left:20px}li{margin:3px 0}
 <li><b>검증의 무게:</b> <code>validate_sweep_toml_text</code>가 geometry를 안 빌드하는지 확인(빌드하면 그것도 컨테이너로). range/schema 체크만이면 web 유지 OK.</li>
 </ul>
 
-<h2>3. 설계 B — <code>/results.csv</code> 제거</h2>
+<h2>3. 설계 B — <code>/results.csv</code> 제거 + 다운로드 포맷 정비</h2>
 <ul>
-<li><b class="bad">제거:</b> <code>/results.csv</code> 엔드포인트, <code>rows_to_csv()</code>, 데이터셋 탭의 "전체 CSV 다운로드 ↓" 링크.</li>
-<li>이유: CSV는 비효율·중복. 결과는 DuckDB에 있고, 실소비/적재는 jsonl. CSV는 용량만 큼.</li>
-<li><b>다운로드가 여전히 필요하면(선택):</b> CSV 대신 <b>스트리밍 NDJSON</b> 엔드포인트(<code>/results.jsonl</code>) — 행을 하나씩 yield(전 행 메모리 적재 없음) + 기본 <code>limit</code>/<code>since</code>. 전 행 통째 빌드 금지.</li>
-<li>관련 테스트(<code>test_csv_includes_full_output_dataset</code> 등)·<code>rows_to_csv</code> 참조 정리.</li>
+<li><b class="bad">제거:</b> <code>/results.csv</code> 엔드포인트, <code>rows_to_csv()</code>, 데이터셋 탭의 "전체 CSV 다운로드 ↓" 링크. 관련 테스트(<code>test_csv_includes_full_output_dataset</code> 등) 정리.</li>
+<li>이유: CSV는 비효율·중복 — 결과는 이미 DuckDB에 있고, 컬럼 늘면 헤더 폭증·타입 손실·용량만 큼.</li>
+</ul>
+
+<h3>3.1 다운로드 포맷 옵션 (전부 <b>서버측 DuckDB <code>COPY</code></b> = web 메모리 적재 0)</h3>
+<div class="sub">핵심: <code>rows_to_csv(fetch_rows(limit=None))</code>처럼 전 행을 Python으로 빌드하지 말고, DuckDB가 파일로 직접 내보내고 그 파일을 스트리밍한다. 메모리 문제도 같이 해결.</div>
+<table>
+<tr><th>포맷</th><th>용도</th><th>방식 / 비고</th></tr>
+<tr><td><b class="ok">Parquet</b> <span class="pill p-new">추천</span></td><td>ML/분석 데이터셋 적재(pandas·polars·duckdb)</td><td><code>COPY (SELECT … WHERE peetsfea_version=?) TO 'x.parquet' (FORMAT PARQUET, COMPRESSION zstd)</code>. 컬럼형+zstd라 CSV/jsonl보다 작고 로드 빠름. <b>사실상 표준.</b></td></tr>
+<tr><td>jsonl(NDJSON)</td><td>사람이 읽기/스트림 처리</td><td>읽기 좋지만 크고 느림. <code>COPY … TO 'x.jsonl' (FORMAT JSON, ARRAY false)</code> 또는 행 단위 yield. 압축 원하면 <code>.jsonl.zst</code>로 스트림.</td></tr>
+<tr><td><b>tar.zstd</b></td><td>압축 번들 다운로드(느린 jsonl 대안 / 원시 산출물)</td><td>(a) Parquet/jsonl 결과 + (b) 선택한 sim들의 <b>원시 per-sim 산출물</b>(리포트 jsonl·곡선 등, 아카이브 <code>batch_*.tar.gz</code> 출처)을 <code>tar | zstd</code>로 묶어 스트리밍. 큰 다운로드는 압축이 사실상 필수.</td></tr>
+</table>
+
+<h3>3.2 엔드포인트(안)</h3>
+<ul>
+<li><code>GET /results.parquet?since=&peetsfea_version=&state=</code> → DuckDB <code>COPY … (FORMAT PARQUET, COMPRESSION zstd)</code> → 임시파일 스트리밍 후 삭제.</li>
+<li><code>GET /results.jsonl?…</code> → 동일하되 JSON(스트리밍·선택적 zstd).</li>
+<li><code>GET /export.tar.zst?ids=…|since=…</code> → 결과 파일 + 원시 산출물 묶음을 <code>zstd</code>로 압축 스트리밍.</li>
+<li>전부 <b>기본 필터/limit</b> 적용(무한 풀스캔 방지) + <b>스트리밍</b>(<code>Content-Length</code> 미리 안 잡고 chunked) → web 메모리 일정.</li>
+<li><span class="mut">의존성: zstd는 <code>python-zstandard</code> 또는 <code>tar --zstd</code>(시스템 zstd). DuckDB Parquet/JSON COPY는 내장.</span></li>
 </ul>
 
 <h2>4. 설계 C — (선택) 서버/폴링 부하</h2>
@@ -107,7 +123,7 @@ ul{margin:6px 0 6px 4px;padding-left:20px}li{margin:3px 0}
 <tr><td><code>single_simulation_store.py</code></td><td>priority_queue 스키마(sweep 요청) + <code>priority_lease_chunk</code>(remaining 차감) + <code>DbPriorityQueue</code> 조정. <code>rows_to_csv</code> 의존 정리</td></tr>
 <tr><td><code>edt_intake.py</code></td><td><code>submit</code>에서 샘플링 제거 → sweep 요청 enqueue. 검증만</td></tr>
 <tr><td><code>edt_priority_lease.py</code></td><td>lease 서버가 chunk 반환. <code>PriorityPuller</code>가 컨테이너에서 샘플링(peetsfea 샘플러 주입)</td></tr>
-<tr><td><code>edt_dashboard.py</code></td><td><code>/results.csv</code>·CSV 링크 제거(또는 <code>/results.jsonl</code> 스트리밍). 입력큐 탭 remaining 표시</td></tr>
+<tr><td><code>edt_dashboard.py</code></td><td><code>/results.csv</code>·<code>rows_to_csv</code>·CSV 링크 제거 → <code>/results.parquet</code>·<code>/results.jsonl</code>·<code>/export.tar.zst</code>(서버측 DuckDB <code>COPY</code> 스트리밍). 입력큐 탭 remaining 표시</td></tr>
 <tr><td><code>scripts/cluster/slot_service.sh</code></td><td>(필요 시) 워커가 샘플러 쓸 수 있게 env/경로 — 이미 peetsfea 0.3.7 있으니 대개 불필요</td></tr>
 </table>
 
