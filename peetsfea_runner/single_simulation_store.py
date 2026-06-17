@@ -2,13 +2,30 @@ from __future__ import annotations
 
 import json
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 import duckdb
 
 from .edt_queue import QueueItem
+
+
+# DuckDB는 한 프로세스에서 같은 파일을 동시에 두 번 connect하면 "Unique file handle conflict"로 죽는다.
+# web은 멀티스레드(ingest 쓰기 + 대시보드 읽기 + lease + 자원기록)라 파일별 lock으로 모든 접근을 직렬화한다.
+_DB_LOCKS: dict[str, threading.RLock] = {}
+_DB_LOCKS_GUARD = threading.Lock()
+
+
+def _db_lock(db_path: Path) -> threading.RLock:
+    key = str(db_path)
+    with _DB_LOCKS_GUARD:
+        lock = _DB_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _DB_LOCKS[key] = lock
+        return lock
 
 
 def _json_dumps(value: Any) -> str:
@@ -27,8 +44,15 @@ class SingleSimulationResultStore:
         self.db_path = Path(self.db_path).expanduser().resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+    @contextmanager
+    def _locked_connect(self) -> "Iterator[duckdb.DuckDBPyConnection]":
+        """파일별 lock으로 직렬화된 연결(동시 connect 시 DuckDB file-handle 충돌 방지)."""
+        with _db_lock(self.db_path):
+            with duckdb.connect(str(self.db_path)) as connection:
+                yield connection
+
     def initialize(self) -> None:
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS single_simulation_results (
@@ -133,7 +157,7 @@ class SingleSimulationResultStore:
         }
         columns = tuple(row)
         placeholders = ", ".join("?" for _ in columns)
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             connection.execute("BEGIN TRANSACTION")
             try:
                 # keep-best: 같은 request_id에 이미 'success'가 있으면, 비-success로 덮어쓰지 않는다.
@@ -181,7 +205,7 @@ class SingleSimulationResultStore:
         sql = f"SELECT * FROM single_simulation_results{where} ORDER BY finished_at"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             result = connection.execute(sql, params)
             columns = [column[0] for column in result.description]
             return [dict(zip(columns, row, strict=True)) for row in result.fetchall()]
@@ -193,7 +217,7 @@ class SingleSimulationResultStore:
         if peetsfea_version:
             sql += " AND peetsfea_version = ?"
             params.append(peetsfea_version)
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             result = connection.execute(sql, params)
             row = result.fetchone()
             if row is None:
@@ -206,7 +230,7 @@ class SingleSimulationResultStore:
         self.initialize()
         where = " WHERE peetsfea_version = ?" if peetsfea_version else ""
         params: list[Any] = [peetsfea_version] if peetsfea_version else []
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             rows = connection.execute(
                 "SELECT terminal_state, count(*) FROM single_simulation_results" + where + " GROUP BY 1",
                 params,
@@ -216,7 +240,7 @@ class SingleSimulationResultStore:
     def version_counts(self) -> dict[str, int]:
         """peetsfea_version별 건수(경량 집계). 대시보드 `/api/versions`용 — 전 버전 분포 노출."""
         self.initialize()
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             rows = connection.execute(
                 "SELECT COALESCE(NULLIF(peetsfea_version,''),'(unknown)'), count(*) "
                 "FROM single_simulation_results GROUP BY 1 ORDER BY 1"
@@ -235,7 +259,7 @@ class SingleSimulationResultStore:
             clauses.append("peetsfea_version = ?")
             params.append(peetsfea_version)
         sql = "SELECT count(*) FROM single_simulation_results WHERE " + " AND ".join(clauses)
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             row = connection.execute(sql, params).fetchone()
         return int(row[0]) if row else 0
 
@@ -262,7 +286,7 @@ class SingleSimulationResultStore:
             "sum(CASE WHEN solve_telemetry_json LIKE '%\"gpu_used\": true%' THEN 1 ELSE 0 END), "
             "count(*) FROM single_simulation_results WHERE " + where + " GROUP BY 1 ORDER BY 1"
         )
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             rows = connection.execute(sql, params).fetchall()
         return [
             {"t": r[0], "success": int(r[1]), "failed": int(r[2]), "gpu": int(r[3]), "total": int(r[4])}
@@ -279,7 +303,7 @@ class SingleSimulationResultStore:
         row = [float(point.get("ts") or 0.0)] + [int(point.get(c) or 0) for c in self._RESOURCE_COLS[1:5]]
         row += [float(point.get("load") or 0.0)] + [int(point.get(c) or 0) for c in self._RESOURCE_COLS[6:]]
         placeholders = ", ".join("?" for _ in self._RESOURCE_COLS)
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             connection.execute(
                 f"INSERT INTO resource_snapshots ({', '.join(self._RESOURCE_COLS)}) VALUES ({placeholders})", row
             )
@@ -292,14 +316,14 @@ class SingleSimulationResultStore:
         sql = f"SELECT {', '.join(self._RESOURCE_COLS)} FROM resource_snapshots{where} ORDER BY ts"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             rows = connection.execute(sql, params).fetchall()
         return [dict(zip(self._RESOURCE_COLS, r, strict=True)) for r in rows]
 
     def prune_resource_snapshots(self, *, before_ts: float) -> int:
         """`before_ts`(epoch)보다 오래된 자원 스냅샷 삭제(무한 성장 방지). 삭제 건수 반환."""
         self.initialize()
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             n = connection.execute("SELECT count(*) FROM resource_snapshots WHERE ts < ?", [float(before_ts)]).fetchone()
             connection.execute("DELETE FROM resource_snapshots WHERE ts < ?", [float(before_ts)])
         return int(n[0]) if n else 0
@@ -311,7 +335,7 @@ class SingleSimulationResultStore:
         self.initialize()
         if not items:
             return 0
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             for idx, item in enumerate(items):
                 connection.execute(
                     "INSERT OR IGNORE INTO priority_queue (request_id, candidate_toml_text, seed, mode, created_at) "
@@ -325,7 +349,7 @@ class SingleSimulationResultStore:
         self.initialize()
         if n <= 0:
             return []
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             connection.execute("BEGIN TRANSACTION")
             try:
                 rows = connection.execute(
@@ -344,7 +368,7 @@ class SingleSimulationResultStore:
 
     def priority_depth(self) -> int:
         self.initialize()
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             row = connection.execute("SELECT count(*) FROM priority_queue").fetchone()
         return int(row[0]) if row else 0
 
@@ -354,7 +378,7 @@ class SingleSimulationResultStore:
         sql = "SELECT request_id, seed, mode, created_at FROM priority_queue ORDER BY created_at"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
-        with duckdb.connect(str(self.db_path)) as connection:
+        with self._locked_connect() as connection:
             rows = connection.execute(sql).fetchall()
         return [{"request_id": r[0], "seed": int(r[1] or 0), "mode": r[2], "created_at": float(r[3] or 0.0)} for r in rows]
 
