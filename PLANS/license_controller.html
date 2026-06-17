@@ -24,7 +24,7 @@ ul{margin:6px 0 6px 4px;padding-left:20px}li{margin:3px 0}
 <div class="sub">상태: <b class="warn">계획(미구현)</b> · 작성 2026-06-17 · 대상 <code>peetsfea-web</code>(중앙 제어) + 컨테이너 워커(게이트) · main 배포·컨테이너 사이클 동반</div>
 
 <div class="card">
-<b>목표.</b> 지금 동시 라이선스가 <b class="bad">~20개만</b> 돌아 클러스터가 놀고 있다. 컨테이너당 슬롯을 50으로 열고, <b>전역 라이선스 사용수를 피드백 제어</b>해 <b class="ok">목표 100</b>으로 끌어올린다. 100 미만이면 솔브를 더 시작, 150 초과면 가장 최근 시작한 솔브를 끈다 → <b>수렴값이 매 시간 100~150 안에</b> 들게 한다. 솔브 안 도는 idle AEDT는 CPU·라이선스를 안 먹으므로 슬롯은 여유롭게(50×9=450) 열어둬도 된다.
+<b>목표.</b> 지금 동시 라이선스가 <b class="bad">~20개만</b> 돌아 클러스터가 놀고 있다. <b>이 제어기의 핵심 이유:</b> 슬롯을 450개(50×9) 열어둬도 실제 동시 솔브는 ~100밖에 안 될 수 있어, 그 수를 <b>능동적으로 목표 100에 맞춰</b> 올리고 묶는다. 100 미만이면 솔브를 더 시작, 150 초과면 가장 최근 시작한 솔브를 끈다 → <b>수렴값이 매 시간 100~150 안에</b>. 솔브 안 도는 idle AEDT는 CPU·라이선스를 안 먹으므로 슬롯은 여유롭게 열어둬도 된다. 솔브가 ~14분짜리라 동역학이 느려서 <b>폴링은 1분이면 충분</b>.
 </div>
 
 <h2>1. 요구사항 (그대로)</h2>
@@ -33,7 +33,7 @@ ul{margin:6px 0 6px 4px;padding-left:20px}li{margin:3px 0}
 <tr><td>로드밸런싱은 그대로(CPU 여유로운 데 admit)</td><td>워커 로컬 <code>AdmissionController</code>(CPU/mem AIMD) <b>유지</b> + 라이선스 게이트 추가</td></tr>
 <tr><td>컨테이너당 최대 50, 여유롭게</td><td><code>EDT_SLOT_COUNT 11→50</code>. idle AEDT는 라이선스 안 먹음(50×9=450 OK)</td></tr>
 <tr><td>제어 지령 = 라이선스 사용수 <b>100</b></td><td>중앙 제어기 TARGET=100. <code>lic_mine &lt; 100</code>이면 permit 발급</td></tr>
-<tr><td>폴링 주기 줄이기</td><td>ResourcePoller <code>refresh 20s→5s</code> + 제어 루프 5s</td></tr>
+<tr><td>폴링 주기 줄이기</td><td>제어 루프·lic_mine 폴 <code>1분</code>(솔브 ~14분이라 충분)</td></tr>
 <tr><td>150 초과 → 가장 적게 시뮬한 ansys 끔</td><td><code>lic_mine &gt; 150</code>이면 in-flight 중 <b>youngest(가장 최근 시작)</b> 솔브 abort</td></tr>
 <tr><td>&lt;100 많이, &gt;150 적게, 수렴 100~150</td><td>permit(상한) + youngest-kill(하한 안전) 이중 피드백 → 밴드 수렴</td></tr>
 </table>
@@ -51,7 +51,7 @@ ul{margin:6px 0 6px 4px;padding-left:20px}li{margin:3px 0}
 
 <h3>3.1 신호와 상태</h3>
 <ul>
-<li><b>lic_mine</b>: ResourcePoller가 lmstat로 빠르게(5s) 폴링하는 <b>내 라이선스 사용수(진실)</b>. 단 측정 지연 있음.</li>
+<li><b>lic_mine</b>: ResourcePoller가 lmstat로 폴링하는 <b>내 라이선스 사용수(진실)</b>. 제어기는 1분 주기로 읽음(솔브 ~14분이라 충분). 측정 지연 있음.</li>
 <li><b>active_permits</b>: 제어기가 발급했고 아직 release 안 된 솔브 집합 <code>{worker_id: (granted_at, last_seen)}</code>. ≈ 내 실제 동시 솔브수.</li>
 <li><b>effective = max(lic_mine, len(active_permits))</b>: 측정 지연(lmstat 늦음)과 드리프트(lmstat가 높음) 양쪽에 안전하게 더 큰 값을 쓴다.</li>
 </ul>
@@ -106,14 +106,14 @@ TTL: heartbeat 끊긴 permit은 만료 제거(워커 사망 등 누수 방지)</
 <li><code>EDT_SLOT_COUNT 50</code>: 노드당 워커 50 → AEDT 50개 상주. 라이선스는 안 먹어도 <b>RAM은 먹는다</b>(idle AEDT도 수백 MB). 노드 768GB라 가능하나 측정 권장.</li>
 <li><b>warm 전략:</b> 현행은 슬롯 시작 시 <code>ensure_warm</code>(AEDT 미리 띄움). 50개를 다 warm하면 RAM·스폰 부담 → <b>lazy warm(첫 솔브 직전 기동)</b> 고려. 단 솔브당 cold-start 지연 추가.</li>
 <li><b>스태거:</b> 50개를 180s 간격이면 2.5h. 줄여야(예 30~60s) 합리적 램프. 단 동시 AEDT cold-start 폭주 회피 균형 필요.</li>
-<li>ResourcePoller <code>refresh 20s→5s</code> + lmstat 호출 빈도↑(gate 부하 확인).</li>
+<li>제어 루프 1분(lmstat 1분 1회 — gate 부하 적음). 솔브가 느려 1분이면 충분.</li>
 </ul>
 
 <h2>7. 변경 파일</h2>
 <table>
 <tr><th>파일</th><th>변경</th></tr>
 <tr><td>(신규) <code>edt_license_ctrl.py</code></td><td>중앙 제어기 + <code>:7879</code> 서버(/permit·/release·/heartbeat) + 워커측 <code>LicensePermitClient</code></td></tr>
-<tr><td><code>edt_resources.py</code></td><td>poll refresh 20→5s. lic_mine 빠른 노출</td></tr>
+<tr><td><code>edt_resources.py</code></td><td>lic_mine 노출(제어기는 1분 주기로 읽음)</td></tr>
 <tr><td><code>edt_dispatcher.py</code></td><td><code>_await_admission</code>에 라이선스 게이트 + 솔브 watcher(heartbeat/abort)</td></tr>
 <tr><td><code>edt_control_plane.py</code></td><td>제어기 기동 + 역터널 :7879. ResourcePoller 빠른 폴 wiring</td></tr>
 <tr><td><code>edt_entrypoint.py</code></td><td>워커에 permit client 주입(EDT_LICENSE_CTRL_URL)</td></tr>
