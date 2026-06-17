@@ -99,6 +99,8 @@ def run_slot_service(service: SteadyStateService, *, max_sims: int = 0) -> int:
     processed = dispatcher.run()
     if service.baseline_refiller is not None:
         service.baseline_refiller.stop()  # 백그라운드 샘플 워커 정지.
+    if service.priority_puller is not None:
+        service.priority_puller.stop()  # 우선순위 lease 풀러 정지.
     for slot in dispatcher.slots:
         slot.backend.kill()
     return processed
@@ -229,8 +231,22 @@ def main() -> int:
 
         text = Path(priority_toml).expanduser().read_text(encoding="utf-8")
         service.queue.put_priority(QueueItem(request_id="prio-0", candidate_toml_text=text, mode="full"))
+    # EDT_PRIORITY_LEASE_URL: 컨트롤플레인(:7878, gate 정터널) 우선순위 큐에서 런타임에 당겨 로컬 레인 보충.
+    # 블렌드(85:15)는 service.queue.get()이 처리 — 우선순위 재고가 있으면 85% 우선, 없으면 100% baseline.
+    lease_url = os.environ.get("EDT_PRIORITY_LEASE_URL")
+    if lease_url:
+        from .edt_priority_lease import PriorityPuller
+
+        puller = PriorityPuller(
+            queue=service.queue,
+            lease_url=lease_url,
+            batch=int(os.environ.get("EDT_PRIORITY_LEASE_BATCH", "16")),
+            low_watermark=int(os.environ.get("EDT_PRIORITY_LEASE_WATERMARK", "8")),
+        )
+        puller.start()
+        service.priority_puller = puller
     worker = os.environ.get("EDT_WORKER_INDEX", "-")
-    print(f"[entrypoint] worker={worker} slots={config.slot_count} seed_start={config.baseline_seed_start} lb={'on' if service.admission else 'off'} ingest={'on' if ingest_url else 'off'} max_sims={max_sims or '∞'} priority={'1' if priority_toml else '0'}", flush=True)
+    print(f"[entrypoint] worker={worker} slots={config.slot_count} seed_start={config.baseline_seed_start} lb={'on' if service.admission else 'off'} ingest={'on' if ingest_url else 'off'} max_sims={max_sims or '∞'} priority={'1' if priority_toml else '0'} lease={'on' if lease_url else 'off'}", flush=True)
     processed = run_slot_service(service, max_sims=max_sims)
     print(f"[entrypoint] processed={processed}", flush=True)
     return 0

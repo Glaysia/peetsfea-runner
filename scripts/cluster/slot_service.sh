@@ -41,7 +41,9 @@ fi
 GATE=${EDT_GATE_HOST:-gate1}
 PORT=${EDT_INGEST_PORT:-7876}        # 결과 JSON ingest 백채널
 BULK=${EDT_BULK_PORT:-7877}          # 대용량 산출물(aedt) 백채널
+LEASE=${EDT_PRIORITY_LEASE_PORT:-7878}  # 우선순위 분배 백채널(컨트롤플레인 → 워커)
 INGEST_URL="http://127.0.0.1:$PORT/ingest"
+LEASE_URL="http://127.0.0.1:$LEASE/lease"
 C=edt-job-$SLURM_JOB_ID
 mkdir -p "$OUT/work" "$CHOME/tmp"
 # Ansoft(계정 initialization)는 **비휘발성**이어야 한다 — AEDT가 추가 init하면 persist돼 누적되어야 함.
@@ -54,13 +56,14 @@ case "$EDT_PARTITION" in
   *)    NVD=void ;;
 esac
 
-# compute node → gate 정터널(결과 push 백채널 7876 + 산출물 7877). 둘 다 한 ssh로 포워딩.
+# compute node → gate 정터널(결과 push 7876 + 산출물 7877 + 우선순위 lease 7878). 한 ssh로 포워딩.
+# ingest/bulk는 -L(컨테이너→로컬), lease도 -L(로컬 lease 서버를 컨테이너가 GET). 전부 같은 방향.
 # 끊기면 즉시 죽고(ExitOnForwardFailure) 재기동 루프가 살린다.
 TUNNEL_PID=""
 start_tunnel() {
   ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
       -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-      -L "$PORT:127.0.0.1:$PORT" -L "$BULK:127.0.0.1:$BULK" "$GATE" &
+      -L "$PORT:127.0.0.1:$PORT" -L "$BULK:127.0.0.1:$BULK" -L "$LEASE:127.0.0.1:$LEASE" "$GATE" &
   TUNNEL_PID=$!
 }
 keep_tunnel() { while true; do start_tunnel; wait "$TUNNEL_PID"; sleep 5; done; }
@@ -80,6 +83,7 @@ enroot start --root --rw \
   --env "HOME=$CHOME" --env "TMPDIR=$CHOME/tmp" \
   --env "EDT_OUTPUT_ROOT=$OUT" --env "EDT_RESULT_INGEST_URL=$INGEST_URL" --env "EDT_WORK_DIR=$OUT/work" \
   --env "EDT_BULK_PORT=$BULK" --env "EDT_BULK_HOST=127.0.0.1" \
+  --env "EDT_PRIORITY_LEASE_URL=$LEASE_URL" \
   --env "EDT_SLOT_COUNT=${EDT_SLOT_COUNT:-11}" --env "EDT_REFERENCE_SWEEP=$REF" \
   --env "EDT_WORKER_STAGGER_SECONDS=${EDT_WORKER_STAGGER_SECONDS:-180}" \
   --env "EDT_JOB_INDEX=${EDT_JOB_INDEX:-0}" --env "EDT_GPU_COUNT=${EDT_GPU_COUNT:-0}" \

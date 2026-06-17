@@ -101,6 +101,20 @@ class TwoLaneQueue:
         with self._lock:
             return len(self._priority), len(self._baseline)
 
+    def lease_priority(self, n: int) -> list[QueueItem]:
+        """우선순위 레인에서 최대 n건 pop(슈퍼컴 워커 분배용). baseline은 건드리지 않는다.
+
+        컨트롤플레인 lease 서버(:7878)가 호출 → 워커가 자기 로컬 우선순위 레인에 다시 적재한다.
+        at-most-once: 당긴 항목이 워커 사망 시 유실(재배달 없음). 우선순위는 sweep 샘플이라 허용.
+        """
+        out: list[QueueItem] = []
+        with self._lock:
+            for _ in range(max(0, n)):
+                if not self._priority:
+                    break
+                out.append(self._priority.popleft())
+        return out
+
     def get(self) -> QueueItem | None:
         with self._lock:
             serve_baseline = (self._tick % 100) < self.baseline_floor_percent

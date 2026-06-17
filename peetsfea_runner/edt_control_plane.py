@@ -31,6 +31,7 @@ from .edt_bulk_transfer import DEFAULT_BULK_PORT, start_bulk_transfer_server
 from .edt_dashboard import start_dashboard_server
 from .edt_intake import IntakeService, start_intake_server
 from .edt_orchestrator import JobLauncher, JobOrchestrator
+from .edt_priority_lease import DEFAULT_PRIORITY_LEASE_PORT, start_priority_lease_server
 from .edt_queue import TwoLaneQueue
 from .edt_resources import ResourcePoller
 from .edt_result_ingest import DEFAULT_INGEST_PORT, start_result_ingest_server
@@ -52,6 +53,7 @@ class ControlPlaneConfig:
     intake_port: int = 7875
     ingest_port: int = DEFAULT_INGEST_PORT  # 슈퍼컴 전용 결과 백채널(역터널로만 도달).
     bulk_port: int = DEFAULT_BULK_PORT  # 슈퍼컴 전용 대용량 산출물 백채널(역터널로만 도달).
+    priority_lease_port: int = DEFAULT_PRIORITY_LEASE_PORT  # 슈퍼컴 전용 우선순위 분배 백채널(역터널로만 도달).
     poll_interval_seconds: float = 60.0
     dashboard_peetsfea_version: str = ""  # 대시보드 표시 버전 필터(빈 값=전 버전). 예: "0.3.7".
 
@@ -68,6 +70,7 @@ class ControlPlane:
     ssh_host: str = "gate1-harry261"
     ingest_port: int = DEFAULT_INGEST_PORT
     bulk_port: int = DEFAULT_BULK_PORT
+    priority_lease_port: int = DEFAULT_PRIORITY_LEASE_PORT
     dashboard_peetsfea_version: str = ""  # 대시보드 표시 버전 필터(빈 값=전 버전).
     resource_poller: ResourcePoller | None = None  # 컨테이너별 실시간 부하(대시보드 /api/resources).
     enable_ingest_tunnel: bool = True  # 테스트에선 ssh 역터널 비활성.
@@ -109,13 +112,19 @@ class ControlPlane:
             ingest_server = start_result_ingest_server(store=self.store, port=self.ingest_port)
             # 대용량 산출물(:7877): project_dir tar.gz 스트림 수신 → 추출 → ArchiveStore(20GB 묶음/2TB FIFO).
             bulk_server = start_bulk_transfer_server(archive_store=self.archive_store, port=self.bulk_port)
-            for server in (dashboard, intake_server, ingest_server, bulk_server):
+            # 우선순위 분배(:7878): intake(:7875)가 채운 우선순위 레인을 슈퍼컴 워커들에 lease로 분배.
+            lease_server = start_priority_lease_server(queue=self.intake.queue, port=self.priority_lease_port)
+            for server in (dashboard, intake_server, ingest_server, bulk_server, lease_server):
                 self._servers.append(server)
                 threading.Thread(target=server.serve_forever, daemon=True, name=type(server).__name__).start()
 
-            # gate 경유 역터널 상시 유지: gate loopback:{7876,7877} → 로컬 ingest/bulk. 둘 다 슈퍼컴 전용.
+            # gate 경유 역터널 상시 유지: gate loopback:{7876,7877,7878} → 로컬 ingest/bulk/lease. 전부 슈퍼컴 전용.
             if self.enable_ingest_tunnel:
-                for port, name in ((self.ingest_port, "edt-ingest-rtunnel"), (self.bulk_port, "edt-bulk-rtunnel")):
+                for port, name in (
+                    (self.ingest_port, "edt-ingest-rtunnel"),
+                    (self.bulk_port, "edt-bulk-rtunnel"),
+                    (self.priority_lease_port, "edt-priority-rtunnel"),
+                ):
                     tunnel = SshTunnel(argv=reverse_tunnel_argv(self.ssh_host, port=port), name=name)
                     tunnel.start()
                     self._tunnels.append(tunnel)
@@ -186,6 +195,7 @@ def build_control_plane(
         ssh_host=config.ssh_host,
         ingest_port=config.ingest_port,
         bulk_port=config.bulk_port,
+        priority_lease_port=config.priority_lease_port,
         dashboard_peetsfea_version=config.dashboard_peetsfea_version,
         resource_poller=ResourcePoller(ssh_host=config.ssh_host),
         run_web=run_web,
@@ -221,6 +231,7 @@ def main() -> int:
         intake_port=int(os.environ.get("EDT_INTAKE_PORT", "7875")),
         ingest_port=int(os.environ.get("EDT_INGEST_PORT", str(DEFAULT_INGEST_PORT))),
         bulk_port=int(os.environ.get("EDT_BULK_PORT", str(DEFAULT_BULK_PORT))),
+        priority_lease_port=int(os.environ.get("EDT_PRIORITY_LEASE_PORT", str(DEFAULT_PRIORITY_LEASE_PORT))),
         dashboard_peetsfea_version=os.environ.get("EDT_DASHBOARD_PEETSFEA_VERSION", "").strip(),
     )
     run_control_plane(config, run_web=run_web, run_keeper=run_keeper)

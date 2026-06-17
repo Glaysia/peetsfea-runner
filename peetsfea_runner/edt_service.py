@@ -18,6 +18,7 @@ from .edt_dispatcher import SimulationPrimitive, SlotDispatcher
 from .edt_intake import IntakeService, make_baseline_sampler
 from .edt_load import AdmissionController, LoadSampler, psutil_load_sampler
 from .edtmgr import EdtManager
+from .edt_priority_lease import PriorityPuller
 from .edt_queue import BaselineRefiller, TomlQueue, TwoLaneQueue, load_queue_items_from_dir
 from .single_simulation_store import SingleSimulationResultStore
 
@@ -113,6 +114,7 @@ class SteadyStateService:
     intake: IntakeService
     admission: AdmissionController | None
     baseline_refiller: BaselineRefiller | None = None
+    priority_puller: "PriorityPuller | None" = None  # 컨트롤플레인 우선순위 lease를 당겨 로컬 레인 보충(entrypoint가 주입).
 
 
 def build_steady_state_service(
