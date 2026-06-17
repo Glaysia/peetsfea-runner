@@ -18,6 +18,14 @@ from .constants import JOB_MAX_LIFETIME_SECONDS, JOBS_PER_ACCOUNT
 
 Clock = Callable[[], float]
 
+# 막힌 PENDING 판정용. squeue REASON이 이 집합이면 "곧 시작/스케줄 중" → 계속 대기.
+# 그 외(Resources, Priority, ReqNodeNotAvail 등)는 그 노드가 한동안 안 비는 것 → 취소하고 다른 노드로.
+_OK_PENDING_REASONS = frozenset({"", "none", "null", "(null)", "pending"})
+
+
+def _pending_is_stuck(reason: str) -> bool:
+    return reason.strip().lower() not in _OK_PENDING_REASONS
+
 
 @dataclass(frozen=True, slots=True)
 class JobHandle:
@@ -26,6 +34,7 @@ class JobHandle:
     job_index: int
     slurm_id: str
     started_at: float
+    node: str = ""  # node_based 제출 시 핀한 노드(막힌 PENDING 취소 후 그 노드를 회피하는 데 사용).
 
 
 class JobLauncher(Protocol):
@@ -52,6 +61,7 @@ class JobOrchestrator:
     submitted: int = field(default=0, init=False)
     restarts: int = field(default=0, init=False)  # 죽어서 재기동한 횟수
     expiries: int = field(default=0, init=False)  # 10h 만료로 폐기·재기동한 횟수
+    cancellations: int = field(default=0, init=False)  # 막힌 PENDING(Resources/Priority 등) 취소 후 다른 노드로 넘긴 횟수
     _jobs: dict[int, JobHandle] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
@@ -93,8 +103,18 @@ class JobOrchestrator:
         fn = getattr(self.launcher, "is_running", None)
         return fn(handle) if callable(fn) else self.launcher.is_alive(handle)
 
+    def _pending_reason(self, handle: JobHandle) -> str:
+        fn = getattr(self.launcher, "pending_reason", None)
+        return fn(handle) if callable(fn) else ""
+
+    def _avoid_node(self, handle: JobHandle) -> None:
+        fn = getattr(self.launcher, "avoid_node", None)
+        node = getattr(handle, "node", "")
+        if callable(fn) and node:
+            fn(node)
+
     def _ramp_poll(self) -> None:
-        """순차 램프 1회: 죽은/만료 잡 정리 후, 대기(PENDING) 잡이 없고 목표 미달이면 **한 개만** 제출."""
+        """순차 램프 1회: 죽은/만료/막힌 PENDING 정리 후, 대기 잡이 없고 목표 미달이면 **한 개만** 제출."""
         with self._lock:
             now = self.clock()
             for i in list(self._jobs):
@@ -106,9 +126,19 @@ class JobOrchestrator:
                     self.launcher.kill(handle)
                     del self._jobs[i]
                     self.expiries += 1
+            # 막힌 PENDING 취소: REASON이 None/곧시작이 아니라 Resources/Priority 등이면 그 노드는 한동안 안 빈다
+            # → 잡을 취소하고 그 노드를 회피 등록 → 다음 제출에서 다른 노드로 넘어간다.
+            for i in list(self._jobs):
+                handle = self._jobs[i]
+                if self.launcher.is_alive(handle) and not self._is_running(handle):
+                    if _pending_is_stuck(self._pending_reason(handle)):
+                        self.launcher.kill(handle)
+                        self._avoid_node(handle)
+                        del self._jobs[i]
+                        self.cancellations += 1
             if len(self._jobs) >= self.job_count:
                 return
-            # 아직 RUNNING 안 된 잡(=직전 제출분)이 있으면 그게 뜰 때까지 대기 — 한 번에 하나씩.
+            # 아직 (정상) RUNNING 대기 중인 잡이 있으면 그게 뜰 때까지 대기 — 한 번에 하나씩.
             if any(self.launcher.is_alive(h) and not self._is_running(h) for h in self._jobs.values()):
                 return
             for i in range(self.job_count):

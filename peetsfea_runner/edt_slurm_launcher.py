@@ -80,8 +80,11 @@ class SlurmJobLauncher:
     # 노드 선택 시 파티션 가중: cpu2와 gpu가 둘 다 가용이면 cpu2를 이 확률로 고른다(나머지는 gpu).
     cpu2_weight: float = 0.7
     rng: Callable[[], float] = random.random  # 가중 선택용(테스트 주입 가능)
+    # 막힌 PENDING으로 취소된 노드를 이 시간 동안 후보에서 제외(그 노드가 한동안 안 비므로). clock 단위.
+    avoid_cooldown_seconds: float = 300.0
     clock: Clock = time.monotonic
     command_runner: CommandRunner = subprocess_runner
+    _avoid: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
     def _ssh(self, remote: str, *, input_text: str | None = None) -> CommandResult:
         argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", self.ssh_host, remote]
@@ -159,10 +162,26 @@ class SlurmJobLauncher:
             return self.partition_chooser(gpus)
         return self.partition_chooser(sorted(available))
 
+    def avoid_node(self, node: str) -> None:
+        """막힌 PENDING으로 취소된 노드를 쿨다운 동안 후보에서 제외 등록."""
+        if node:
+            self._avoid[node] = self.clock()
+
+    def _avoided_nodes(self) -> set[str]:
+        now = self.clock()
+        return {n for n, t in self._avoid.items() if (now - t) < self.avoid_cooldown_seconds}
+
+    def pending_reason(self, handle: JobHandle) -> str:
+        """PENDING 사유(squeue %r). 'None'/빈값=곧 시작, 'Resources'/'Priority' 등=한동안 대기."""
+        result = self._ssh(f"squeue -j {handle.slurm_id} -h -o %r")
+        if result.returncode != 0 or not result.stdout.strip():
+            return ""
+        return result.stdout.strip().splitlines()[0].strip()
+
     def _ordered_candidates(self) -> list[tuple[str, str]]:
-        """제출 후보 노드 순서: 빈 노드 중 가중 선택된 파티션을 앞에(나머지는 fallback). busy 노드 제외."""
-        busy = self._busy_nodes()
-        cands = [(n, p) for (n, p) in self._candidate_nodes() if n not in busy]
+        """제출 후보 노드 순서: 빈 노드 중 가중 선택된 파티션을 앞에(나머지는 fallback). busy·회피 노드 제외."""
+        skip = self._busy_nodes() | self._avoided_nodes()
+        cands = [(n, p) for (n, p) in self._candidate_nodes() if n not in skip]
         if not cands:
             return []
         by_part: dict[str, list[tuple[str, str]]] = {}
@@ -188,17 +207,17 @@ class SlurmJobLauncher:
             cpus = self._cpus_for(partition)
             result = self._ssh("sbatch", input_text=self._sbatch_script(job_index, partition, cpus, node=node))
             if result.returncode == 0 and _SUBMITTED_RE.search(result.stdout):
-                return self._parse_submit(result, job_index)
+                return self._parse_submit(result, job_index, node=node)
             last_err = result.stderr.strip() or result.stdout.strip()
         raise SlurmLauncherError(f"sbatch failed on all candidate nodes (job {job_index}): {last_err}")
 
-    def _parse_submit(self, result: CommandResult, job_index: int) -> JobHandle:
+    def _parse_submit(self, result: CommandResult, job_index: int, *, node: str = "") -> JobHandle:
         if result.returncode != 0:
             raise SlurmLauncherError(f"sbatch failed (rc={result.returncode}): {result.stderr.strip()}")
         match = _SUBMITTED_RE.search(result.stdout)
         if match is None:
             raise SlurmLauncherError(f"could not parse sbatch output: {result.stdout.strip()!r}")
-        return JobHandle(job_index=job_index, slurm_id=match.group(1), started_at=self.clock())
+        return JobHandle(job_index=job_index, slurm_id=match.group(1), started_at=self.clock(), node=node)
 
     def is_alive(self, handle: JobHandle) -> bool:
         result = self._ssh(f"squeue -j {handle.slurm_id} -h -o %T")

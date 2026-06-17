@@ -90,9 +90,11 @@ class SeqFakeLauncher(JobLauncher):
     def __init__(self) -> None:
         self.alive: dict[str, bool] = {}
         self.running: dict[str, bool] = {}
+        self.reason: dict[str, str] = {}
         self.submits = 0
         self.kills = 0
         self.fail_submit = False
+        self.avoided: list[str] = []
 
     def submit(self, job_index: int) -> JobHandle:
         if self.fail_submit:
@@ -101,13 +103,20 @@ class SeqFakeLauncher(JobLauncher):
         sid = f"s-{job_index}-{self.submits}"
         self.alive[sid] = True
         self.running[sid] = False  # 처음엔 PENDING
-        return JobHandle(job_index=job_index, slurm_id=sid, started_at=0.0)
+        self.reason[sid] = "None"  # 곧 시작
+        return JobHandle(job_index=job_index, slurm_id=sid, started_at=0.0, node=f"node{self.submits}")
 
     def is_alive(self, handle: JobHandle) -> bool:
         return self.alive.get(handle.slurm_id, False)
 
     def is_running(self, handle: JobHandle) -> bool:
         return self.running.get(handle.slurm_id, False)
+
+    def pending_reason(self, handle: JobHandle) -> str:
+        return self.reason.get(handle.slurm_id, "")
+
+    def avoid_node(self, node: str) -> None:
+        self.avoided.append(node)
 
     def kill(self, handle: JobHandle) -> None:
         self.kills += 1
@@ -158,3 +167,26 @@ def test_sequential_ramp_refills_after_death() -> None:
     orch.poll()  # 죽은 잡 drop + 새로 1개 제출
     assert orch.restarts == 1
     assert launcher.submits == 3
+
+
+def test_sequential_ramp_cancels_stuck_pending_and_moves_on() -> None:
+    launcher = SeqFakeLauncher()
+    orch = JobOrchestrator(launcher=launcher, clock=FakeClock(), job_count=2, sequential_ramp=True)
+    orch.ensure_running()
+    assert launcher.submits == 1
+    stuck = orch.handles()[0]
+    launcher.reason[stuck.slurm_id] = "Resources"  # 노드가 한동안 안 비는 막힌 PENDING
+    orch.poll()  # 막힌 잡 취소 + 노드 회피 + 다른 노드로 재제출
+    assert orch.cancellations == 1
+    assert launcher.kills == 1
+    assert stuck.node in launcher.avoided          # 취소한 노드 회피 등록
+    assert launcher.submits == 2                    # 다음 노드로 새로 제출
+
+
+def test_sequential_ramp_keeps_waiting_on_none_reason() -> None:
+    launcher = SeqFakeLauncher()
+    orch = JobOrchestrator(launcher=launcher, clock=FakeClock(), job_count=2, sequential_ramp=True)
+    orch.ensure_running()
+    orch.poll()  # reason='None'(곧 시작) → 취소 안 하고 대기
+    assert orch.cancellations == 0
+    assert launcher.submits == 1  # 직전 잡 대기 중 → 추가 제출 없음

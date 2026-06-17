@@ -199,3 +199,29 @@ def test_is_running_only_true_for_running() -> None:
     runner.responses["squeue -j"] = CommandResult(0, "PENDING\n", "")
     assert launcher.is_running(handle) is False  # PENDING은 아직 아님
     assert launcher.is_alive(handle) is True     # 단 살아있음
+
+
+def test_node_based_handle_records_node() -> None:
+    runner = _node_runner("n001 cpu2 idle\n")
+    launcher = SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0,
+                                partitions=("cpu2",), node_based=True, cpu2_weight=1.0)
+    handle = launcher.submit(0)
+    assert handle.node == "n001"  # 핀한 노드가 핸들에 기록(취소 시 회피용)
+
+
+def test_pending_reason_parses_squeue_r() -> None:
+    runner = FakeRunner()
+    runner.responses["-o %r"] = CommandResult(0, "Resources\n", "")
+    launcher = _launcher(runner)
+    assert launcher.pending_reason(JobHandle(0, "5", 0.0)) == "Resources"
+
+
+def test_node_based_avoids_cancelled_node() -> None:
+    runner = _node_runner("n001 cpu2 idle\nn002 cpu2 idle\n")
+    launcher = SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0,
+                                partitions=("cpu2",), node_based=True, cpu2_weight=1.0)
+    h1 = launcher.submit(0)
+    assert h1.node == "n001"
+    launcher.avoid_node("n001")           # 막힌 PENDING으로 취소됐다고 가정
+    h2 = launcher.submit(1)
+    assert h2.node == "n002"              # n001 회피 → 다음 노드
