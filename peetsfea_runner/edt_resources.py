@@ -140,6 +140,7 @@ class ResourcePoller:
     runner: CommandRunner | None = None
     clock: Callable[[], float] = time.time
     history_sink: Callable[[dict[str, Any]], None] | None = None  # 각 포인트 영속(store.record_resource_snapshot)
+    extra_provider: Callable[[], dict[str, Any]] | None = None  # 포인트에 합칠 추가 필드(예: 라이선스 제어기 nominal/effective AEDT)
     # DB 영속 시계열 보존기간(기본 7일). 주기적으로 그보다 오래된 스냅샷을 prune해 무한 성장 방지.
     history_retention_seconds: float = 7 * 24 * 3600.0
     history_prune_interval_seconds: float = 3600.0  # prune 검사 주기(매 폴링마다 DELETE는 낭비라 1h마다)
@@ -180,6 +181,11 @@ class ResourcePoller:
             snap = _empty_snapshot()
         snap["ts"] = self.clock()
         point = _history_point(snap)
+        if self.extra_provider is not None:
+            try:
+                point.update(self.extra_provider() or {})  # 라이선스 제어기 nominal/effective AEDT 등
+            except Exception:  # noqa: BLE001 — 추가 필드 실패가 폴러를 죽이면 안 된다.
+                pass
         with self._lock:
             self._snapshot = snap
             self._history.append(point)

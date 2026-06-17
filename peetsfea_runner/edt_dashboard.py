@@ -302,6 +302,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:var(--mut);font-size:12px;margin-bot
 .card .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
 .card .v{font-size:24px;font-weight:700;margin-top:3px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px}
+.grid.c2{grid-template-columns:repeat(2,1fr)}
 .cont{background:var(--pan);border:1px solid var(--ln);border-radius:10px;padding:12px 14px}
 .cont .top{display:flex;justify-content:space-between;align-items:baseline}
 .cont .node{font-weight:700}.cont .meta{color:var(--mut);font-size:12px}
@@ -359,6 +360,7 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
     <div class="card"><div class="k">메모리 — 우리 노드 사용 GB (선)</div><div id="tsMem"></div></div>
     <div class="card"><div class="k">동시 잡 — RUNNING / PENDING (선)</div><div id="tsJobs"></div></div>
     <div class="card"><div class="k">라이선스 — 내 점유 / 전체 사용 (선)</div><div id="tsLic"></div></div>
+    <div class="card"><div class="k">AEDT — 명목(켜놓은 전체) / 유효(솔브중=라이선스) (선)</div><div id="tsAedt"></div></div>
   </div>
 </div>
 
@@ -534,7 +536,8 @@ async function trends(){TS_WIN_MIN=+(($('#tswin')&&$('#tswin').value)||30);
   tsLines('tsCpu',hp,[{key:'load',color:'#58a6ff',label:'노드부하합'},{key:'cpus',color:'#d29922',label:'할당코어합'}],'ts');
   tsLines('tsMem',hp.map(p=>({ts:p.ts,gb:Math.round((p.mem_used_mb||0)/1024)})),[{key:'gb',color:'#58a6ff',label:'사용 GB'}],'ts');
   tsLines('tsJobs',hp,[{key:'running',color:'#3fb950',label:'RUNNING'},{key:'pending',color:'#d29922',label:'PENDING'}],'ts');
-  tsLines('tsLic',hp,[{key:'lic_mine',color:'#b392f0',label:'내 점유'},{key:'lic_inuse',color:'#58a6ff',label:'전체 사용'}],'ts');}
+  tsLines('tsLic',hp,[{key:'lic_mine',color:'#b392f0',label:'내 점유'},{key:'lic_inuse',color:'#58a6ff',label:'전체 사용'}],'ts');
+  tsLines('tsAedt',hp,[{key:'nominal_aedt',color:'#d29922',label:'명목(켜놓은 전체)'},{key:'effective_aedt',color:'#3fb950',label:'유효(솔브중)'}],'ts');}
 $('#tswin')&&($('#tswin').onchange=trends);
 async function loadQueue(){const d=await f('/api/queue');
   $('#qcount').textContent=d.depth+'개 후보 대기 ('+(d.items||[]).length+' sweep)';

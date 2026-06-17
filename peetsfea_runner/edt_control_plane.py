@@ -151,6 +151,12 @@ class ControlPlane:
                 lic_provider=self._lic_mine, target=self.license_target, ceiling=self.license_ceiling,
             )
             self.license_controller = controller
+            # 추세 영속에 AEDT 명목(켜놓은 전체)/유효(솔브중=라이선스)를 함께 기록.
+            if self.resource_poller is not None:
+                self.resource_poller.extra_provider = lambda: {
+                    "nominal_aedt": controller.nominal(),
+                    "effective_aedt": controller.status()["active_permits"],
+                }
             license_server = start_license_ctrl_server(controller=controller, port=self.license_ctrl_port)
             for server in (dashboard, intake_server, ingest_server, bulk_server, lease_server, license_server):
                 self._servers.append(server)

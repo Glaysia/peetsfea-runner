@@ -41,23 +41,37 @@ class LicenseController:
     target: int = 100
     ceiling: int = 150
     permit_ttl_seconds: float = 180.0  # heartbeat 끊긴 permit 만료(워커 사망 누수 방지)
+    nominal_ttl_seconds: float = 120.0  # 이 안에 ping(permit/heartbeat)한 워커 = 명목 AEDT(켜져 있는 것)
     clock: Callable[[], float] = time.time
     _lic_cached: int = field(default=0, init=False)
-    _active: dict[str, dict[str, float]] = field(default_factory=dict, init=False, repr=False)  # worker -> state
+    _active: dict[str, dict[str, float]] = field(default_factory=dict, init=False, repr=False)  # 솔브중(=유효 AEDT)
+    _seen: dict[str, float] = field(default_factory=dict, init=False, repr=False)  # 최근 ping한 전체 워커(=명목 AEDT)
     _abort: set[str] = field(default_factory=set, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def _touch(self, worker_id: str, now: float) -> None:
+        self._seen[worker_id] = now  # 명목 AEDT 카운트용(솔브 안 해도 ping하면 켜져 있는 것)
 
     def _gc(self, now: float) -> None:
         dead = [w for w, s in self._active.items() if (now - s["last_seen"]) > self.permit_ttl_seconds]
         for w in dead:
             self._active.pop(w, None)
             self._abort.discard(w)
+        for w in [w for w, t in self._seen.items() if (now - t) > self.nominal_ttl_seconds]:
+            self._seen.pop(w, None)
+
+    def nominal(self) -> int:
+        """명목 AEDT = 최근 nominal_ttl 안에 ping한 워커 수(켜놓은 것 포함; idle도)."""
+        with self._lock:
+            now = self.clock()
+            return sum(1 for t in self._seen.values() if (now - t) <= self.nominal_ttl_seconds)
 
     def permit(self, worker_id: str) -> bool:
         """솔브 1건 허가 여부. effective < target이면 grant하고 active에 등록."""
         with self._lock:
             now = self.clock()
             self._gc(now)
+            self._touch(worker_id, now)  # 명목 AEDT: permit 거절돼도 워커가 켜져 있다는 신호
             effective = max(self._lic_cached, len(self._active))
             if effective >= self.target:
                 return False
@@ -66,6 +80,7 @@ class LicenseController:
 
     def release(self, worker_id: str) -> None:
         with self._lock:
+            self._touch(worker_id, self.clock())
             self._active.pop(worker_id, None)
             self._abort.discard(worker_id)
 
@@ -73,6 +88,7 @@ class LicenseController:
         """솔브 중 워커가 호출. abort 표시됐으면 True. permit 없이 온 경우(재시작)도 등록."""
         with self._lock:
             now = self.clock()
+            self._touch(worker_id, now)
             state = self._active.get(worker_id)
             if state is None:
                 self._active[worker_id] = {"granted_at": now, "solve_started_at": solve_started_at, "last_seen": now}
@@ -99,9 +115,12 @@ class LicenseController:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
+            now = self.clock()
+            nominal = sum(1 for t in self._seen.values() if (now - t) <= self.nominal_ttl_seconds)
             return {
                 "lic_mine": self._lic_cached,
-                "active_permits": len(self._active),
+                "active_permits": len(self._active),  # 솔브중 = 유효 AEDT
+                "nominal_aedt": nominal,  # 켜져 있는 전체 = 명목 AEDT
                 "effective": max(self._lic_cached, len(self._active)),
                 "target": self.target,
                 "ceiling": self.ceiling,

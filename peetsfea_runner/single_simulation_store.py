@@ -112,10 +112,15 @@ class SingleSimulationResultStore:
                     load DOUBLE,
                     cpus BIGINT,
                     mem_used_mb BIGINT,
-                    mem_total_mb BIGINT
+                    mem_total_mb BIGINT,
+                    nominal_aedt BIGINT,
+                    effective_aedt BIGINT
                 )
                 """
             )
+            # 기존(구 스키마) 테이블 마이그레이션 — AEDT 명목/유효 컬럼 추가.
+            for _col in ("nominal_aedt", "effective_aedt"):
+                connection.execute(f"ALTER TABLE resource_snapshots ADD COLUMN IF NOT EXISTS {_col} BIGINT")
             # 우선순위 큐(intake :7875 적재 / lease :7878 분배). **sweep 요청** 단위로 저장 —
             # 무거운 cadquery 샘플링은 web이 아니라 컨테이너 워커가 lease 후 수행(baseline과 대칭).
             # row 1개 = "이 sweep을 count개 시뮬", remaining_count를 chunk lease가 차감.
@@ -367,7 +372,10 @@ class SingleSimulationResultStore:
 
     # --- 라이선스/자원 시계열 영속 (대시보드 추세 탭; web 재시작·12h 넘어 보존) ----------------
 
-    _RESOURCE_COLS = ("ts", "running", "pending", "lic_mine", "lic_inuse", "load", "cpus", "mem_used_mb", "mem_total_mb")
+    _RESOURCE_COLS = (
+        "ts", "running", "pending", "lic_mine", "lic_inuse", "load", "cpus", "mem_used_mb", "mem_total_mb",
+        "nominal_aedt", "effective_aedt",
+    )
 
     def record_resource_snapshot(self, point: Mapping[str, Any]) -> None:
         """`ResourcePoller`의 history 포인트 1개를 영속(폴링마다 호출)."""
