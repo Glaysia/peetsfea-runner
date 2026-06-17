@@ -53,6 +53,13 @@ class SingleSimulationResultStore:
             conn = _DB_CONNS.get(key)
             if conn is None:
                 conn = duckdb.connect(key)
+                # 버퍼풀 상한 — 기본 DuckDB는 RAM의 ~80%까지 캐시한다(영속 연결이라 누적). web 정상화를 위해
+                # 제한. 우리 쿼리(수천 행·parquet COPY)엔 충분하고 web 메모리를 일정하게 묶는다.
+                try:
+                    conn.execute("PRAGMA memory_limit='3GB'")
+                    conn.execute("PRAGMA threads=4")
+                except Exception:  # noqa: BLE001 — pragma 미지원 버전이어도 동작은 해야 함.
+                    pass
                 _DB_CONNS[key] = conn
             yield conn
 
@@ -301,6 +308,27 @@ class SingleSimulationResultStore:
             {"t": r[0], "success": int(r[1]), "failed": int(r[2]), "gpu": int(r[3]), "total": int(r[4])}
             for r in rows
         ]
+
+    def fetch_solve_telemetry(
+        self, *, terminal_state: str = "success", peetsfea_version: str | None = None, limit: int | None = 5000
+    ) -> list[dict[str, Any]]:
+        """build_summary용 경량 조회 — partition + solve_telemetry_json만(리포트 원문 등 무거운 컬럼 제외)."""
+        self.initialize()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if terminal_state:
+            clauses.append("terminal_state = ?")
+            params.append(terminal_state)
+        if peetsfea_version:
+            clauses.append("peetsfea_version = ?")
+            params.append(peetsfea_version)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"SELECT partition, solve_telemetry_json FROM single_simulation_results{where} ORDER BY finished_at"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        with self._locked_connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [{"partition": r[0], "solve_telemetry_json": r[1]} for r in rows]
 
     def export_parquet(
         self,

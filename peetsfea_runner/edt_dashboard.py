@@ -83,7 +83,7 @@ def build_summary(store: SingleSimulationResultStore, *, peetsfea_version: str |
     counts = store.state_counts(peetsfea_version=peetsfea_version)
     total = sum(counts.values())
     success = counts.get("success", 0)
-    srows = store.fetch_rows(terminal_state="success", peetsfea_version=peetsfea_version, limit=5000)
+    srows = store.fetch_solve_telemetry(terminal_state="success", peetsfea_version=peetsfea_version, limit=5000)
     mins: list[float] = []
     gpu = 0
     by_partition: dict[str, list[float]] = {}
