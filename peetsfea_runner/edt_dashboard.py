@@ -247,7 +247,16 @@ def start_dashboard_server(
             elif path == "/api/resources":
                 self._json(200, dict(resource_provider()) if resource_provider else {"ok": False, "jobs": [], "nodes": {}, "license": {}, "counts": {}})
             elif path == "/api/resources/history":
-                self._json(200, {"points": history_provider() if history_provider else []})
+                # DB 영속(web 재시작·12h 넘어 보존)을 우선, 비었으면 인메모리 폴백.
+                since_raw = query.get("since", [None])[0]
+                try:
+                    since_ts = float(since_raw) if since_raw else None
+                except ValueError:
+                    since_ts = None
+                points = store.fetch_resource_history(since_ts=since_ts)
+                if not points and history_provider:
+                    points = history_provider()
+                self._json(200, {"points": points})
             elif path == "/api/timeseries":
                 bucket = int(query.get("bucket", ["15"])[0] or 15)
                 since = query.get("since", [None])[0]
@@ -514,7 +523,7 @@ async function trends(){TS_WIN_MIN=+(($('#tswin')&&$('#tswin').value)||30);
   TS_NOW=Date.now()/1000;const startSec=TS_NOW-TS_WIN_MIN*60;
   const since=new Date(startSec*1000).toISOString();
   const ts=await f(`/api/timeseries?bucket=${TS_BUCKET_MIN}&since=${encodeURIComponent(since)}`).catch(()=>({points:[]}));
-  const hist=await f('/api/resources/history').catch(()=>({points:[]}));
+  const hist=await f(`/api/resources/history?since=${startSec.toFixed(0)}`).catch(()=>({points:[]}));
   const tp=(ts.points||[]).filter(p=>Date.parse(p.t+':00Z')/1000>=startSec-TS_BUCKET_MIN*60);
   const hp=(hist.points||[]).filter(p=>(+p.ts||0)>=startSec);
   $('#tssub').textContent=`${TS_WIN_LABEL[TS_WIN_MIN]||TS_WIN_MIN+'분'} · 버킷 ${TS_BUCKET_MIN}분 · 결과 ${tp.length} · 자원 ${hp.length} (지금 기준 상대시간)`;

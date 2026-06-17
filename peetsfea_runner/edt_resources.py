@@ -136,9 +136,10 @@ class ResourcePoller:
 
     ssh_host: str = "gate1-harry261"
     refresh_seconds: float = 20.0
-    history_maxlen: int = 2160  # 20s × 2160 = 12h 시계열 ring buffer(대시보드 추세 탭 최대 범위)
+    history_maxlen: int = 2160  # 20s × 2160 = 12h 시계열 ring buffer(인메모리; DB 영속은 history_sink로 별도)
     runner: CommandRunner | None = None
     clock: Callable[[], float] = time.time
+    history_sink: Callable[[dict[str, Any]], None] | None = None  # 각 포인트 영속(store.record_resource_snapshot)
     _snapshot: dict[str, Any] = field(default_factory=_empty_snapshot, init=False, repr=False)
     _history: "deque[dict[str, Any]]" = field(default_factory=deque, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -173,9 +174,15 @@ class ResourcePoller:
         except Exception:  # noqa: BLE001 — 폴링 실패가 데몬/대시보드를 죽이면 안 된다.
             snap = _empty_snapshot()
         snap["ts"] = self.clock()
+        point = _history_point(snap)
         with self._lock:
             self._snapshot = snap
-            self._history.append(_history_point(snap))
+            self._history.append(point)
+        if self.history_sink is not None:
+            try:
+                self.history_sink(point)  # DB 영속(실패해도 폴링 지속).
+            except Exception:  # noqa: BLE001 — 영속 실패가 폴러를 죽이면 안 된다.
+                pass
         return snap
 
     def snapshot(self) -> dict[str, Any]:

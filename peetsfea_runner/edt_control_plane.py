@@ -32,12 +32,11 @@ from .edt_dashboard import start_dashboard_server
 from .edt_intake import IntakeService, start_intake_server
 from .edt_orchestrator import JobLauncher, JobOrchestrator
 from .edt_priority_lease import DEFAULT_PRIORITY_LEASE_PORT, start_priority_lease_server
-from .edt_queue import TwoLaneQueue
 from .edt_resources import ResourcePoller
 from .edt_result_ingest import DEFAULT_INGEST_PORT, start_result_ingest_server
 from .edt_slurm_launcher import SlurmJobLauncher
 from .edt_ssh_tunnel import SshTunnel, reverse_tunnel_argv
-from .single_simulation_store import SingleSimulationResultStore
+from .single_simulation_store import DbPriorityQueue, SingleSimulationResultStore
 
 
 @dataclass(slots=True)
@@ -191,8 +190,8 @@ def build_control_plane(
         job_count=config.job_count,
         sequential_ramp=config.sequential_ramp,
     )
-    # 호스트측 Intake 큐(우선순위 분배는 후속; 여기선 수신·검증·샘플까지).
-    intake = IntakeService(queue=TwoLaneQueue())
+    # 호스트측 Intake 큐 — DB 영속(web 재시작에도 미처리 우선순위 항목 보존). lease :7878이 같은 큐를 분배.
+    intake = IntakeService(queue=DbPriorityQueue(store=store))
     return ControlPlane(
         orchestrator=orchestrator,
         store=store,
@@ -206,7 +205,8 @@ def build_control_plane(
         bulk_port=config.bulk_port,
         priority_lease_port=config.priority_lease_port,
         dashboard_peetsfea_version=config.dashboard_peetsfea_version,
-        resource_poller=ResourcePoller(ssh_host=config.ssh_host),
+        # 라이선스/자원 시계열을 DB에 영속(web 재시작·12h ring buffer 넘어 보존).
+        resource_poller=ResourcePoller(ssh_host=config.ssh_host, history_sink=store.record_resource_snapshot),
         run_web=run_web,
         run_keeper=run_keeper,
     )

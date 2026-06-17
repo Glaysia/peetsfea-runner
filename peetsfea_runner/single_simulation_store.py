@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 import duckdb
+
+from .edt_queue import QueueItem
 
 
 def _json_dumps(value: Any) -> str:
@@ -58,6 +61,34 @@ class SingleSimulationResultStore:
                     error_message VARCHAR,
                     result_json VARCHAR,
                     envelope_json VARCHAR
+                )
+                """
+            )
+            # 라이선스/자원 시계열(대시보드 추세 탭). web 재시작·12h ring buffer 한계를 넘어 영속.
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS resource_snapshots (
+                    ts DOUBLE,
+                    running BIGINT,
+                    pending BIGINT,
+                    lic_mine BIGINT,
+                    lic_inuse BIGINT,
+                    load DOUBLE,
+                    cpus BIGINT,
+                    mem_used_mb BIGINT,
+                    mem_total_mb BIGINT
+                )
+                """
+            )
+            # 우선순위 큐(intake :7875가 채우고 lease :7878이 분배). 인메모리 deque였던 것을 영속화.
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS priority_queue (
+                    request_id VARCHAR PRIMARY KEY,
+                    candidate_toml_text VARCHAR,
+                    seed BIGINT,
+                    mode VARCHAR,
+                    created_at DOUBLE
                 )
                 """
             )
@@ -238,5 +269,114 @@ class SingleSimulationResultStore:
             for r in rows
         ]
 
+    # --- 라이선스/자원 시계열 영속 (대시보드 추세 탭; web 재시작·12h 넘어 보존) ----------------
 
-__all__ = ["SingleSimulationResultStore"]
+    _RESOURCE_COLS = ("ts", "running", "pending", "lic_mine", "lic_inuse", "load", "cpus", "mem_used_mb", "mem_total_mb")
+
+    def record_resource_snapshot(self, point: Mapping[str, Any]) -> None:
+        """`ResourcePoller`의 history 포인트 1개를 영속(폴링마다 호출)."""
+        self.initialize()
+        row = [float(point.get("ts") or 0.0)] + [int(point.get(c) or 0) for c in self._RESOURCE_COLS[1:5]]
+        row += [float(point.get("load") or 0.0)] + [int(point.get(c) or 0) for c in self._RESOURCE_COLS[6:]]
+        placeholders = ", ".join("?" for _ in self._RESOURCE_COLS)
+        with duckdb.connect(str(self.db_path)) as connection:
+            connection.execute(
+                f"INSERT INTO resource_snapshots ({', '.join(self._RESOURCE_COLS)}) VALUES ({placeholders})", row
+            )
+
+    def fetch_resource_history(self, *, since_ts: float | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+        """자원 시계열(오래된→최신). `since_ts`(epoch)로 범위 제한. 대시보드 `/api/resources/history`용."""
+        self.initialize()
+        where = " WHERE ts >= ?" if since_ts is not None else ""
+        params: list[Any] = [float(since_ts)] if since_ts is not None else []
+        sql = f"SELECT {', '.join(self._RESOURCE_COLS)} FROM resource_snapshots{where} ORDER BY ts"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        with duckdb.connect(str(self.db_path)) as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [dict(zip(self._RESOURCE_COLS, r, strict=True)) for r in rows]
+
+    def prune_resource_snapshots(self, *, before_ts: float) -> int:
+        """`before_ts`(epoch)보다 오래된 자원 스냅샷 삭제(무한 성장 방지). 삭제 건수 반환."""
+        self.initialize()
+        with duckdb.connect(str(self.db_path)) as connection:
+            n = connection.execute("SELECT count(*) FROM resource_snapshots WHERE ts < ?", [float(before_ts)]).fetchone()
+            connection.execute("DELETE FROM resource_snapshots WHERE ts < ?", [float(before_ts)])
+        return int(n[0]) if n else 0
+
+    # --- 우선순위 큐 영속 (intake :7875 적재 / lease :7878 분배) -----------------------------
+
+    def priority_enqueue(self, items: "list[QueueItem]", *, now: float) -> int:
+        """우선순위 항목 적재(intake). 같은 request_id는 무시. 적재 시도 건수 반환."""
+        self.initialize()
+        if not items:
+            return 0
+        with duckdb.connect(str(self.db_path)) as connection:
+            for idx, item in enumerate(items):
+                connection.execute(
+                    "INSERT OR IGNORE INTO priority_queue (request_id, candidate_toml_text, seed, mode, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [item.request_id, item.candidate_toml_text, int(item.seed), item.mode, float(now) + idx * 1e-6],
+                )
+        return len(items)
+
+    def priority_lease(self, n: int) -> "list[QueueItem]":
+        """오래된 순으로 최대 n건 pop(원자적: SELECT→DELETE 한 트랜잭션). lease 서버가 호출."""
+        self.initialize()
+        if n <= 0:
+            return []
+        with duckdb.connect(str(self.db_path)) as connection:
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                rows = connection.execute(
+                    "SELECT request_id, candidate_toml_text, seed, mode FROM priority_queue ORDER BY created_at LIMIT ?",
+                    [int(n)],
+                ).fetchall()
+                if rows:
+                    ids = [r[0] for r in rows]
+                    placeholders = ", ".join("?" for _ in ids)
+                    connection.execute(f"DELETE FROM priority_queue WHERE request_id IN ({placeholders})", ids)
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        return [QueueItem(request_id=r[0], candidate_toml_text=r[1], seed=int(r[2] or 0), mode=r[3] or "full") for r in rows]
+
+    def priority_depth(self) -> int:
+        self.initialize()
+        with duckdb.connect(str(self.db_path)) as connection:
+            row = connection.execute("SELECT count(*) FROM priority_queue").fetchone()
+        return int(row[0]) if row else 0
+
+
+@dataclass
+class DbPriorityQueue:
+    """DB 영속 우선순위 큐 — `TwoLaneQueue`의 우선순위 메서드를 드롭인 대체(IntakeService/lease 서버용).
+
+    baseline은 컨테이너 자기공급이라 여기선 우선순위 레인만 다룬다. web 재시작에도 미처리 항목이 남는다.
+    """
+
+    store: SingleSimulationResultStore
+    clock: Any = None  # () -> float; None이면 time.time
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def _now(self) -> float:
+        import time
+
+        return (self.clock or time.time)()
+
+    def extend_priority(self, items: "list[QueueItem]") -> None:
+        self.store.priority_enqueue(list(items), now=self._now())
+
+    def put_priority(self, item: "QueueItem") -> None:
+        self.store.priority_enqueue([item], now=self._now())
+
+    def lease_priority(self, n: int) -> "list[QueueItem]":
+        with self._lock:  # 한 web 프로세스 내 동시 lease 직렬화(중복 분배 방지)
+            return self.store.priority_lease(n)
+
+    def depths(self) -> tuple[int, int]:
+        return (self.store.priority_depth(), 0)
+
+
+__all__ = ["DbPriorityQueue", "SingleSimulationResultStore"]
