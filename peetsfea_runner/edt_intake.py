@@ -121,8 +121,7 @@ def start_intake_server(*, service: IntakeService, host: str = "127.0.0.1", port
 
         def do_GET(self) -> None:
             if urlparse(self.path).path == "/health":
-                p, b = service.queue.depths()
-                _write_json(self, 200, {"status": "ok", "priority_depth": p, "baseline_depth": b})
+                _write_json(self, 200, {"status": "ok", "priority_depth": service.queue.depth()})
                 return
             _write_json(self, 404, {"error": "not_found"})
 
