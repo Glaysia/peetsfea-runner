@@ -32,6 +32,27 @@ def test_parse_remote_empty_is_safe() -> None:
     assert snap["jobs"] == [] and snap["nodes"] == {} and snap["counts"]["running"] == 0
 
 
+def test_history_sink_and_periodic_prune() -> None:
+    fake = lambda argv: (0, _SAMPLE)  # noqa: E731
+    sunk: list[dict] = []
+    pruned: list[float] = []
+    t0 = 1_700_000_000.0  # 현실적 epoch(첫 폴링이 바로 prune 조건 충족)
+    ticks = iter([t0, t0 + 1800, t0 + 3700])  # 0s, 30분, ~1h2m
+    poller = ResourcePoller(
+        runner=fake, clock=lambda: next(ticks),
+        history_sink=sunk.append,
+        history_prune=pruned.append,
+        history_retention_seconds=7 * 24 * 3600.0,
+        history_prune_interval_seconds=3600.0,
+    )
+    poller.poll_once()  # t0 → 첫 prune (cutoff = t0 - 7d)
+    poller.poll_once()  # +30분 → 간격 미달, prune 없음
+    poller.poll_once()  # +~1h2m → prune 1회 더
+    assert len(sunk) == 3  # 매 폴링 DB 기록
+    assert len(pruned) == 2  # 1h 간격 충족한 2회만(첫 폴링 + 1h 경과 후)
+    assert pruned[0] == t0 - 7 * 24 * 3600.0  # 7일 컷오프
+
+
 def test_poller_caches_snapshot_via_fake_runner() -> None:
     calls = {"n": 0}
 

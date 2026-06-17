@@ -205,8 +205,12 @@ def build_control_plane(
         bulk_port=config.bulk_port,
         priority_lease_port=config.priority_lease_port,
         dashboard_peetsfea_version=config.dashboard_peetsfea_version,
-        # 라이선스/자원 시계열을 DB에 영속(web 재시작·12h ring buffer 넘어 보존).
-        resource_poller=ResourcePoller(ssh_host=config.ssh_host, history_sink=store.record_resource_snapshot),
+        # 라이선스/자원 시계열을 DB에 영속(web 재시작·12h ring buffer 넘어 보존) + 7일 넘은 건 자동 prune.
+        resource_poller=ResourcePoller(
+            ssh_host=config.ssh_host,
+            history_sink=store.record_resource_snapshot,
+            history_prune=lambda cutoff: store.prune_resource_snapshots(before_ts=cutoff),
+        ),
         run_web=run_web,
         run_keeper=run_keeper,
     )

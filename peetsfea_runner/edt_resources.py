@@ -140,6 +140,11 @@ class ResourcePoller:
     runner: CommandRunner | None = None
     clock: Callable[[], float] = time.time
     history_sink: Callable[[dict[str, Any]], None] | None = None  # 각 포인트 영속(store.record_resource_snapshot)
+    # DB 영속 시계열 보존기간(기본 7일). 주기적으로 그보다 오래된 스냅샷을 prune해 무한 성장 방지.
+    history_retention_seconds: float = 7 * 24 * 3600.0
+    history_prune_interval_seconds: float = 3600.0  # prune 검사 주기(매 폴링마다 DELETE는 낭비라 1h마다)
+    history_prune: Callable[[float], Any] | None = None  # (cutoff_ts) -> None; store.prune_resource_snapshots 와이어링
+    _last_prune: float = field(default=0.0, init=False, repr=False)
     _snapshot: dict[str, Any] = field(default_factory=_empty_snapshot, init=False, repr=False)
     _history: "deque[dict[str, Any]]" = field(default_factory=deque, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -183,7 +188,20 @@ class ResourcePoller:
                 self.history_sink(point)  # DB 영속(실패해도 폴링 지속).
             except Exception:  # noqa: BLE001 — 영속 실패가 폴러를 죽이면 안 된다.
                 pass
+        self._maybe_prune(snap["ts"])
         return snap
+
+    def _maybe_prune(self, now: float) -> None:
+        """7일 넘은 DB 자원 스냅샷을 1시간마다 한 번 prune(무한 성장 방지)."""
+        if self.history_prune is None:
+            return
+        if (now - self._last_prune) < self.history_prune_interval_seconds:
+            return
+        self._last_prune = now
+        try:
+            self.history_prune(now - self.history_retention_seconds)
+        except Exception:  # noqa: BLE001 — prune 실패가 폴러를 죽이면 안 된다.
+            pass
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
