@@ -136,7 +136,7 @@ class ResourcePoller:
 
     ssh_host: str = "gate1-harry261"
     refresh_seconds: float = 20.0
-    history_maxlen: int = 1080  # 20s × 1080 = 6h 시계열 ring buffer(경량, 대시보드 추세 탭)
+    history_maxlen: int = 2160  # 20s × 2160 = 12h 시계열 ring buffer(대시보드 추세 탭 최대 범위)
     runner: CommandRunner | None = None
     clock: Callable[[], float] = time.time
     _snapshot: dict[str, Any] = field(default_factory=_empty_snapshot, init=False, repr=False)

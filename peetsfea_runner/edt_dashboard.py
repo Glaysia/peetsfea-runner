@@ -346,8 +346,8 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
 
 <div id="trends" class="page hide">
   <div class="tools">
-    <span class="muted">버킷</span>
-    <select id="tsbucket"><option value="10">10분</option><option value="15" selected>15분</option><option value="30">30분</option><option value="60">60분</option></select>
+    <span class="muted">범위</span>
+    <select id="tswin"><option value="30" selected>최근 30분</option><option value="60">최근 1시간</option><option value="180">최근 3시간</option><option value="360">최근 6시간</option><option value="720">최근 12시간</option></select>
     <button onclick="trends()">새로고침</button>
     <span class="muted" id="tssub"></span>
   </div>
@@ -475,42 +475,55 @@ async function loadFailures(){const d=await f('/api/failures?limit=80');
   $('#ftable tbody').innerHTML=d.recent.map(r=>`<tr><td>${esc(r.request_id)}</td><td>${esc(r.partition)}</td>
     <td class="bigbad">${esc(r.error_type)}</td><td>${esc(r.error_message)}</td><td>${esc(r.finished_at)}</td></tr>`).join('');
 }
-function fmtX(t){if(typeof t==='number'){const d=new Date(t*1000);return(''+d.getHours()).padStart(2,'0')+':'+(''+d.getMinutes()).padStart(2,'0');}return String(t).slice(-5);}
+// 추세 탭: 상대시간(지금 기준) 시간비례 축. 범위 [now-win, now]에 모든 차트를 동일 기준으로 맞춘다.
+// 절대시간(HH:MM) 대신 now 기준 상대 라벨(-30m … now). x는 인덱스가 아니라 실제 시각 비례(공백도 비례).
+let TS_WIN_MIN=30, TS_BUCKET_MIN=1, TS_NOW=0;
+function relX(epochSec,W,P){const start=TS_NOW-TS_WIN_MIN*60;const fr=(epochSec-start)/((TS_WIN_MIN*60)||1);
+  return P+(W-P-8)*Math.max(0,Math.min(1,fr));}
+function relTicks(W,P,H){let g='';[0,.5,1].forEach(fr=>{const x=P+(W-P-8)*fr;const ago=Math.round(TS_WIN_MIN*(1-fr));
+  const lbl=fr===1?'now':(TS_WIN_MIN>90?'-'+(+(ago/60).toFixed(1))+'h':'-'+ago+'m');
+  g+=`<text x="${(x-10).toFixed(1)}" y="${H-4}" fill="#8b949e" font-size="9">${lbl}</text>`;});return g;}
 function tsLines(id,points,series,xkey){const e=$('#'+id);
-  if(!points||!points.length){e.innerHTML='<span class="muted">데이터 없음 (가동 후 누적)</span>';return;}
-  const W=560,H=170,P=34,n=points.length;let mx=0;
+  if(!points||!points.length){e.innerHTML='<span class="muted">데이터 없음 (선택 범위 내 자원 포인트 없음)</span>';return;}
+  const W=560,H=170,P=34;let mx=0;
   series.forEach(s=>points.forEach(p=>{const v=+p[s.key]||0;if(v>mx)mx=v;}));mx=mx||1;
-  const X=i=>P+(W-P-8)*(n>1?i/(n-1):0.5),Y=v=>H-P-(H-P-14)*v/mx;let g='';
+  const Y=v=>H-P-(H-P-14)*v/mx;let g='';
   [0,.5,1].forEach(fr=>{const y=Y(mx*fr);g+=`<line x1="${P}" y1="${y}" x2="${W-8}" y2="${y}" stroke="#2c313c"/><text x="2" y="${y+4}" fill="#8b949e" font-size="9">${Math.round(mx*fr)}</text>`;});
-  series.forEach(s=>{let d='';points.forEach((p,i)=>{d+=(d?'L':'M')+X(i).toFixed(1)+' '+Y(+p[s.key]||0).toFixed(1);});g+=`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.6"/>`;});
-  [0,Math.floor(n/2),n-1].forEach(i=>{g+=`<text x="${X(i)-14}" y="${H-4}" fill="#8b949e" font-size="9">${fmtX(points[i][xkey])}</text>`;});
+  series.forEach(s=>{let d='';points.forEach(p=>{const x=relX(+p[xkey]||0,W,P);d+=(d?'L':'M')+x.toFixed(1)+' '+Y(+p[s.key]||0).toFixed(1);});g+=`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.6"/>`;});
+  g+=relTicks(W,P,H);
   const lg=series.map(s=>`<span style="color:${s.color}">■ ${s.label}</span>`).join(' &nbsp;');
   e.innerHTML=`<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${g}</svg><div style="font-size:11px;margin-top:3px">${lg}</div>`;}
 function tsStack(id,points){const e=$('#'+id);
-  if(!points||!points.length){e.innerHTML='<span class="muted">데이터 없음 (가동 후 누적)</span>';return;}
-  const W=1080,H=210,P=30,n=points.length,bw=(W-P-10)/n;
+  if(!points||!points.length){e.innerHTML='<span class="muted">데이터 없음 (선택 범위 내 결과 없음)</span>';return;}
+  const W=1080,H=210,P=30;
   const mx=Math.max(1,...points.map(p=>p.success+p.failed)),gmx=Math.max(1,...points.map(p=>p.gpu));
-  const Y=v=>(H-P-16)*v/mx;let g='';
+  const Y=v=>(H-P-16)*v/mx;
+  const bw=Math.max(2,(W-P-8)*TS_BUCKET_MIN/(TS_WIN_MIN||1)-1);let g='';  // 버킷 폭 = 시간 비례
   [0,.5,1].forEach(fr=>{const y=H-P-Y(mx*fr);g+=`<line x1="${P}" y1="${y}" x2="${W-6}" y2="${y}" stroke="#2c313c"/><text x="2" y="${y+4}" fill="#8b949e" font-size="9">${Math.round(mx*fr)}</text>`;});
-  let gd='';points.forEach((p,i)=>{const x=P+i*bw+1,w=Math.max(1,bw-2),sh=Y(p.success),fh=Y(p.failed);
-    g+=`<rect x="${x}" y="${H-P-sh}" width="${w}" height="${sh}" fill="#3fb950" opacity=".85"/>`;
-    g+=`<rect x="${x}" y="${H-P-sh-fh}" width="${w}" height="${fh}" fill="#f85149" opacity=".85"/>`;
-    gd+=(gd?'L':'M')+(x+w/2).toFixed(1)+' '+(H-P-(H-P-16)*p.gpu/gmx).toFixed(1);});
+  let gd='';points.forEach(p=>{const te=Date.parse(p.t+':00Z')/1000;const x=relX(te,W,P),sh=Y(p.success),fh=Y(p.failed);
+    g+=`<rect x="${x.toFixed(1)}" y="${(H-P-sh).toFixed(1)}" width="${bw.toFixed(1)}" height="${sh.toFixed(1)}" fill="#3fb950" opacity=".85"/>`;
+    g+=`<rect x="${x.toFixed(1)}" y="${(H-P-sh-fh).toFixed(1)}" width="${bw.toFixed(1)}" height="${fh.toFixed(1)}" fill="#f85149" opacity=".85"/>`;
+    gd+=(gd?'L':'M')+(x+bw/2).toFixed(1)+' '+(H-P-(H-P-16)*p.gpu/gmx).toFixed(1);});
   g+=`<path d="${gd}" fill="none" stroke="#b392f0" stroke-width="1.6"/>`;
-  [0,Math.floor(n/2),n-1].forEach(i=>{g+=`<text x="${P+i*bw-14}" y="${H-4}" fill="#8b949e" font-size="9">${fmtX(points[i].t)}</text>`;});
+  g+=relTicks(W,P,H);
   e.innerHTML=`<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${g}</svg>
     <div style="font-size:11px;margin-top:2px"><span style="color:#3fb950">■ 성공</span> <span style="color:#f85149">■ 실패</span> <span style="color:#b392f0">— GPU 사용</span></div>`;}
-async function trends(){const b=$('#tsbucket').value;
-  const ts=await f('/api/timeseries?bucket='+b).catch(()=>({points:[]}));
+const TS_WIN_LABEL={30:'최근 30분',60:'최근 1시간',180:'최근 3시간',360:'최근 6시간',720:'최근 12시간'};
+async function trends(){TS_WIN_MIN=+(($('#tswin')&&$('#tswin').value)||30);
+  TS_BUCKET_MIN=Math.max(1,Math.min(60,Math.round(TS_WIN_MIN/40)));  // 범위에 맞춰 ~40버킷
+  TS_NOW=Date.now()/1000;const startSec=TS_NOW-TS_WIN_MIN*60;
+  const since=new Date(startSec*1000).toISOString();
+  const ts=await f(`/api/timeseries?bucket=${TS_BUCKET_MIN}&since=${encodeURIComponent(since)}`).catch(()=>({points:[]}));
   const hist=await f('/api/resources/history').catch(()=>({points:[]}));
-  const tp=ts.points||[],hp=hist.points||[];
-  $('#tssub').textContent=`결과 ${tp.length}버킷 · 자원 ${hp.length}포인트`;
+  const tp=(ts.points||[]).filter(p=>Date.parse(p.t+':00Z')/1000>=startSec-TS_BUCKET_MIN*60);
+  const hp=(hist.points||[]).filter(p=>(+p.ts||0)>=startSec);
+  $('#tssub').textContent=`${TS_WIN_LABEL[TS_WIN_MIN]||TS_WIN_MIN+'분'} · 버킷 ${TS_BUCKET_MIN}분 · 결과 ${tp.length} · 자원 ${hp.length} (지금 기준 상대시간)`;
   tsStack('tsThroughput',tp);
   tsLines('tsCpu',hp,[{key:'load',color:'#58a6ff',label:'노드부하합'},{key:'cpus',color:'#d29922',label:'할당코어합'}],'ts');
   tsLines('tsMem',hp.map(p=>({ts:p.ts,gb:Math.round((p.mem_used_mb||0)/1024)})),[{key:'gb',color:'#58a6ff',label:'사용 GB'}],'ts');
   tsLines('tsJobs',hp,[{key:'running',color:'#3fb950',label:'RUNNING'},{key:'pending',color:'#d29922',label:'PENDING'}],'ts');
   tsLines('tsLic',hp,[{key:'lic_mine',color:'#b392f0',label:'내 점유'},{key:'lic_inuse',color:'#58a6ff',label:'전체 사용'}],'ts');}
-$('#tsbucket')&&($('#tsbucket').onchange=trends);
+$('#tswin')&&($('#tswin').onchange=trends);
 function tick(){if(cur==='overview')overview();else if(cur==='containers')containers();else if(cur==='trends')trends();}
 $('#dsearch').oninput=()=>{if(cur==='dataset')loadDataset()};
 tick();loadDataset();setInterval(()=>{if(cur==='overview'||cur==='containers'||cur==='trends')tick()},8000);
