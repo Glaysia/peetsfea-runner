@@ -348,6 +348,16 @@ class SingleSimulationResultStore:
             row = connection.execute("SELECT count(*) FROM priority_queue").fetchone()
         return int(row[0]) if row else 0
 
+    def priority_list(self, *, limit: int | None = 200) -> list[dict[str, Any]]:
+        """대기 중인 우선순위 항목 조회(pop 안 함; 무거운 toml 본문 제외). 대시보드 입력큐 탭용."""
+        self.initialize()
+        sql = "SELECT request_id, seed, mode, created_at FROM priority_queue ORDER BY created_at"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        with duckdb.connect(str(self.db_path)) as connection:
+            rows = connection.execute(sql).fetchall()
+        return [{"request_id": r[0], "seed": int(r[1] or 0), "mode": r[2], "created_at": float(r[3] or 0.0)} for r in rows]
+
 
 @dataclass
 class DbPriorityQueue:

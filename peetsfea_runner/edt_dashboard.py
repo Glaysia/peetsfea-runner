@@ -265,6 +265,10 @@ def start_dashboard_server(
                 limit = int(query.get("limit", ["200"])[0] or 200)
                 rows = _query_rows({**query, "limit": [str(limit)]}, default_state="success")
                 self._json(200, {"rows": [_row_to_io(r) for r in rows]})
+            elif path == "/api/queue":
+                # 우선순위 입력큐(intake :7875가 채우고 lease :7878이 분배). DB(priority_queue) 기반.
+                limit = int(query.get("limit", ["300"])[0] or 300)
+                self._json(200, {"depth": store.priority_depth(), "items": store.priority_list(limit=limit)})
             elif path == "/api/failures":
                 self._json(200, build_failures(store, limit=int(query.get("limit", ["60"])[0] or 60), peetsfea_version=version_filter))
             elif path.startswith("/api/sim/"):
@@ -339,6 +343,7 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
   <div class="tab" data-t="containers">컨테이너 부하</div>
   <div class="tab" data-t="trends">추세</div>
   <div class="tab" data-t="dataset">입출력 데이터셋</div>
+  <div class="tab" data-t="queue">입력큐</div>
   <div class="tab" data-t="failures">실패</div>
 </div>
 
@@ -378,6 +383,16 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
     <span class="muted" id="dcount"></span>
   </div>
   <div style="overflow:auto;max-height:70vh"><table id="dtable"><thead></thead><tbody></tbody></table></div>
+</div>
+
+<div id="queue" class="page hide">
+  <div class="tools">
+    <button onclick="loadQueue()">새로고침</button>
+    <span class="muted">intake(:7875) 적재 → lease(:7878) 분배. DB 영속(재시작 보존).</span>
+    <span class="muted" id="qcount"></span>
+  </div>
+  <div class="cards" id="qcards"></div>
+  <div style="overflow:auto;max-height:66vh"><table id="qtable"><thead></thead><tbody></tbody></table></div>
 </div>
 
 <div id="failures" class="page hide">
@@ -533,9 +548,19 @@ async function trends(){TS_WIN_MIN=+(($('#tswin')&&$('#tswin').value)||30);
   tsLines('tsJobs',hp,[{key:'running',color:'#3fb950',label:'RUNNING'},{key:'pending',color:'#d29922',label:'PENDING'}],'ts');
   tsLines('tsLic',hp,[{key:'lic_mine',color:'#b392f0',label:'내 점유'},{key:'lic_inuse',color:'#58a6ff',label:'전체 사용'}],'ts');}
 $('#tswin')&&($('#tswin').onchange=trends);
-function tick(){if(cur==='overview')overview();else if(cur==='containers')containers();else if(cur==='trends')trends();}
+async function loadQueue(){const d=await f('/api/queue');
+  $('#qcount').textContent=d.depth+'건 대기';
+  $('#qcards').innerHTML=`<div class="card"><div class="k">대기 중 우선순위</div><div class="v">${d.depth}</div></div>`;
+  const now=Date.now()/1000;
+  $('#qtable thead').innerHTML='<tr><th>request_id</th><th>seed</th><th>mode</th><th>대기</th></tr>';
+  $('#qtable tbody').innerHTML=(d.items||[]).map(r=>{const ago=Math.max(0,Math.round(now-(+r.created_at||0)));
+    const w=ago<60?ago+'s':(ago<3600?Math.round(ago/60)+'m':Math.round(ago/3600)+'h');
+    return `<tr><td>${esc(r.request_id)}</td><td>${esc(r.seed)}</td><td>${esc(r.mode)}</td><td class="muted">${w}</td></tr>`;}).join('')
+    ||'<tr><td colspan="4" class="muted">대기 중인 우선순위 항목 없음 (intake :7875로 sweep 제출 시 여기 표시)</td></tr>';
+}
+function tick(){if(cur==='overview')overview();else if(cur==='containers')containers();else if(cur==='trends')trends();else if(cur==='queue')loadQueue();}
 $('#dsearch').oninput=()=>{if(cur==='dataset')loadDataset()};
-tick();loadDataset();setInterval(()=>{if(cur==='overview'||cur==='containers'||cur==='trends')tick()},8000);
+tick();loadDataset();setInterval(()=>{if(cur==='overview'||cur==='containers'||cur==='trends'||cur==='queue')tick()},8000);
 </script></body></html>"""
 
 

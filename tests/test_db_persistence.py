@@ -64,6 +64,15 @@ def test_priority_enqueue_dedup_request_id(tmp_path: Path) -> None:
     assert {it.request_id for it in store.priority_lease(10)} == {"a", "b"}
 
 
+def test_priority_list_does_not_pop(tmp_path: Path) -> None:
+    store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
+    store.priority_enqueue(_items("a", "b"), now=5.0)
+    listed = store.priority_list()
+    assert [r["request_id"] for r in listed] == ["a", "b"]
+    assert "candidate_toml_text" not in listed[0]  # 무거운 toml 본문 제외
+    assert store.priority_depth() == 2  # 조회는 pop 안 함
+
+
 def test_priority_queue_survives_restart(tmp_path: Path) -> None:
     db = tmp_path / "r.duckdb"
     SingleSimulationResultStore(db_path=db).priority_enqueue(_items("x", "y"), now=1.0)
