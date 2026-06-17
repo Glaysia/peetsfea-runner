@@ -238,7 +238,13 @@ class SlurmJobLauncher:
         # graceful SIGTERM만 보낸다(자동 SIGKILL 없음): supervisor/워커가 TERM에 깨끗이 종료하고
         # slot_service trap이 /enroot 노드 로컬 스크래치를 청소한다. raw `scancel`(KILL 폴백)을 쓰면
         # SIGKILL이 trap보다 빨라 /enroot 잔재가 남을 수 있다(공용 공간). 강제 종료가 필요하면 safe_scancel.sh.
+        # 주의: `--signal=TERM`은 **RUNNING 잡 전용** — PENDING 잡엔 시그널 받을 step이 없어 no-op이라 안 꺼진다.
         self._ssh(f"scancel --full --signal=TERM {handle.slurm_id}")
+
+    def cancel(self, handle: JobHandle) -> None:
+        # PENDING 잡 취소용: plain `scancel`로 큐에서 즉시 제거(컨테이너 미기동 → /enroot 청소 불필요).
+        # 막힌 PENDING(Resources/ReqNodeNotAvail 등)은 kill(--signal=TERM)으론 안 빠지므로 이걸 쓴다.
+        self._ssh(f"scancel {handle.slurm_id}")
 
 
 __all__ = ["CommandResult", "CommandRunner", "SlurmJobLauncher", "SlurmLauncherError", "subprocess_runner"]

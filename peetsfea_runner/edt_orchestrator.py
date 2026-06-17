@@ -113,6 +113,11 @@ class JobOrchestrator:
         if callable(fn) and node:
             fn(node)
 
+    def _cancel_pending(self, handle: JobHandle) -> None:
+        # PENDING 취소는 plain scancel(launcher.cancel). kill(--signal=TERM)은 PENDING엔 no-op이라 좀비로 남는다.
+        fn = getattr(self.launcher, "cancel", None)
+        (fn if callable(fn) else self.launcher.kill)(handle)
+
     def _ramp_poll(self) -> None:
         """순차 램프 1회: 죽은/만료/막힌 PENDING 정리 후, 대기 잡이 없고 목표 미달이면 **한 개만** 제출."""
         with self._lock:
@@ -132,7 +137,7 @@ class JobOrchestrator:
                 handle = self._jobs[i]
                 if self.launcher.is_alive(handle) and not self._is_running(handle):
                     if _pending_is_stuck(self._pending_reason(handle)):
-                        self.launcher.kill(handle)
+                        self._cancel_pending(handle)  # plain scancel(PENDING은 TERM no-op)
                         self._avoid_node(handle)
                         del self._jobs[i]
                         self.cancellations += 1

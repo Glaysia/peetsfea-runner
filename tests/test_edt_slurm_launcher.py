@@ -122,6 +122,15 @@ def test_kill_calls_scancel() -> None:
     assert any("scancel --full --signal=TERM 99" in r for r in runner.remotes())
 
 
+def test_cancel_uses_plain_scancel_for_pending() -> None:
+    runner = FakeRunner()
+    launcher = _launcher(runner)
+    launcher.cancel(JobHandle(job_index=0, slurm_id="77", started_at=0.0))
+    # PENDING 취소는 plain `scancel 77`(큐에서 제거). --signal=TERM은 PENDING엔 no-op이라 쓰면 안 됨.
+    assert any(r == "scancel 77" for r in runner.remotes())
+    assert not any("--signal=TERM 77" in r for r in runner.remotes())
+
+
 # --- node_based 제출 (특정 노드 핀 + 빈 노드 발견 + 가중 파티션) ---------------------
 
 def _node_runner(sinfo_out: str, *, busy: str = "", sbatch_id: str = "500") -> FakeRunner:

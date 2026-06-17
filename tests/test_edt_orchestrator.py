@@ -93,6 +93,7 @@ class SeqFakeLauncher(JobLauncher):
         self.reason: dict[str, str] = {}
         self.submits = 0
         self.kills = 0
+        self.cancels = 0
         self.fail_submit = False
         self.avoided: list[str] = []
 
@@ -120,6 +121,10 @@ class SeqFakeLauncher(JobLauncher):
 
     def kill(self, handle: JobHandle) -> None:
         self.kills += 1
+        self.alive[handle.slurm_id] = False
+
+    def cancel(self, handle: JobHandle) -> None:  # plain scancel(PENDING 제거)
+        self.cancels += 1
         self.alive[handle.slurm_id] = False
 
     def mark_running(self) -> None:
@@ -178,7 +183,7 @@ def test_sequential_ramp_cancels_stuck_pending_and_moves_on() -> None:
     launcher.reason[stuck.slurm_id] = "Resources"  # 노드가 한동안 안 비는 막힌 PENDING
     orch.poll()  # 막힌 잡 취소 + 노드 회피 + 다른 노드로 재제출
     assert orch.cancellations == 1
-    assert launcher.kills == 1
+    assert launcher.cancels == 1 and launcher.kills == 0  # PENDING은 plain scancel(cancel), TERM(kill) 아님
     assert stuck.node in launcher.avoided          # 취소한 노드 회피 등록
     assert launcher.submits == 2                    # 다음 노드로 새로 제출
 
