@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from peetsfea_runner.edt_queue import QueueItem
 from peetsfea_runner.single_simulation_store import DbPriorityQueue, SingleSimulationResultStore
 
 
@@ -41,56 +40,67 @@ def test_resource_prune(tmp_path: Path) -> None:
 
 # --- 우선순위 큐 영속 ----------------------------------------------------------
 
-def _items(*ids: str) -> list[QueueItem]:
-    return [QueueItem(request_id=i, candidate_toml_text=f"# {i}", seed=1, mode="full") for i in ids]
+def _sweep(store: SingleSimulationResultStore, rid: str, count: int, *, seed: int = 0, now: float = 1.0) -> None:
+    store.priority_enqueue_sweep(request_id=rid, sweep_toml_text=f"# {rid}", seed=seed, count=count, mode="full", now=now)
 
 
-def test_priority_enqueue_lease_fifo_and_depth(tmp_path: Path) -> None:
+def test_priority_chunk_lease_decrements_remaining(tmp_path: Path) -> None:
     store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
-    store.priority_enqueue(_items("a", "b", "c"), now=1000.0)
-    assert store.priority_depth() == 3
-    leased = store.priority_lease(2)
-    assert [it.request_id for it in leased] == ["a", "b"]  # FIFO(created_at 순)
-    assert store.priority_depth() == 1
-    assert [it.request_id for it in store.priority_lease(10)] == ["c"]  # 남은 만큼만
-    assert store.priority_lease(5) == []  # 비면 빈 리스트
+    _sweep(store, "sweep-1", 50, seed=100, now=1.0)
+    assert store.priority_depth() == 50  # 대기 후보 = remaining 합
+    c1 = store.priority_lease_chunk(16)
+    assert c1["request_id"] == "sweep-1" and c1["count"] == 16 and c1["seed_base"] == 100  # offset 0
+    assert store.priority_depth() == 34
+    c2 = store.priority_lease_chunk(16)
+    assert c2["count"] == 16 and c2["seed_base"] == 116  # offset 16 → 다른 후보 seed대역
+    assert store.priority_depth() == 18
 
 
-def test_priority_enqueue_dedup_request_id(tmp_path: Path) -> None:
+def test_priority_chunk_fifo_across_sweeps_and_drain(tmp_path: Path) -> None:
     store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
-    store.priority_enqueue(_items("a"), now=1.0)
-    store.priority_enqueue(_items("a", "b"), now=2.0)  # a는 중복 → 무시
-    assert store.priority_depth() == 2
-    assert {it.request_id for it in store.priority_lease(10)} == {"a", "b"}
+    _sweep(store, "sweep-1", 2, now=1.0)
+    _sweep(store, "sweep-2", 3, now=2.0)
+    assert store.priority_lease_chunk(10)["request_id"] == "sweep-1"  # 오래된 것 먼저
+    assert store.priority_lease_chunk(10)["request_id"] == "sweep-2"  # sweep-1 소진 → 다음
+    assert store.priority_depth() == 0
+    assert store.priority_lease_chunk(10) is None  # 비면 None
 
 
-def test_priority_list_does_not_pop(tmp_path: Path) -> None:
+def test_priority_enqueue_sweep_dedup(tmp_path: Path) -> None:
     store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
-    store.priority_enqueue(_items("a", "b"), now=5.0)
+    _sweep(store, "sweep-1", 5, now=1.0)
+    _sweep(store, "sweep-1", 99, now=2.0)  # 같은 request_id → 무시
+    assert store.priority_depth() == 5
+
+
+def test_priority_list_shows_remaining_no_toml(tmp_path: Path) -> None:
+    store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
+    _sweep(store, "sweep-1", 10, now=5.0)
+    store.priority_lease_chunk(4)
     listed = store.priority_list()
-    assert [r["request_id"] for r in listed] == ["a", "b"]
-    assert "candidate_toml_text" not in listed[0]  # 무거운 toml 본문 제외
-    assert store.priority_depth() == 2  # 조회는 pop 안 함
+    assert listed[0]["request_id"] == "sweep-1" and listed[0]["total_count"] == 10 and listed[0]["remaining_count"] == 6
+    assert "sweep_toml_text" not in listed[0]  # 무거운 본문 제외
+    assert store.priority_depth() == 6  # 조회는 차감 안 함
 
 
-def test_priority_queue_survives_restart(tmp_path: Path) -> None:
+def test_priority_sweep_survives_restart(tmp_path: Path) -> None:
     db = tmp_path / "r.duckdb"
-    SingleSimulationResultStore(db_path=db).priority_enqueue(_items("x", "y"), now=1.0)
-    # 새 인스턴스(web 재시작) → 미처리 우선순위 항목 보존
-    store2 = SingleSimulationResultStore(db_path=db)
-    assert store2.priority_depth() == 2
-    assert [it.request_id for it in store2.priority_lease(2)] == ["x", "y"]
+    _sweep(SingleSimulationResultStore(db_path=db), "sweep-9", 7, now=1.0)
+    store2 = SingleSimulationResultStore(db_path=db)  # web 재시작
+    assert store2.priority_depth() == 7
+    assert store2.priority_lease_chunk(7)["count"] == 7
 
 
 # --- DbPriorityQueue 드롭인 어댑터(IntakeService/lease 서버용) ------------------
 
 def test_db_priority_queue_dropin(tmp_path: Path) -> None:
     store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
-    clock = iter([1.0, 2.0, 3.0, 4.0])
+    clock = iter([1.0, 2.0])
     q = DbPriorityQueue(store=store, clock=lambda: next(clock))
-    q.extend_priority(_items("a", "b"))   # IntakeService가 호출
-    q.put_priority(QueueItem(request_id="c", candidate_toml_text="# c"))
-    assert q.depths() == (3, 0)           # (priority, baseline) — baseline은 컨테이너 자기공급이라 0
-    leased = q.lease_priority(2)          # lease 서버가 호출
-    assert [it.request_id for it in leased] == ["a", "b"]
-    assert q.depths() == (1, 0)
+    q.enqueue_sweep(request_id="sweep-1", sweep_toml_text="# s1", seed=0, count=20)  # IntakeService가 호출
+    q.enqueue_sweep(request_id="sweep-2", sweep_toml_text="# s2", seed=0, count=5)
+    assert q.depth() == 25
+    chunk = q.lease_chunk(8)  # lease 서버가 호출
+    assert chunk["request_id"] == "sweep-1" and chunk["count"] == 8
+    assert q.depth() == 17
+    assert [r["request_id"] for r in q.list_requests()] == ["sweep-1", "sweep-2"]

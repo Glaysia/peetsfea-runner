@@ -231,16 +231,22 @@ def main() -> int:
 
         text = Path(priority_toml).expanduser().read_text(encoding="utf-8")
         service.queue.put_priority(QueueItem(request_id="prio-0", candidate_toml_text=text, mode="full"))
-    # EDT_PRIORITY_LEASE_URL: 컨트롤플레인(:7878, gate 정터널) 우선순위 큐에서 런타임에 당겨 로컬 레인 보충.
-    # 블렌드(85:15)는 service.queue.get()이 처리 — 우선순위 재고가 있으면 85% 우선, 없으면 100% baseline.
+    # EDT_PRIORITY_LEASE_URL: 컨트롤플레인(:7878, gate 정터널)에서 sweep chunk를 당겨 **컨테이너에서 샘플링**
+    # 후 로컬 레인 보충. 블렌드(85:15)는 service.queue.get()이 처리. 무거운 cadquery는 여기(컨테이너)서만 돈다.
     lease_url = os.environ.get("EDT_PRIORITY_LEASE_URL")
     if lease_url:
         from .edt_priority_lease import PriorityPuller
 
+        def _container_sampler(sweep_text: str, count: int, seed: int) -> list[str]:
+            from peetsfea.ssw_design_space import sample_fixed_candidates_from_toml_text
+
+            return list(sample_fixed_candidates_from_toml_text(sweep_text, count, seed))
+
         puller = PriorityPuller(
             queue=service.queue,
             lease_url=lease_url,
-            batch=int(os.environ.get("EDT_PRIORITY_LEASE_BATCH", "16")),
+            sampler=_container_sampler,
+            batch=int(os.environ.get("EDT_PRIORITY_LEASE_BATCH", "8")),
             low_watermark=int(os.environ.get("EDT_PRIORITY_LEASE_WATERMARK", "8")),
         )
         puller.start()

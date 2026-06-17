@@ -537,14 +537,16 @@ async function trends(){TS_WIN_MIN=+(($('#tswin')&&$('#tswin').value)||30);
   tsLines('tsLic',hp,[{key:'lic_mine',color:'#b392f0',label:'내 점유'},{key:'lic_inuse',color:'#58a6ff',label:'전체 사용'}],'ts');}
 $('#tswin')&&($('#tswin').onchange=trends);
 async function loadQueue(){const d=await f('/api/queue');
-  $('#qcount').textContent=d.depth+'건 대기';
-  $('#qcards').innerHTML=`<div class="card"><div class="k">대기 중 우선순위</div><div class="v">${d.depth}</div></div>`;
+  $('#qcount').textContent=d.depth+'개 후보 대기 ('+(d.items||[]).length+' sweep)';
+  $('#qcards').innerHTML=`<div class="card"><div class="k">대기 중 후보(남은 시뮬)</div><div class="v">${d.depth}</div></div>`+
+    `<div class="card"><div class="k">대기 sweep 요청</div><div class="v">${(d.items||[]).length}</div></div>`;
   const now=Date.now()/1000;
-  $('#qtable thead').innerHTML='<tr><th>request_id</th><th>seed</th><th>mode</th><th>대기</th></tr>';
+  $('#qtable thead').innerHTML='<tr><th>request_id (sweep)</th><th>분배 진행</th><th>남은</th><th>대기</th></tr>';
   $('#qtable tbody').innerHTML=(d.items||[]).map(r=>{const ago=Math.max(0,Math.round(now-(+r.created_at||0)));
     const w=ago<60?ago+'s':(ago<3600?Math.round(ago/60)+'m':Math.round(ago/3600)+'h');
-    return `<tr><td>${esc(r.request_id)}</td><td>${esc(r.seed)}</td><td>${esc(r.mode)}</td><td class="muted">${w}</td></tr>`;}).join('')
-    ||'<tr><td colspan="4" class="muted">대기 중인 우선순위 항목 없음 (intake :7875로 sweep 제출 시 여기 표시)</td></tr>';
+    const tot=+r.total_count||0, rem=+r.remaining_count||0, done=tot-rem;
+    return `<tr><td>${esc(r.request_id)}</td><td>${done}/${tot}</td><td>${rem}</td><td class="muted">${w}</td></tr>`;}).join('')
+    ||'<tr><td colspan="4" class="muted">대기 중 sweep 없음 (intake :7875로 sweep+count 제출 시 여기 표시)</td></tr>';
 }
 function tick(){if(cur==='overview')overview();else if(cur==='containers')containers();else if(cur==='trends')trends();else if(cur==='queue')loadQueue();}
 $('#dsearch').oninput=()=>{if(cur==='dataset')loadDataset()};

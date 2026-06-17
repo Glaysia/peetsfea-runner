@@ -9,8 +9,6 @@ from typing import Any, Iterator, Mapping
 
 import duckdb
 
-from .edt_queue import QueueItem
-
 
 # DuckDB는 한 프로세스에서 같은 파일을 동시에 두 번 connect하면 "Unique file handle conflict"로 죽는다.
 # web은 멀티스레드(ingest 쓰기 + 대시보드 읽기 + lease + 자원기록)라 파일별 lock으로 모든 접근을 직렬화한다.
@@ -111,14 +109,18 @@ class SingleSimulationResultStore:
                 )
                 """
             )
-            # 우선순위 큐(intake :7875가 채우고 lease :7878이 분배). 인메모리 deque였던 것을 영속화.
+            # 우선순위 큐(intake :7875 적재 / lease :7878 분배). **sweep 요청** 단위로 저장 —
+            # 무거운 cadquery 샘플링은 web이 아니라 컨테이너 워커가 lease 후 수행(baseline과 대칭).
+            # row 1개 = "이 sweep을 count개 시뮬", remaining_count를 chunk lease가 차감.
             connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS priority_queue (
+                CREATE TABLE IF NOT EXISTS priority_sweeps (
                     request_id VARCHAR PRIMARY KEY,
-                    candidate_toml_text VARCHAR,
+                    sweep_toml_text VARCHAR,
                     seed BIGINT,
                     mode VARCHAR,
+                    total_count BIGINT,
+                    remaining_count BIGINT,
                     created_at DOUBLE
                 )
                 """
@@ -370,66 +372,91 @@ class SingleSimulationResultStore:
             connection.execute("DELETE FROM resource_snapshots WHERE ts < ?", [float(before_ts)])
         return int(n[0]) if n else 0
 
-    # --- 우선순위 큐 영속 (intake :7875 적재 / lease :7878 분배) -----------------------------
+    # --- 우선순위 큐 영속 (intake :7875 sweep 적재 / lease :7878 chunk 분배) ------------------
 
-    def priority_enqueue(self, items: "list[QueueItem]", *, now: float) -> int:
-        """우선순위 항목 적재(intake). 같은 request_id는 무시. 적재 시도 건수 반환."""
+    def priority_enqueue_sweep(
+        self, *, request_id: str, sweep_toml_text: str, seed: int, count: int, mode: str, now: float
+    ) -> None:
+        """sweep 요청 1줄 적재(intake; 샘플링 없음). 같은 request_id는 무시."""
         self.initialize()
-        if not items:
-            return 0
         with self._locked_connect() as connection:
-            for idx, item in enumerate(items):
-                connection.execute(
-                    "INSERT OR IGNORE INTO priority_queue (request_id, candidate_toml_text, seed, mode, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    [item.request_id, item.candidate_toml_text, int(item.seed), item.mode, float(now) + idx * 1e-6],
-                )
-        return len(items)
+            connection.execute(
+                "INSERT OR IGNORE INTO priority_sweeps "
+                "(request_id, sweep_toml_text, seed, mode, total_count, remaining_count, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [request_id, sweep_toml_text, int(seed), mode, int(count), int(count), float(now)],
+            )
 
-    def priority_lease(self, n: int) -> "list[QueueItem]":
-        """오래된 순으로 최대 n건 pop(원자적: SELECT→DELETE 한 트랜잭션). lease 서버가 호출."""
+    def priority_lease_chunk(self, k: int) -> dict[str, Any] | None:
+        """가장 오래된 미완료 sweep에서 최대 k개 분배(원자적). 컨테이너 워커가 받아 k개 샘플링·솔브.
+
+        반환 `{request_id, sweep_toml_text, seed_base, mode, count}` 또는 None. `seed_base`는 이미 분배된
+        오프셋(total-remaining)을 더해 chunk마다 다른 후보가 나오게 한다. remaining=0이면 행 삭제.
+        """
         self.initialize()
-        if n <= 0:
-            return []
+        if k <= 0:
+            return None
         with self._locked_connect() as connection:
             connection.execute("BEGIN TRANSACTION")
             try:
-                rows = connection.execute(
-                    "SELECT request_id, candidate_toml_text, seed, mode FROM priority_queue ORDER BY created_at LIMIT ?",
-                    [int(n)],
-                ).fetchall()
-                if rows:
-                    ids = [r[0] for r in rows]
-                    placeholders = ", ".join("?" for _ in ids)
-                    connection.execute(f"DELETE FROM priority_queue WHERE request_id IN ({placeholders})", ids)
+                row = connection.execute(
+                    "SELECT request_id, sweep_toml_text, seed, mode, total_count, remaining_count "
+                    "FROM priority_sweeps WHERE remaining_count > 0 ORDER BY created_at LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    connection.execute("COMMIT")
+                    return None
+                rid, sweep, seed, mode, total, remaining = row
+                take = min(int(k), int(remaining))
+                offset = int(total) - int(remaining)  # 이미 분배된 수 = seed 오프셋
+                new_remaining = int(remaining) - take
+                if new_remaining <= 0:
+                    connection.execute("DELETE FROM priority_sweeps WHERE request_id = ?", [rid])
+                else:
+                    connection.execute(
+                        "UPDATE priority_sweeps SET remaining_count = ? WHERE request_id = ?", [new_remaining, rid]
+                    )
                 connection.execute("COMMIT")
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
-        return [QueueItem(request_id=r[0], candidate_toml_text=r[1], seed=int(r[2] or 0), mode=r[3] or "full") for r in rows]
+        return {
+            "request_id": rid,
+            "sweep_toml_text": sweep,
+            "seed_base": int(seed) + offset,
+            "mode": mode or "full",
+            "count": take,
+        }
 
     def priority_depth(self) -> int:
+        """대기 중 후보 총수(= 미완료 sweep들의 remaining_count 합)."""
         self.initialize()
         with self._locked_connect() as connection:
-            row = connection.execute("SELECT count(*) FROM priority_queue").fetchone()
+            row = connection.execute("SELECT COALESCE(sum(remaining_count), 0) FROM priority_sweeps").fetchone()
         return int(row[0]) if row else 0
 
     def priority_list(self, *, limit: int | None = 200) -> list[dict[str, Any]]:
-        """대기 중인 우선순위 항목 조회(pop 안 함; 무거운 toml 본문 제외). 대시보드 입력큐 탭용."""
+        """대기 중 sweep 요청 조회(pop 안 함; toml 본문 제외). 대시보드 입력큐 탭용."""
         self.initialize()
-        sql = "SELECT request_id, seed, mode, created_at FROM priority_queue ORDER BY created_at"
+        sql = (
+            "SELECT request_id, total_count, remaining_count, created_at FROM priority_sweeps "
+            "WHERE remaining_count > 0 ORDER BY created_at"
+        )
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         with self._locked_connect() as connection:
             rows = connection.execute(sql).fetchall()
-        return [{"request_id": r[0], "seed": int(r[1] or 0), "mode": r[2], "created_at": float(r[3] or 0.0)} for r in rows]
+        return [
+            {"request_id": r[0], "total_count": int(r[1] or 0), "remaining_count": int(r[2] or 0), "created_at": float(r[3] or 0.0)}
+            for r in rows
+        ]
 
 
 @dataclass
 class DbPriorityQueue:
-    """DB 영속 우선순위 큐 — `TwoLaneQueue`의 우선순위 메서드를 드롭인 대체(IntakeService/lease 서버용).
+    """DB 영속 우선순위 큐(sweep 요청 단위). IntakeService가 sweep을 적재, lease 서버가 chunk를 분배.
 
-    baseline은 컨테이너 자기공급이라 여기선 우선순위 레인만 다룬다. web 재시작에도 미처리 항목이 남는다.
+    무거운 샘플링은 web이 아니라 컨테이너 워커가 lease 후 수행. web 재시작에도 미처리 요청이 남는다.
     """
 
     store: SingleSimulationResultStore
@@ -441,18 +468,20 @@ class DbPriorityQueue:
 
         return (self.clock or time.time)()
 
-    def extend_priority(self, items: "list[QueueItem]") -> None:
-        self.store.priority_enqueue(list(items), now=self._now())
+    def enqueue_sweep(self, *, request_id: str, sweep_toml_text: str, seed: int, count: int, mode: str = "full") -> None:
+        self.store.priority_enqueue_sweep(
+            request_id=request_id, sweep_toml_text=sweep_toml_text, seed=seed, count=count, mode=mode, now=self._now()
+        )
 
-    def put_priority(self, item: "QueueItem") -> None:
-        self.store.priority_enqueue([item], now=self._now())
-
-    def lease_priority(self, n: int) -> "list[QueueItem]":
+    def lease_chunk(self, k: int) -> dict[str, Any] | None:
         with self._lock:  # 한 web 프로세스 내 동시 lease 직렬화(중복 분배 방지)
-            return self.store.priority_lease(n)
+            return self.store.priority_lease_chunk(k)
 
-    def depths(self) -> tuple[int, int]:
-        return (self.store.priority_depth(), 0)
+    def depth(self) -> int:
+        return self.store.priority_depth()
+
+    def list_requests(self, *, limit: int | None = 200) -> list[dict[str, Any]]:
+        return self.store.priority_list(limit=limit)
 
 
 __all__ = ["DbPriorityQueue", "SingleSimulationResultStore"]

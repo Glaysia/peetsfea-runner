@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from .edt_queue import BaselineSampler, QueueItem, TwoLaneQueue
+from .edt_queue import BaselineSampler, QueueItem
 
 # (sweep_text) -> None. 기준 범위를 벗어나면 예외.
 SweepValidator = Callable[[str], None]
@@ -69,11 +69,14 @@ def make_baseline_sampler(
 
 @dataclass
 class IntakeService:
-    """7875 인입 처리: 검증 → 샘플 → 우선순위 레인 적재."""
+    """7875 인입 처리: 가벼운 검증 → **sweep 요청 1줄 적재**(샘플링 없음).
 
-    queue: TwoLaneQueue
+    무거운 cadquery 샘플링은 web이 아니라 컨테이너 워커가 lease 후 수행(baseline과 대칭). `queue`는
+    `enqueue_sweep(request_id, sweep_toml_text, seed, count, mode)`를 가진 객체(예: DbPriorityQueue).
+    """
+
+    queue: Any  # enqueue_sweep(...)를 가진 큐(DbPriorityQueue)
     validator: SweepValidator = _peetsfea_validator
-    sampler: SweepSampler = _peetsfea_sampler
     _seq: int = field(default=0, init=False)
     _seq_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -93,22 +96,20 @@ class IntakeService:
         if isinstance(raw_seed, bool) or not isinstance(raw_seed, int):
             raise IntakeRequestError("seed must be an integer")
 
-        # 기준 범위 검증(넓으면 거절 → 400). peetsfea 검증 예외를 입력 오류로 변환.
+        # 기준 범위 검증(넓으면 거절 → 400). geometry 빌드 없음(샘플링은 컨테이너로 내림).
         try:
             self.validator(sweep_text)
         except IntakeRequestError:
             raise
         except Exception as exc:
             raise IntakeRequestError(f"sweep range validation failed: {exc}") from exc
-        # 통과 시 N개 샘플 → 우선순위 레인.
-        fixed = self.sampler(sweep_text, raw_count, raw_seed)
+        # sweep 요청 1줄만 적재 → 즉시 반환(샘플링은 워커가 chunk lease 후 수행).
         batch = self._next_seq()
-        items = [
-            QueueItem(request_id=f"intake-{batch}-{i}", candidate_toml_text=text, seed=raw_seed, mode="full")
-            for i, text in enumerate(fixed)
-        ]
-        self.queue.extend_priority(items)
-        return {"accepted": len(items), "batch": batch, "request_ids": [it.request_id for it in items]}
+        request_id = f"sweep-{batch}"
+        self.queue.enqueue_sweep(
+            request_id=request_id, sweep_toml_text=sweep_text, seed=raw_seed, count=raw_count, mode="full"
+        )
+        return {"accepted": raw_count, "request_id": request_id, "batch": batch}
 
 
 def start_intake_server(*, service: IntakeService, host: str = "127.0.0.1", port: int = 7875) -> ThreadingHTTPServer:
