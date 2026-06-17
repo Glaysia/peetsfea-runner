@@ -1,4 +1,4 @@
-"""결과 대시보드 + CSV export + 운영 텔레메트리 (Phase 5, MASTER_PLAN §2.7).
+"""결과 대시보드 + parquet export + 운영 텔레메트리 (Phase 5, MASTER_PLAN §2.7).
 
 `localhost:8080`에서 결과 DB(DuckDB)를 **읽기 전용**으로 시각화/조회한다. 시뮬에 영향 주는 입력은 받지 않는다.
 성공/데이터 중심으로 보여주고(실패는 on-demand), **컨테이너(잡)별 실시간 부하**는 `ResourcePoller` 스냅샷으로 띄운다.
@@ -10,30 +10,20 @@
 - `GET /api/sim/<request_id>` — 단건 상세(입력 + telemetry + 출력 리포트 곡선).
 - `GET /api/failures?limit=` — 실패 요약(error_type별) + 최근 실패(on-demand).
 - `GET /api/resources` — 컨테이너별 실시간 부하(노드 CPULoad/mem) + 라이선스 + 잡 상태.
-- `GET /results.csv` — 전체 입출력 데이터셋 CSV(무거운 `.aedt`만 제외). 쿼리: `?since=&terminal_state=&limit=`.
+- `GET /results.parquet` — 결과 데이터셋 parquet(zstd) 다운로드(DuckDB COPY 서버측 스트리밍). 쿼리: `?since=&state=&limit=`.
 - `GET /health` — 상태.
 """
 
 from __future__ import annotations
 
-import csv
 import datetime
-import io
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .single_simulation_store import SingleSimulationResultStore
-
-# CSV 스칼라 메타 컬럼 — 그 뒤에 입력(in_*)/telemetry(tel_*)/패스(pass_*)/출력 데이터셋 컬럼이 붙는다.
-_BASE_COLUMNS = (
-    "request_id", "terminal_state", "started_at", "finished_at", "account_id", "host_alias",
-    "partition", "node", "peetsfea_version", "mode", "seed", "design_id", "point_hash",
-    "dimension_count", "input_toml_hash", "error_stage", "error_type", "error_message",
-)
-_TRAILING_COLUMNS = ("reports_json", "csv_paths_json", "artifact_references_json")
 
 # 운영 리소스 스냅샷 제공자(없으면 빈 스냅샷). edt_resources.ResourcePoller.snapshot 와이어링.
 ResourceProvider = Callable[[], Mapping[str, Any]]
@@ -53,39 +43,6 @@ def _flatten_scalar(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-def rows_to_csv(rows: Sequence[Mapping[str, Any]]) -> str:
-    """결과 행들을 CSV로. **무거운 `.aedt`만 빼고 입출력 데이터셋 전부** 포함(한 행 = 한 시뮬)."""
-    in_keys = sorted({k for r in rows for k in _loads(r.get("point_values_json"))})
-    tel_keys = sorted({k for r in rows for k in _loads(r.get("solve_telemetry_json"))})
-    pass_keys = sorted({k for r in rows for k in _loads(r.get("setup_pass_counts_json"))})
-    fieldnames = [
-        *_BASE_COLUMNS,
-        *(f"in_{k}" for k in in_keys),
-        *(f"tel_{k}" for k in tel_keys),
-        *(f"pass_{k}" for k in pass_keys),
-        *_TRAILING_COLUMNS,
-    ]
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
-    writer.writeheader()
-    for r in rows:
-        point_values = _loads(r.get("point_values_json"))
-        telemetry = _loads(r.get("solve_telemetry_json"))
-        pass_counts = _loads(r.get("setup_pass_counts_json"))
-        row: dict[str, Any] = {col: r.get(col) for col in _BASE_COLUMNS}
-        for k in in_keys:
-            row[f"in_{k}"] = _flatten_scalar(point_values.get(k))
-        for k in tel_keys:
-            row[f"tel_{k}"] = _flatten_scalar(telemetry.get(k))
-        for k in pass_keys:
-            row[f"pass_{k}"] = _flatten_scalar(pass_counts.get(k))
-        row["reports_json"] = r.get("csv_text_by_report_json") or ""
-        row["csv_paths_json"] = r.get("csv_paths_json") or ""
-        row["artifact_references_json"] = r.get("artifact_references_json") or ""
-        writer.writerow(row)
-    return buffer.getvalue()
 
 
 # --- API payload 빌더 (read-only) --------------------------------------------
@@ -274,16 +231,47 @@ def start_dashboard_server(
             elif path.startswith("/api/sim/"):
                 detail = build_sim_detail(store, path[len("/api/sim/"):], peetsfea_version=version_filter)
                 self._json(200 if detail else 404, detail or {"error": "not_found"})
-            elif path == "/results.csv":
-                self._csv(rows_to_csv(_query_rows(query)))
+            elif path == "/results.parquet":
+                # 결과 데이터셋 다운로드 — DuckDB COPY로 parquet(zstd) 직접 내보내 스트리밍(web 메모리에 전 행 적재 안 함).
+                self._export_parquet(query)
             else:
                 self._json(404, {"error": "not_found"})
 
         def _json(self, status: int, payload: Mapping[str, Any]) -> None:
             self._send(status, "application/json", json.dumps(payload, default=str).encode("utf-8"))
 
-        def _csv(self, text: str) -> None:
-            self._send(200, "text/csv", text.encode("utf-8"))
+        def _export_parquet(self, query: dict[str, list[str]]) -> None:
+            import os
+            import tempfile
+
+            since = query.get("since", [None])[0]
+            state = query.get("state", query.get("terminal_state", [None]))[0]
+            limit_raw = query.get("limit", [None])[0]
+            limit = int(limit_raw) if limit_raw and limit_raw.isdigit() else None
+            fd, tmp = tempfile.mkstemp(suffix=".parquet")
+            os.close(fd)
+            try:
+                store.export_parquet(tmp, since=since, terminal_state=state, peetsfea_version=version_filter, limit=limit)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(os.path.getsize(tmp)))
+                self.send_header("Content-Disposition", 'attachment; filename="results.parquet"')
+                self.end_headers()
+                with open(tmp, "rb") as fh:  # 64KB chunk 스트리밍 — 메모리 일정
+                    for chunk in iter(lambda: fh.read(65536), b""):
+                        self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as exc:  # noqa: BLE001 — 내보내기 실패는 500으로.
+                try:
+                    self._json(500, {"error": "export_failed", "message": str(exc)})
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
         def _send(self, status: int, content_type: str, body: bytes) -> None:
             try:
@@ -293,7 +281,7 @@ def start_dashboard_server(
                 self.end_headers()
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
-                # 클라이언트가 응답 도중(특히 큰 results.csv) 끊으면 정상 상황 — 트레이스백 스팸을 막는다.
+                # 클라이언트가 응답 도중 끊으면 정상 상황 — 트레이스백 스팸을 막는다.
                 pass
 
     return ThreadingHTTPServer((host, port), Handler)
@@ -379,7 +367,7 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
     <select id="dstate"><option value="success">success</option><option value="">전체</option><option value="aborted">aborted</option></select>
     <input id="dsearch" placeholder="검색(노드/설계id/입력값)"/>
     <button onclick="loadDataset()">새로고침</button>
-    <a href="/results.csv">전체 CSV 다운로드 ↓</a>
+    <a href="/results.parquet" download>Parquet 다운로드 ↓</a>
     <span class="muted" id="dcount"></span>
   </div>
   <div style="overflow:auto;max-height:70vh"><table id="dtable"><thead></thead><tbody></tbody></table></div>
@@ -565,5 +553,5 @@ tick();loadDataset();setInterval(()=>{if(cur==='overview'||cur==='containers'||c
 
 
 __all__ = [
-    "build_failures", "build_sim_detail", "build_summary", "rows_to_csv", "start_dashboard_server",
+    "build_failures", "build_sim_detail", "build_summary", "start_dashboard_server",
 ]

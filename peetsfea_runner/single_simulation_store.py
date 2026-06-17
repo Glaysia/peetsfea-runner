@@ -300,6 +300,41 @@ class SingleSimulationResultStore:
             for r in rows
         ]
 
+    def export_parquet(
+        self,
+        dest: Path,
+        *,
+        since: str | None = None,
+        terminal_state: str | None = None,
+        peetsfea_version: str | None = None,
+        limit: int | None = None,
+    ) -> None:
+        """결과를 **DuckDB COPY로 parquet(zstd) 직접 내보내기**(서버측; web 메모리에 전 행 적재 안 함).
+
+        무거운 중복 컬럼(envelope_json·result_json)은 제외. JSON 컬럼(point_values_json 등)은 그대로 둔다.
+        """
+        self.initialize()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if since:
+            clauses.append("started_at >= ?")
+            params.append(since)
+        if terminal_state:
+            clauses.append("terminal_state = ?")
+            params.append(terminal_state)
+        if peetsfea_version:
+            clauses.append("peetsfea_version = ?")
+            params.append(peetsfea_version)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        limit_sql = f" LIMIT {int(limit)}" if limit is not None else ""
+        dest_sql = str(dest).replace("'", "''")  # 경로는 서버 임시파일(사용자 입력 아님); 따옴표만 방어 이스케이프
+        sql = (
+            "COPY (SELECT * EXCLUDE (envelope_json, result_json) FROM single_simulation_results"
+            f"{where} ORDER BY finished_at{limit_sql}) TO '{dest_sql}' (FORMAT PARQUET, COMPRESSION 'zstd')"
+        )
+        with self._locked_connect() as connection:
+            connection.execute(sql, params)
+
     # --- 라이선스/자원 시계열 영속 (대시보드 추세 탭; web 재시작·12h 넘어 보존) ----------------
 
     _RESOURCE_COLS = ("ts", "running", "pending", "lic_mine", "lic_inuse", "load", "cpus", "mem_used_mb", "mem_total_mb")

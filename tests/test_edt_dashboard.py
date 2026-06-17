@@ -5,11 +5,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import duckdb
+
 from peetsfea_runner.edt_dashboard import (
     build_failures,
     build_sim_detail,
     build_summary,
-    rows_to_csv,
     start_dashboard_server,
 )
 from peetsfea_runner.single_simulation_store import SingleSimulationResultStore
@@ -37,35 +38,46 @@ def _seed(store: SingleSimulationResultStore, rid: str, k_in: float, passes: int
     )
 
 
-def test_fetch_rows_and_csv_flattens_inputs(tmp_path: Path) -> None:
+def test_export_parquet_filters_and_excludes(tmp_path: Path) -> None:
     store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
     store.initialize()
     _seed(store, "r0", 1.5, 12)
     _seed(store, "r1", 2.5, 20)
 
-    rows = store.fetch_rows()
-    assert len(rows) == 2
-    csv_text = rows_to_csv(rows)
-    header = csv_text.splitlines()[0]
-    assert "request_id" in header and "in_coil_w" in header and "in_ferrite" in header and "pass_Setup1" in header
-    # 값이 행에 들어갔는지
-    assert "1.5" in csv_text and "2.5" in csv_text and "r0" in csv_text
+    out = tmp_path / "export.parquet"
+    store.export_parquet(out, peetsfea_version="0.3.4")
+    con = duckdb.connect()
+    cols = [c[0] for c in con.execute(f"DESCRIBE SELECT * FROM '{out}'").fetchall()]
+    assert con.execute(f"SELECT count(*) FROM '{out}'").fetchone()[0] == 2
+    # 무거운 중복 컬럼 제외, 데이터 JSON 컬럼은 포함(손실 없이; 입력·telemetry·리포트).
+    assert "envelope_json" not in cols and "result_json" not in cols
+    for c in ("request_id", "peetsfea_version", "point_values_json", "solve_telemetry_json", "csv_text_by_report_json"):
+        assert c in cols
+    pv = con.execute(f"SELECT point_values_json FROM '{out}' ORDER BY request_id").fetchall()
+    assert "coil_w" in pv[0][0] and "1.5" in pv[0][0]  # 입력값 보존
+    # state 필터
+    store.record_envelope({"request_id": "bad", "terminal_state": "failed", "peetsfea_version": "0.3.4", "result": {}})
+    out2 = tmp_path / "succ.parquet"
+    store.export_parquet(out2, peetsfea_version="0.3.4", terminal_state="success")
+    assert con.execute(f"SELECT count(*) FROM '{out2}'").fetchone()[0] == 2  # success만
 
 
-def test_csv_includes_full_output_dataset(tmp_path: Path) -> None:
-    # 요구사항: 무거운 .aedt만 빼고 입출력 데이터셋 전부 포함(telemetry + 리포트 출력 데이터).
+def test_results_parquet_endpoint_streams(tmp_path: Path) -> None:
     store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
     store.initialize()
     _seed(store, "r0", 1.5, 12)
 
-    csv_text = rows_to_csv(store.fetch_rows())
-    header = csv_text.splitlines()[0]
-    # 출력 telemetry 컬럼(gpu/solver_cores/시간) — 자동 GPU 벤치마크의 원천.
-    assert "tel_gpu_used" in header and "tel_solver_cores" in header and "tel_solve_seconds" in header
-    # 출력 리포트 데이터셋(csv_text_by_report)이 손실 없이 임베드.
-    assert "reports_json" in header
-    assert "S11" in csv_text and "-12.3" in csv_text  # 실제 리포트 출력값이 CSV에 있음
-    assert "4" in csv_text and "812.5" in csv_text  # solver_cores, solve_seconds
+    server = start_dashboard_server(store=store, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        data = urllib.request.urlopen(f"http://127.0.0.1:{port}/results.parquet").read()
+    finally:
+        server.shutdown()
+    assert data[:4] == b"PAR1" and data[-4:] == b"PAR1"  # parquet 매직
+    dl = tmp_path / "dl.parquet"
+    dl.write_bytes(data)
+    assert duckdb.connect().execute(f"SELECT count(*) FROM '{dl}'").fetchone()[0] == 1
 
 
 def test_fetch_rows_filter_terminal_state(tmp_path: Path) -> None:
@@ -78,7 +90,7 @@ def test_fetch_rows_filter_terminal_state(tmp_path: Path) -> None:
     assert len(store.fetch_rows(limit=1)) == 1
 
 
-def test_dashboard_server_serves_csv_and_health(tmp_path: Path) -> None:
+def test_dashboard_server_serves_parquet_and_health(tmp_path: Path) -> None:
     store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
     store.initialize()
     _seed(store, "r0", 3.0, 15)
@@ -91,12 +103,11 @@ def test_dashboard_server_serves_csv_and_health(tmp_path: Path) -> None:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as resp:
             assert resp.status == 200
             assert b'"count"' in resp.read()
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/results.csv", timeout=5) as resp:
-            body = resp.read().decode("utf-8")
-            assert resp.headers["Content-Type"] == "text/csv"
-            assert "in_coil_w" in body and "r0" in body
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/results.parquet", timeout=5) as resp:
+            assert resp.headers["Content-Type"] == "application/octet-stream"
+            assert resp.read()[:4] == b"PAR1"  # parquet 매직
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as resp:
-            assert b"results.csv" in resp.read()
+            assert b"results.parquet" in resp.read()
     finally:
         server.shutdown()
         thread.join(timeout=5)
