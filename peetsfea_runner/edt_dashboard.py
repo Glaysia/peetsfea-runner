@@ -259,6 +259,7 @@ def start_dashboard_server(
             fd, tmp = tempfile.mkstemp(suffix=".parquet")
             os.close(fd)
             try:
+                # pyarrow 인프로세스 export(DuckDB 은퇴) — dest 파일 하나만 열고 닫아 fd 누수 없음.
                 store.export_parquet(tmp, since=since, terminal_state=state, peetsfea_version=version_filter, limit=limit)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")

@@ -369,10 +369,11 @@ class PostgresResultStore:
         peetsfea_version: str | None = None,
         limit: int | None = None,
     ) -> None:
-        """Postgres에는 native parquet이 없어 DuckDB의 postgres 확장으로 ATTACH 후 COPY로 내보낸다.
+        """PG에서 결과를 읽어 **pyarrow**로 parquet(zstd) 작성. DuckDB 완전 은퇴 — 운영 경로에서 DuckDB 미사용.
 
-        DuckDB store와 동일하게 envelope_json/result_json 제외, finished_at 정렬. 확장 설치 실패(오프라인 등)
-        시에는 예외를 잡아 로그만 남기고 조용히 반환한다(우회 불가시 graceful fallback).
+        거대 컬럼(envelope_json/result_json)은 제외, finished_at 정렬. pyarrow는 dest 파일 하나만 열고 닫으므로
+        과거 DuckDB COPY의 temp-block spill fd 누수('Too many open files' → /results.parquet 500)가 구조적으로 소멸한다.
+        pyarrow 부재 시 로그만 남기고 조용히 반환(graceful fallback).
         """
         self.initialize()
         clauses: list[str] = []
@@ -388,35 +389,31 @@ class PostgresResultStore:
             params.append(peetsfea_version)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         limit_sql = f" LIMIT {int(limit)}" if limit is not None else ""
-        dest_sql = str(dest).replace("'", "''")
-        attach_dsn = self.dsn.replace("'", "''")
-        # 파라미터 바인딩을 DuckDB COPY에 그대로 쓰기 위해 리터럴로 안전 이스케이프(작은따옴표 방어).
-        lit_clauses: list[str] = []
-        if since:
-            lit_clauses.append("started_at >= '" + str(since).replace("'", "''") + "'")
-        if terminal_state:
-            lit_clauses.append("terminal_state = '" + str(terminal_state).replace("'", "''") + "'")
-        if peetsfea_version:
-            lit_clauses.append("peetsfea_version = '" + str(peetsfea_version).replace("'", "''") + "'")
-        lit_where = (" WHERE " + " AND ".join(lit_clauses)) if lit_clauses else ""
         try:
-            import duckdb
-
-            con = duckdb.connect()
-            try:
-                con.execute("INSTALL postgres; LOAD postgres;")
-                con.execute(f"ATTACH '{attach_dsn}' AS pg (TYPE postgres, READ_ONLY)")
-                con.execute(
-                    "COPY (SELECT * EXCLUDE (envelope_json, result_json) FROM pg.single_simulation_results"
-                    f"{lit_where} ORDER BY finished_at{limit_sql}) TO '{dest_sql}' "
-                    "(FORMAT PARQUET, COMPRESSION 'zstd')"
-                )
-            finally:
-                con.close()
-        except Exception as exc:  # noqa: BLE001 — 오프라인 등으로 postgres 확장 불가시 graceful fallback.
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except Exception as exc:  # noqa: BLE001 — pyarrow 부재 시 graceful fallback.
             import logging
 
-            logging.getLogger(__name__).warning("export_parquet via duckdb postgres failed: %s", exc)
+            logging.getLogger(__name__).warning("export_parquet unavailable (pyarrow missing): %s", exc)
+            return
+        with self._locked_connect() as connection:
+            cols = [
+                r[0]
+                for r in connection.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'single_simulation_results' "
+                    "AND column_name NOT IN ('envelope_json', 'result_json') "
+                    "ORDER BY ordinal_position"
+                ).fetchall()
+            ]
+            col_sql = ", ".join('"' + c + '"' for c in cols)
+            rows = connection.execute(
+                f"SELECT {col_sql} FROM single_simulation_results{where} ORDER BY finished_at{limit_sql}",
+                params,
+            ).fetchall()
+        columns: dict[str, list[Any]] = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
+        pq.write_table(pa.table(columns) if columns else pa.table({}), str(dest), compression="zstd")
 
     # --- 라이선스/자원 시계열 영속 --------------------------------------------------------------
 
