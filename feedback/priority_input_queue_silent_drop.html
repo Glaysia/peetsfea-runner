@@ -2,13 +2,13 @@
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<title>[버그] 우선순위 입력큐 제출이 조용히 드롭됨 (intake는 accepted 반환)</title>
+<title>[버그] 우선순위 입력큐: 제출이 accepted인데 워커가 영영 처리 안 함</title>
 <style>
   :root{--bg:#0f1117;--pan:#171a23;--ln:#2a2f3d;--fg:#e6e9ef;--mut:#9aa3b2;--acc:#5eb1ff;--ok:#7ee787;--warn:#ffb454;--bad:#ff7b72;--pill:#242a38;--mono:ui-monospace,"JetBrains Mono",Consolas,monospace}
   *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,"Pretendard","Apple SD Gothic Neo",Segoe UI,sans-serif;line-height:1.65;font-size:15px}
-  .wrap{max-width:1020px;margin:0 auto;padding:34px 24px 90px}
-  h1{font-size:24px;margin:0 0 4px;color:#fff} h1 small{display:block;font-size:13px;color:var(--mut);font-weight:400;margin-top:8px}
-  h2{font-size:18px;margin:34px 0 10px;border-top:1px solid var(--ln);padding-top:20px} h2 .n{color:var(--acc);margin-right:8px}
+  .wrap{max-width:1040px;margin:0 auto;padding:34px 24px 90px}
+  h1{font-size:23px;margin:0 0 4px;color:#fff} h1 small{display:block;font-size:13px;color:var(--mut);font-weight:400;margin-top:8px}
+  h2{font-size:18px;margin:32px 0 10px;border-top:1px solid var(--ln);padding-top:18px} h2 .n{color:var(--acc);margin-right:8px}
   h3{font-size:14.5px;margin:16px 0 6px;color:#cdd4e0}
   code{font-family:var(--mono);background:var(--pill);padding:1px 6px;border-radius:5px;font-size:.85em;color:#d7e3f4}
   pre{background:#0b0d13;border:1px solid var(--ln);border-radius:9px;padding:12px 15px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.5;color:#cdd9ec}
@@ -21,104 +21,88 @@
   .note{border-left:3px solid var(--warn);background:#1c1a14;padding:11px 15px;border-radius:0 8px 8px 0;margin:12px 0;color:#e7d9bd}
   .pill{display:inline-block;background:var(--pill);border:1px solid var(--ln);border-radius:999px;padding:2px 10px;font-size:12px;color:var(--mut);margin:2px 4px 2px 0}
   .sev{background:#3a1414;color:#ff9c94;border:1px solid #5a2a2a;font-weight:700}
+  .sevb{background:#3a2c14;color:#ffce8a;border:1px solid #5a472a;font-weight:700}
   b.file{font-family:var(--mono);color:var(--acc);font-weight:600}
+  .key{background:#10243a;border:1px solid #244;border-radius:8px;padding:12px 15px;margin:12px 0;color:#cfe3f7}
 </style>
 </head>
 <body>
 <div class="wrap">
-<h1>[버그] 우선순위 입력큐 제출이 조용히 드롭됨
-  <small>intake(:7875)는 <code>accepted</code>를 돌려주지만, 제출한 sweep이 실제로는 <code>priority_sweeps</code>에 안 들어가 워커가 영원히 처리하지 않음. 클라이언트는 성공으로 오인.</small>
+<h1>[버그] 우선순위 입력큐: 제출은 <code>accepted</code>인데 워커가 영영 처리하지 않음
+  <small>클라이언트(어댑티브 샘플러)에서 실측·코드추적한 진단. 문제는 <b>둘</b>: ① 지금 막고 있는 활성 장애(enqueue 쓰기가 store에 안 남음) ② request_id 설계 버그(재시작 시 유실).</small>
 </h1>
 <div>
-  <span class="pill sev">심각도: 높음 (silent data loss)</span>
-  <span class="pill">edt_intake.py</span><span class="pill">single_simulation_store.py</span><span class="pill">postgres_store.py</span>
+  <span class="pill sev">① 활성 장애: 우선순위 제출 전량 유실</span>
+  <span class="pill sevb">② 설계: request_id 비유일 + silent drop</span>
 </div>
 
-<h2><span class="n">1</span>증상 (실측)</h2>
-<p>우선순위 클라이언트(어댑티브 샘플러)가 서브셋 toml 5건을 <code>count=20</code>으로 제출. intake 응답은 전부 정상:</p>
-<pre>POST :7875/submit ×5
-<span class="g">→ {"accepted": 20, "request_id": "sweep-1", "batch": 1}</span>
-<span class="g">→ {"accepted": 20, "request_id": "sweep-2", "batch": 2}</span> ... sweep-5</pre>
-<p>그러나 곧바로 대시보드/큐를 보면 <b>제출분이 어디에도 없음</b>:</p>
+<h2><span class="n">0</span>증상 (실측)</h2>
+<p>서브셋 toml을 <code>POST :7875/submit {sweep_toml_text, count, seed}</code>로 제출. 응답은 항상 정상:</p>
+<pre><span class="g">→ {"accepted": 5, "request_id": "sweep-7", "batch": 7}</span>   <span class="c"># 충돌 없는 새 id</span></pre>
+<p>그러나 제출 직후:</p>
 <table>
 <tr><th>확인</th><th>결과</th></tr>
-<tr><td><code>GET :7875/health</code></td><td><code>priority_depth = 0</code></td></tr>
-<tr><td><code>GET :8080/api/queue</code></td><td><code>{"depth":0,"items":[]}</code></td></tr>
-<tr><td>최근 결과 <code>/api/results</code></td><td>전부 <code>base-*</code> (baseline). <b><code>sweep-*</code> 0건</b></td></tr>
-<tr><td>워커 9개 (SLURM RUNNING)</td><td>전부 baseline만 처리, 우선순위 sweep 미처리</td></tr>
+<tr><td><code>:7875/health</code> 의 <code>priority_depth</code></td><td><b>0</b> (제출 전·후 동일)</td></tr>
+<tr><td><code>:8080/api/queue</code></td><td><code>{"depth":0,"items":[]}</code></td></tr>
+<tr><td><code>/api/results</code> 최근</td><td>전부 <code>base-*</code> (baseline). <b><code>sweep-*</code> 0건</b></td></tr>
+<tr><td>워커 9개(SLURM RUNNING)</td><td>baseline만 처리, 우선순위 sweep 미처리</td></tr>
 </table>
-<div class="bad"><b>즉</b>: intake가 <code>accepted</code>로 응답한 100건이 실제 큐(<code>priority_sweeps</code>)에 들어가지 않아 영구 유실. HTTP 200이라 클라이언트는 알 길이 없음.</div>
 
-<h2><span class="n">2</span>근본 원인 (코드 3개 조합)</h2>
+<h2><span class="n">1</span>활성 장애 — enqueue 쓰기가 store에 안 남음 <span class="pill sev">지금 이걸 먼저</span></h2>
+<p>control_plane 구조상 <b>한 web 프로세스가 store 1개를 공유</b>합니다:</p>
+<pre><span class="c"># edt_control_plane.py</span>
+store  = make_result_store(config.db_path)                 <span class="c"># L270</span>
+intake = IntakeService(queue=<span class="f">DbPriorityQueue(store=store)</span>)  <span class="c"># L304</span>
+start_priority_lease_server(queue=<span class="f">self.intake.queue</span>, ...)    <span class="c"># L211 (같은 큐)</span>
+start_dashboard(store=<span class="f">self.store</span>, ...)                       <span class="c"># L202 (같은 store)</span></pre>
+<pre><span class="c"># edt_intake.py — /health 도 submit과 같은 큐를 읽음</span>
+<span class="d">/health</span> → {"priority_depth": <span class="f">service.queue.depth()</span>}      <span class="c"># L141 → store.priority_depth()</span>
+submit  → <span class="f">service.queue.enqueue_sweep(...)</span>             <span class="c"># L126 → store.priority_enqueue_sweep()</span></pre>
+<div class="bad"><b>모순</b>: submit과 /health가 <b>같은 store 객체</b>를 쓰고 읽습니다. <code>sweep-7</code>이 INSERT되고 커밋됐다면 <code>priority_depth</code>(= <code>SELECT sum(remaining_count) FROM priority_sweeps</code>)가 반드시 증가해야 하는데 <b>0 그대로</b> → <b>enqueue의 INSERT가 그 store에 실제로 남지 않았다</b>는 뜻.</div>
 
-<h3>① request_id가 인메모리 카운터라 재시작마다 <code>sweep-1</code>로 리셋</h3>
-<p><b class="file">peetsfea_runner/edt_intake.py</b></p>
-<pre>_seq: int = field(default=<span class="d">0</span>, init=False)        <span class="c"># L97 — 프로세스 메모리에만 존재</span>
-def _next_seq(self) -&gt; int:                       <span class="c"># L100</span>
-    with self._seq_lock:
-        self._seq += 1
-        return self._seq
+<h3>유력 원인 (호스트에서 확인 필요)</h3>
+<ol>
+  <li><b>(최우선) 돌고 있는 :7875 데몬이 이 코드가 아님</b> — 패치가 실제 배포/재시작 안 됨. 응답이 <code>accepted</code>·<code>batch</code> 증가하는 건 옛 코드여도 동일할 수 있음. <b>먼저 배포 버전·재시작 여부 확인.</b></li>
+  <li><b>backend 쓰기/가시성 불일치</b> — <code>EDT_STORE_BACKEND</code>가 의도와 다르거나(duckdb↔postgres), DuckDB의 별도 연결이 미커밋 쓰기를 못 보거나, <code>priority_sweeps</code>가 read와 다른 DB/DSN에 생성됨. (Postgres는 <code>autocommit=True</code>라 정상이어야 함 → 1번이 더 의심.)</li>
+  <li><code>initialize()</code>가 <code>priority_sweeps</code>를 엉뚱한 DB에 만들거나, enqueue 경로가 baseline 리필 store와 분리됨.</li>
+</ol>
+<div class="key"><b>호스트에서 1초 판별</b>: 제출 1건 직후 <b>활성 DB</b>에 직접 —
+<pre>SELECT count(*), COALESCE(sum(remaining_count),0) FROM priority_sweeps;</pre>
+<b>0이면</b> enqueue 쓰기가 안 들어가는 것(배포/백엔드 문제) → 여기부터 고쳐야 함. 0이 아니면 lease/분배 쪽 문제.</div>
 
-batch = self._next_seq()                          <span class="c"># L124</span>
-request_id = f<span class="g">"sweep-{batch}"</span>                   <span class="c"># L125 — 영속 X</span></pre>
-<p><code>_seq</code>는 데몬 메모리에만 있어 <b>intake 재시작/재배포 때마다 0으로 리셋</b> → 발급되는 request_id가 <code>sweep-1, sweep-2, …</code>로 <b>이전 세션과 반복</b>됨. (패치/재시작이 잦은 환경에서 항상 충돌 후보.)</p>
+<h2><span class="n">2</span>설계 버그 — request_id <span class="pill sevb">①을 고쳐도 재발</span></h2>
+<h3>② request_id가 인메모리 순번 → 재시작 시 <code>sweep-1</code>부터 반복</h3>
+<pre><span class="c"># edt_intake.py</span>
+_seq: int = field(default=<span class="d">0</span>, init=False)    <span class="c"># L97 프로세스 메모리에만 존재 → 재시작 시 0</span>
+request_id = f<span class="g">"sweep-{self._next_seq()}"</span>   <span class="c"># L125 sweep-1, sweep-2, … 반복</span></pre>
+<h3>③ 중복이면 조용히 버림 + 그래도 accepted</h3>
+<pre><span class="c"># 두 backend 모두 중복 request_id(PK) → silent drop</span>
+single_simulation_store.py:423   <span class="f">INSERT OR IGNORE</span> INTO priority_sweeps ...
+postgres_store.py:436            INSERT ... <span class="f">ON CONFLICT (request_id) DO NOTHING</span>
 
-<h3>② 같은 request_id는 조용히 무시 (PK 충돌 → DO NOTHING)</h3>
-<p><code>priority_sweeps.request_id</code> 는 PRIMARY KEY이고, 두 백엔드 모두 충돌 시 <b>그냥 버림</b>:</p>
-<pre><span class="c"># single_simulation_store.py L416~423 (DuckDB)</span>
-<span class="f">INSERT OR IGNORE</span> INTO priority_sweeps (...) VALUES (...)
-
-<span class="c"># postgres_store.py L428~436 (Postgres)</span>
-INSERT INTO priority_sweeps (...) VALUES (...) <span class="f">ON CONFLICT (request_id) DO NOTHING</span></pre>
-<p>주석도 <code>"같은 request_id는 무시"</code>. 재시작 후 재사용된 <code>sweep-N</code>이, 아직 lease/삭제되지 않고 남아있는 같은 id 행과 충돌하면 <b>신규 제출이 통째로 드롭</b>. (lease 완료 시 행을 <code>DELETE</code>하지만, 미완료/대기 중이면 잔존.)</p>
-
-<h3>③ intake가 삽입 성공 여부와 무관하게 <code>accepted</code> 반환 (거짓 성공)</h3>
-<pre><span class="c"># edt_intake.py L126~129</span>
-self.queue.enqueue_sweep(request_id=request_id, ...)   <span class="c"># 반환값 없음(None) — 삽입 여부 모름</span>
-return {<span class="g">"accepted"</span>: raw_count, <span class="g">"request_id"</span>: request_id, <span class="g">"batch"</span>: batch}</pre>
-<p><code>enqueue_sweep</code>/<code>priority_enqueue_sweep</code>는 <code>-&gt; None</code>이라 실제 INSERT가 무시됐는지 알 수 없고, <code>submit()</code>은 무조건 <code>accepted</code>를 돌려줌 → <b>유실을 성공으로 보고</b>.</p>
-
-<div class="bad"><b>연쇄</b>: ①재사용 id + ②충돌 시 silent drop + ③무조건 accepted = <b>재시작 후 우선순위 제출이 조용히 사라지는데 클라이언트는 성공으로 오인</b>. 어댑티브 샘플링이 통째로 무효가 됨.</div>
+<span class="c"># edt_intake.py L126-129 — 삽입 여부 모른 채 무조건 성공 보고</span>
+self.queue.enqueue_sweep(...)         <span class="c"># -> None (삽입행수 안 돌려줌)</span>
+return {<span class="g">"accepted"</span>: raw_count, ...}     <span class="c"># 거짓 성공 가능</span></pre>
+<div class="bad">→ intake 재시작 후 재사용된 <code>sweep-N</code>이 잔존 행과 충돌하면 제출이 통째로 드롭되는데 <b>HTTP 200 accepted</b>. (①과 별개로 반드시 존재하는 위험.)</div>
 
 <h2><span class="n">3</span>권장 수정</h2>
-<div class="ok"><b>핵심:</b> request_id를 <b>전역 유일·영속</b>으로 만들고, 삽입 결과를 <b>호출자에게 정직하게</b> 돌려줄 것.</div>
-
-<h3>A. request_id를 유일하게 (인메모리 시퀀스 폐기)</h3>
+<div class="ok"><b>①(활성):</b> 위 1초 판별로 "쓰기가 안 남는" 지점부터 — 배포 버전/재시작, <code>EDT_STORE_BACKEND</code>·DSN·<code>db_path</code> 일관성, <code>priority_sweeps</code> 실제 행 생성 확인.</div>
+<div class="ok"><b>②③(설계):</b>
 <ul>
-  <li>옵션 1 — store가 발급: DB 시퀀스/SERIAL, 또는 <code>max(seq)+1</code>을 트랜잭션 내에서.</li>
-  <li>옵션 2 — 충돌 불가능한 토큰: <code>f"sweep-{uuid4().hex}"</code> 또는 <code>f"sweep-{epoch_ns}-{rand}"</code>. (가장 간단, 권장)</li>
+  <li><b>request_id를 UUID로</b> — 인메모리 순번 폐기, 재시작·중복과 무관하게 유일:
+    <pre>import uuid
+request_id = f<span class="g">"sweep-{uuid.uuid4().hex}"</span></pre></li>
+  <li><b>enqueue가 삽입행수 반환</b> → <code>submit()</code>이 0이면 <code>accepted</code> 대신 정확한 상태(409 / <code>{"accepted":0,"reason":"duplicate"}</code>). silent drop이 거짓 성공으로 새지 않게.</li>
 </ul>
-<pre><span class="c"># 예: edt_intake.py</span>
-import uuid
-request_id = f<span class="g">"sweep-{uuid.uuid4().hex[:16]}"</span>     <span class="c"># 재시작 무관 유일</span></pre>
+</div>
 
-<h3>B. 삽입 실패를 표면화 (silent drop 금지)</h3>
-<ul>
-  <li><code>priority_enqueue_sweep</code>가 <b>실제 삽입 행수(rowcount)</b>를 반환하도록.
-    DuckDB/Postgres 모두 <code>INSERT … (OR IGNORE / ON CONFLICT DO NOTHING)</code> 후 <code>rowcount</code> 확인 가능.</li>
-  <li><code>submit()</code>은 삽입 0이면 <code>accepted</code> 대신 명확한 상태(예: <code>409 conflict</code> 또는 <code>{"accepted":0,"reason":"duplicate_request_id"}</code>) 반환.</li>
-</ul>
-<pre>inserted = self.queue.enqueue_sweep(...)          <span class="c"># bool/rowcount 반환하도록 변경</span>
-if not inserted:
-    return {<span class="g">"accepted"</span>: 0, <span class="g">"reason"</span>: <span class="g">"duplicate_request_id"</span>, <span class="g">"request_id"</span>: request_id}, 409
-return {<span class="g">"accepted"</span>: raw_count, <span class="g">"request_id"</span>: request_id}</pre>
-<p>A를 적용하면 충돌 자체가 사라지므로 B는 방어선(회귀 감지)용.</p>
+<h2><span class="n">4</span>수정 후 검증</h2>
+<pre>1) POST /submit {count:20}
+2) 즉시 :7875/health → priority_depth == 20  (또는 활성 DB의 priority_sweeps에 행)
+3) :8080/api/queue items 에 해당 request_id, lease 후 워커 결과 request_id가 sweep-*
+4) intake 재시작 후 재제출해도 (UUID라) 정상 적재</pre>
 
-<h3>C. (점검) intake와 lease/dashboard가 같은 store를 보는가</h3>
-<p>최근 Postgres 백엔드 토글(<code>EDT_STORE_BACKEND</code>) 도입 이후라, <b>intake(:7875) / lease(:7878) / dashboard(:8080) 세 서비스가 동일 backend·동일 DB</b>(<code>EDT_STORE_BACKEND</code>, <code>db_path</code>/DSN)를 보는지 확인 필요. 한쪽만 postgres이고 다른 쪽이 duckdb면, 제출은 한 store에 들어가고 lease는 다른 store를 비워 보게 되어 동일 증상(depth 0, 미처리)이 납니다.</p>
-
-<h2><span class="n">4</span>재현 / 검증</h2>
-<pre><span class="c"># 재현</span>
-1) 제출 A: POST /submit {sweep_toml_text, count:20}  → sweep-1 적재
-2) intake 데몬 재시작 (또는 _seq 리셋되는 상황)
-3) 제출 B: POST /submit {...}  → 다시 sweep-1 발급 → sweep-1 잔존 시 DROP, 그래도 200 accepted
-
-<span class="c"># 검증(수정 후 기대)</span>
-- 제출 직후 GET :8080/api/queue → depth가 count만큼 증가, items에 해당 request_id
-- /api/queue lineage(priority_lineage)에 request_id 보임
-- 워커 결과(request_id)가 sweep-*(우선순위)로 기록됨</pre>
-
-<p class="note">관련 코드: <b class="file">edt_intake.py</b> L97/100/124-129, <b class="file">single_simulation_store.py</b> priority_sweeps 스키마(request_id PK)·<code>priority_enqueue_sweep</code> L416-423, <b class="file">postgres_store.py</b> <code>priority_enqueue_sweep</code> L428-436. 작성: surrogate/어댑티브 쪽(클라이언트)에서 실측 후 정리.</p>
+<p class="note">참조: <b class="file">edt_control_plane.py</b> L202/211/270/304 · <b class="file">edt_intake.py</b> L97/100/124-129/141 · <b class="file">single_simulation_store.py</b> priority_sweeps 스키마·<code>priority_enqueue_sweep</code> L416-423·<code>priority_depth</code> L470 · <b class="file">postgres_store.py</b> <code>priority_enqueue_sweep</code> L428-436. 실측: 어댑티브 클라이언트에서 sweep-7(신규 id) 제출 → accepted인데 depth 0·미처리 확인.</p>
 </div>
 </body>
 </html>
