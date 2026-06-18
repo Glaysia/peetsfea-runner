@@ -53,11 +53,14 @@ class SingleSimulationResultStore:
             conn = _DB_CONNS.get(key)
             if conn is None:
                 conn = duckdb.connect(key)
-                # 버퍼풀 상한 — 기본 DuckDB는 RAM의 ~80%까지 캐시한다(영속 연결이라 누적). web 정상화를 위해
-                # 제한. 우리 쿼리(수천 행·parquet COPY)엔 충분하고 web 메모리를 일정하게 묶는다.
+                # 메모리 한도 — 너무 낮으면(과거 3GB) 11GB DB의 무거운 쿼리가 디스크로 spill하고, spill 블록
+                # 파일이 fd 한도(유저서비스 1024)를 터뜨려 DuckDB가 FATAL(invalidated)로 죽었다. 머신 RAM이
+                # 넉넉하므로(46GB) 한도를 크게 잡아 **spill 자체를 없앤다**. EDT_DB_MEMORY_LIMIT로 조절.
+                import os
+
                 try:
-                    conn.execute("PRAGMA memory_limit='3GB'")
-                    conn.execute("PRAGMA threads=4")
+                    conn.execute(f"PRAGMA memory_limit='{os.environ.get('EDT_DB_MEMORY_LIMIT', '24GB')}'")
+                    conn.execute(f"PRAGMA threads={os.environ.get('EDT_DB_THREADS', '4')}")
                 except Exception:  # noqa: BLE001 — pragma 미지원 버전이어도 동작은 해야 함.
                     pass
                 _DB_CONNS[key] = conn
