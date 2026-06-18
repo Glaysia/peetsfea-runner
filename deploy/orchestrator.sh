@@ -52,7 +52,7 @@ case "${EDT_PARTITION:-}" in gpu*) NVD=all ;; *) NVD=void ;; esac
 TTL=${EDT_JOB_TTL_SEC:-1800}              # 잡 수명(초) — 경과 시 안전종료
 STAGGER=${EDT_SPAWN_STAGGER_SEC:-15}      # 컨테이너 출생 최소 간격(초)
 COLD_EST=${EDT_COLD_EST_SEC:-200}         # 콜드스타트로 간주하는 나이(초)
-COLD_CAP=${EDT_COLD_CAP:-3}               # 노드당 동시 콜드스타트 상한(herd 차단)
+COLD_CAP=${EDT_COLD_CAP:-10}              # 노드당 동시 콜드스타트 상한(herd 차단). 10 동시 기동은 안전 확인됨.
 START=$(date +%s)
 
 # N = 제어기가 출생 시 결정한 컨테이너 수. env 없으면 /job_plan 1회 조회, 그것도 없으면 기본 12.
