@@ -218,6 +218,7 @@ class SingleSimulationResultStore:
         since: str | None = None,
         terminal_state: str | None = None,
         peetsfea_version: str | None = None,
+        request_id_prefix: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """결과 행 조회(대시보드/CSV용, 읽기 전용). `peetsfea_version`은 표시용 버전 필터."""
@@ -233,6 +234,9 @@ class SingleSimulationResultStore:
         if peetsfea_version:
             clauses.append("peetsfea_version = ?")
             params.append(peetsfea_version)
+        if request_id_prefix:  # 출처 필터(데이터셋 탭): base-=baseline, sweep-=intake, prio-=static
+            clauses.append("request_id LIKE ?")
+            params.append(request_id_prefix.replace("%", "") + "%")
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT * FROM single_simulation_results{where} ORDER BY finished_at"
         if limit is not None:

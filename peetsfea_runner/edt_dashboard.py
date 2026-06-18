@@ -179,7 +179,11 @@ def start_dashboard_server(
         state = query.get("state", query.get("terminal_state", [default_state]))[0]
         limit_raw = query.get("limit", [None])[0]
         limit = int(limit_raw) if limit_raw and limit_raw.isdigit() else None
-        return store.fetch_rows(since=since, terminal_state=state, peetsfea_version=version_filter, limit=limit)
+        origin = query.get("origin", [None])[0]  # 출처 접두(base-/sweep-/prio-) — 데이터셋 탭 필터
+        return store.fetch_rows(
+            since=since, terminal_state=state, peetsfea_version=version_filter,
+            request_id_prefix=origin or None, limit=limit,
+        )
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "peetsfea-dashboard"
@@ -371,6 +375,7 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
 <div id="dataset" class="page hide">
   <div class="tools">
     <select id="dstate"><option value="success">success</option><option value="">전체</option><option value="aborted">aborted</option></select>
+    <select id="dorigin"><option value="">전체 출처</option><option value="sweep-">intake(입력큐)</option><option value="base-">baseline</option><option value="prio-">static</option></select>
     <input id="dsearch" placeholder="검색(노드/설계id/입력값)"/>
     <button onclick="loadDataset()">새로고침</button>
     <a href="/results.parquet" download>Parquet 다운로드 ↓</a>
@@ -456,15 +461,20 @@ async function containers(){const r=await f('/api/resources');
   if(pend.length)$('#contgrid').innerHTML+=`<div class="cont muted">+ PENDING ${pend.length}개 (${pend.map(p=>p.partition).join(', ')})</div>`;
 }
 
-async function loadDataset(){const st=$('#dstate').value,q=$('#dsearch').value.toLowerCase();
-  const d=await f('/api/results?limit=500&state='+st);let rows=d.rows;
+function dorigin(rid){rid=String(rid||'');
+  if(rid.startsWith('sweep-'))return 'intake';
+  if(rid.startsWith('base-'))return 'baseline';
+  if(rid.startsWith('prio-'))return 'static';
+  return '?';}
+async function loadDataset(){const st=$('#dstate').value,q=$('#dsearch').value.toLowerCase(),og=$('#dorigin').value;
+  const d=await f('/api/results?limit=500&state='+st+(og?'&origin='+og:''));let rows=d.rows;
   if(q)rows=rows.filter(r=>JSON.stringify(r).toLowerCase().includes(q));
   $('#dcount').textContent=rows.length+'행';
   const inks=[...new Set(rows.flatMap(r=>Object.keys(r).filter(k=>k.startsWith('in_'))))].slice(0,8);
-  const cols=['request_id','partition','node','gpu_used','solver_cores','elapsed_min',...inks];
+  const cols=['출처','request_id','partition','node','gpu_used','solver_cores','elapsed_min',...inks];
   $('#dtable thead').innerHTML='<tr>'+cols.map(c=>`<th>${c.replace('in_','')}</th>`).join('')+'</tr>';
   $('#dtable tbody').innerHTML=rows.map(r=>`<tr onclick="detail('${r.request_id}')">`+
-    cols.map(c=>`<td>${esc(r[c])}</td>`).join('')+'</tr>').join('');
+    cols.map(c=>`<td>${c==='출처'?dorigin(r.request_id):esc(r[c])}</td>`).join('')+'</tr>').join('');
 }
 async function detail(id){const d=await f('/api/sim/'+id);if(!d||d.error)return;
   const ins=Object.entries(d.inputs||{}).map(([k,v])=>`<div class="k">${k}</div><div>${esc(v)}</div>`).join('');
@@ -565,6 +575,8 @@ async function loadQueue(){const d=await f('/api/queue/lineage');
 }
 function tick(){if(cur==='overview')overview();else if(cur==='containers')containers();else if(cur==='trends')trends();else if(cur==='queue')loadQueue();}
 $('#dsearch').oninput=()=>{if(cur==='dataset')loadDataset()};
+$('#dorigin').onchange=()=>{if(cur==='dataset')loadDataset()};
+$('#dstate').onchange=()=>{if(cur==='dataset')loadDataset()};
 tick();loadDataset();setInterval(()=>{if(cur==='overview'||cur==='containers'||cur==='trends'||cur==='queue')tick()},8000);
 </script></body></html>"""
 

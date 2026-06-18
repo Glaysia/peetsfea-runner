@@ -210,6 +210,7 @@ class PostgresResultStore:
         since: str | None = None,
         terminal_state: str | None = None,
         peetsfea_version: str | None = None,
+        request_id_prefix: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         self.initialize()
@@ -224,6 +225,9 @@ class PostgresResultStore:
         if peetsfea_version:
             clauses.append("peetsfea_version = %s")
             params.append(peetsfea_version)
+        if request_id_prefix:  # 출처 필터(데이터셋 탭): base-=baseline, sweep-=intake, prio-=static
+            clauses.append("request_id LIKE %s")
+            params.append(request_id_prefix.replace("%", "") + "%")
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT * FROM single_simulation_results{where} ORDER BY finished_at"
         if limit is not None:
