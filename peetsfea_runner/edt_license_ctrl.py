@@ -157,12 +157,12 @@ class ContainerScheduler:
       solve < target  → 가장 한가한 노드의 잡 target↑ (LB: CPU 낮은 노드 우선; 다 90%↑면 free-RAM 큰 노드)
       solve > ceiling → 가장 바쁜 노드의 잡 target↓ (→ 오케스트레이터가 youngest 컨테이너를 SIGTERM 안전종료)
 
-    잡당 max_per_job(40) 상한. 1컨테이너=1솔브=종료라 누수 0; 오버슈팅은 컨테이너 수로 흡수(콜드스타트 듀티 보상)."""
+    잡당 max_per_job(20) 상한. 1컨테이너=1솔브=종료라 누수 0; 오버슈팅은 컨테이너 수로 흡수(콜드스타트 듀티 보상)."""
 
     snapshot_provider: Callable[[], Mapping[str, Any]]   # poller.snapshot
     target: int = 100
     ceiling: int = 150
-    max_per_job: int = 40
+    max_per_job: int = 20
     min_per_job: int = 2
     step: int = 3
     _job_target: dict[int, int] = field(default_factory=dict, init=False, repr=False)
@@ -204,6 +204,10 @@ class ContainerScheduler:
                 self._job_target.setdefault(ji, self.min_per_job)
             for ji in [j for j in self._job_target if j not in jn]:
                 self._job_target.pop(ji, None)
+            # cap 하향 시 기존 target도 즉시 클램프(orchestrator가 youngest 컨테이너 안전종료로 흡수).
+            for ji in list(self._job_target):
+                if self._job_target[ji] > self.max_per_job:
+                    self._job_target[ji] = self.max_per_job
             if not jn:
                 return
             if eff < self.target:
