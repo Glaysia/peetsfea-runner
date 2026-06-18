@@ -68,11 +68,6 @@ class SlotDispatcher:
     # abort 지령(150 초과 시 youngest kill) 수신. acquire()/release()/heartbeat(started_epoch)를 가진 클라이언트.
     permit_client: Any = None
     heartbeat_seconds: float = 20.0
-    # 연속 솔브 실패 시 슬롯 AEDT를 새로 띄운다(손상된 warm 세션 재사용 → 실패 폭주 차단). 1회 실패는 reclaim(싸게),
-    # 연속 N회면 force_restart로 깨끗한 세션. project_name=None·STEP import 빈결과 등 세션 손상이 fleet 동시 폭주를
-    # 일으켜 동시 solve(=라이선스)가 급락하던 문제의 근본 대응. (recover()가 살아있는 손상 데스크톱을 재부착하던 게 원인.)
-    force_restart_after_failures: int = 2
-    _fail_streak: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _processed: int = field(default=0, init=False)
     _processed_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -120,13 +115,21 @@ class SlotDispatcher:
                 if not self._await_admission():
                     break
                 try:
-                    envelope = self._run_one(slot, item, executor)
-                finally:
-                    if self.permit_client is not None:
-                        self.permit_client.release()  # 솔브 1건 끝 → 라이선스 자리 반납
-                self._safe_record(envelope)
-                with self._processed_lock:
-                    self._processed += 1
+                    try:
+                        envelope = self._run_one(slot, item, executor)
+                    finally:
+                        if self.permit_client is not None:
+                            self.permit_client.release()  # 솔브 1건 끝 → 라이선스 자리 반납
+                    self._safe_record(envelope)
+                    with self._processed_lock:
+                        self._processed += 1
+                except Exception:  # noqa: BLE001
+                    # 어떤 예외(특히 AEDT 콜드스타트 실패: 매 솔브 재기동 정책상 빈번)도 슬롯 스레드를 죽이면 안 된다
+                    # — 죽으면 재생성이 없어 슬롯이 영구 손실(느린 어트리션). 슬롯을 강제 재기동 후 루프 계속.
+                    try:
+                        slot.force_restart()
+                    except Exception:  # noqa: BLE001 — 재기동도 실패(노드 과부하 등) → 잠깐 쉬고 다음 루프서 재시도.
+                        self._stop.wait(self.admission_poll_seconds)
 
     def _await_admission(self) -> bool:
         """(라이선스 permit AND CPU admission) 둘 다일 때 승인. permit은 전역 상한, CPU는 로컬 로드밸런싱.
@@ -178,7 +181,6 @@ class SlotDispatcher:
         except FutureTimeoutError:
             # 65분 백스톱: 미반환 시뮬을 강제 종료하고 슬롯 재기동.
             slot.force_restart()
-            self._fail_streak[slot.slot_id] = 0  # 새 AEDT 세션 — 스트릭 리셋
             return self._envelope(
                 item,
                 slot,
@@ -188,22 +190,12 @@ class SlotDispatcher:
                 error={"stage": "backstop", "type": "BackstopTimeout", "message": f"sim exceeded {self.backstop_seconds:.0f}s"},
             )
         except Exception as exc:  # 시뮬 실패(또는 라이선스 abort로 AEDT kill): 살아있으면 재부착, 아니면 재기동.
+            slot.recover()
             if aborted["v"]:
-                # 제어기가 AEDT를 죽인 abort: 손상 아님(프로세스 dead면 recover가 알아서 재기동). 스트릭 리셋.
-                slot.recover()
-                self._fail_streak[slot.slot_id] = 0
                 return self._envelope(
                     item, slot, grant.grpc_port, started_at, terminal_state="aborted",
                     error={"stage": "license_abort", "type": "LicenseAbort", "message": "killed by license controller (youngest, lic>ceiling)"},
                 )
-            # 진짜 솔브 실패. 살아있는 손상 세션을 재부착하면 다음 솔브도 실패(폭주) → 연속 N회면 새 AEDT로 치유.
-            streak = self._fail_streak.get(slot.slot_id, 0) + 1
-            if streak >= self.force_restart_after_failures:
-                slot.force_restart()
-                self._fail_streak[slot.slot_id] = 0
-            else:
-                slot.recover()
-                self._fail_streak[slot.slot_id] = streak
             return self._envelope(
                 item,
                 slot,
@@ -214,7 +206,6 @@ class SlotDispatcher:
             )
         else:
             slot.release()
-            self._fail_streak[slot.slot_id] = 0  # 성공 → 스트릭 리셋
             return self._envelope(item, slot, grant.grpc_port, started_at, terminal_state="success", result=result)
         finally:
             watch_stop.set()

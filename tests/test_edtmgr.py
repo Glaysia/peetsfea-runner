@@ -71,7 +71,10 @@ def test_acquire_release_cycle() -> None:
     assert grant.pid > 0 and grant.grpc_port > 0
     mgr.release()
     assert mgr.state is SlotState.WARM
-    assert backend.reclaims == 1
+    # 1솔브=1AEDT: release는 사용한 ansysedt를 죽이고 새 세션을 띄운다(누수/손상 차단). reclaim 재사용 안 함.
+    assert backend.reclaims == 0
+    assert backend.kills == 1
+    assert backend.starts == 2  # 초기 warm + release 후 새 기동
 
 
 def test_double_acquire_raises() -> None:
@@ -86,6 +89,7 @@ def test_release_when_not_lent_is_noop() -> None:
     mgr.ensure_warm()
     mgr.release()
     assert backend.reclaims == 0
+    assert backend.kills == 0  # 대여 중 아니면 죽이지도 않음(noop)
 
 
 def test_backstop_force_restarts_after_deadline() -> None:
@@ -111,12 +115,14 @@ def test_liveness_restart_when_dead_while_warm() -> None:
     assert mgr.state is SlotState.WARM
 
 
-def test_recover_reattaches_when_alive() -> None:
+def test_recover_restarts_even_when_alive() -> None:
+    # 새 정책: 실패 반환은 살아있어도 재부착하지 않고 죽이고 새 세션으로 교체(손상/누수 세션 재사용 차단).
     mgr, backend, _ = _mgr()
     mgr.acquire()
-    mgr.recover()  # 살아있음 → reclaim
-    assert backend.reclaims == 1
-    assert backend.kills == 0
+    mgr.recover()
+    assert backend.reclaims == 0
+    assert backend.kills == 1
+    assert backend.starts == 2
     assert mgr.state is SlotState.WARM
 
 

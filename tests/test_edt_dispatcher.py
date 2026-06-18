@@ -95,30 +95,43 @@ def test_failure_records_failed_and_recovers(tmp_path: Path) -> None:
     env = recorded[0]
     assert env["terminal_state"] == "failed"
     assert env["error"]["type"] == "RuntimeError"
-    # 살아있는 백엔드 → recover는 reclaim(재부착)으로 처리.
+    # 새 정책: 실패 반환도 사용한 AEDT를 죽이고 새 세션으로 교체(손상/누수 세션 재사용 폭주 차단).
     backend = slots[0].backend
     assert isinstance(backend, FakeBackend)
-    assert backend.reclaims == 1 and backend.kills == 0
+    assert backend.reclaims == 0 and backend.kills == 1
 
 
-def test_consecutive_failures_force_restart_session(tmp_path: Path) -> None:
-    """연속 실패 → 손상된 warm 세션을 새 AEDT로 치유(force_restart). 실패 폭주 근본 차단."""
+class FlakyStartBackend(FakeBackend):
+    """N번째 start()에서 콜드스타트 실패(grpc 미기동)를 흉내. 매 솔브 재기동 정책의 복원력 검증용."""
+    def __init__(self, base_port: int, fail_on_start_call: int) -> None:
+        super().__init__(base_port)
+        self._fail_on = fail_on_start_call
+
+    def start(self) -> AedtSession:
+        self.starts += 1
+        if self.starts == self._fail_on:
+            self.alive = False
+            raise RuntimeError("grpc not up within timeout (cold-start fail)")
+        self.alive = True
+        return AedtSession(pid=self._pid, grpc_port=self._port)
+
+
+def test_worker_survives_coldstart_failure(tmp_path: Path) -> None:
+    # 매 솔브 후 재기동(release=kill+start) 중 콜드스타트가 실패해도 워커 스레드는 안 죽고 슬롯 재기동 후 계속.
     def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int, **_: Any) -> dict[str, Any]:
-        raise RuntimeError("corrupted session")
+        return {"k_ratio": 1.0}
 
+    backend = FlakyStartBackend(50000, fail_on_start_call=2)  # item1 후 재기동 start가 실패
+    slot = EdtManager(backend=backend, clock=time.monotonic, slot_id="s0")
     queue = TomlQueue()
-    queue.extend(QueueItem(f"req_{i}", "x = 1\n", seed=i) for i in range(3))
-    slots = _slots(1)
-    disp, recorded = _dispatcher(slots, queue, primitive, tmp_path, force_restart_after_failures=2)
+    queue.extend(QueueItem(f"req_{i}", "x = 1\n", seed=i) for i in range(2))
+    disp, recorded = _dispatcher([slot], queue, primitive, tmp_path)
 
-    disp.run()
+    disp.run()  # 안 멈추고 끝나야 함(스레드 사망 시 join 영원 대기 X — daemon이라 run은 반환하나 미처리)
 
-    assert len(recorded) == 3 and all(e["terminal_state"] == "failed" for e in recorded)
-    backend = slots[0].backend
-    assert isinstance(backend, FakeBackend)
-    # 1회차 실패 → reclaim(재부착). 2회차(연속) → force_restart(kill+재기동). 3회차 → 다시 reclaim(스트릭 리셋됨).
-    assert backend.kills == 1
-    assert backend.reclaims == 2
+    # 콜드스타트 실패를 살아남아 최소 1건은 처리(둘째 item). starts: 초기+실패+재시도 ≥ 3.
+    assert len(recorded) >= 1
+    assert backend.starts >= 3
 
 
 def test_backstop_aborts_hung_sim(tmp_path: Path) -> None:

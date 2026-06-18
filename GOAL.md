@@ -27,5 +27,20 @@ keeper·web 두 서비스를 자유롭게 올리고 내려도 된다(사용자 �
 - PG: 10분 버킷 완료율 + avg_solve_min 추세 (UTC; finished_at는 UTC 문자열).
 - `curl localhost:8080/api/summary` (이제 ~0.02s) → success/throughput_1h.
 
+## 근본 원인 (확정)
+스루풋 붕괴 = 워커 idle이 아니라 **AEDT 세션 손상 실패 폭주**. fail율 5%→73%(190/10분).
+실패: project_name=None·STEP import 빈 바디(peetsfea ssw_ports.py). 실패 솔브는 라이선스 짧게 쥐어
+동시 solve 급락 = "100 밑". **메커니즘: EdtManager.recover()가 실패 시 살아있는 손상 데스크톱을 재부착
+→ 다음 솔브도 같은 세션서 실패 → 폭주.** 제어기 throttle 아님(effective<target, active_permits≈1).
+
+## 처방 (배포됨)
+- 러너 `edt_dispatcher`: 연속 실패 N회(2)면 recover 대신 **force_restart**(새 AEDT 세션)로 자가치유.
+  da0d15a, 145 passed. 게이트 venv에 배포(백업 .bak) + keeper 재램프로 적용.
+- peetsfea 본체 수정 불요(1차). 잔여 의심: 공유 $HOME/Ansoft 격리는 2차 관찰 후 판단.
+
 ## 진행 로그
-- (작성 시작) 2026-06-19 ~00:40 KST: 미션 수립. 현재 solve ~13으로 붕괴 상태 → 회복 착수.
+- 2026-06-19 ~00:40 KST: 미션 수립. solve 붕괴(~13) — 원인 분석(재램프 보류).
+- ~00:50: 데이터로 실패 폭주 확정. srun --overlap로 노드 내부 검사(RAM/디스크 무관 확인).
+- ~01:03: recover() 재부착이 폭주 원인 확정. force_restart fix 구현·테스트·커밋·게이트 배포.
+- ~01:10: keeper 재램프로 fix 적용(직전 자체회복 119였으나 OLD코드라 재램프 불가피).
+  → **검증 과제: 다음 ~1.5~2h 동안 폭주 없이 100+ 유지되는지 관찰.**

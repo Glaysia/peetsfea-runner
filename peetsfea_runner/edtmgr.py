@@ -111,16 +111,20 @@ class EdtManager:
             return session
 
     def release(self) -> None:
-        """정상 완료 반환: 관리 세션 재부착 → WARM. (대여 중이 아니면 무시.)"""
+        """정상 완료 반환: 사용한 ansysedt를 **죽이고 새 깨끗한 세션을 띄워 둔다(1솔브=1AEDT)**.
+
+        원래는 reclaim(관리세션 재부착)으로 warm 재사용해 콜드스타트(~분)를 아꼈으나, AEDT는 close_project로
+        점유 메모리를 OS에 반환하지 않아(프로세스 종료 시에만 해제) 재사용할수록 누수가 누적된다 →
+        메모리 압박 → 할당 실패(geometry import 빈 결과·project_name=None) → 손상 세션 재사용 실패 폭주 →
+        동시 solve(라이선스) 급락. 매 솔브마다 새 프로세스로 교체해 누수·세션 손상을 **구조적으로 차단**한다.
+        (대여 중이 아니면 무시. ensure_warm으로 띄운 새 AEDT가 다음 요청까지 idle 대기.)"""
         with self._lock:
             if self.state is not SlotState.LENT:
                 return
-            self.backend.reclaim()
-            self._lent_at = None
-            self.state = SlotState.WARM
+            self.force_restart()
 
     def force_restart(self) -> AedtSession:
-        """현재 ansysedt를 SIGKILL하고 다시 warm 기동."""
+        """현재 ansysedt를 SIGKILL하고 다시 warm 기동(새 프로세스 = 누수/손상 0에서 시작)."""
         with self._lock:
             try:
                 self.backend.kill()
@@ -131,18 +135,10 @@ class EdtManager:
             return self.ensure_warm()
 
     def recover(self) -> None:
-        """실패/이상 반환 처리: ansysedt 살아 있으면 재부착, 아니면 강제 재기동."""
+        """실패/이상 반환: 사용한(손상·누수 가능) ansysedt를 죽이고 새 세션으로 교체. release와 동일 정책."""
         with self._lock:
             if self.state is not SlotState.LENT:
                 return
-            if self.backend.is_alive():
-                try:
-                    self.backend.reclaim()
-                    self._lent_at = None
-                    self.state = SlotState.WARM
-                    return
-                except Exception:
-                    pass
             self.force_restart()
 
     def lease_age_seconds(self) -> float | None:
