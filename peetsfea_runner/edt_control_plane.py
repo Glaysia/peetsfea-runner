@@ -33,7 +33,12 @@ from .edt_intake import IntakeService, start_intake_server
 from .edt_license_ctrl import DEFAULT_LICENSE_CTRL_PORT, LicenseController, start_license_ctrl_server
 from .edt_orchestrator import JobLauncher, JobOrchestrator
 from .edt_priority_lease import DEFAULT_PRIORITY_LEASE_PORT, start_priority_lease_server
-from .edt_resources import ResourcePoller
+from .edt_resources import (
+    DEFAULT_RESOURCE_PORT,
+    RemoteResourceProvider,
+    ResourcePoller,
+    start_resource_server,
+)
 from .edt_result_ingest import DEFAULT_INGEST_PORT, start_result_ingest_server
 from .edt_slurm_launcher import SlurmJobLauncher
 from .edt_ssh_tunnel import SshTunnel, reverse_tunnel_argv
@@ -64,6 +69,10 @@ class ControlPlaneConfig:
     license_target: int = 100  # permit 상한(<100이면 더 솔브)
     license_ceiling: int = 150  # 초과 시 youngest abort
     license_poll_seconds: float = 60.0  # 솔브 ~14분이라 1분이면 충분
+    # 자원 백채널(control→web): 폴러를 무거운 데이터플레인(web)과 분리해 control(keeper)에서 돌리고
+    # 대시보드는 이 포트로 프록시한다. 같은 호스트의 로컬 루프백.
+    resource_port: int = DEFAULT_RESOURCE_PORT
+    resources_db_path: Path | None = None  # control측 자원 시계열 전용 소형 DB(미지정 시 db_path 옆 .resources).
 
 
 @dataclass
@@ -84,7 +93,9 @@ class ControlPlane:
     license_ceiling: int = 150
     license_poll_seconds: float = 60.0
     dashboard_peetsfea_version: str = ""  # 대시보드 표시 버전 필터(빈 값=전 버전).
-    resource_poller: ResourcePoller | None = None  # 컨테이너별 실시간 부하(대시보드 /api/resources).
+    resource_poller: ResourcePoller | None = None  # control(keeper)측: 컨테이너별 실시간 부하 폴러.
+    resource_provider: RemoteResourceProvider | None = None  # web측: control의 자원 엔드포인트 프록시.
+    resource_port: int = DEFAULT_RESOURCE_PORT
     enable_ingest_tunnel: bool = True  # 테스트에선 ssh 역터널 비활성.
     # 역할 분리: web=대시보드/intake/ingest/bulk/터널/아카이브/폴러(DB 보유), keeper=오케스트레이터(9잡 유지, DB 무관).
     # 둘 다 True면 단일 프로세스(기존 동작). 분리 운영 시 web 재시작이 컨테이너를 건드리지 않는다(scancel은 keeper만).
@@ -131,55 +142,71 @@ class ControlPlane:
         except ValueError:
             pass
 
-        # --- web 데이터 플레인(대시보드/intake/ingest/bulk/터널/폴러) — DB 보유 측 ---
-        if self.run_web:
-            # 컨테이너별 실시간 부하 폴러 시작(있으면) → 대시보드 /api/resources.
-            provider = None
-            history = None
+        # --- control 플레인(keeper측): 폴러 + 라이선스 제어기 — 경량, 무거운 데이터플레인과 격리 ---
+        # 폴러를 web과 분리해 여기서 돌리면, web이 OOM/fd-고갈로 허덕여도 텔레메트리가 안 끊긴다(차트 빈 구간 해소).
+        if self.run_keeper:
             if self.resource_poller is not None:
                 self.resource_poller.start()
-                provider = self.resource_poller.snapshot
-                history = self.resource_poller.history  # 시계열(추세 탭) ring buffer
+            # 라이선스 제어(:7879): solve 수를 읽어 전역 동시 솔브를 target~ceiling 밴드로. 워커가 permit/heartbeat.
+            controller = LicenseController(
+                lic_provider=self._lic_mine, target=self.license_target, ceiling=self.license_ceiling,
+            )
+            self.license_controller = controller
+            if self.resource_poller is not None:
+                self.resource_poller.aedt_provider = controller.per_job  # 컨테이너(잡)별 pyaedt 수 → 부하 탭
+            license_server = start_license_ctrl_server(controller=controller, port=self.license_ctrl_port)
+            self._servers.append(license_server)
+            threading.Thread(target=license_server.serve_forever, daemon=True, name="LicenseServer").start()
+            # 자원 백채널(:7882): web 대시보드가 폴러 스냅샷/시계열을 HTTP 프록시로 읽는다.
+            if self.resource_poller is not None:
+                resource_server = start_resource_server(poller=self.resource_poller, port=self.resource_port)
+                self._servers.append(resource_server)
+                threading.Thread(target=resource_server.serve_forever, daemon=True, name="ResourceServer").start()
+            # 제어 루프(1분): solve 갱신 + ceiling 초과 시 youngest abort 표시.
+            threading.Thread(target=self._license_poll_loop, daemon=True, name="license-ctrl-poll").start()
+            # 라이선스 역터널만 control측: gate loopback:7879 → 로컬 제어기.
+            if self.enable_ingest_tunnel:
+                tunnel = SshTunnel(
+                    argv=reverse_tunnel_argv(self.ssh_host, port=self.license_ctrl_port), name="edt-license-rtunnel"
+                )
+                tunnel.start()
+                self._tunnels.append(tunnel)
+
+        # --- web 데이터 플레인(대시보드/intake/ingest/bulk) — 무거운 DB·I/O 측 ---
+        if self.run_web:
+            # 자원 프로바이더: 같은 프로세스에 폴러가 있으면(all 모드) 직접, 없으면(web 전용) control에 HTTP 프록시.
+            if self.resource_poller is not None:
+                provider, history = self.resource_poller.snapshot, self.resource_poller.history
+            elif self.resource_provider is not None:
+                provider, history = self.resource_provider.snapshot, self.resource_provider.history
+            else:
+                provider = history = None
             dashboard = start_dashboard_server(
                 store=self.store, port=self.dashboard_port, resource_provider=provider, history_provider=history,
                 peetsfea_version=self.dashboard_peetsfea_version,
             )
             intake_server = start_intake_server(service=self.intake, port=self.intake_port)
-            # 결과 ingest(:7876): 슈퍼컴 컨테이너가 역터널로 push → 로컬 단일 DB(대시보드와 동일 store).
+            # 결과 ingest(:7876): 슈퍼컴 컨테이너가 역터널로 push → 로컬 단일 DB.
             ingest_server = start_result_ingest_server(store=self.store, port=self.ingest_port)
-            # 대용량 산출물(:7877): project_dir tar.gz 스트림 수신 → 추출 → ArchiveStore(20GB 묶음/2TB FIFO).
+            # 대용량 산출물(:7877): project_dir tar.gz 스트림 수신 → 추출 → ArchiveStore.
             bulk_server = start_bulk_transfer_server(archive_store=self.archive_store, port=self.bulk_port)
-            # 우선순위 분배(:7878): intake(:7875)가 채운 우선순위 레인을 슈퍼컴 워커들에 lease로 분배.
+            # 우선순위 분배(:7878): intake(:7875)가 채운 레인을 워커들에 lease로 분배.
             lease_server = start_priority_lease_server(queue=self.intake.queue, port=self.priority_lease_port)
-            # 라이선스 제어(:7879): lic_mine을 읽어 전역 동시 솔브를 target~ceiling 밴드로. 워커가 permit/heartbeat.
-            controller = LicenseController(
-                lic_provider=self._lic_mine, target=self.license_target, ceiling=self.license_ceiling,
-            )
-            self.license_controller = controller
-            # 추세의 AEDT 명목(열린 데스크톱)/유효(솔브중)는 _history_point가 lmstat 실측으로 채운다.
-            # (제어기 내부 ping 집계는 솔브 사이 idle 워커를 놓쳐 과소계상되므로 extra_provider로 덮지 않는다.)
-            if self.resource_poller is not None:
-                self.resource_poller.aedt_provider = controller.per_job  # 컨테이너(잡)별 pyaedt 수 → 부하 탭
-            license_server = start_license_ctrl_server(controller=controller, port=self.license_ctrl_port)
-            for server in (dashboard, intake_server, ingest_server, bulk_server, lease_server, license_server):
+            for server in (dashboard, intake_server, ingest_server, bulk_server, lease_server):
                 self._servers.append(server)
                 threading.Thread(target=server.serve_forever, daemon=True, name=type(server).__name__).start()
-            # 제어 루프(1분): lic_mine 갱신 + ceiling 초과 시 youngest abort 표시.
-            threading.Thread(target=self._license_poll_loop, daemon=True, name="license-ctrl-poll").start()
-
-            # gate 경유 역터널 상시 유지: gate loopback:{7876,7877,7878,7879} → 로컬 ingest/bulk/lease/lic. 전부 슈퍼컴 전용.
+            # 역터널: ingest/bulk/lease(라이선스는 control측). 전부 슈퍼컴 전용.
             if self.enable_ingest_tunnel:
                 for port, name in (
                     (self.ingest_port, "edt-ingest-rtunnel"),
                     (self.bulk_port, "edt-bulk-rtunnel"),
                     (self.priority_lease_port, "edt-priority-rtunnel"),
-                    (self.license_ctrl_port, "edt-license-rtunnel"),
                 ):
                     tunnel = SshTunnel(argv=reverse_tunnel_argv(self.ssh_host, port=port), name=name)
                     tunnel.start()
                     self._tunnels.append(tunnel)
 
-        # --- keeper 컨트롤 플레인(오케스트레이터) — 컨테이너 유지 측. scancel은 여기서만 발생 ---
+        # --- keeper 오케스트레이터 기동(컨테이너 유지). scancel은 keeper 역할에서만 ---
         if self.run_keeper:
             self.orchestrator.ensure_running()
         try:
@@ -198,13 +225,14 @@ class ControlPlane:
             # scancel은 keeper 역할에서만: web 단독 재시작이 컨테이너를 죽이지 않게 한다(분리 운영의 핵심).
             if self.run_keeper:
                 _safe("orchestrator", self.orchestrator.shutdown)  # 잡 scancel(TERM); ssh ConnectTimeout=10
-            if self.run_web:
                 if self.resource_poller is not None:
-                    _safe("poller", self.resource_poller.stop)
-                for tunnel in self._tunnels:
-                    _safe("tunnel", tunnel.stop)
-                for server in self._servers:
-                    _safe("server", server.shutdown)
+                    _safe("poller", self.resource_poller.stop)  # 폴러는 control(keeper)측.
+            # 터널·서버는 양쪽 역할에서 생길 수 있으니(이 프로세스가 만든 것만 _tunnels/_servers에 있음) 모두 정리.
+            for tunnel in self._tunnels:
+                _safe("tunnel", tunnel.stop)
+            for server in self._servers:
+                _safe("server", server.shutdown)
+            if self.run_web:
                 # 아카이브 flush(대기 묶음 tar.gz 압축)는 수 분 걸릴 수 있어 systemd TimeoutStopSec를 넘기면
                 # 서비스가 'failed'로 죽는다. 별도 스레드 + 시한으로 감싸 시한 초과 시 다음 기동에 위임(유실 아님).
                 flusher = threading.Thread(target=lambda: _safe("flush", self.archive_store.flush), daemon=True)
@@ -223,9 +251,25 @@ def build_control_plane(
     run_keeper: bool = True,
 ) -> ControlPlane:
     store = SingleSimulationResultStore(db_path=config.db_path)
-    # DB 초기화(스키마 보장)는 web 역할에서만 — keeper는 DB를 안 쓰므로 부팅 시 writer 락 경합을 피한다.
+    # 결과 DB(11GB)는 web 역할(대시보드/ingest/intake/lease)만 초기화·소유 — 단일 writer 락 경합 회피.
     if run_web:
         store.initialize()
+    # control(keeper)측 폴러는 결과 DB가 아니라 **전용 소형 자원 DB**에 시계열을 영속한다.
+    # 그래야 web의 무거운 쿼리/락과 분리되고, keeper 프로세스가 11GB DB를 안 연다.
+    resource_poller = None
+    resource_provider = None
+    if run_keeper:
+        resources_db = config.resources_db_path or config.db_path.with_suffix(".resources.duckdb")
+        resources_store = SingleSimulationResultStore(db_path=resources_db)
+        resources_store.initialize()
+        resource_poller = ResourcePoller(
+            ssh_host=config.ssh_host,
+            history_sink=resources_store.record_resource_snapshot,
+            history_prune=lambda cutoff: resources_store.prune_resource_snapshots(before_ts=cutoff),
+        )
+    elif run_web:
+        # web 전용 프로세스: 폴러가 없으니 control(keeper)의 자원 엔드포인트를 HTTP로 프록시.
+        resource_provider = RemoteResourceProvider(base_url=f"http://127.0.0.1:{config.resource_port}")
     archive_store = ArchiveStore(archive_root=config.archive_root, buffer_limit_bytes=config.archive_buffer_bytes)
     job_launcher = launcher if launcher is not None else SlurmJobLauncher(
         ssh_host=config.ssh_host,
@@ -257,12 +301,9 @@ def build_control_plane(
         license_ceiling=config.license_ceiling,
         license_poll_seconds=config.license_poll_seconds,
         dashboard_peetsfea_version=config.dashboard_peetsfea_version,
-        # 라이선스/자원 시계열을 DB에 영속(web 재시작·12h ring buffer 넘어 보존) + 7일 넘은 건 자동 prune.
-        resource_poller=ResourcePoller(
-            ssh_host=config.ssh_host,
-            history_sink=store.record_resource_snapshot,
-            history_prune=lambda cutoff: store.prune_resource_snapshots(before_ts=cutoff),
-        ),
+        resource_poller=resource_poller,  # keeper측에만 존재(전용 자원 DB로 영속).
+        resource_provider=resource_provider,  # web 전용 프로세스에서 control 자원 엔드포인트 프록시.
+        resource_port=config.resource_port,
         run_web=run_web,
         run_keeper=run_keeper,
     )
@@ -302,6 +343,7 @@ def main() -> int:
         license_ceiling=int(os.environ.get("EDT_LICENSE_CEILING", "150")),
         license_poll_seconds=float(os.environ.get("EDT_LICENSE_POLL_SECONDS", "60")),
         dashboard_peetsfea_version=os.environ.get("EDT_DASHBOARD_PEETSFEA_VERSION", "").strip(),
+        resource_port=int(os.environ.get("EDT_RESOURCE_PORT", str(DEFAULT_RESOURCE_PORT))),
     )
     run_control_plane(config, run_web=run_web, run_keeper=run_keeper)
     return 0

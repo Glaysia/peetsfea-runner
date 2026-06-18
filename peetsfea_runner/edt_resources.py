@@ -8,16 +8,23 @@ read-only(시뮬 무간섭).
 
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlparse
 
 # argv -> (returncode, stdout)
 CommandRunner = Callable[[list[str]], "tuple[int, str]"]
+
+DEFAULT_RESOURCE_PORT = 7882  # control 프로세스가 자원 스냅샷/시계열을 web(대시보드)에 제공하는 로컬 백채널.
 
 # gate에서 한 번에 잡/노드/라이선스를 뽑는 원격 스크립트(섹션 마커로 구분).
 _REMOTE = r"""
@@ -247,4 +254,78 @@ class ResourcePoller:
             thread.join(timeout=5)
 
 
-__all__ = ["CommandRunner", "ResourcePoller", "parse_remote"]
+def start_resource_server(
+    *, poller: ResourcePoller, host: str = "127.0.0.1", port: int = DEFAULT_RESOURCE_PORT
+) -> ThreadingHTTPServer:
+    """control 프로세스의 자원 백채널. GET /resources(스냅샷) · /resources/history · /health.
+
+    폴러를 무거운 데이터플레인(web)과 분리해 별도 프로세스에서 돌리고, web 대시보드는
+    `RemoteResourceProvider`로 이 엔드포인트를 프록시한다. 그래야 web이 OOM/fd-고갈로
+    허덕여도 텔레메트리(폴러)가 질식하지 않는다(차트 빈 구간 해소).
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "peetsfea-resources"
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            return
+
+        def _json(self, status: int, payload: Any) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def do_GET(self) -> None:
+            path = urlparse(self.path).path
+            if path == "/resources":
+                self._json(200, poller.snapshot())
+            elif path == "/resources/history":
+                self._json(200, {"points": poller.history()})
+            elif path == "/health":
+                self._json(200, {"status": "ok"})
+            else:
+                self._json(404, {"error": "not_found"})
+
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+@dataclass
+class RemoteResourceProvider:
+    """web 대시보드측 클라이언트 — control 프로세스의 자원 엔드포인트를 프록시. 실패 시 빈값(fail-safe)."""
+
+    base_url: str  # 예: http://127.0.0.1:7882
+    timeout_seconds: float = 8.0
+
+    def _get(self, path: str) -> Any:
+        url = self.base_url.rstrip("/") + path
+        try:
+            with urllib.request.urlopen(url, timeout=self.timeout_seconds) as resp:  # noqa: S310 — 로컬 신뢰 URL
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+            return None
+
+    def snapshot(self) -> dict[str, Any]:
+        data = self._get("/resources")
+        return data if isinstance(data, dict) else _empty_snapshot()
+
+    def history(self) -> list[dict[str, Any]]:
+        data = self._get("/resources/history")
+        if isinstance(data, dict) and isinstance(data.get("points"), list):
+            return data["points"]
+        return []
+
+
+__all__ = [
+    "CommandRunner",
+    "ResourcePoller",
+    "RemoteResourceProvider",
+    "parse_remote",
+    "start_resource_server",
+    "DEFAULT_RESOURCE_PORT",
+]
