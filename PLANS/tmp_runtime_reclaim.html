@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ko"><head><meta charset="utf-8">
+<title>패치 계획 — /tmp 런타임 잔재 자동회수 (pull.* 워크dir + 터널 소켓)</title>
+<style>
+:root{--bg:#0d1117;--pan:#161b22;--ln:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14.5px/1.65 -apple-system,"Noto Sans KR",Segoe UI,sans-serif}
+.wrap{max-width:1040px;margin:0 auto;padding:32px 22px 80px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:18px;margin:28px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--ln)}
+h3{font-size:15px;margin:16px 0 6px;color:var(--acc)}
+.sub{color:var(--mut);font-size:13px;margin-bottom:8px}
+code{background:#0b0f14;border:1px solid var(--ln);border-radius:5px;padding:1px 6px;font:12.5px ui-monospace,Menlo,monospace}
+pre{background:#0b0f14;border:1px solid var(--ln);border-radius:9px;padding:13px 15px;overflow:auto;font:12.5px/1.55 ui-monospace,Menlo,monospace;white-space:pre}
+table{width:100%;border-collapse:collapse;margin:8px 0;font-size:13.5px}
+th,td{border:1px solid var(--ln);padding:7px 10px;text-align:left;vertical-align:top}
+th{background:var(--pan);color:var(--mut);font-weight:600}
+.card{background:var(--pan);border:1px solid var(--ln);border-radius:11px;padding:14px 18px;margin:12px 0}
+.bad{color:var(--bad)}.ok{color:var(--ok)}.warn{color:var(--warn)}.mut{color:var(--mut)}
+ul{margin:6px 0 6px 4px;padding-left:20px}li{margin:3px 0}
+.pill{display:inline-block;font-size:11px;padding:1px 9px;border-radius:11px;font-weight:700;background:rgba(210,153,34,.16);color:var(--warn)}
+.k{color:var(--ok);font-weight:700}
+</style></head><body><div class="wrap">
+
+<h1>패치 계획 — <code>/tmp</code> 런타임 잔재 자동회수 <span class="pill">미구현 · dev 전용</span></h1>
+<div class="sub">상태: 설계만 · 작성 2026-06-18 · 형제 문서 <code>enroot_db_tracking.html</code>(중앙 가시성) · <b>구현·배포 안 함</b></div>
+
+<div class="card">
+<b>한 줄.</b> 강제킬(SIGKILL/OOM/노드크래시)로 trap을 못 탄 잡이 남긴 <code>/tmp/$USER/peetsfea-runner/_runtime/pull.&lt;jobid&gt;.*</code>(개당 2.7G)와 <code>/tmp/peets-cp-&lt;jobid&gt;-*.sock</code>을, <b>이미 잘 도는 slot_service 시작-청소(squeue 기반 고아회수)에 2줄 추가</b>해서 자동 회수한다. 오늘 수동으로 34G 지운 그 잔재의 영구 해결.
+</div>
+
+<h2>1. 문제</h2>
+<p>오늘 28노드에서 회수한 잔재의 정체(전부 harry261 소유):</p>
+<table>
+<tr><th>유형</th><th>경로</th><th>생성 주체</th><th>크기</th></tr>
+<tr><td><b>워크dir</b></td><td><code>/tmp/$USER/peetsfea-runner/_runtime/pull.&lt;jobid&gt;.XXXXXX/</code></td><td>잡 스크립트 <code>mktemp -d</code></td><td><b>2.7G/개</b> (n109 22G·n110 6.6G·n112 4.9G)</td></tr>
+<tr><td><b>터널 소켓</b></td><td><code>/tmp/peets-cp-&lt;jobid&gt;-&lt;port&gt;-&lt;pid&gt;.sock</code></td><td>잡 스크립트 ssh control-master</td><td>0바이트(개수만)</td></tr>
+</table>
+<p class="mut">※ AEDT 임시(pyaedt 로그·.pjt·file*)는 이미 <code>TMPDIR</code> 리다이렉트로 워크dir <b>안</b>에 들어가므로 워크dir만 지우면 같이 회수됨. <code>AnsysEM.mw.&lt;user&gt;</code>는 노드당 1개·비누적이라 범위 외.</p>
+
+<h2>2. 근본 원인 (코드 앵커)</h2>
+<ul>
+<li><b>워크dir 생성:</b> <code>remote_job.py:3670</code> <code>mktemp -d "$REMOTE_RUNTIME_ROOT/pull.${SLURM_JOB_ID}.XXXXXX"</code>.</li>
+<li><b>정상 종료 청소는 있음:</b> <code>remote_job.py:3680-3691</code> <code>trap cleanup EXIT → cleanup_workdir()=rm -rf $workdir</code>. <span class="warn">→ 그러나 <b>SIGKILL/OOM/노드크래시 땐 trap을 못 타</b> 워크dir 통째 고아.</span></li>
+<li><b>소켓은 정상 종료에도 샐 수 있음:</b> <code>remote_job.py:3714</code>의 <code>/tmp/peets-cp-*.sock</code>은 <b>workdir 밖</b>이라 <code>cleanup_workdir</code>가 안 지움.</li>
+<li class="bad"><b>TTL 자니터가 엉뚱한 호스트에서 돈다:</b> <code>cleanup_orphan_sessions_for_run</code>(<code>remote_job.py:587-616</code>)은 <code>runtime_root</code>의 오래된 dir을 <code>rm</code>하지만 <code>_ssh_command(config, <b>config.host</b>, …)</code> 즉 <b>gate</b>에서 실행됨. 잔재는 <b>컴퓨트노드 로컬 /tmp</b>라 <b>영영 안 닿음.</b> (게다가 순수 <code>-mmin</code> 기반이라 live 잡 보호도 없음.)</li>
+<li><b>시작-청소는 /enroot만:</b> <code>slot_service.sh:24-37</code>은 컴퓨트노드에서 <code>squeue</code>로 죽은 잡 jobid를 구해 <code>/enroot/${USER}_*</code> 스크래치와 <code>edt-job-*</code> 컨테이너를 회수한다 — <span class="warn">근데 <code>/tmp/$USER/peetsfea-runner/_runtime/pull.*</code>·소켓은 대상에서 빠져 있음.</span></li>
+</ul>
+
+<h2>3. 픽스 (최소·검증된 메커니즘 재사용)</h2>
+
+<h3>3.1 (주) slot_service 시작-청소에 (c)·(d) 추가</h3>
+<p>이미 도는 <code>slot_service.sh:24-37</code> 블록(squeue 기반·prefix 스코프·멱등·squeue 실패 시 스킵)에 두 케이스만 덧붙인다:</p>
+<pre>RUNNING_JIDS=$(squeue -h -u "$USER" -o "%i" 2>/dev/null)
+if [ -n "$RUNNING_JIDS" ]; then          # 실패 시 스킵 = live 잡 오삭제 방지(기존 안전장치)
+  ...(a) /enroot/${USER}_* 스크래치  ...(b) edt-job-* 컨테이너  [기존]
+
+  # (c) /tmp 런타임 워크dir 잔재 — 죽은 잡의 pull.&lt;jobid&gt;.*
+  for d in /tmp/${USER}/peetsfea-runner/_runtime/pull.*; do
+    [ -d "$d" ] || continue
+    jid=$(basename "$d" | sed -E 's/pull\.([0-9]+)\..*/\1/')
+    echo "$RUNNING_JIDS" | grep -qx "$jid" || { echo "[slot] cleaning stale runtime: $d"; rm -rf "$d" 2>/dev/null || true; }
+  done
+
+  # (d) 컨트롤플레인 터널 소켓 잔재 — 죽은 잡의 peets-cp-&lt;jobid&gt;-*.sock
+  for s in /tmp/peets-cp-*.sock; do
+    [ -e "$s" ] || continue
+    jid=$(basename "$s" | sed -E 's/peets-cp-([0-9]+)-.*/\1/')
+    echo "$RUNNING_JIDS" | grep -qx "$jid" || { echo "[slot] cleaning stale sock: $s"; rm -f "$s" 2>/dev/null || true; }
+  done
+fi</pre>
+<p class="mut">소켓은 <code>find -user $USER</code> 대신 <code>peets-cp-</code> prefix라 우리 것만 매칭. jobid가 squeue에 살아있으면 보존.</p>
+
+<h3>3.2 (부) 정상 종료 경로도 소켓 청소</h3>
+<p><code>remote_job.py</code>의 <code>cleanup_workdir()</code>(3680)에 <code>rm -f "$PEETS_TUNNEL_SOCKET"</code> 한 줄 추가 → graceful 종료에서도 소켓이 안 남게(3.1의 (d)는 강제킬 백스톱).</p>
+
+<h3>3.3 (선택) TTL 자니터 호스트 수정 또는 폐기</h3>
+<p><code>cleanup_orphan_sessions_for_run</code>은 gate에서 도느라 무용 → (i) 컴퓨트노드 타깃으로 고치거나, (ii) 3.1이 노드-로컬을 덮으므로 <b>그냥 폐기</b>(권장). 다만 3.1은 <b>그 노드에 새 잡이 떠야</b> 도는 한계가 있어, 재사용 안 되는 idle 노드 잔재는 못 잡음 → <b>중앙 가시성은 <code>enroot_db_tracking.html</code>(생성/삭제 DB 기록)로 보완.</b></p>
+
+<h2>4. 안전성</h2>
+<ul>
+<li><b>squeue 실패 → 전체 스킵</b>(기존 가드 그대로): live 잡 dir 오삭제 0.</li>
+<li><b>스코프 한정:</b> <code>/tmp/$USER/...</code>·<code>peets-cp-</code> prefix·jobid 매칭 → 남의 파일/시스템 파일 안 건드림(오늘 수동청소와 동일 원칙).</li>
+<li><b>멱등:</b> <code>rm -rf</code> 반복 무해.</li>
+<li><b>live 보호:</b> jobid가 squeue에 있으면 보존 → 돌고 있는 잡의 워크dir·소켓 안전.</li>
+</ul>
+
+<h2>5. 테스트 / 검증</h2>
+<ul>
+<li><b>단위:</b> jobid 파싱 정규식(<code>pull.&lt;jobid&gt;.</code>, <code>peets-cp-&lt;jobid&gt;-</code>) 케이스, squeue-빈값 스킵.</li>
+<li><b>통합:</b> 잡 하나 <code>scancel -s KILL</code>(트랩 우회)로 죽여 잔재 생성 → 같은 노드에 새 잡 → 시작로그에 <code>cleaning stale runtime/sock</code> + <code>find /tmp -user $USER</code> 0 확인.</li>
+<li><b>회귀:</b> 돌고 있는 잡의 <code>pull.&lt;live&gt;</code>·소켓이 보존되는지(오삭제 0).</li>
+</ul>
+
+<h2>6. 롤아웃 / 범위</h2>
+<ul>
+<li><code>slot_service.sh</code>는 컨테이너 동봉 → <b>컨테이너 재배포(keeper 재시작)</b> 필요. <code>remote_job.py</code> 변경분도 같이.</li>
+<li><b>지금은 구현 안 함</b> — dev 브랜치 계획 문서로만. 승인 시 3.1→3.2→(3.3 폐기) 순 패치 + 테스트 + 재배포.</li>
+<li>오늘 이미 수동으로 34G 회수 완료 → 이 패치는 <b>재발 방지(영구 자동화)</b>가 목적.</li>
+</ul>
+
+</div></body></html>

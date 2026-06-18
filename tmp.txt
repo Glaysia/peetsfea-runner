@@ -1,0 +1,1010 @@
+[root@tgm-master kevin]# pdsh -w n[115,116] 'du -sh /tmp' | sort;
+n115: 60G	/tmp
+n116: 55G	/tmp
+[root@tgm-master kevin]#
+
+
+
+
+
+
+
+[root@tgm-master kevin]# pdsh -w n[115,116] 'ls -al /tmp/' | sort;
+n115: -rw-r-----   1 root     root      11 Mar 24 13:48 .wwgetfiles_timestamp
+n115: -rw-r--r--   1 dhj02    users   9072 Mar 24 14:03 pyaedt_dhj02_278adb3f-470a-460b-9cd1-f1680164c390.log
+n115: -rw-r--r--   1 dhj02    users   9971 Mar 24 14:02 pyaedt_dhj02_0cda09c0-bf2d-44b8-8128-7fad5dfc8e53.log
+n115: -rw-r--r--   1 dhj02    users  10349 Mar 24 14:03 pyaedt_dhj02_eaa6fcaa-1d70-4724-b6e9-8389ad975fa7.log
+n115: -rw-r--r--   1 dhj02    users  10616 Mar 24 14:03 pyaedt_dhj02_c3adf0ff-7ab0-4aa9-96b0-27620e1978ee.log
+n115: -rw-r--r--   1 dhj02    users  10616 Mar 24 14:04 pyaedt_dhj02_60959cee-9744-4f34-b398-ea72dad493d0.log
+n115: -rw-r--r--   1 dhj02    users  11595 Mar 24 14:03 pyaedt_dhj02_77ab7cae-e78a-49fa-a87d-c23619b52723.log
+n115: -rw-r--r--   1 dhj02    users  11595 Mar 24 14:04 pyaedt_dhj02_61d8552d-b445-4153-bb85-497c35e06c29.log
+n115: -rw-r--r--   1 dhj02    users  11809 Mar 24 14:03 pyaedt_dhj02_945da92e-da83-4036-9de2-64f769aaa097.log
+n115: -rw-r--r--   1 dhj02    users  12076 Mar 24 14:04 pyaedt_dhj02_ea2610c2-5345-4b71-920b-77597782833e.log
+n115: -rw-r--r--   1 dhj02    users  12230 Mar 24 14:02 pyaedt_dhj02_bbf3aa3d-2137-41a8-b14b-e1d027349d42.log
+n115: -rw-r--r--   1 dhj02    users  16153 Mar 24 14:04 pyaedt_dhj02_c5fe67e8-1d97-47f2-a170-a76bac8187bb.log
+n115: -rw-r--r--   1 dhj02    users  18813 Mar 24 14:03 pyaedt_dhj02_b45f0599-5968-4eb4-bb81-8cddc8f757d8.log
+n115: -rw-r--r--   1 dhj02    users  34662 Mar 24 14:12 pyaedt_dhj02_7d91509a-61a6-4886-8698-cdfaea6ccc60.log
+n115: -rw-r--r--   1 dhj02    users  77743 Mar 24 14:14 pyaedt_dhj02_d8edb877-f8a5-43bb-98e6-49c334a2637d.log
+n115: -rw-r--r--   1 dhj02    users 109899 Mar 24 14:14 pyaedt_dhj02_10d7fd6f-4ff1-4d8b-b6cc-6434dbbad485.log
+n115: -rw-r--r--   1 dw16     users   9599 Mar 24 14:03 pyaedt_dw16_3f14a9be-edde-4ae4-920a-c791c03d7c1d.log
+n115: -rw-r--r--   1 dw16     users   9955 Mar 24 14:02 pyaedt_dw16_fb9259a5-62b7-458d-8d40-860bf7796272.log
+n115: -rw-r--r--   1 dw16     users  10044 Mar 24 14:02 pyaedt_dw16_23c4230f-c1e2-44e2-922d-5d0d30b059fd.log
+n115: -rw-r--r--   1 dw16     users  10489 Mar 24 14:03 pyaedt_dw16_336dd026-d8f0-4e6a-a5eb-e5e79827e143.log
+n115: -rw-r--r--   1 dw16     users  10667 Mar 24 14:02 pyaedt_dw16_b2973c1b-ee59-498b-80d0-a8c0b54d5252.log
+n115: -rw-r--r--   1 dw16     users  10934 Mar 24 14:03 pyaedt_dw16_7b9b6308-7381-44d4-93d1-c5282f1d58bd.log
+n115: -rw-r--r--   1 dw16     users  11009 Mar 24 14:03 pyaedt_dw16_4825dd96-1c16-4e56-ac41-830e2b5fd3ca.log
+n115: -rw-r--r--   1 dw16     users  11734 Mar 24 14:02 pyaedt_dw16_01dd30a3-9480-436a-a890-eecf43d12586.log
+n115: -rw-r--r--   1 dw16     users  11963 Mar 24 14:02 pyaedt_dw16_863e02f0-0ceb-4209-80bf-5ab7d5acd69a.log
+n115: -rw-r--r--   1 dw16     users  12377 Mar 24 14:04 pyaedt_dw16_e1a10f50-62cb-4bf3-b4d5-8285e8d8a146.log
+n115: -rw-r--r--   1 dw16     users  13320 Mar 24 14:03 pyaedt_dw16_64c26d7b-47d7-4502-b0d3-233380b3abbd.log
+n115: -rw-r--r--   1 dw16     users  13409 Mar 24 14:03 pyaedt_dw16_dc6deba8-55bc-4d37-8ec2-4af3007f73a7.log
+n115: -rw-r--r--   1 dw16     users  13801 Mar 24 14:04 pyaedt_dw16_52c7f130-2155-43f1-a377-9b64a471ecb8.log
+n115: -rw-r--r--   1 dw16     users  14230 Mar 24 14:04 pyaedt_dw16_9351ee87-1a88-4fa2-a925-25b418176ef8.log
+n115: -rw-r--r--   1 dw16     users  24195 Mar 24 14:57 pyaedt_dw16_23b625cf-b5a8-444a-a826-e9a391909c9a.log
+n115: -rw-r--r--   1 harry261 users   9247 Mar 24 14:03 pyaedt_harry261_f2502ccd-a63c-422c-a3f4-45cd5fdc0183.log
+n115: -rw-r--r--   1 harry261 users   9692 Mar 24 14:04 pyaedt_harry261_66898409-97f7-4b67-8aa4-66b8ef6d0496.log
+n115: -rw-r--r--   1 harry261 users   9870 Mar 24 14:03 pyaedt_harry261_ffc6e432-456b-45d9-a351-4b84668721d8.log
+n115: -rw-r--r--   1 harry261 users   9998 Mar 24 14:03 pyaedt_harry261_d9e57fb0-80c2-4505-9189-d58d7fdd9ca7.log
+n115: -rw-r--r--   1 harry261 users  10173 Mar 24 14:03 pyaedt_harry261_07bd0c14-09ea-408d-a916-295f59a91c20.log
+n115: -rw-r--r--   1 harry261 users  10926 Mar 24 14:02 pyaedt_harry261_c483506c-35e8-4a62-bf21-7d4b5af882dd.log
+n115: -rw-r--r--   1 harry261 users  11914 Mar 24 14:02 pyaedt_harry261_eb539e0c-8102-4b05-a1cf-6359b29f684b.log
+n115: -rw-r--r--   1 harry261 users  12523 Mar 24 14:04 pyaedt_harry261_f2ed3259-0f25-4ce2-a360-2f926759f859.log
+n115: -rw-r--r--   1 harry261 users  13146 Mar 24 14:02 pyaedt_harry261_a4a20a91-6819-4e10-8d59-82bcb6130ec7.log
+n115: -rw-r--r--   1 harry261 users  13517 Mar 24 14:02 pyaedt_harry261_90215cce-5a3f-40a9-a4f4-ad280132917f.log
+n115: -rw-r--r--   1 jji0930  users   9424 Mar 24 14:03 pyaedt_jji0930_d059dd1a-b847-4ad6-b223-1a95cd189c77.log
+n115: -rw-r--r--   1 jji0930  users  10015 Mar 24 14:02 pyaedt_jji0930_ba642f43-d35e-4235-b458-1d73aeb7fc9b.log
+n115: -rw-r--r--   1 jji0930  users  10136 Mar 24 14:03 pyaedt_jji0930_63259297-e3f9-4c73-b99d-b097e6d2b592.log
+n115: -rw-r--r--   1 jji0930  users  10172 Mar 24 14:03 pyaedt_jji0930_6d46bdc0-a527-45c8-bfcf-3528bdc6dc03.log
+n115: -rw-r--r--   1 jji0930  users  10490 Mar 24 14:02 pyaedt_jji0930_ef5636f3-d6bb-41da-96a8-336e0dbbbf0a.log
+n115: -rw-r--r--   1 jji0930  users  12344 Mar 24 14:04 pyaedt_jji0930_592a0f31-ce70-4beb-bf9d-0140bf6858d6.log
+n115: -rw-r--r--   1 jji0930  users  12500 Mar 24 14:02 pyaedt_jji0930_80ff6d1f-8050-4438-b1ad-df6e837b4094.log
+n115: -rw-r--r--   1 jji0930  users  13395 Mar 24 14:03 pyaedt_jji0930_d21f32c6-f171-4768-80f8-3326ee8cba61.log
+n115: -rw-r--r--   1 jji0930  users  14603 Mar 24 14:02 pyaedt_jji0930_cf5b0ecb-e049-41b2-8aa0-0b208bb48208.log
+n115: -rw-r--r--   1 jji0930  users  14783 Mar 24 14:04 pyaedt_jji0930_cac0d5ad-8214-40b7-b35c-7cf7f72db67a.log
+n115: -rw-r--r--   1 r1jae262 users  20595 Mar 24 15:07 pyaedt_r1jae262_c1378908-9870-4a61-8e65-a70dc84bffe0.log
+n115: -rw-r--r--   1 r1jae262 users  37034 Mar 24 15:07 pyaedt_r1jae262_fcab61ea-c931-4998-915d-ceeaad4ab3a6.log
+n115: -rw-r--r--   1 r1jae262 users  37551 Mar 24 15:07 pyaedt_r1jae262_c32cd0a3-6507-440e-a45d-c83f0f57dce3.log
+n115: -rw-r--r--   1 r1jae262 users  39313 Mar 24 15:07 pyaedt_r1jae262_f404aedd-8e59-4d9b-9086-a53ec72824e0.log
+n115: -rw-r--r--   1 r1jae262 users  39686 Mar 24 15:07 pyaedt_r1jae262_e818a91d-cf31-4f88-b15d-b6b165bd858c.log
+n115: -rw-r--r--   1 r1jae262 users  40549 Mar 24 15:01 pyaedt_r1jae262_6e71f30b-f75d-468d-a3ba-4cb8011ea715.log
+n115: -rw-r--r--   1 r1jae262 users  41601 Mar 24 15:07 pyaedt_r1jae262_b084f12a-bc67-44c8-8c47-51b0508b71a0.log
+n115: -rw-r--r--   1 r1jae262 users 115016 Mar 24 15:07 pyaedt_r1jae262_fce00a7b-94e4-42b9-85f5-b3fc2506ce5c.log
+n115: -rw-r--r--   1 r1jae262 users 115319 Mar 24 15:07 pyaedt_r1jae262_c4f7772f-12b1-4927-8836-8d130cc31731.log
+n115: -rw-r--r--   1 r1jae262 users 115729 Mar 24 15:07 pyaedt_r1jae262_8529f902-ffdb-4929-b65e-9a3e2e302160.log
+n115: -rw-r--r--   1 root     root       7 Mar 24 15:05 .wwgetfile.lock
+n115: dr-xr-xr-x  22 root     root     600 Mar 24 13:48 ..
+n115: drwx------   2 ekgus638 users     40 Mar 24 15:00 Rtmpn8z26l
+n115: drwx------   3 root     root      60 Mar 24 13:48 mmfs
+n115: drwx------   3 root     root      60 Mar 24 13:48 systemd-private-07fe63ffad354644a3099f13ba976acd-chronyd.service-lAEmIg
+n115: drwxr-xr-x   2 dhj02    users     80 Mar 24 14:02 Maxwell
+n115: drwxr-xr-x   2 dhj02    users    520 Mar 24 14:03 maxwell_nib115.hpc_218424.pjt
+n115: drwxr-xr-x   2 dhj02    users    520 Mar 24 14:04 maxwell_nib115.hpc_374363.pjt
+n115: drwxr-xr-x   2 dhj02    users    520 Mar 24 14:04 maxwell_nib115.hpc_440955.pjt
+n115: drwxr-xr-x   2 dhj02    users   1240 Mar 24 14:49 maxwell_nib115.hpc_410159.pjt
+n115: drwxr-xr-x   2 dhj02    users   1260 Mar 24 14:49 maxwell_nib115.hpc_22690.pjt
+n115: drwxr-xr-x   2 dhj02    users   1260 Mar 24 14:50 maxwell_nib115.hpc_266194.pjt
+n115: drwxr-xr-x   2 dw16     users    520 Mar 24 14:04 maxwell_nib115.hpc_441152.pjt
+n115: drwxr-xr-x   2 dw16     users    520 Mar 24 14:04 maxwell_nib115.hpc_447827.pjt
+n115: drwxr-xr-x   2 dw16     users    520 Mar 24 14:05 maxwell_nib115.hpc_448106.pjt
+n115: drwxr-xr-x   2 dw16     users    520 Mar 24 14:55 maxwell_nib115.hpc_23627.pjt
+n115: drwxr-xr-x   2 dw16     users    520 Mar 24 14:57 maxwell_nib115.hpc_473369.pjt
+n115: drwxr-xr-x   2 dw16     users   1180 Mar 24 15:06 maxwell_nib115.hpc_172889.pjt
+n115: drwxr-xr-x   2 dw16     users   1260 Mar 24 15:06 maxwell_nib115.hpc_187241.pjt
+n115: drwxr-xr-x   2 dw16     users   1260 Mar 24 15:07 maxwell_nib115.hpc_181020.pjt
+n115: drwxr-xr-x   2 dw16     users   1280 Mar 24 15:07 maxwell_nib115.hpc_323011.pjt
+n115: drwxr-xr-x   2 harry261 users    520 Mar 24 14:02 maxwell_nib115.hpc_101049.pjt
+n115: drwxr-xr-x   2 harry261 users    520 Mar 24 14:02 maxwell_nib115.hpc_28187.pjt
+n115: drwxr-xr-x   2 harry261 users    520 Mar 24 14:04 maxwell_nib115.hpc_383345.pjt
+n115: drwxr-xr-x   2 harry261 users   1180 Mar 24 15:07 maxwell_nib115.hpc_267320.pjt
+n115: drwxr-xr-x   2 harry261 users   1240 Mar 24 15:07 maxwell_nib115.hpc_102007.pjt
+n115: drwxr-xr-x   2 harry261 users   1260 Mar 24 15:07 maxwell_nib115.hpc_174465.pjt
+n115: drwxr-xr-x   2 jji0930  users    520 Mar 24 14:02 maxwell_nib115.hpc_24017.pjt
+n115: drwxr-xr-x   2 jji0930  users    520 Mar 24 14:03 maxwell_nib115.hpc_101530.pjt
+n115: drwxr-xr-x   2 jji0930  users    520 Mar 24 14:03 maxwell_nib115.hpc_266417.pjt
+n115: drwxr-xr-x   2 jji0930  users    520 Mar 24 14:04 maxwell_nib115.hpc_292390.pjt
+n115: drwxr-xr-x   2 jji0930  users    520 Mar 24 14:04 maxwell_nib115.hpc_382467.pjt
+n115: drwxr-xr-x   2 jji0930  users   1180 Mar 24 15:05 maxwell_nib115.hpc_88482.pjt
+n115: drwxr-xr-x   2 jji0930  users   1240 Mar 24 15:06 maxwell_nib115.hpc_159373.pjt
+n115: drwxr-xr-x   2 jji0930  users   1240 Mar 24 15:06 maxwell_nib115.hpc_24330.pjt
+n115: drwxr-xr-x   2 jji0930  users   1240 Mar 24 15:06 maxwell_nib115.hpc_403221.pjt
+n115: drwxr-xr-x   2 jji0930  users   1260 Mar 24 15:07 maxwell_nib115.hpc_175157.pjt
+n115: drwxr-xr-x   2 r1jae262 users    520 Mar 24 14:03 maxwell_nib115.hpc_266735.pjt
+n115: drwxr-xr-x   2 r1jae262 users    520 Mar 24 14:04 maxwell_nib115.hpc_375460.pjt
+n115: drwxr-xr-x   2 r1jae262 users    520 Mar 24 15:01 maxwell_nib115.hpc_481672.pjt
+n115: drwxr-xr-x   2 r1jae262 users   1180 Mar 24 14:49 maxwell_nib115.hpc_151586.pjt
+n115: drwxr-xr-x   2 r1jae262 users   1280 Mar 24 14:53 maxwell_nib115.hpc_173921.pjt
+n115: drwxr-xr-x   2 r1jae262 users   1280 Mar 24 14:54 maxwell_nib115.hpc_26062.pjt
+n115: drwxr-xr-x   2 r1jae262 users   1280 Mar 24 14:54 maxwell_nib115.hpc_384300.pjt
+n115: drwxr-xr-x   2 r1jae262 users   1280 Mar 24 14:55 maxwell_nib115.hpc_83739.pjt
+n115: drwxr-xr-x   2 r1jae262 users   1300 Mar 24 14:54 maxwell_nib115.hpc_100589.pjt
+n115: drwxr-xr-x   2 r1jae262 users   1300 Mar 24 15:06 maxwell_nib115.hpc_248315.pjt
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:02 fileXtYZnq2071617743285463
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:02 filer6RMVN2071117743285443
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:03 fileMEtlpt20711177432862219
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:03 filebECKD320711177432863425
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:03 filegZElvy20711177432861116
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:03 filettqKxh20711177432863022
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:03 filevfVSd620711177432860410
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:04 fileSOWseG20711177432866337
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:04 fileSR6v6K20711177432867043
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:04 fileSTiqw320711177432865334
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:04 fileq5oGtm20711177432864131
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:04 filexquXS520711177432866740
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:12 filePcDf7b20711177432916354
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:14 filemBAiU020711177432925660
+n115: drwxr-xr-x   3 dhj02    users    100 Mar 24 14:14 fileoeIiqT20711177432926263
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:02 fileGHwa4r2269017743285450
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:02 fileKd0VDF2461517743285470
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:03 file31nebe20799217743286050
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:03 fileMxhleS21842417743286120
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:03 fileO5JOUI31505317743286350
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:03 fileekOZ7n26619417743286230
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:03 filerHDUqq30275617743286310
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:04 fileESbbxN37436317743286530
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:04 fileKUXL9T32322417743286420
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:04 filePaJICL41015917743286630
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:04 filecdGUcy42975817743286670
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:04 filejdrXeo44095517743286710
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:12 fileT19Gn145022217743291640
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:14 fileZBYvRk46315917743292570
+n115: drwxr-xr-x   3 dhj02    users    260 Mar 24 14:14 filekZkBYO46347717743292620
+n115: drwxr-xr-x   3 dhj02    users   1280 Mar 24 14:50 maxwell_nib115.hpc_450222.pjt
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:02 file240zN32087117743285619
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:02 fileDPK2Hw2087217743285453
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:02 filePtY2Me20871177432856512
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:02 filedtIGfK2087117743285453
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:02 filervDZ6I20871177432856815
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:03 file9P0FX520871177432859524
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:03 fileI2PkD020871177432859927
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:03 fileKA4bBY20871177432859121
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:03 filePhyHNH20871177432862933
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:03 fileddsMXC20871177432863536
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:04 file7bepM620871177432867748
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:04 fileVOoNZF20871177432867145
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:04 fileWY5v4N20871177432868351
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:04 filewfqfI620871177432864142
+n115: drwxr-xr-x   3 dw16     users    100 Mar 24 14:57 fileyYOwzT208711774331853119
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:02 fileCaMIZ310125417743285680
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:02 fileHXdTTo9881717743285650
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:02 filejgiT5q2334617743285460
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:02 filemT2Y8B2362717743285460
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:02 filemj7PF08379117743285620
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:03 fileGZhXNu31563717743286360
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:03 fileTPhhLp30215117743286300
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:03 filelbZCpu18724117743285990
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:03 fileoMXOtO18102017743285960
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:03 fileruW2B417288917743285920
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:04 fileAQ066z44782717743286780
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:04 fileFzXkij32301117743286420
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:04 fileUijAit44810617743286840
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:04 filetzfzPx44115217743286720
+n115: drwxr-xr-x   3 dw16     users    260 Mar 24 14:57 filerBuVw447336917743318540
+n115: drwxr-xr-x   3 harry261 users    100 Mar 24 14:02 fileCbQDis19968177432857111
+n115: drwxr-xr-x   3 harry261 users    100 Mar 24 14:02 fileJ79rlq1997017743285493
+n115: drwxr-xr-x   3 harry261 users    100 Mar 24 14:02 fileRr0pwa1996817743285678
+n115: drwxr-xr-x   3 harry261 users    100 Mar 24 14:02 fileTONjQD1996817743285515
+n115: drwxr-xr-x   3 harry261 users    100 Mar 24 14:03 fileHoKsv319968177432859319
+n115: drwxr-xr-x   3 harry261 users    100 Mar 24 14:03 fileX0ReEA19968177432862327
+n115: drwxr-xr-x   3 harry261 users    100 Mar 24 14:03 fileePtkdF19968177432861924
+n115: drwxr-xr-x   3 harry261 users    100 Mar 24 14:04 fileO1bS1m19968177432865132
+n115: drwxr-xr-x   3 harry261 users    100 Mar 24 14:04 fileUEqbLo19968177432865635
+n115: drwxr-xr-x   3 harry261 users    260 Mar 24 14:02 fileRoyMkw10104917743285680
+n115: drwxr-xr-x   3 harry261 users    260 Mar 24 14:02 filelOzuP52818717743285520
+n115: drwxr-xr-x   3 harry261 users    260 Mar 24 14:02 filennhCUk2632817743285500
+n115: drwxr-xr-x   3 harry261 users    260 Mar 24 14:02 fileuhUimq10200717743285720
+n115: drwxr-xr-x   3 harry261 users    260 Mar 24 14:03 fileaJbRH626732017743286240
+n115: drwxr-xr-x   3 harry261 users    260 Mar 24 14:03 fileaWMJCQ17446517743285940
+n115: drwxr-xr-x   3 harry261 users    260 Mar 24 14:03 fileg2wrEC25347617743286200
+n115: drwxr-xr-x   3 harry261 users    260 Mar 24 14:04 fileIE0poR38334517743286560
+n115: drwxr-xr-x   3 harry261 users    260 Mar 24 14:04 fileOI6jpf36624617743286520
+n115: drwxr-xr-x   3 jji0930  users    100 Mar 24 14:02 fileNkbAK22109717743285463
+n115: drwxr-xr-x   3 jji0930  users    100 Mar 24 14:02 fileUxcUh621097177432856811
+n115: drwxr-xr-x   3 jji0930  users    100 Mar 24 14:02 filedUHphT2110017743285463
+n115: drwxr-xr-x   3 jji0930  users    100 Mar 24 14:02 filegreWNU2109717743285638
+n115: drwxr-xr-x   3 jji0930  users    100 Mar 24 14:03 fileCmaNA621097177432862727
+n115: drwxr-xr-x   3 jji0930  users    100 Mar 24 14:03 fileMubJKn21097177432862224
+n115: drwxr-xr-x   3 jji0930  users    100 Mar 24 14:03 fileXKIOae21097177432859319
+n115: drwxr-xr-x   3 jji0930  users    100 Mar 24 14:03 filembIAXR21097177432858916
+n115: drwxr-xr-x   3 jji0930  users    100 Mar 24 14:04 fileCU9n3p21097177432866135
+n115: drwxr-xr-x   3 jji0930  users    100 Mar 24 14:04 filePrF1pX21097177432865532
+n115: drwxr-xr-x   3 jji0930  users    260 Mar 24 14:02 fileMAiVFl10153017743285690
+n115: drwxr-xr-x   3 jji0930  users    260 Mar 24 14:02 fileVaqQvx2433017743285470
+n115: drwxr-xr-x   3 jji0930  users    260 Mar 24 14:02 filedVO6G78848217743285640
+n115: drwxr-xr-x   3 jji0930  users    260 Mar 24 14:02 filefKDZkb2401717743285460
+n115: drwxr-xr-x   3 jji0930  users    260 Mar 24 14:03 fileSkRNvh15937317743285900
+n115: drwxr-xr-x   3 jji0930  users    260 Mar 24 14:03 filedzZUE126641717743286230
+n115: drwxr-xr-x   3 jji0930  users    260 Mar 24 14:03 filenkah0y29239017743286280
+n115: drwxr-xr-x   3 jji0930  users    260 Mar 24 14:03 filet35b8617515717743285940
+n115: drwxr-xr-x   3 jji0930  users    260 Mar 24 14:04 filebidPVL38246717743286560
+n115: drwxr-xr-x   3 jji0930  users    260 Mar 24 14:04 filej50Su740322117743286610
+n115: drwxr-xr-x   3 r1jae262 users    100 Mar 24 14:02 file7l3et71962317743285618
+n115: drwxr-xr-x   3 r1jae262 users    100 Mar 24 14:02 fileCrzFyr1962317743285495
+n115: drwxr-xr-x   3 r1jae262 users    100 Mar 24 14:02 fileiNwRWP19623177432856511
+n115: drwxr-xr-x   3 r1jae262 users    100 Mar 24 14:03 file55NsUP19623177432862327
+n115: drwxr-xr-x   3 r1jae262 users    100 Mar 24 14:03 fileZqILcX19623177432859219
+n115: drwxr-xr-x   3 r1jae262 users    100 Mar 24 14:03 fileh5nPO219623177432858916
+n115: drwxr-xr-x   3 r1jae262 users    100 Mar 24 14:03 filepOtPub19623177432861924
+n115: drwxr-xr-x   3 r1jae262 users    100 Mar 24 14:04 fileDJAV3B19623177432865332
+n115: drwxr-xr-x   3 r1jae262 users    100 Mar 24 14:04 fileVE0ged19623177432865735
+n115: drwxr-xr-x   3 r1jae262 users    100 Mar 24 15:01 fileHhvk8448136917743320923
+n115: drwxr-xr-x   3 r1jae262 users    260 Mar 24 14:02 fileuZsIkk10058917743285660
+n115: drwxr-xr-x   3 r1jae262 users    260 Mar 24 14:03 filewOOtw224831517743286190
+n115: drwxr-xr-x   3 r1jae262 users    260 Mar 24 14:04 fileOI3Dj437546017743286530
+n115: drwxr-xr-x   3 r1jae262 users    260 Mar 24 15:01 fileepTe3Y48167217743320920
+n115: drwxr-xr-x   4 dw16     users   1360 Mar 24 14:58 maxwell_nib115.hpc_83791.pjt
+n115: drwxr-xr-x   4 dw16     users   1360 Mar 24 15:04 maxwell_nib115.hpc_101254.pjt
+n115: drwxr-xr-x   5 dw16     users   1320 Mar 24 15:07 maxwell_nib115.hpc_23346.pjt
+n115: drwxr-xr-x   8 dw16     users   1380 Mar 24 15:07 maxwell_nib115.hpc_98817.pjt
+n115: drwxr-xr-x   9 dhj02    users   1040 Mar 24 14:48 maxwell_nib115.hpc_463477.pjt
+n115: drwxr-xr-x   9 dhj02    users   1400 Mar 24 14:41 maxwell_nib115.hpc_24615.pjt
+n115: drwxr-xr-x   9 dhj02    users   1400 Mar 24 14:43 maxwell_nib115.hpc_315053.pjt
+n115: drwxr-xr-x   9 dhj02    users   1400 Mar 24 14:45 maxwell_nib115.hpc_207992.pjt
+n115: drwxr-xr-x   9 dhj02    users   1400 Mar 24 14:45 maxwell_nib115.hpc_463159.pjt
+n115: drwxr-xr-x   9 dhj02    users   1400 Mar 24 14:46 maxwell_nib115.hpc_323224.pjt
+n115: drwxr-xr-x   9 dhj02    users   1400 Mar 24 14:46 maxwell_nib115.hpc_429758.pjt
+n115: drwxr-xr-x   9 dhj02    users   1400 Mar 24 14:47 maxwell_nib115.hpc_302756.pjt
+n115: drwxr-xr-x   9 dw16     users   1400 Mar 24 14:57 maxwell_nib115.hpc_315637.pjt
+n115: drwxr-xr-x   9 dw16     users   1400 Mar 24 15:03 maxwell_nib115.hpc_302151.pjt
+n115: drwxr-xr-x   9 harry261 users   1400 Mar 24 15:00 maxwell_nib115.hpc_366246.pjt
+n115: drwxr-xr-x   9 harry261 users   1400 Mar 24 15:04 maxwell_nib115.hpc_253476.pjt
+n115: drwxr-xr-x   9 harry261 users   1400 Mar 24 15:06 maxwell_nib115.hpc_26328.pjt
+n115: drwxrwxrwt   2 root     root      40 Mar 24 13:48 .ICE-unix
+n115: drwxrwxrwt   2 root     root      40 Mar 24 13:48 .Test-unix
+n115: drwxrwxrwt   2 root     root      40 Mar 24 13:48 .X11-unix
+n115: drwxrwxrwt   2 root     root      40 Mar 24 13:48 .XIM-unix
+n115: drwxrwxrwt   2 root     root      40 Mar 24 13:48 .font-unix
+n115: drwxrwxrwt 187 root     root    4980 Mar 24 15:07 .
+n115: drwxrwxrwx   3 r1jae262 users     60 Mar 24 15:01 AnsysEM.mw.r1jae262
+n115: drwxrwxrwx   4 dhj02    users     80 Mar 24 14:02 AnsysEM.mw.dhj02
+n115: drwxrwxrwx   4 dw16     users     80 Mar 24 14:56 AnsysEM.mw.dw16
+n115: drwxrwxrwx   4 harry261 users     80 Mar 24 14:01 AnsysEM.mw.harry261
+n115: drwxrwxrwx   4 jji0930  users     80 Mar 24 14:01 AnsysEM.mw.jji0930
+n115: total 1484
+
+
+
+
+n116: -rw-r-----   1 root     root     11 Mar 24 13:48 .wwgetfiles_timestamp
+n116: -rw-r--r--   1 dhj02    users 14260 Mar 24 14:02 pyaedt_dhj02_97edc610-e433-4e05-ac79-ff9d164a1543.log
+n116: -rw-r--r--   1 dhj02    users 26806 Mar 24 14:54 pyaedt_dhj02_b371b669-eefe-4a9f-930a-f2b86b7d2ede.log
+n116: -rw-r--r--   1 dhj02    users 31521 Mar 24 15:04 pyaedt_dhj02_1c028a11-60d5-41a5-a34a-d7439b8e2f63.log
+n116: -rw-r--r--   1 dhj02    users 34131 Mar 24 15:04 pyaedt_dhj02_c8207681-774c-4c80-9900-3e15a385bf09.log
+n116: -rw-r--r--   1 dhj02    users 34632 Mar 24 15:04 pyaedt_dhj02_146450c0-2b9b-408b-82b2-0bbcc035c60d.log
+n116: -rw-r--r--   1 dhj02    users 34762 Mar 24 15:04 pyaedt_dhj02_4b4b7879-d432-4df5-9a1e-795e66c716c5.log
+n116: -rw-r--r--   1 dhj02    users 34985 Mar 24 15:04 pyaedt_dhj02_292f9d20-554d-4478-b490-32c1f6071c6a.log
+n116: -rw-r--r--   1 dhj02    users 35888 Mar 24 15:04 pyaedt_dhj02_0971bce3-f562-4f73-bbf1-ab5f28b3af35.log
+n116: -rw-r--r--   1 dhj02    users 35895 Mar 24 15:04 pyaedt_dhj02_88fc193b-27dc-4351-8d18-161ec97c98a3.log
+n116: -rw-r--r--   1 dhj02    users 36480 Mar 24 15:04 pyaedt_dhj02_f82355b4-2b9b-4aa9-abe6-cf0aad98f3b6.log
+n116: -rw-r--r--   1 dw16     users  8892 Mar 24 14:02 pyaedt_dw16_bc638f36-c5e7-4ccd-998e-6f3dcb77de59.log
+n116: -rw-r--r--   1 dw16     users  9084 Mar 24 14:02 pyaedt_dw16_a1807559-8fc5-427a-9998-4cd608a14451.log
+n116: -rw-r--r--   1 dw16     users  9599 Mar 24 14:03 pyaedt_dw16_4c0f082d-a43a-420d-9e23-490817385cf0.log
+n116: -rw-r--r--   1 dw16     users 10133 Mar 24 14:02 pyaedt_dw16_014542e2-9809-4b48-ba17-839b60ad7213.log
+n116: -rw-r--r--   1 dw16     users 10258 Mar 24 14:04 pyaedt_dw16_6f60c131-9a53-422c-af22-fe36167d91de.log
+n116: -rw-r--r--   1 dw16     users 10845 Mar 24 14:03 pyaedt_dw16_3e0427c5-2b80-49f0-b5d3-cb79a2eb20cb.log
+n116: -rw-r--r--   1 dw16     users 11593 Mar 24 15:06 pyaedt_dw16_d5671237-ed93-4082-8b1c-f82a9bcb8a4d.log
+n116: -rw-r--r--   1 dw16     users 12875 Mar 24 14:03 pyaedt_dw16_ffd29699-9420-41b8-ae2e-e2826c60b38f.log
+n116: -rw-r--r--   1 dw16     users 13459 Mar 24 14:02 pyaedt_dw16_9973ee94-4931-4025-96ff-c124ed2f04bd.log
+n116: -rw-r--r--   1 dw16     users 13587 Mar 24 14:03 pyaedt_dw16_a14c724a-5a54-4714-a0b5-956ee77be09a.log
+n116: -rw-r--r--   1 harry261 users  8896 Mar 24 14:02 pyaedt_harry261_15566932-0590-49b1-af39-8bbe8c4e4921.log
+n116: -rw-r--r--   1 harry261 users  8896 Mar 24 14:03 pyaedt_harry261_265c2905-35bc-4b95-b1ec-12e1a89416bd.log
+n116: -rw-r--r--   1 harry261 users  9617 Mar 24 14:02 pyaedt_harry261_9290cf65-959e-4321-8a23-12a56c4e7e8b.log
+n116: -rw-r--r--   1 harry261 users  9911 Mar 24 14:02 pyaedt_harry261_f918d252-dfa5-40c7-8904-14897819d993.log
+n116: -rw-r--r--   1 harry261 users 10173 Mar 24 14:03 pyaedt_harry261_e62a26e9-0786-414b-af91-92a1412718b3.log
+n116: -rw-r--r--   1 harry261 users 10226 Mar 24 14:04 pyaedt_harry261_7a0566e8-0ae9-4127-b3f4-ff549f11b979.log
+n116: -rw-r--r--   1 harry261 users 10351 Mar 24 14:03 pyaedt_harry261_c017eaa4-1eea-4ccc-9ee7-81d09905474b.log
+n116: -rw-r--r--   1 harry261 users 10493 Mar 24 14:03 pyaedt_harry261_6ab6a77e-9b77-4392-96d4-8221c5f3d876.log
+n116: -rw-r--r--   1 harry261 users 10760 Mar 24 14:04 pyaedt_harry261_f6ab0adc-f842-4271-bf0a-c7e1e3d779ad.log
+n116: -rw-r--r--   1 harry261 users 10849 Mar 24 14:03 pyaedt_harry261_52f0394b-e65a-459f-9932-c9ea661aa45c.log
+n116: -rw-r--r--   1 harry261 users 10849 Mar 24 14:04 pyaedt_harry261_875e364f-8e1e-4255-8830-d9217c9153c8.log
+n116: -rw-r--r--   1 harry261 users 11277 Mar 24 14:02 pyaedt_harry261_91046ba6-6142-4311-afe8-25b25baee8fb.log
+n116: -rw-r--r--   1 harry261 users 12220 Mar 24 14:03 pyaedt_harry261_126e4741-deab-4666-b4ca-e09655c4214b.log
+n116: -rw-r--r--   1 harry261 users 24409 Mar 24 14:47 pyaedt_harry261_da4fe89a-c64f-4318-b3ca-04bdc9994892.log
+n116: -rw-r--r--   1 harry261 users 24453 Mar 24 14:52 pyaedt_harry261_4abf9d48-f6bc-4d00-a459-4967e635c11c.log
+n116: -rw-r--r--   1 jji0930  users 10773 Mar 24 14:02 pyaedt_jji0930_c189748a-eb5b-4f3e-ab26-a8ac38ce17c0.log
+n116: -rw-r--r--   1 jji0930  users 12483 Mar 24 14:02 pyaedt_jji0930_eb75f151-8c29-4ddb-9864-ba726192aaa5.log
+n116: -rw-r--r--   1 jji0930  users 27538 Mar 24 15:04 pyaedt_jji0930_0e79ea3f-71cf-40e7-83d1-376c488f7124.log
+n116: -rw-r--r--   1 jji0930  users 28635 Mar 24 14:54 pyaedt_jji0930_296b7ae0-2b29-4dcd-aa8a-2684c28f27a9.log
+n116: -rw-r--r--   1 jji0930  users 31872 Mar 24 15:04 pyaedt_jji0930_0e975305-bd5c-4a43-bd83-674f12a7c4d9.log
+n116: -rw-r--r--   1 jji0930  users 31891 Mar 24 15:04 pyaedt_jji0930_175f9255-8935-494a-8d2d-26e831a44683.log
+n116: -rw-r--r--   1 jji0930  users 31947 Mar 24 15:04 pyaedt_jji0930_b43ddfa8-61ff-416d-bc77-51d70ecd0877.log
+n116: -rw-r--r--   1 jji0930  users 32427 Mar 24 15:04 pyaedt_jji0930_1c57f35b-4539-458f-b7b5-b34b19a4fd9b.log
+n116: -rw-r--r--   1 jji0930  users 33366 Mar 24 15:05 pyaedt_jji0930_124fdb38-dd33-4103-9a2c-54e854aba689.log
+n116: -rw-r--r--   1 jji0930  users 35745 Mar 24 15:05 pyaedt_jji0930_5453fbe8-5136-4707-9fae-c493ad62da59.log
+n116: -rw-r--r--   1 jji0930  users 35754 Mar 24 15:05 pyaedt_jji0930_b08b77e3-4d06-4d0d-9590-3ac81d6e2d28.log
+n116: -rw-r--r--   1 jji0930  users 35826 Mar 24 15:04 pyaedt_jji0930_fc8941b1-2e90-4615-b64f-0f4e2dafb910.log
+n116: -rw-r--r--   1 jji0930  users 35842 Mar 24 15:05 pyaedt_jji0930_df387926-aa9e-4229-945b-493cfc632297.log
+n116: -rw-r--r--   1 jji0930  users 38585 Mar 24 15:05 pyaedt_jji0930_46831e36-3bc9-4fb7-8ed6-ea3e43aec0a1.log
+n116: -rw-r--r--   1 jji0930  users 39289 Mar 24 15:04 pyaedt_jji0930_5739475b-d5cd-4c92-8a0b-22d7163d9f89.log
+n116: -rw-r--r--   1 r1jae262 users  9070 Mar 24 14:04 pyaedt_r1jae262_2a1dc80d-d352-41a7-8775-a24b8fb781be.log
+n116: -rw-r--r--   1 r1jae262 users  9425 Mar 24 14:02 pyaedt_r1jae262_cc28bf85-473a-49bb-a434-236519de784a.log
+n116: -rw-r--r--   1 r1jae262 users  9425 Mar 24 14:04 pyaedt_r1jae262_d454dd07-ad26-45df-832b-e20f97bc9941.log
+n116: -rw-r--r--   1 r1jae262 users  9439 Mar 24 14:02 pyaedt_r1jae262_46d49e21-ee01-4093-9a89-3fb038dcb54f.log
+n116: -rw-r--r--   1 r1jae262 users  9824 Mar 24 14:03 pyaedt_r1jae262_7528ff1d-9b2d-4dbe-82be-b9b757c588a1.log
+n116: -rw-r--r--   1 r1jae262 users  9959 Mar 24 14:02 pyaedt_r1jae262_9aa8274f-a54e-45f2-86fa-358f6f6104ff.log
+n116: -rw-r--r--   1 r1jae262 users 12042 Mar 24 14:03 pyaedt_r1jae262_6c7375a8-8d4e-40c9-811c-22c028c6619c.log
+n116: -rw-r--r--   1 r1jae262 users 14161 Mar 24 14:03 pyaedt_r1jae262_5df1a333-d71b-4d18-aa8a-475932bf64a6.log
+n116: -rw-r--r--   1 r1jae262 users 14873 Mar 24 14:03 pyaedt_r1jae262_7bdfbf5c-1281-4570-b873-825570f64d1e.log
+n116: -rw-r--r--   1 r1jae262 users 24876 Mar 24 14:45 pyaedt_r1jae262_6279ba6b-6aac-4f19-aff6-d7939ee6eb31.log
+n116: -rw-r--r--   1 root     root      7 Mar 24 15:05 .wwgetfile.lock
+n116: dr-xr-xr-x  22 root     root    600 Mar 24 13:49 ..
+n116: drwx------   3 root     root     60 Mar 24 13:48 systemd-private-bd9a7d562acf44eeb7f938b89a346a54-chronyd.service-axAjSD
+n116: drwx------   3 root     root     60 Mar 24 13:49 mmfs
+n116: drwxr-xr-x   2 dhj02    users   520 Mar 24 14:02 maxwell_nib116.hpc_26547.pjt
+n116: drwxr-xr-x   2 dhj02    users   520 Mar 24 14:03 maxwell_nib116.hpc_195083.pjt
+n116: drwxr-xr-x   2 dhj02    users   520 Mar 24 14:04 maxwell_nib116.hpc_379315.pjt
+n116: drwxr-xr-x   2 dhj02    users   520 Mar 24 14:54 maxwell_nib116.hpc_444917.pjt
+n116: drwxr-xr-x   2 dhj02    users   520 Mar 24 15:04 maxwell_nib116.hpc_519447.pjt
+n116: drwxr-xr-x   2 dhj02    users   520 Mar 24 15:04 maxwell_nib116.hpc_531871.pjt
+n116: drwxr-xr-x   2 dhj02    users   520 Mar 24 15:04 maxwell_nib116.hpc_566005.pjt
+n116: drwxr-xr-x   2 dhj02    users   520 Mar 24 15:04 maxwell_nib116.hpc_587423.pjt
+n116: drwxr-xr-x   2 dhj02    users   520 Mar 24 15:04 maxwell_nib116.hpc_589145.pjt
+n116: drwxr-xr-x   2 dhj02    users   520 Mar 24 15:05 maxwell_nib116.hpc_599860.pjt
+n116: drwxr-xr-x   2 dhj02    users   520 Mar 24 15:05 maxwell_nib116.hpc_608130.pjt
+n116: drwxr-xr-x   2 dhj02    users   520 Mar 24 15:05 maxwell_nib116.hpc_609543.pjt
+n116: drwxr-xr-x   2 dhj02    users  1280 Mar 24 14:54 maxwell_nib116.hpc_84258.pjt
+n116: drwxr-xr-x   2 dhj02    users  1300 Mar 24 14:57 maxwell_nib116.hpc_67832.pjt
+n116: drwxr-xr-x   2 dhj02    users  1300 Mar 24 15:00 maxwell_nib116.hpc_319357.pjt
+n116: drwxr-xr-x   2 dw16     users  1180 Mar 24 15:06 maxwell_nib116.hpc_201132.pjt
+n116: drwxr-xr-x   2 harry261 users   520 Mar 24 14:03 maxwell_nib116.hpc_112180.pjt
+n116: drwxr-xr-x   2 harry261 users   520 Mar 24 14:03 maxwell_nib116.hpc_326883.pjt
+n116: drwxr-xr-x   2 harry261 users  1240 Mar 24 15:07 maxwell_nib116.hpc_444120.pjt
+n116: drwxr-xr-x   2 harry261 users  1280 Mar 24 15:06 maxwell_nib116.hpc_305453.pjt
+n116: drwxr-xr-x   2 jji0930  users    80 Mar 24 14:02 Maxwell
+n116: drwxr-xr-x   2 jji0930  users   520 Mar 24 14:03 maxwell_nib116.hpc_115628.pjt
+n116: drwxr-xr-x   2 jji0930  users   520 Mar 24 15:04 maxwell_nib116.hpc_577559.pjt
+n116: drwxr-xr-x   2 jji0930  users   520 Mar 24 15:04 maxwell_nib116.hpc_587728.pjt
+n116: drwxr-xr-x   2 jji0930  users   520 Mar 24 15:04 maxwell_nib116.hpc_590067.pjt
+n116: drwxr-xr-x   2 jji0930  users   520 Mar 24 15:05 maxwell_nib116.hpc_600840.pjt
+n116: drwxr-xr-x   2 jji0930  users   520 Mar 24 15:05 maxwell_nib116.hpc_609011.pjt
+n116: drwxr-xr-x   2 jji0930  users   520 Mar 24 15:05 maxwell_nib116.hpc_609336.pjt
+n116: drwxr-xr-x   2 jji0930  users   520 Mar 24 15:05 maxwell_nib116.hpc_611361.pjt
+n116: drwxr-xr-x   2 jji0930  users   520 Mar 24 15:05 maxwell_nib116.hpc_611839.pjt
+n116: drwxr-xr-x   2 jji0930  users   520 Mar 24 15:05 maxwell_nib116.hpc_615101.pjt
+n116: drwxr-xr-x   2 jji0930  users   520 Mar 24 15:05 maxwell_nib116.hpc_620257.pjt
+n116: drwxr-xr-x   2 jji0930  users   520 Mar 24 15:05 maxwell_nib116.hpc_620680.pjt
+n116: drwxr-xr-x   2 jji0930  users   600 Mar 24 15:00 maxwell_nib116.hpc_421962.pjt
+n116: drwxr-xr-x   2 jji0930  users  1160 Mar 24 15:07 maxwell_nib116.hpc_445112.pjt
+n116: drwxr-xr-x   2 jji0930  users  1200 Mar 24 14:54 maxwell_nib116.hpc_327378.pjt
+n116: drwxr-xr-x   2 jji0930  users  1260 Mar 24 15:07 maxwell_nib116.hpc_22455.pjt
+n116: drwxr-xr-x   2 jji0930  users  1280 Mar 24 14:54 maxwell_nib116.hpc_105042.pjt
+n116: drwxr-xr-x   2 jji0930  users  1280 Mar 24 15:03 maxwell_nib116.hpc_111972.pjt
+n116: drwxr-xr-x   2 jji0930  users  1300 Mar 24 14:53 maxwell_nib116.hpc_329946.pjt
+n116: drwxr-xr-x   2 jji0930  users  1300 Mar 24 14:54 maxwell_nib116.hpc_221484.pjt
+n116: drwxr-xr-x   2 jji0930  users  1300 Mar 24 15:02 maxwell_nib116.hpc_223233.pjt
+n116: drwxr-xr-x   2 jji0930  users  1300 Mar 24 15:07 maxwell_nib116.hpc_423763.pjt
+n116: drwxr-xr-x   2 r1jae262 users   520 Mar 24 14:45 maxwell_nib116.hpc_441902.pjt
+n116: drwxr-xr-x   2 r1jae262 users  1260 Mar 24 15:06 maxwell_nib116.hpc_371256.pjt
+n116: drwxr-xr-x   3 dhj02    users   100 Mar 24 14:02 fileUj8iw32032117743285483
+n116: drwxr-xr-x   3 dhj02    users   100 Mar 24 14:54 filemW7IqC2032117743316787
+n116: drwxr-xr-x   3 dhj02    users   100 Mar 24 15:04 fileAC00AA20321177433226918
+n116: drwxr-xr-x   3 dhj02    users   100 Mar 24 15:04 fileB8csQu20321177433227321
+n116: drwxr-xr-x   3 dhj02    users   100 Mar 24 15:04 fileahowTH20321177433229436
+n116: drwxr-xr-x   3 dhj02    users   100 Mar 24 15:04 fileda35eS20321177433228327
+n116: drwxr-xr-x   3 dhj02    users   100 Mar 24 15:04 filel99cI920321177433228630
+n116: drwxr-xr-x   3 dhj02    users   100 Mar 24 15:04 fileq4yM1120321177433228933
+n116: drwxr-xr-x   3 dhj02    users   100 Mar 24 15:04 filewAFJ3v20321177433229939
+n116: drwxr-xr-x   3 dhj02    users   100 Mar 24 15:04 filez17Dps20321177433227724
+n116: drwxr-xr-x   3 dhj02    users   260 Mar 24 14:02 filegPRe1C2654717743285490
+n116: drwxr-xr-x   3 dhj02    users   260 Mar 24 14:03 fileYiidhj31935717743286280
+n116: drwxr-xr-x   3 dhj02    users   260 Mar 24 14:54 filesu5G2N44491717743316790
+n116: drwxr-xr-x   3 dhj02    users   260 Mar 24 15:04 file0EHu1p51944717743322690
+n116: drwxr-xr-x   3 dhj02    users   260 Mar 24 15:04 file5sQXYD59986017743322900
+n116: drwxr-xr-x   3 dhj02    users   260 Mar 24 15:04 fileCItOgJ53187117743322730
+n116: drwxr-xr-x   3 dhj02    users   260 Mar 24 15:04 fileCm7uhs60813017743322940
+n116: drwxr-xr-x   3 dhj02    users   260 Mar 24 15:04 fileS4RaYi58742317743322840
+n116: drwxr-xr-x   3 dhj02    users   260 Mar 24 15:04 filegeU5eZ56600517743322780
+n116: drwxr-xr-x   3 dhj02    users   260 Mar 24 15:04 fileiMfEZG58914517743322860
+n116: drwxr-xr-x   3 dhj02    users   260 Mar 24 15:05 fileYgKgBx60954317743323000
+n116: drwxr-xr-x   3 dw16     users   100 Mar 24 14:02 fileGXd5Iu20268177432855911
+n116: drwxr-xr-x   3 dw16     users   100 Mar 24 14:02 filerWHQVL2032617743285473
+n116: drwxr-xr-x   3 dw16     users   100 Mar 24 14:03 filea7Njla20268177432859416
+n116: drwxr-xr-x   3 dw16     users   100 Mar 24 14:03 filefpkBjT20268177432859819
+n116: drwxr-xr-x   3 dw16     users   100 Mar 24 14:04 fileKqKLj320268177432865032
+n116: drwxr-xr-x   3 dw16     users   260 Mar 24 14:02 file7wsZB76935717743285600
+n116: drwxr-xr-x   3 dw16     users   260 Mar 24 14:02 fileloQgsV2579217743285470
+n116: drwxr-xr-x   3 dw16     users   260 Mar 24 14:03 fileWDLqNZ18773917743285940
+n116: drwxr-xr-x   3 dw16     users   260 Mar 24 14:03 filezPoFIf20113217743285980
+n116: drwxr-xr-x   3 dw16     users   260 Mar 24 14:04 fileqAOVQP37779817743286500
+n116: drwxr-xr-x   3 harry261 users   100 Mar 24 14:02 fileH9YyuA20523177432856812
+n116: drwxr-xr-x   3 harry261 users   100 Mar 24 14:02 fileLZ1RtG20523177432857215
+n116: drwxr-xr-x   3 harry261 users   100 Mar 24 14:02 fileXR4wZ22052317743285443
+n116: drwxr-xr-x   3 harry261 users   100 Mar 24 14:03 fileLXNlnP20523177432863239
+n116: drwxr-xr-x   3 harry261 users   100 Mar 24 14:03 fileVaaHub20523177432862433
+n116: drwxr-xr-x   3 harry261 users   100 Mar 24 14:03 fileYRRRQl20523177432860024
+n116: drwxr-xr-x   3 harry261 users   100 Mar 24 14:03 fileZFDi9420523177432862836
+n116: drwxr-xr-x   3 harry261 users   100 Mar 24 14:03 filegrVvqe20523177432860427
+n116: drwxr-xr-x   3 harry261 users   100 Mar 24 14:04 fileGr3xBL20523177432865848
+n116: drwxr-xr-x   3 harry261 users   100 Mar 24 14:04 fileOnsyda20523177432866251
+n116: drwxr-xr-x   3 harry261 users   100 Mar 24 14:47 filekdXkLW205231774331238117
+n116: drwxr-xr-x   3 harry261 users   100 Mar 24 14:52 fileNRT4iS205231774331563127
+n116: drwxr-xr-x   3 harry261 users   260 Mar 24 14:02 fileCFZDTn2366517743285450
+n116: drwxr-xr-x   3 harry261 users   260 Mar 24 14:02 fileePaoQ210529917743285690
+n116: drwxr-xr-x   3 harry261 users   260 Mar 24 14:02 filef5EhLn11218017743285730
+n116: drwxr-xr-x   3 harry261 users   260 Mar 24 14:03 fileDH4kVZ30545317743286250
+n116: drwxr-xr-x   3 harry261 users   260 Mar 24 14:03 fileEaNyA532960817743286330
+n116: drwxr-xr-x   3 harry261 users   260 Mar 24 14:03 fileUINVMQ21209217743286010
+n116: drwxr-xr-x   3 harry261 users   260 Mar 24 14:03 fileYjA0mK22018617743286050
+n116: drwxr-xr-x   3 harry261 users   260 Mar 24 14:03 filekhGOJn32688317743286290
+n116: drwxr-xr-x   3 harry261 users   260 Mar 24 14:04 fileKME63q42344717743286630
+n116: drwxr-xr-x   3 harry261 users   260 Mar 24 14:04 filePeM9XR42126317743286590
+n116: drwxr-xr-x   3 harry261 users   260 Mar 24 14:47 fileNRmfxE44253417743312390
+n116: drwxr-xr-x   3 harry261 users   260 Mar 24 14:52 file6qS5bU44412017743315640
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 14:02 fileKHoFxV2096517743285393
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 14:54 file2rHJaW2096417743316797
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 15:04 file8Xy9ub20964177433229838
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 15:04 fileVISZXT20964177433229535
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 15:04 fileWT2AGP20964177433228326
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 15:04 fileWmfowc20964177433228629
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 15:04 filea0i4eS20964177433229032
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 15:04 filehbrDCV20964177433227923
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 15:05 fileGJgGrW20964177433230242
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 15:05 fileTPX4QS20964177433231251
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 15:05 fileUqEouz20964177433230445
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 15:05 fileeOZN3a20964177433231854
+n116: drwxr-xr-x   3 jji0930  users   100 Mar 24 15:05 filegteo5E20964177433230848
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 14:02 file6VLCK82245517743285390
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 14:54 file9pAYwj44511217743316790
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 15:04 file4NlAEZ60933617743322980
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 15:04 fileAOF4Iy60901117743322960
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 15:04 fileGBCZ8b59006717743322870
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 15:04 filesRqLUo60084017743322910
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 15:04 filesrCuGg57755917743322800
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 15:04 filezhpMx258772817743322840
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 15:05 file7pOgON61510117743323090
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 15:05 fileBJbGhx62068017743323190
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 15:05 fileKRslGB61183917743323050
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 15:05 fileP9RsH862025717743323130
+n116: drwxr-xr-x   3 jji0930  users   260 Mar 24 15:05 filecHnns061136117743323020
+n116: drwxr-xr-x   3 r1jae262 users   100 Mar 24 14:02 file4VjVDf1943317743285568
+n116: drwxr-xr-x   3 r1jae262 users   100 Mar 24 14:02 filetynkx11943317743285413
+n116: drwxr-xr-x   3 r1jae262 users   100 Mar 24 14:02 filewlBvVs19433177432855811
+n116: drwxr-xr-x   3 r1jae262 users   100 Mar 24 14:03 fileQXntFN19433177432858816
+n116: drwxr-xr-x   3 r1jae262 users   100 Mar 24 14:03 fileV9lSt619433177432862624
+n116: drwxr-xr-x   3 r1jae262 users   100 Mar 24 14:03 filezcLUou19433177432863027
+n116: drwxr-xr-x   3 r1jae262 users   100 Mar 24 14:04 filepblrPH19433177432864935
+n116: drwxr-xr-x   3 r1jae262 users   100 Mar 24 14:45 fileqyjeXH19433177433112992
+n116: drwxr-xr-x   3 r1jae262 users   260 Mar 24 14:02 file4BCe3u5603717743285560
+n116: drwxr-xr-x   3 r1jae262 users   260 Mar 24 14:02 file9RfoHV6782617743285590
+n116: drwxr-xr-x   3 r1jae262 users   260 Mar 24 14:02 fileaIMPCC2285417743285420
+n116: drwxr-xr-x   3 r1jae262 users   260 Mar 24 14:03 fileS01Hx232758217743286310
+n116: drwxr-xr-x   3 r1jae262 users   260 Mar 24 14:03 fileZK3lCc30768917743286260
+n116: drwxr-xr-x   3 r1jae262 users   260 Mar 24 14:03 fileuYYx8i13939017743285890
+n116: drwxr-xr-x   3 r1jae262 users   260 Mar 24 14:04 fileu1c70V37125617743286490
+n116: drwxr-xr-x   3 r1jae262 users   260 Mar 24 14:45 fileqr6dQH44190217743311300
+n116: drwxr-xr-x   4 r1jae262 users  1360 Mar 24 15:07 maxwell_nib116.hpc_67826.pjt
+n116: drwxr-xr-x   9 dw16     users  1400 Mar 24 14:59 maxwell_nib116.hpc_25792.pjt
+n116: drwxr-xr-x   9 dw16     users  1400 Mar 24 15:04 maxwell_nib116.hpc_377798.pjt
+n116: drwxr-xr-x   9 dw16     users  1400 Mar 24 15:04 maxwell_nib116.hpc_69357.pjt
+n116: drwxr-xr-x   9 dw16     users  1400 Mar 24 15:05 maxwell_nib116.hpc_187739.pjt
+n116: drwxr-xr-x   9 harry261 users  1400 Mar 24 14:54 maxwell_nib116.hpc_421263.pjt
+n116: drwxr-xr-x   9 harry261 users  1400 Mar 24 14:55 maxwell_nib116.hpc_23665.pjt
+n116: drwxr-xr-x   9 harry261 users  1400 Mar 24 14:56 maxwell_nib116.hpc_105299.pjt
+n116: drwxr-xr-x   9 harry261 users  1400 Mar 24 14:56 maxwell_nib116.hpc_220186.pjt
+n116: drwxr-xr-x   9 harry261 users  1400 Mar 24 15:01 maxwell_nib116.hpc_329608.pjt
+n116: drwxr-xr-x   9 harry261 users  1400 Mar 24 15:02 maxwell_nib116.hpc_212092.pjt
+n116: drwxr-xr-x   9 harry261 users  1400 Mar 24 15:04 maxwell_nib116.hpc_442534.pjt
+n116: drwxr-xr-x   9 harry261 users  1400 Mar 24 15:06 maxwell_nib116.hpc_423447.pjt
+n116: drwxr-xr-x   9 jji0930  users  1400 Mar 24 14:57 maxwell_nib116.hpc_333137.pjt
+n116: drwxr-xr-x   9 r1jae262 users  1400 Mar 24 14:53 maxwell_nib116.hpc_56037.pjt
+n116: drwxr-xr-x   9 r1jae262 users  1400 Mar 24 14:55 maxwell_nib116.hpc_139390.pjt
+n116: drwxr-xr-x   9 r1jae262 users  1400 Mar 24 15:02 maxwell_nib116.hpc_22854.pjt
+n116: drwxr-xr-x   9 r1jae262 users  1400 Mar 24 15:02 maxwell_nib116.hpc_307689.pjt
+n116: drwxr-xr-x   9 r1jae262 users  1400 Mar 24 15:02 maxwell_nib116.hpc_327582.pjt
+n116: drwxrwxrwt   2 root     root     40 Mar 24 13:48 .ICE-unix
+n116: drwxrwxrwt   2 root     root     40 Mar 24 13:48 .Test-unix
+n116: drwxrwxrwt   2 root     root     40 Mar 24 13:48 .X11-unix
+n116: drwxrwxrwt   2 root     root     40 Mar 24 13:48 .XIM-unix
+n116: drwxrwxrwt   2 root     root     40 Mar 24 13:48 .font-unix
+n116: drwxrwxrwt 175 root     root   4740 Mar 24 15:07 .
+n116: drwxrwxrwx   3 dhj02    users    60 Mar 24 14:53 AnsysEM.mw.dhj02
+n116: drwxrwxrwx   3 harry261 users    60 Mar 24 14:51 AnsysEM.mw.harry261
+n116: drwxrwxrwx   3 r1jae262 users    60 Mar 24 14:44 AnsysEM.mw.r1jae262
+n116: drwxrwxrwx   4 dw16     users    80 Mar 24 14:01 AnsysEM.mw.dw16
+n116: drwxrwxrwx   4 jji0930  users    80 Mar 24 14:53 AnsysEM.mw.jji0930
+n116: total 1288
+
+
+
+
+
+
+
+
+
+
+[root@tgm-master kevin]# pdsh -w n[115,116] 'du -ah --max-depth=1 /tmp/' | sort;
+n115: 0	/tmp/.ICE-unix
+n115: 0	/tmp/.Test-unix
+n115: 0	/tmp/.X11-unix
+n115: 0	/tmp/.XIM-unix
+n115: 0	/tmp/.font-unix
+n115: 0	/tmp/Maxwell
+n115: 0	/tmp/Rtmpn8z26l
+n115: 0	/tmp/mmfs
+n115: 0	/tmp/systemd-private-07fe63ffad354644a3099f13ba976acd-chronyd.service-lAEmIg
+n115: 1.1G	/tmp/maxwell_nib115.hpc_450222.pjt
+n115: 1.2G	/tmp/maxwell_nib115.hpc_174465.pjt
+n115: 1.2G	/tmp/maxwell_nib115.hpc_266194.pjt
+n115: 1.2G	/tmp/maxwell_nib115.hpc_302151.pjt
+n115: 1.2G	/tmp/maxwell_nib115.hpc_410159.pjt
+n115: 1.2G	/tmp/maxwell_nib115.hpc_429758.pjt
+n115: 1.3G	/tmp/maxwell_nib115.hpc_151586.pjt
+n115: 1.3G	/tmp/maxwell_nib115.hpc_207992.pjt
+n115: 1.3G	/tmp/maxwell_nib115.hpc_253476.pjt
+n115: 1.3G	/tmp/maxwell_nib115.hpc_315053.pjt
+n115: 1.3G	/tmp/maxwell_nib115.hpc_98817.pjt
+n115: 1.4G	/tmp/maxwell_nib115.hpc_173921.pjt
+n115: 1.4G	/tmp/maxwell_nib115.hpc_323224.pjt
+n115: 1.4M	/tmp/AnsysEM.mw.r1jae262
+n115: 1.5G	/tmp/maxwell_nib115.hpc_159373.pjt
+n115: 1.5G	/tmp/maxwell_nib115.hpc_23346.pjt
+n115: 1.6G	/tmp/maxwell_nib115.hpc_181020.pjt
+n115: 1.6G	/tmp/maxwell_nib115.hpc_187241.pjt
+n115: 1.6G	/tmp/maxwell_nib115.hpc_22690.pjt
+n115: 1.6G	/tmp/maxwell_nib115.hpc_24615.pjt
+n115: 1.6G	/tmp/maxwell_nib115.hpc_26062.pjt
+n115: 1.7G	/tmp/maxwell_nib115.hpc_315637.pjt
+n115: 1.8G	/tmp/maxwell_nib115.hpc_100589.pjt
+n115: 1.8G	/tmp/maxwell_nib115.hpc_102007.pjt
+n115: 1.8G	/tmp/maxwell_nib115.hpc_172889.pjt
+n115: 1.8G	/tmp/maxwell_nib115.hpc_267320.pjt
+n115: 1.8G	/tmp/maxwell_nib115.hpc_323011.pjt
+n115: 1.8G	/tmp/maxwell_nib115.hpc_366246.pjt
+n115: 1.8G	/tmp/maxwell_nib115.hpc_384300.pjt
+n115: 1.8G	/tmp/maxwell_nib115.hpc_83739.pjt
+n115: 1.9G	/tmp/maxwell_nib115.hpc_248315.pjt
+n115: 1.9G	/tmp/maxwell_nib115.hpc_83791.pjt
+n115: 1.9G	/tmp/maxwell_nib115.hpc_88482.pjt
+n115: 1022M	/tmp/maxwell_nib115.hpc_463159.pjt
+n115: 108K	/tmp/pyaedt_dhj02_10d7fd6f-4ff1-4d8b-b6cc-6434dbbad485.log
+n115: 116K	/tmp/pyaedt_r1jae262_8529f902-ffdb-4929-b65e-9a3e2e302160.log
+n115: 116K	/tmp/pyaedt_r1jae262_c4f7772f-12b1-4927-8836-8d130cc31731.log
+n115: 116K	/tmp/pyaedt_r1jae262_fce00a7b-94e4-42b9-85f5-b3fc2506ce5c.log
+n115: 12K	/tmp/pyaedt_dhj02_0cda09c0-bf2d-44b8-8128-7fad5dfc8e53.log
+n115: 12K	/tmp/pyaedt_dhj02_278adb3f-470a-460b-9cd1-f1680164c390.log
+n115: 12K	/tmp/pyaedt_dhj02_60959cee-9744-4f34-b398-ea72dad493d0.log
+n115: 12K	/tmp/pyaedt_dhj02_61d8552d-b445-4153-bb85-497c35e06c29.log
+n115: 12K	/tmp/pyaedt_dhj02_77ab7cae-e78a-49fa-a87d-c23619b52723.log
+n115: 12K	/tmp/pyaedt_dhj02_945da92e-da83-4036-9de2-64f769aaa097.log
+n115: 12K	/tmp/pyaedt_dhj02_bbf3aa3d-2137-41a8-b14b-e1d027349d42.log
+n115: 12K	/tmp/pyaedt_dhj02_c3adf0ff-7ab0-4aa9-96b0-27620e1978ee.log
+n115: 12K	/tmp/pyaedt_dhj02_ea2610c2-5345-4b71-920b-77597782833e.log
+n115: 12K	/tmp/pyaedt_dhj02_eaa6fcaa-1d70-4724-b6e9-8389ad975fa7.log
+n115: 12K	/tmp/pyaedt_dw16_01dd30a3-9480-436a-a890-eecf43d12586.log
+n115: 12K	/tmp/pyaedt_dw16_23c4230f-c1e2-44e2-922d-5d0d30b059fd.log
+n115: 12K	/tmp/pyaedt_dw16_336dd026-d8f0-4e6a-a5eb-e5e79827e143.log
+n115: 12K	/tmp/pyaedt_dw16_3f14a9be-edde-4ae4-920a-c791c03d7c1d.log
+n115: 12K	/tmp/pyaedt_dw16_4825dd96-1c16-4e56-ac41-830e2b5fd3ca.log
+n115: 12K	/tmp/pyaedt_dw16_7b9b6308-7381-44d4-93d1-c5282f1d58bd.log
+n115: 12K	/tmp/pyaedt_dw16_863e02f0-0ceb-4209-80bf-5ab7d5acd69a.log
+n115: 12K	/tmp/pyaedt_dw16_b2973c1b-ee59-498b-80d0-a8c0b54d5252.log
+n115: 12K	/tmp/pyaedt_dw16_fb9259a5-62b7-458d-8d40-860bf7796272.log
+n115: 12K	/tmp/pyaedt_harry261_07bd0c14-09ea-408d-a916-295f59a91c20.log
+n115: 12K	/tmp/pyaedt_harry261_66898409-97f7-4b67-8aa4-66b8ef6d0496.log
+n115: 12K	/tmp/pyaedt_harry261_c483506c-35e8-4a62-bf21-7d4b5af882dd.log
+n115: 12K	/tmp/pyaedt_harry261_d9e57fb0-80c2-4505-9189-d58d7fdd9ca7.log
+n115: 12K	/tmp/pyaedt_harry261_eb539e0c-8102-4b05-a1cf-6359b29f684b.log
+n115: 12K	/tmp/pyaedt_harry261_f2502ccd-a63c-422c-a3f4-45cd5fdc0183.log
+n115: 12K	/tmp/pyaedt_harry261_ffc6e432-456b-45d9-a351-4b84668721d8.log
+n115: 12K	/tmp/pyaedt_jji0930_63259297-e3f9-4c73-b99d-b097e6d2b592.log
+n115: 12K	/tmp/pyaedt_jji0930_6d46bdc0-a527-45c8-bfcf-3528bdc6dc03.log
+n115: 12K	/tmp/pyaedt_jji0930_ba642f43-d35e-4235-b458-1d73aeb7fc9b.log
+n115: 12K	/tmp/pyaedt_jji0930_d059dd1a-b847-4ad6-b223-1a95cd189c77.log
+n115: 12K	/tmp/pyaedt_jji0930_ef5636f3-d6bb-41da-96a8-336e0dbbbf0a.log
+n115: 147M	/tmp/maxwell_nib115.hpc_463477.pjt
+n115: 16K	/tmp/pyaedt_dhj02_c5fe67e8-1d97-47f2-a170-a76bac8187bb.log
+n115: 16K	/tmp/pyaedt_dw16_52c7f130-2155-43f1-a377-9b64a471ecb8.log
+n115: 16K	/tmp/pyaedt_dw16_64c26d7b-47d7-4502-b0d3-233380b3abbd.log
+n115: 16K	/tmp/pyaedt_dw16_9351ee87-1a88-4fa2-a925-25b418176ef8.log
+n115: 16K	/tmp/pyaedt_dw16_dc6deba8-55bc-4d37-8ec2-4af3007f73a7.log
+n115: 16K	/tmp/pyaedt_dw16_e1a10f50-62cb-4bf3-b4d5-8285e8d8a146.log
+n115: 16K	/tmp/pyaedt_harry261_90215cce-5a3f-40a9-a4f4-ad280132917f.log
+n115: 16K	/tmp/pyaedt_harry261_a4a20a91-6819-4e10-8d59-82bcb6130ec7.log
+n115: 16K	/tmp/pyaedt_harry261_f2ed3259-0f25-4ce2-a360-2f926759f859.log
+n115: 16K	/tmp/pyaedt_jji0930_592a0f31-ce70-4beb-bf9d-0140bf6858d6.log
+n115: 16K	/tmp/pyaedt_jji0930_80ff6d1f-8050-4438-b1ad-df6e837b4094.log
+n115: 16K	/tmp/pyaedt_jji0930_cac0d5ad-8214-40b7-b35c-7cf7f72db67a.log
+n115: 16K	/tmp/pyaedt_jji0930_cf5b0ecb-e049-41b2-8aa0-0b208bb48208.log
+n115: 16K	/tmp/pyaedt_jji0930_d21f32c6-f171-4768-80f8-3326ee8cba61.log
+n115: 2.0G	/tmp/maxwell_nib115.hpc_175157.pjt
+n115: 2.0G	/tmp/maxwell_nib115.hpc_403221.pjt
+n115: 2.1G	/tmp/maxwell_nib115.hpc_101254.pjt
+n115: 2.2G	/tmp/maxwell_nib115.hpc_24330.pjt
+n115: 2.2G	/tmp/maxwell_nib115.hpc_26328.pjt
+n115: 2.7M	/tmp/AnsysEM.mw.harry261
+n115: 2.7M	/tmp/AnsysEM.mw.jji0930
+n115: 2.7M	/tmp/maxwell_nib115.hpc_473369.pjt
+n115: 2.8M	/tmp/AnsysEM.mw.dhj02
+n115: 2.8M	/tmp/AnsysEM.mw.dw16
+n115: 20K	/tmp/pyaedt_dhj02_b45f0599-5968-4eb4-bb81-8cddc8f757d8.log
+n115: 24K	/tmp/pyaedt_dw16_23b625cf-b5a8-444a-a826-e9a391909c9a.log
+n115: 24K	/tmp/pyaedt_r1jae262_c1378908-9870-4a61-8e65-a70dc84bffe0.log
+n115: 3.1M	/tmp/maxwell_nib115.hpc_481672.pjt
+n115: 3.2M	/tmp/maxwell_nib115.hpc_24017.pjt
+n115: 3.4M	/tmp/maxwell_nib115.hpc_266417.pjt
+n115: 3.5M	/tmp/filerBuVw447336917743318540
+n115: 3.5M	/tmp/filerHDUqq30275617743286310
+n115: 3.5M	/tmp/filettqKxh20711177432863022
+n115: 3.5M	/tmp/fileyYOwzT208711774331853119
+n115: 3.7M	/tmp/fileePtkdF19968177432861924
+n115: 3.7M	/tmp/maxwell_nib115.hpc_101049.pjt
+n115: 3.8M	/tmp/fileg2wrEC25347617743286200
+n115: 3.9M	/tmp/fileSkRNvh15937317743285900
+n115: 3.9M	/tmp/filembIAXR21097177432858916
+n115: 3.9M	/tmp/maxwell_nib115.hpc_266735.pjt
+n115: 36K	/tmp/pyaedt_dhj02_7d91509a-61a6-4886-8698-cdfaea6ccc60.log
+n115: 4.0K	/tmp/.wwgetfile.lock
+n115: 4.0K	/tmp/.wwgetfiles_timestamp
+n115: 4.0M	/tmp/file7l3et71962317743285618
+n115: 4.0M	/tmp/fileHhvk8448136917743320923
+n115: 4.0M	/tmp/fileKA4bBY20871177432859121
+n115: 4.0M	/tmp/fileO1bS1m19968177432865132
+n115: 4.0M	/tmp/fileepTe3Y48167217743320920
+n115: 4.0M	/tmp/fileruW2B417288917743285920
+n115: 4.0M	/tmp/maxwell_nib115.hpc_23627.pjt
+n115: 4.0M	/tmp/maxwell_nib115.hpc_28187.pjt
+n115: 4.1M	/tmp/fileGHwa4r2269017743285450
+n115: 4.1M	/tmp/fileOI6jpf36624617743286520
+n115: 4.1M	/tmp/filedUHphT2110017743285463
+n115: 4.1M	/tmp/filefKDZkb2401717743285460
+n115: 4.1M	/tmp/filepOtPub19623177432861924
+n115: 4.1M	/tmp/filer6RMVN2071117743285443
+n115: 4.1M	/tmp/filewOOtw224831517743286190
+n115: 4.1M	/tmp/maxwell_nib115.hpc_218424.pjt
+n115: 4.2M	/tmp/file240zN32087117743285619
+n115: 4.2M	/tmp/fileX0ReEA19968177432862327
+n115: 4.2M	/tmp/fileaJbRH626732017743286240
+n115: 4.2M	/tmp/filemj7PF08379117743285620
+n115: 4.2M	/tmp/maxwell_nib115.hpc_440955.pjt
+n115: 4.3M	/tmp/fileHXdTTo9881717743285650
+n115: 4.3M	/tmp/fileHoKsv319968177432859319
+n115: 4.3M	/tmp/fileMubJKn21097177432862224
+n115: 4.3M	/tmp/filePcDf7b20711177432916354
+n115: 4.3M	/tmp/filePtY2Me20871177432856512
+n115: 4.3M	/tmp/fileXKIOae21097177432859319
+n115: 4.3M	/tmp/filebECKD320711177432863425
+n115: 4.3M	/tmp/maxwell_nib115.hpc_375460.pjt
+n115: 4.4M	/tmp/fileO5JOUI31505317743286350
+n115: 4.4M	/tmp/fileT19Gn145022217743291640
+n115: 4.4M	/tmp/fileaWMJCQ17446517743285940
+n115: 4.4M	/tmp/filedzZUE126641717743286230
+n115: 4.4M	/tmp/filet35b8617515717743285940
+n115: 4.5M	/tmp/file31nebe20799217743286050
+n115: 4.5M	/tmp/filePaJICL41015917743286630
+n115: 4.5M	/tmp/fileSOWseG20711177432866337
+n115: 4.5M	/tmp/fileZBYvRk46315917743292570
+n115: 4.5M	/tmp/filemBAiU020711177432925660
+n115: 4.5M	/tmp/filevfVSd620711177432860410
+n115: 4.5M	/tmp/maxwell_nib115.hpc_382467.pjt
+n115: 4.5M	/tmp/maxwell_nib115.hpc_441152.pjt
+n115: 4.6M	/tmp/file9P0FX520871177432859524
+n115: 4.6M	/tmp/filedVO6G78848217743285640
+n115: 4.6M	/tmp/filegreWNU2109717743285638
+n115: 4.6M	/tmp/fileh5nPO219623177432858916
+n115: 4.6M	/tmp/fileoMXOtO18102017743285960
+n115: 4.6M	/tmp/maxwell_nib115.hpc_383345.pjt
+n115: 4.7M	/tmp/fileCaMIZ310125417743285680
+n115: 4.7M	/tmp/filervDZ6I20871177432856815
+n115: 4.8M	/tmp/fileRoyMkw10104917743285680
+n115: 4.8M	/tmp/fileRr0pwa1996817743285678
+n115: 4.9M	/tmp/fileI2PkD020871177432859927
+n115: 4.9M	/tmp/filePhyHNH20871177432862933
+n115: 4.9M	/tmp/fileTPhhLp30215117743286300
+n115: 4.9M	/tmp/filelbZCpu18724117743285990
+n115: 40K	/tmp/pyaedt_r1jae262_6e71f30b-f75d-468d-a3ba-4cb8011ea715.log
+n115: 40K	/tmp/pyaedt_r1jae262_c32cd0a3-6507-440e-a45d-c83f0f57dce3.log
+n115: 40K	/tmp/pyaedt_r1jae262_e818a91d-cf31-4f88-b15d-b6b165bd858c.log
+n115: 40K	/tmp/pyaedt_r1jae262_f404aedd-8e59-4d9b-9086-a53ec72824e0.log
+n115: 40K	/tmp/pyaedt_r1jae262_fcab61ea-c931-4998-915d-ceeaad4ab3a6.log
+n115: 44K	/tmp/pyaedt_r1jae262_b084f12a-bc67-44c8-8c47-51b0508b71a0.log
+n115: 5.0M	/tmp/file55NsUP19623177432862327
+n115: 5.0M	/tmp/maxwell_nib115.hpc_292390.pjt
+n115: 5.2M	/tmp/fileDPK2Hw2087217743285453
+n115: 5.2M	/tmp/fileKUXL9T32322417743286420
+n115: 5.2M	/tmp/filecdGUcy42975817743286670
+n115: 5.2M	/tmp/fileq5oGtm20711177432864131
+n115: 5.2M	/tmp/filexquXS520711177432866740
+n115: 5.2M	/tmp/maxwell_nib115.hpc_447827.pjt
+n115: 5.3M	/tmp/fileMEtlpt20711177432862219
+n115: 5.3M	/tmp/fileMxhleS21842417743286120
+n115: 5.3M	/tmp/fileTONjQD1996817743285515
+n115: 5.3M	/tmp/fileekOZ7n26619417743286230
+n115: 5.3M	/tmp/filegZElvy20711177432861116
+n115: 5.3M	/tmp/filemT2Y8B2362717743285460
+n115: 5.4M	/tmp/fileZqILcX19623177432859219
+n115: 5.4M	/tmp/filedtIGfK2087117743285453
+n115: 5.4M	/tmp/filejgiT5q2334617743285460
+n115: 5.4M	/tmp/filelOzuP52818717743285520
+n115: 5.4M	/tmp/maxwell_nib115.hpc_448106.pjt
+n115: 5.5M	/tmp/fileDJAV3B19623177432865332
+n115: 5.5M	/tmp/fileSR6v6K20711177432867043
+n115: 5.5M	/tmp/filejdrXeo44095517743286710
+n115: 5.6M	/tmp/fileKd0VDF2461517743285470
+n115: 5.6M	/tmp/fileOI3Dj437546017743286530
+n115: 5.6M	/tmp/fileXtYZnq2071617743285463
+n115: 5.6M	/tmp/maxwell_nib115.hpc_101530.pjt
+n115: 5.8M	/tmp/fileNkbAK22109717743285463
+n115: 5.8M	/tmp/filePrF1pX21097177432865532
+n115: 5.8M	/tmp/fileVOoNZF20871177432867145
+n115: 5.8M	/tmp/fileVaqQvx2433017743285470
+n115: 5.8M	/tmp/filebidPVL38246717743286560
+n115: 5.8M	/tmp/fileiNwRWP19623177432856511
+n115: 5.8M	/tmp/fileoeIiqT20711177432926263
+n115: 5.8M	/tmp/filetzfzPx44115217743286720
+n115: 5.9M	/tmp/fileIE0poR38334517743286560
+n115: 5.9M	/tmp/fileUEqbLo19968177432865635
+n115: 5.9M	/tmp/filekZkBYO46347717743292620
+n115: 5.9M	/tmp/fileuZsIkk10058917743285660
+n115: 6.3M	/tmp/fileCbQDis19968177432857111
+n115: 6.3M	/tmp/fileuhUimq10200717743285720
+n115: 6.3M	/tmp/maxwell_nib115.hpc_374363.pjt
+n115: 6.4M	/tmp/fileCmaNA621097177432862727
+n115: 6.4M	/tmp/fileGZhXNu31563717743286360
+n115: 6.4M	/tmp/fileJ79rlq1997017743285493
+n115: 6.4M	/tmp/fileddsMXC20871177432863536
+n115: 6.4M	/tmp/filenkah0y29239017743286280
+n115: 6.5M	/tmp/fileFzXkij32301117743286420
+n115: 6.5M	/tmp/fileVE0ged19623177432865735
+n115: 6.5M	/tmp/filennhCUk2632817743285500
+n115: 6.5M	/tmp/filewfqfI620871177432864142
+n115: 6.7M	/tmp/file7bepM620871177432867748
+n115: 6.7M	/tmp/fileAQ066z44782717743286780
+n115: 61G	/tmp/
+n115: 661M	/tmp/maxwell_nib115.hpc_302756.pjt
+n115: 7.0M	/tmp/fileUijAit44810617743286840
+n115: 7.0M	/tmp/fileWY5v4N20871177432868351
+n115: 7.3M	/tmp/fileMAiVFl10153017743285690
+n115: 7.3M	/tmp/fileUxcUh621097177432856811
+n115: 7.4M	/tmp/fileCU9n3p21097177432866135
+n115: 7.4M	/tmp/filej50Su740322117743286610
+n115: 7.6M	/tmp/fileCrzFyr1962317743285495
+n115: 76K	/tmp/pyaedt_dhj02_d8edb877-f8a5-43bb-98e6-49c334a2637d.log
+n115: 8.2M	/tmp/fileESbbxN37436317743286530
+n115: 8.2M	/tmp/fileSTiqw320711177432865334
+
+
+
+
+
+
+
+
+
+
+
+n116: 0	/tmp/.ICE-unix
+n116: 0	/tmp/.Test-unix
+n116: 0	/tmp/.X11-unix
+n116: 0	/tmp/.XIM-unix
+n116: 0	/tmp/.font-unix
+n116: 0	/tmp/Maxwell
+n116: 0	/tmp/mmfs
+n116: 0	/tmp/systemd-private-bd9a7d562acf44eeb7f938b89a346a54-chronyd.service-axAjSD
+n116: 1.2G	/tmp/maxwell_nib116.hpc_329946.pjt
+n116: 1.4G	/tmp/maxwell_nib116.hpc_105042.pjt
+n116: 1.4G	/tmp/maxwell_nib116.hpc_333137.pjt
+n116: 1.4M	/tmp/AnsysEM.mw.dhj02
+n116: 1.4M	/tmp/AnsysEM.mw.harry261
+n116: 1.5G	/tmp/maxwell_nib116.hpc_105299.pjt
+n116: 1.5G	/tmp/maxwell_nib116.hpc_221484.pjt
+n116: 1.5G	/tmp/maxwell_nib116.hpc_305453.pjt
+n116: 1.5G	/tmp/maxwell_nib116.hpc_307689.pjt
+n116: 1.5M	/tmp/AnsysEM.mw.r1jae262
+n116: 1.6G	/tmp/maxwell_nib116.hpc_139390.pjt
+n116: 1.6G	/tmp/maxwell_nib116.hpc_212092.pjt
+n116: 1.6G	/tmp/maxwell_nib116.hpc_23665.pjt
+n116: 1.6G	/tmp/maxwell_nib116.hpc_421263.pjt
+n116: 1.6G	/tmp/maxwell_nib116.hpc_56037.pjt
+n116: 1.7G	/tmp/maxwell_nib116.hpc_111972.pjt
+n116: 1.7G	/tmp/maxwell_nib116.hpc_220186.pjt
+n116: 1.7G	/tmp/maxwell_nib116.hpc_319357.pjt
+n116: 1.7G	/tmp/maxwell_nib116.hpc_377798.pjt
+n116: 1.7G	/tmp/maxwell_nib116.hpc_423447.pjt
+n116: 1.8G	/tmp/maxwell_nib116.hpc_187739.pjt
+n116: 1.8G	/tmp/maxwell_nib116.hpc_25792.pjt
+n116: 1.8G	/tmp/maxwell_nib116.hpc_327582.pjt
+n116: 1.8G	/tmp/maxwell_nib116.hpc_329608.pjt
+n116: 1.8G	/tmp/maxwell_nib116.hpc_371256.pjt
+n116: 1.8G	/tmp/maxwell_nib116.hpc_67832.pjt
+n116: 1.8G	/tmp/maxwell_nib116.hpc_69357.pjt
+n116: 1.9G	/tmp/maxwell_nib116.hpc_223233.pjt
+n116: 1.9G	/tmp/maxwell_nib116.hpc_22854.pjt
+n116: 1.9G	/tmp/maxwell_nib116.hpc_423763.pjt
+n116: 1.9G	/tmp/maxwell_nib116.hpc_84258.pjt
+n116: 12K	/tmp/pyaedt_dw16_014542e2-9809-4b48-ba17-839b60ad7213.log
+n116: 12K	/tmp/pyaedt_dw16_3e0427c5-2b80-49f0-b5d3-cb79a2eb20cb.log
+n116: 12K	/tmp/pyaedt_dw16_4c0f082d-a43a-420d-9e23-490817385cf0.log
+n116: 12K	/tmp/pyaedt_dw16_6f60c131-9a53-422c-af22-fe36167d91de.log
+n116: 12K	/tmp/pyaedt_dw16_a1807559-8fc5-427a-9998-4cd608a14451.log
+n116: 12K	/tmp/pyaedt_dw16_bc638f36-c5e7-4ccd-998e-6f3dcb77de59.log
+n116: 12K	/tmp/pyaedt_dw16_d5671237-ed93-4082-8b1c-f82a9bcb8a4d.log
+n116: 12K	/tmp/pyaedt_harry261_126e4741-deab-4666-b4ca-e09655c4214b.log
+n116: 12K	/tmp/pyaedt_harry261_15566932-0590-49b1-af39-8bbe8c4e4921.log
+n116: 12K	/tmp/pyaedt_harry261_265c2905-35bc-4b95-b1ec-12e1a89416bd.log
+n116: 12K	/tmp/pyaedt_harry261_52f0394b-e65a-459f-9932-c9ea661aa45c.log
+n116: 12K	/tmp/pyaedt_harry261_6ab6a77e-9b77-4392-96d4-8221c5f3d876.log
+n116: 12K	/tmp/pyaedt_harry261_7a0566e8-0ae9-4127-b3f4-ff549f11b979.log
+n116: 12K	/tmp/pyaedt_harry261_875e364f-8e1e-4255-8830-d9217c9153c8.log
+n116: 12K	/tmp/pyaedt_harry261_91046ba6-6142-4311-afe8-25b25baee8fb.log
+n116: 12K	/tmp/pyaedt_harry261_9290cf65-959e-4321-8a23-12a56c4e7e8b.log
+n116: 12K	/tmp/pyaedt_harry261_c017eaa4-1eea-4ccc-9ee7-81d09905474b.log
+n116: 12K	/tmp/pyaedt_harry261_e62a26e9-0786-414b-af91-92a1412718b3.log
+n116: 12K	/tmp/pyaedt_harry261_f6ab0adc-f842-4271-bf0a-c7e1e3d779ad.log
+n116: 12K	/tmp/pyaedt_harry261_f918d252-dfa5-40c7-8904-14897819d993.log
+n116: 12K	/tmp/pyaedt_jji0930_c189748a-eb5b-4f3e-ab26-a8ac38ce17c0.log
+n116: 12K	/tmp/pyaedt_r1jae262_2a1dc80d-d352-41a7-8775-a24b8fb781be.log
+n116: 12K	/tmp/pyaedt_r1jae262_46d49e21-ee01-4093-9a89-3fb038dcb54f.log
+n116: 12K	/tmp/pyaedt_r1jae262_6c7375a8-8d4e-40c9-811c-22c028c6619c.log
+n116: 12K	/tmp/pyaedt_r1jae262_7528ff1d-9b2d-4dbe-82be-b9b757c588a1.log
+n116: 12K	/tmp/pyaedt_r1jae262_9aa8274f-a54e-45f2-86fa-358f6f6104ff.log
+n116: 12K	/tmp/pyaedt_r1jae262_cc28bf85-473a-49bb-a434-236519de784a.log
+n116: 12K	/tmp/pyaedt_r1jae262_d454dd07-ad26-45df-832b-e20f97bc9941.log
+n116: 16K	/tmp/pyaedt_dhj02_97edc610-e433-4e05-ac79-ff9d164a1543.log
+n116: 16K	/tmp/pyaedt_dw16_9973ee94-4931-4025-96ff-c124ed2f04bd.log
+n116: 16K	/tmp/pyaedt_dw16_a14c724a-5a54-4714-a0b5-956ee77be09a.log
+n116: 16K	/tmp/pyaedt_dw16_ffd29699-9420-41b8-ae2e-e2826c60b38f.log
+n116: 16K	/tmp/pyaedt_jji0930_eb75f151-8c29-4ddb-9864-ba726192aaa5.log
+n116: 16K	/tmp/pyaedt_r1jae262_5df1a333-d71b-4d18-aa8a-475932bf64a6.log
+n116: 16K	/tmp/pyaedt_r1jae262_7bdfbf5c-1281-4570-b873-825570f64d1e.log
+n116: 2.0G	/tmp/maxwell_nib116.hpc_201132.pjt
+n116: 2.0G	/tmp/maxwell_nib116.hpc_22455.pjt
+n116: 2.7G	/tmp/maxwell_nib116.hpc_67826.pjt
+n116: 2.7M	/tmp/maxwell_nib116.hpc_441902.pjt
+n116: 2.8M	/tmp/AnsysEM.mw.dw16
+n116: 2.8M	/tmp/AnsysEM.mw.jji0930
+n116: 2.8M	/tmp/maxwell_nib116.hpc_519447.pjt
+n116: 2.8M	/tmp/maxwell_nib116.hpc_577559.pjt
+n116: 2.9M	/tmp/maxwell_nib116.hpc_531871.pjt
+n116: 2.9M	/tmp/maxwell_nib116.hpc_587728.pjt
+n116: 2.9M	/tmp/maxwell_nib116.hpc_590067.pjt
+n116: 24K	/tmp/pyaedt_harry261_4abf9d48-f6bc-4d00-a459-4967e635c11c.log
+n116: 24K	/tmp/pyaedt_harry261_da4fe89a-c64f-4318-b3ca-04bdc9994892.log
+n116: 28K	/tmp/pyaedt_dhj02_b371b669-eefe-4a9f-930a-f2b86b7d2ede.log
+n116: 28K	/tmp/pyaedt_jji0930_0e79ea3f-71cf-40e7-83d1-376c488f7124.log
+n116: 28K	/tmp/pyaedt_jji0930_296b7ae0-2b29-4dcd-aa8a-2684c28f27a9.log
+n116: 28K	/tmp/pyaedt_r1jae262_6279ba6b-6aac-4f19-aff6-d7939ee6eb31.log
+n116: 3.2M	/tmp/maxwell_nib116.hpc_600840.pjt
+n116: 3.3M	/tmp/maxwell_nib116.hpc_444917.pjt
+n116: 3.4M	/tmp/maxwell_nib116.hpc_326883.pjt
+n116: 3.4M	/tmp/maxwell_nib116.hpc_379315.pjt
+n116: 3.4M	/tmp/maxwell_nib116.hpc_566005.pjt
+n116: 3.5M	/tmp/fileDH4kVZ30545317743286250
+n116: 3.5M	/tmp/fileVaaHub20523177432862433
+n116: 3.5M	/tmp/fileqyjeXH19433177433112992
+n116: 3.5M	/tmp/maxwell_nib116.hpc_609011.pjt
+n116: 3.5M	/tmp/maxwell_nib116.hpc_609336.pjt
+n116: 3.5M	/tmp/maxwell_nib116.hpc_611361.pjt
+n116: 3.6M	/tmp/file0EHu1p51944717743322690
+n116: 3.6M	/tmp/fileAC00AA20321177433226918
+n116: 3.6M	/tmp/filehbrDCV20964177433227923
+n116: 3.6M	/tmp/fileqr6dQH44190217743311300
+n116: 3.6M	/tmp/filesrCuGg57755917743322800
+n116: 3.6M	/tmp/maxwell_nib116.hpc_611839.pjt
+n116: 3.7M	/tmp/fileB8csQu20321177433227321
+n116: 3.7M	/tmp/fileWT2AGP20964177433228326
+n116: 3.7M	/tmp/filetynkx11943317743285413
+n116: 3.8M	/tmp/fileCItOgJ53187117743322730
+n116: 3.8M	/tmp/fileGBCZ8b59006717743322870
+n116: 3.8M	/tmp/fileWmfowc20964177433228629
+n116: 3.8M	/tmp/fileaIMPCC2285417743285420
+n116: 3.8M	/tmp/filezhpMx258772817743322840
+n116: 3.9M	/tmp/file4BCe3u5603717743285560
+n116: 3.9M	/tmp/file4VjVDf1943317743285568
+n116: 3.9M	/tmp/fileCFZDTn2366517743285450
+n116: 3.9M	/tmp/fileXR4wZ22052317743285443
+n116: 3.9M	/tmp/filepblrPH19433177432864935
+n116: 3.9M	/tmp/fileu1c70V37125617743286490
+n116: 3.9M	/tmp/maxwell_nib116.hpc_112180.pjt
+n116: 3.9M	/tmp/maxwell_nib116.hpc_615101.pjt
+n116: 32K	/tmp/pyaedt_dhj02_1c028a11-60d5-41a5-a34a-d7439b8e2f63.log
+n116: 32K	/tmp/pyaedt_jji0930_0e975305-bd5c-4a43-bd83-674f12a7c4d9.log
+n116: 32K	/tmp/pyaedt_jji0930_175f9255-8935-494a-8d2d-26e831a44683.log
+n116: 32K	/tmp/pyaedt_jji0930_1c57f35b-4539-458f-b7b5-b34b19a4fd9b.log
+n116: 32K	/tmp/pyaedt_jji0930_b43ddfa8-61ff-416d-bc77-51d70ecd0877.log
+n116: 36K	/tmp/pyaedt_dhj02_0971bce3-f562-4f73-bbf1-ab5f28b3af35.log
+n116: 36K	/tmp/pyaedt_dhj02_146450c0-2b9b-408b-82b2-0bbcc035c60d.log
+n116: 36K	/tmp/pyaedt_dhj02_292f9d20-554d-4478-b490-32c1f6071c6a.log
+n116: 36K	/tmp/pyaedt_dhj02_4b4b7879-d432-4df5-9a1e-795e66c716c5.log
+n116: 36K	/tmp/pyaedt_dhj02_88fc193b-27dc-4351-8d18-161ec97c98a3.log
+n116: 36K	/tmp/pyaedt_dhj02_c8207681-774c-4c80-9900-3e15a385bf09.log
+n116: 36K	/tmp/pyaedt_dhj02_f82355b4-2b9b-4aa9-abe6-cf0aad98f3b6.log
+n116: 36K	/tmp/pyaedt_jji0930_124fdb38-dd33-4103-9a2c-54e854aba689.log
+n116: 36K	/tmp/pyaedt_jji0930_5453fbe8-5136-4707-9fae-c493ad62da59.log
+n116: 36K	/tmp/pyaedt_jji0930_b08b77e3-4d06-4d0d-9590-3ac81d6e2d28.log
+n116: 36K	/tmp/pyaedt_jji0930_df387926-aa9e-4229-945b-493cfc632297.log
+n116: 36K	/tmp/pyaedt_jji0930_fc8941b1-2e90-4615-b64f-0f4e2dafb910.log
+n116: 4.0K	/tmp/.wwgetfile.lock
+n116: 4.0K	/tmp/.wwgetfiles_timestamp
+n116: 4.0M	/tmp/fileNRT4iS205231774331563127
+n116: 4.0M	/tmp/maxwell_nib116.hpc_587423.pjt
+n116: 4.0M	/tmp/maxwell_nib116.hpc_589145.pjt
+n116: 4.1M	/tmp/file6qS5bU44412017743315640
+n116: 4.1M	/tmp/fileH9YyuA20523177432856812
+n116: 4.1M	/tmp/fileQXntFN19433177432858816
+n116: 4.1M	/tmp/fileuYYx8i13939017743285890
+n116: 4.1M	/tmp/maxwell_nib116.hpc_599860.pjt
+n116: 4.2M	/tmp/file9RfoHV6782617743285590
+n116: 4.2M	/tmp/filea0i4eS20964177433229032
+n116: 4.2M	/tmp/fileePaoQ210529917743285690
+n116: 4.2M	/tmp/filesRqLUo60084017743322910
+n116: 4.2M	/tmp/filewlBvVs19433177432855811
+n116: 4.3M	/tmp/fileGXd5Iu20268177432855911
+n116: 4.3M	/tmp/filemW7IqC2032117743316787
+n116: 4.4M	/tmp/file7wsZB76935717743285600
+n116: 4.4M	/tmp/fileKqKLj320268177432865032
+n116: 4.4M	/tmp/fileZFDi9420523177432862836
+n116: 4.4M	/tmp/filegeU5eZ56600517743322780
+n116: 4.4M	/tmp/fileqAOVQP37779817743286500
+n116: 4.4M	/tmp/filesu5G2N44491717743316790
+n116: 4.4M	/tmp/filez17Dps20321177433227724
+n116: 4.4M	/tmp/maxwell_nib116.hpc_608130.pjt
+n116: 4.5M	/tmp/fileNRmfxE44253417743312390
+n116: 4.5M	/tmp/filekdXkLW205231774331238117
+n116: 4.5M	/tmp/filekhGOJn32688317743286290
+n116: 4.5M	/tmp/maxwell_nib116.hpc_620257.pjt
+n116: 4.6M	/tmp/file4NlAEZ60933617743322980
+n116: 4.6M	/tmp/file8Xy9ub20964177433229838
+n116: 4.6M	/tmp/fileAOF4Iy60901117743322960
+n116: 4.6M	/tmp/fileGJgGrW20964177433230242
+n116: 4.6M	/tmp/fileKHoFxV2096517743285393
+n116: 4.6M	/tmp/fileUINVMQ21209217743286010
+n116: 4.6M	/tmp/fileVISZXT20964177433229535
+n116: 4.6M	/tmp/fileYRRRQl20523177432860024
+n116: 4.6M	/tmp/filecHnns061136117743323020
+n116: 4.7M	/tmp/file6VLCK82245517743285390
+n116: 4.7M	/tmp/fileKRslGB61183917743323050
+n116: 4.7M	/tmp/fileUqEouz20964177433230445
+n116: 4.8M	/tmp/fileEaNyA532960817743286330
+n116: 4.8M	/tmp/fileGr3xBL20523177432865848
+n116: 4.8M	/tmp/fileKME63q42344717743286630
+n116: 4.8M	/tmp/fileLXNlnP20523177432863239
+n116: 4.8M	/tmp/fileOnsyda20523177432866251
+n116: 4.8M	/tmp/filePeM9XR42126317743286590
+n116: 4.9M	/tmp/maxwell_nib116.hpc_609543.pjt
+n116: 40K	/tmp/pyaedt_jji0930_46831e36-3bc9-4fb7-8ed6-ea3e43aec0a1.log
+n116: 40K	/tmp/pyaedt_jji0930_5739475b-d5cd-4c92-8a0b-22d7163d9f89.log
+n116: 5.0M	/tmp/file7pOgON61510117743323090
+n116: 5.0M	/tmp/fileLZ1RtG20523177432857215
+n116: 5.0M	/tmp/filegteo5E20964177433230848
+n116: 5.1M	/tmp/filef5EhLn11218017743285730
+n116: 5.2M	/tmp/fileS4RaYi58742317743322840
+n116: 5.2M	/tmp/fileda35eS20321177433228327
+n116: 5.2M	/tmp/fileiMfEZG58914517743322860
+n116: 5.2M	/tmp/filel99cI920321177433228630
+n116: 5.3M	/tmp/maxwell_nib116.hpc_26547.pjt
+n116: 5.4M	/tmp/file2rHJaW2096417743316797
+n116: 5.4M	/tmp/file5sQXYD59986017743322900
+n116: 5.4M	/tmp/file9pAYwj44511217743316790
+n116: 5.4M	/tmp/fileq4yM1120321177433228933
+n116: 5.5M	/tmp/maxwell_nib116.hpc_195083.pjt
+n116: 5.7M	/tmp/fileCm7uhs60813017743322940
+n116: 5.7M	/tmp/fileYjA0mK22018617743286050
+n116: 5.7M	/tmp/fileahowTH20321177433229436
+n116: 5.7M	/tmp/filegrVvqe20523177432860427
+n116: 5.8M	/tmp/fileTPX4QS20964177433231251
+n116: 5.8M	/tmp/maxwell_nib116.hpc_620680.pjt
+n116: 5.9M	/tmp/fileP9RsH862025717743323130
+n116: 559M	/tmp/maxwell_nib116.hpc_444120.pjt
+n116: 56G	/tmp/
+n116: 6.1M	/tmp/fileWDLqNZ18773917743285940
+n116: 6.1M	/tmp/filea7Njla20268177432859416
+n116: 6.4M	/tmp/fileYgKgBx60954317743323000
+n116: 6.4M	/tmp/fileloQgsV2579217743285470
+n116: 6.4M	/tmp/filerWHQVL2032617743285473
+n116: 6.4M	/tmp/filewAFJ3v20321177433229939
+n116: 6.4M	/tmp/maxwell_nib116.hpc_115628.pjt
+n116: 6.6M	/tmp/filefpkBjT20268177432859819
+n116: 6.6M	/tmp/filezPoFIf20113217743285980
+n116: 6.7M	/tmp/fileYiidhj31935717743286280
+n116: 6.9M	/tmp/fileUj8iw32032117743285483
+n116: 6.9M	/tmp/filegPRe1C2654717743285490
+n116: 607M	/tmp/maxwell_nib116.hpc_445112.pjt
+n116: 7.0M	/tmp/fileV9lSt619433177432862624
+n116: 7.0M	/tmp/fileZK3lCc30768917743286260
+n116: 7.4M	/tmp/filezcLUou19433177432863027
+n116: 7.5M	/tmp/fileBJbGhx62068017743323190
+n116: 7.5M	/tmp/fileS01Hx232758217743286310
+n116: 7.5M	/tmp/fileeOZN3a20964177433231854
+n116: 70M	/tmp/maxwell_nib116.hpc_421962.pjt
+n116: 720M	/tmp/maxwell_nib116.hpc_442534.pjt
+n116: 954M	/tmp/maxwell_nib116.hpc_327378.pjt
