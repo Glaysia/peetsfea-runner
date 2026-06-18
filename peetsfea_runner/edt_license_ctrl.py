@@ -29,6 +29,12 @@ from urllib.parse import urlparse
 DEFAULT_LICENSE_CTRL_PORT = 7879
 
 
+def _job_index(worker_id: str) -> str:
+    """worker_id `j{jidx}-w{widx}-{host}-{pid}` → 잡 인덱스 문자열('0' 등). 형식 불일치 시 '?'."""
+    head = worker_id.split("-", 1)[0]
+    return head[1:] if head[:1] == "j" and head[1:].isdigit() else "?"
+
+
 @dataclass
 class LicenseController:
     """전역 동시 솔브 제어기. permit 상한(target) + youngest-kill(ceiling)로 밴드 수렴.
@@ -65,6 +71,20 @@ class LicenseController:
         with self._lock:
             now = self.clock()
             return sum(1 for t in self._seen.values() if (now - t) <= self.nominal_ttl_seconds)
+
+    def _per_job_locked(self, now: float) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for w in self._active:  # 솔브중(=유효 AEDT)
+            out.setdefault(_job_index(w), {"active": 0, "nominal": 0})["active"] += 1
+        for w, t in self._seen.items():  # 최근 ping한 전체(=명목 AEDT, idle 포함)
+            if (now - t) <= self.nominal_ttl_seconds:
+                out.setdefault(_job_index(w), {"active": 0, "nominal": 0})["nominal"] += 1
+        return out
+
+    def per_job(self) -> dict[str, dict[str, int]]:
+        """컨테이너(잡 인덱스)별 pyaedt 수 — {jidx: {active(솔브중), nominal(켜진)}}."""
+        with self._lock:
+            return self._per_job_locked(self.clock())
 
     def permit(self, worker_id: str) -> bool:
         """솔브 1건 허가 여부. effective < target이면 grant하고 active에 등록."""
@@ -125,6 +145,7 @@ class LicenseController:
                 "target": self.target,
                 "ceiling": self.ceiling,
                 "abort_marked": len(self._abort),
+                "aedt_per_job": self._per_job_locked(now),  # 컨테이너당 pyaedt(솔브중/켜짐)
             }
 
 

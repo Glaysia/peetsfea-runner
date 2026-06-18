@@ -123,3 +123,27 @@ def test_client_fail_closed_when_ctrl_unreachable() -> None:
     client = LicensePermitClient(ctrl_url="http://127.0.0.1:1", worker_id="w0", timeout_seconds=0.3)
     assert client.acquire() is False  # 제어기 불가 → fail-closed
     assert client.heartbeat(1.0) is False
+
+
+def test_per_job_groups_active_and_nominal_by_job_index() -> None:
+    c = _ctrl(lic=0, target=100)
+    # j0: 두 워커가 솔브중(permit), j1: 한 워커는 켜짐만(permit 거절 안 됨이라 active도 됨)
+    assert c.permit("j0-w0-nA-1") is True
+    assert c.permit("j0-w1-nA-2") is True
+    assert c.permit("j1-w0-nB-3") is True
+    # j1의 또다른 워커는 heartbeat만(=active 등록) — 그래도 per_job에 잡힘
+    c.heartbeat("j1-w1-nB-4", 1000.0)
+    pj = c.per_job()
+    assert pj["0"]["active"] == 2
+    assert pj["1"]["active"] == 2
+    # nominal(켜진)도 잡 인덱스별로 집계 — 모든 ping 워커 포함
+    assert pj["0"]["nominal"] == 2
+    assert pj["1"]["nominal"] == 2
+    # status()에도 노출
+    assert c.status()["aedt_per_job"]["0"]["active"] == 2
+
+
+def test_per_job_handles_malformed_worker_id() -> None:
+    c = _ctrl(lic=0, target=100)
+    c.permit("weird_id_no_prefix")
+    assert c.per_job()["?"]["active"] == 1

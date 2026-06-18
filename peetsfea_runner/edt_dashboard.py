@@ -432,8 +432,10 @@ async function containers(){const r=await f('/api/resources');
     '<span class="bigbad">리소스 폴링 응답 없음(서비스/게이트 확인)</span>';
   const jobs=(r.jobs||[]).filter(j=>j.state==='RUNNING');
   const pend=(r.jobs||[]).filter(j=>j.state==='PENDING');
+  const apj=r.aedt_per_job||{};
   $('#contgrid').innerHTML=jobs.map(j=>{const nd=(r.nodes||{})[j.node]||{};
     const load=nd.cpuload||0,memU=(nd.memtotal_mb||0)-(nd.memfree_mb||0),memT=nd.memtotal_mb||1;
+    const ae=apj[String(j.name||'').split('-').pop()]||{};   // 잡 이름 peetsfea-edt-{jidx} → 제어기 per_job
     const ct=nd.cputot||0,alloc=nd.cpualloc||0;                 // ct=물리 전체, alloc=노드 전체 할당(공유)
     const mine=parseInt(j.cpus||'0',10)||0;                     // 이 잡(컨테이너)에 할당된 코어
     // 부하 막대 기준은 '우리 잡 할당 코어'(mine). load는 노드 전역값이지만, 노드 물리(ct=256 등)로 나누면
@@ -442,6 +444,7 @@ async function containers(){const r=await f('/api/resources');
     const lc=load/base>1.1?'#f85149':load/base>.75?'#d29922':'#3fb950';
     return `<div class="cont"><div class="top"><span class="node">${esc(j.node||'?')}</span>
       <span class="meta">${esc(j.partition)} · ${esc(j.time)} · ${esc(j.name)}</span></div>
+      <div class="lbl"><span>pyaedt (솔브중 / 켜짐)</span><span><b style="color:#3fb950">${ae.active||0}</b> / ${ae.nominal||0}</span></div>
       <div class="lbl"><span>부하 / 우리 할당</span><span>${load.toFixed(1)} / ${mine} 코어</span></div>${bar(load,base,lc)}
       <div class="lbl muted"><span>노드(공유) 전역</span><span>load ${load.toFixed(1)} · 할당 ${alloc}/${ct} 물리코어</span></div>
       <div class="lbl"><span>메모리(노드)</span><span>${(memU/1024).toFixed(0)} / ${(memT/1024).toFixed(0)} GB</span></div>${bar(memU,memT,'#58a6ff')}

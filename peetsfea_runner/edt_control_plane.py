@@ -157,6 +157,7 @@ class ControlPlane:
                     "nominal_aedt": controller.nominal(),
                     "effective_aedt": controller.status()["active_permits"],
                 }
+                self.resource_poller.aedt_provider = controller.per_job  # 컨테이너(잡)별 pyaedt 수 → 부하 탭
             license_server = start_license_ctrl_server(controller=controller, port=self.license_ctrl_port)
             for server in (dashboard, intake_server, ingest_server, bulk_server, lease_server, license_server):
                 self._servers.append(server)
