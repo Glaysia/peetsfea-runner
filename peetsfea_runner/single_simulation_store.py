@@ -103,6 +103,9 @@ class SingleSimulationResultStore:
                 )
                 """
             )
+            # elapsed_ms·gpu_used 추출 컬럼(build_summary가 거대 solve_telemetry_json 재파싱하던 것 회피).
+            connection.execute("ALTER TABLE single_simulation_results ADD COLUMN IF NOT EXISTS elapsed_ms DOUBLE")
+            connection.execute("ALTER TABLE single_simulation_results ADD COLUMN IF NOT EXISTS gpu_used BOOLEAN")
             # 라이선스/자원 시계열(대시보드 추세 탭). web 재시작·12h ring buffer 한계를 넘어 영속.
             connection.execute(
                 """
@@ -148,6 +151,8 @@ class SingleSimulationResultStore:
         request_id = str(envelope.get("request_id") or "")
         if not request_id:
             raise ValueError("simulation envelope is missing request_id")
+        tel = _mapping(result.get("solve_telemetry"))
+        _elapsed = tel.get("elapsed_ms")
         row = {
             "request_id": request_id,
             "account_id": str(envelope.get("account_id") or ""),
@@ -169,7 +174,7 @@ class SingleSimulationResultStore:
             "started_at": str(envelope.get("started_at") or ""),
             "finished_at": str(envelope.get("finished_at") or ""),
             "setup_pass_counts_json": _json_dumps(result.get("setup_pass_counts") or {}),
-            "solve_telemetry_json": _json_dumps(result.get("solve_telemetry") or {}),
+            "solve_telemetry_json": _json_dumps(tel),
             "csv_text_by_report_json": _json_dumps(result.get("csv_text_by_report") or {}),
             "csv_paths_json": _json_dumps(result.get("csv_paths") or {}),
             "artifact_references_json": _json_dumps(result.get("artifact_references") or {}),
@@ -178,6 +183,9 @@ class SingleSimulationResultStore:
             "error_message": str(error.get("message") or ""),
             "result_json": _json_dumps(result),
             "envelope_json": _json_dumps(envelope),
+            # build_summary 집계용 추출 컬럼(거대 JSON 재파싱 회피).
+            "elapsed_ms": float(_elapsed) if isinstance(_elapsed, (int, float)) and not isinstance(_elapsed, bool) else None,
+            "gpu_used": bool(tel.get("gpu_used")),
         }
         columns = tuple(row)
         placeholders = ", ".join("?" for _ in columns)
@@ -331,12 +339,13 @@ class SingleSimulationResultStore:
             clauses.append("peetsfea_version = ?")
             params.append(peetsfea_version)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        sql = f"SELECT partition, solve_telemetry_json FROM single_simulation_results{where} ORDER BY finished_at"
+        # 거대 solve_telemetry_json 대신 추출 컬럼만(로드당 ~880MB → ~수십KB). ingest/백필이 채움.
+        sql = f"SELECT partition, elapsed_ms, gpu_used FROM single_simulation_results{where}"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         with self._locked_connect() as connection:
             rows = connection.execute(sql, params).fetchall()
-        return [{"partition": r[0], "solve_telemetry_json": r[1]} for r in rows]
+        return [{"partition": r[0], "elapsed_ms": r[1], "gpu_used": bool(r[2])} for r in rows]
 
     def export_parquet(
         self,

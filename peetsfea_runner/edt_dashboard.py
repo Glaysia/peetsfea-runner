@@ -88,13 +88,12 @@ def build_summary(store: SingleSimulationResultStore, *, peetsfea_version: str |
     gpu = 0
     by_partition: dict[str, list[float]] = {}
     for r in srows:
-        tel = _loads(r.get("solve_telemetry_json"))
-        e = tel.get("elapsed_ms")
+        e = r.get("elapsed_ms")  # 전용 컬럼(ingest/백필이 채움) — 거대 JSON 재파싱 제거
         if isinstance(e, (int, float)):
             m = e / 60000
             mins.append(m)
             by_partition.setdefault(str(r.get("partition") or "?"), []).append(m)
-        if tel.get("gpu_used"):
+        if r.get("gpu_used"):
             gpu += 1
     now = datetime.datetime.now(datetime.timezone.utc)
     since_1h = (now - datetime.timedelta(hours=1)).isoformat()

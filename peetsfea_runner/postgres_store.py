@@ -104,6 +104,14 @@ class PostgresResultStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS ssr_peetsfea_version_idx ON single_simulation_results (peetsfea_version)"
             )
+            # elapsed_ms·gpu_used 전용 컬럼: build_summary가 거대 solve_telemetry_json(평균 342KB)을 매 로드
+            # 통째로 끌어와 파싱하던 걸 제거(로드당 ~880MB → 인덱스 집계). ingest가 텔레메트리에서 추출해 채운다.
+            connection.execute(
+                "ALTER TABLE single_simulation_results ADD COLUMN IF NOT EXISTS elapsed_ms double precision"
+            )
+            connection.execute(
+                "ALTER TABLE single_simulation_results ADD COLUMN IF NOT EXISTS gpu_used boolean"
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS resource_snapshots (
@@ -146,6 +154,8 @@ class PostgresResultStore:
         request_id = str(envelope.get("request_id") or "")
         if not request_id:
             raise ValueError("simulation envelope is missing request_id")
+        tel = _mapping(result.get("solve_telemetry"))
+        _elapsed = tel.get("elapsed_ms")
         row = {
             "request_id": request_id,
             "account_id": str(envelope.get("account_id") or ""),
@@ -167,7 +177,7 @@ class PostgresResultStore:
             "started_at": str(envelope.get("started_at") or ""),
             "finished_at": str(envelope.get("finished_at") or ""),
             "setup_pass_counts_json": _json_dumps(result.get("setup_pass_counts") or {}),
-            "solve_telemetry_json": _json_dumps(result.get("solve_telemetry") or {}),
+            "solve_telemetry_json": _json_dumps(tel),
             "csv_text_by_report_json": _json_dumps(result.get("csv_text_by_report") or {}),
             "csv_paths_json": _json_dumps(result.get("csv_paths") or {}),
             "artifact_references_json": _json_dumps(result.get("artifact_references") or {}),
@@ -176,6 +186,9 @@ class PostgresResultStore:
             "error_message": str(error.get("message") or ""),
             "result_json": _json_dumps(result),
             "envelope_json": _json_dumps(envelope),
+            # build_summary 집계용 추출 컬럼(거대 JSON 재파싱 회피).
+            "elapsed_ms": float(_elapsed) if isinstance(_elapsed, (int, float)) and not isinstance(_elapsed, bool) else None,
+            "gpu_used": bool(tel.get("gpu_used")),
         }
         columns = tuple(row)
         placeholders = ", ".join("%s" for _ in columns)
@@ -321,12 +334,13 @@ class PostgresResultStore:
             clauses.append("peetsfea_version = %s")
             params.append(peetsfea_version)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        sql = f"SELECT partition, solve_telemetry_json FROM single_simulation_results{where} ORDER BY finished_at"
+        # 거대 solve_telemetry_json 대신 추출 컬럼만(로드당 ~880MB → ~수십KB). ingest/백필이 채움.
+        sql = f"SELECT partition, elapsed_ms, gpu_used FROM single_simulation_results{where}"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         with self._locked_connect() as connection:
             rows = connection.execute(sql, params).fetchall()
-        return [{"partition": r[0], "solve_telemetry_json": r[1]} for r in rows]
+        return [{"partition": r[0], "elapsed_ms": r[1], "gpu_used": bool(r[2])} for r in rows]
 
     def export_parquet(
         self,
