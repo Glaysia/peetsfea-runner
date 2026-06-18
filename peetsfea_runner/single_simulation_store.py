@@ -487,6 +487,51 @@ class SingleSimulationResultStore:
             for r in rows
         ]
 
+    def priority_lineage(self, *, limit: int | None = 200) -> dict[str, Any]:
+        """입력큐 계보 — 들어온/대기/분배 수 + 입력큐에서 파생된 출력(성공/실패) 집계.
+
+        결과는 워커가 `{sweep_request_id}-{seed}`로 기록(edt_priority_lease)하므로, request_id(PK)의
+        **prefix 범위스캔**(`>= rid||'-'` AND `< rid||'.'`)으로 sweep↔결과를 연결한다. 컨테이너 무수정.
+        진행 중(inflight)은 (분배−완료) 근사(결과가 아직 안 들어온 분; at-most-once 유실 포함 가능).
+        """
+        self.initialize()
+        lim = f" LIMIT {int(limit)}" if limit is not None else ""
+        with self._locked_connect() as connection:
+            tot = connection.execute(
+                "SELECT count(*), COALESCE(sum(total_count),0), COALESCE(sum(remaining_count),0) FROM priority_sweeps"
+            ).fetchone()
+            rows = connection.execute(
+                "SELECT ps.request_id, ps.total_count, ps.remaining_count, ps.created_at, "
+                "  COALESCE(sum(CASE WHEN r.terminal_state='success' THEN 1 ELSE 0 END),0), "
+                "  COALESCE(sum(CASE WHEN r.terminal_state IS NOT NULL AND r.terminal_state<>'success' THEN 1 ELSE 0 END),0) "
+                "FROM priority_sweeps ps "
+                "LEFT JOIN single_simulation_results r "
+                "  ON r.request_id >= ps.request_id || '-' AND r.request_id < ps.request_id || '.' "
+                "GROUP BY ps.request_id, ps.total_count, ps.remaining_count, ps.created_at "
+                "ORDER BY ps.created_at DESC" + lim
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        ok_sum = fail_sum = 0
+        for rid, total, remaining, created, ok, fail in rows:
+            total_i, rem_i, ok_i, fail_i = int(total or 0), int(remaining or 0), int(ok or 0), int(fail or 0)
+            leased = total_i - rem_i
+            done = ok_i + fail_i
+            ok_sum += ok_i
+            fail_sum += fail_i
+            items.append({
+                "request_id": rid, "total": total_i, "remaining": rem_i, "leased": leased,
+                "ok": ok_i, "fail": fail_i, "done": done, "inflight": max(0, leased - done),
+                "created_at": float(created or 0.0),
+            })
+        submitted, waiting = int(tot[1]), int(tot[2])
+        leased_all = submitted - waiting
+        done_all = ok_sum + fail_sum
+        return {
+            "sweeps": int(tot[0]), "submitted": submitted, "waiting": waiting, "leased": leased_all,
+            "ok": ok_sum, "fail": fail_sum, "done": done_all, "inflight": max(0, leased_all - done_all),
+            "items": items,
+        }
+
 
 @dataclass
 class DbPriorityQueue:

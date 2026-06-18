@@ -83,6 +83,21 @@ def test_priority_list_shows_remaining_no_toml(tmp_path: Path) -> None:
     assert store.priority_depth() == 6  # 조회는 차감 안 함
 
 
+def test_priority_lineage_links_results_by_prefix(tmp_path: Path) -> None:
+    # 입력큐 계보: 결과 request_id=`{sweep}-{seed}`를 prefix로 sweep에 연결, baseline(base-*)은 제외.
+    store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
+    _sweep(store, "userA", 10, now=1.0)
+    _sweep(store, "userB", 5, now=2.0)
+    store.priority_lease_chunk(3)  # 가장 오래된(userA) 3 차감
+    for rid, state in [("userA-1000", "success"), ("userA-1001", "failed"), ("base-99-0", "success")]:
+        store.record_envelope({"request_id": rid, "terminal_state": state, "seed": 0, "mode": "full"})
+    lin = store.priority_lineage()
+    assert lin["submitted"] == 15 and lin["waiting"] == 12 and lin["leased"] == 3
+    assert lin["done"] == 2 and lin["ok"] == 1 and lin["fail"] == 1 and lin["inflight"] == 1  # base-* 제외됨
+    a = next(i for i in lin["items"] if i["request_id"] == "userA")
+    assert a["total"] == 10 and a["leased"] == 3 and a["done"] == 2 and a["inflight"] == 1
+
+
 def test_priority_sweep_survives_restart(tmp_path: Path) -> None:
     db = tmp_path / "r.duckdb"
     _sweep(SingleSimulationResultStore(db_path=db), "sweep-9", 7, now=1.0)
