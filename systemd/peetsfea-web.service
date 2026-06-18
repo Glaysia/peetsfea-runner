@@ -1,7 +1,7 @@
 [Unit]
 Description=Peets FEA — web/데이터 플레인 (대시보드:8080 + intake:7875 + ingest:7876 + bulk:7877)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target peetsfea-pg.service
+Wants=network-online.target peetsfea-pg.service
 
 [Service]
 Type=simple
@@ -11,6 +11,9 @@ WorkingDirectory=%h/mnt/8tb/peetsfea-runner
 # 오케스트레이터는 안 돌린다 → 이 서비스를 재시작/정지해도 컨테이너(9잡)는 그대로 산다(scancel 없음).
 ExecStart=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -m peetsfea_runner.edt_control_plane
 Environment=EDT_ROLE=web
+# OLTP store: postgres(유저공간 :5433) — DuckDB 단일writer/메모리 spill 근본해결. 롤백: duckdb로 토글.
+Environment=EDT_STORE_BACKEND=postgres
+Environment=EDT_PG_DSN=host=127.0.0.1 port=5433 dbname=peetsfea user=peets
 Environment=EDT_DB_PATH=%h/edt-deploy/results.duckdb
 Environment=EDT_ARCHIVE_ROOT=%h/mnt/8tb/edt-archive
 Environment=EDT_ARCHIVE_BUFFER_BYTES=1099511627776

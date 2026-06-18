@@ -1,7 +1,7 @@
 [Unit]
 Description=Peets FEA — 컨테이너 유지 (오케스트레이터: 9 SLURM 잡 상시 유지 + 10h 만료 재기동)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target peetsfea-pg.service
+Wants=network-online.target peetsfea-pg.service
 
 [Service]
 Type=simple
@@ -10,6 +10,9 @@ WorkingDirectory=%h/mnt/8tb/peetsfea-runner
 # scancel(잡 종료)은 이 서비스에서만 발생 — web 재시작과 분리되어 컨테이너 수명을 단독 관리.
 ExecStart=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -m peetsfea_runner.edt_control_plane
 Environment=EDT_ROLE=keeper
+# keeper도 자원 시계열(resource_snapshots)을 OLTP store에 쓴다 → 분리 후 PG 백엔드 필요.
+Environment=EDT_STORE_BACKEND=postgres
+Environment=EDT_PG_DSN=host=127.0.0.1 port=5433 dbname=peetsfea user=peets
 Environment=EDT_SSH_HOST=gate1-harry261
 Environment=EDT_JOB_COUNT=9
 Restart=always

@@ -1,0 +1,14 @@
+[Unit]
+Description=Peets FEA — Postgres (OLTP store, 유저공간 conda)
+After=network.target
+
+[Service]
+Type=simple
+# 유저공간 conda Postgres. web/keeper가 이 DB(:5433, peetsfea)를 OLTP store로 쓴다.
+ExecStart=%h/miniconda3/envs/pg/bin/postgres -D %h/edt-deploy/pgdata -p 5433
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
