@@ -5,7 +5,8 @@
 #   동시 컨테이너 수 = 제어기(:7879 /container_plan?job=N)가 지정. solve<100이면 제어기가 target↑, >150이면
 #   target↓(→ 여기서 가장 최근 컨테이너를 SIGTERM 안전종료, 강종 금지). 잡당 ≤40(제어기 cap).
 #   permit 게이팅 없음(제어기가 컨테이너 수로 직접 제어). 터널 1개/잡(host netns 공유).
-set -u
+# 주의: set -u 금지 — 컴퓨트노드 구버전 bash에서 빈 연관배열 접근(${#C_PID[@]}, ${!C_PID[@]})이
+# "unbound variable"로 잡을 즉사시킨다. 모든 변수는 ${VAR:-default}로 방어.
 echo "[orch] NODE=$(hostname) JOB=$SLURM_JOB_ID JIDX=${EDT_JOB_INDEX:-0} PART=${EDT_PARTITION:-}"
 ANSB=/opt/ohpc/pub/Electronics/v252
 DEPLOY=$HOME/edt-deploy
