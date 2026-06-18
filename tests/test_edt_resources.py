@@ -8,7 +8,7 @@ _SAMPLE = """###JOBS
 ###NODES
 n003|4.62|32|48|682334|768000
 ###LIC
-550|78|31
+550|78|31|55|41
 """
 
 
@@ -21,8 +21,11 @@ def test_parse_remote_jobs_nodes_license() -> None:
     # 노드 부하(컨테이너별 실시간 부하 원천)
     n = snap["nodes"]["n003"]
     assert n["cpuload"] == 4.62 and n["cputot"] == 48 and n["memfree_mb"] == 682334 and n["memtotal_mb"] == 768000
-    # 라이선스
-    assert snap["license"] == {"feature": "electronics_desktop", "issued": 550, "in_use": 78, "mine": 31}
+    # 라이선스: electronics_desktop(데스크톱) + elec_solve_hfss(솔브)
+    assert snap["license"] == {
+        "feature": "electronics_desktop", "issued": 550, "in_use": 78, "mine": 31,
+        "solve_feature": "elec_solve_hfss", "solve_in_use": 55, "solve_mine": 41,
+    }
     # 카운트
     assert snap["counts"] == {"running": 1, "pending": 1}
 
@@ -91,6 +94,8 @@ def test_history_ring_buffer_accumulates_compact_points() -> None:
     p = hist[0]
     assert p["ts"] == 10.0 and p["running"] == 1 and p["pending"] == 1
     assert p["lic_mine"] == 31 and p["lic_inuse"] == 78
+    # AEDT 추세(lmstat 실측): 명목=데스크톱(mine 31), 유효=솔브(solve_mine 41)
+    assert p["nominal_aedt"] == 31 and p["effective_aedt"] == 41
     assert p["load"] == 4.6 and p["cpus"] == 32  # n003 부하(round1) / RUNNING 잡 cpus
     assert p["mem_used_mb"] == 768000 - 682334 and p["mem_total_mb"] == 768000
 

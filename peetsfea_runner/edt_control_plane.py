@@ -99,12 +99,17 @@ class ControlPlane:
         self._stop.set()
 
     def _lic_mine(self) -> int:
-        """현재 내 라이선스 사용수(lic_mine) — poller 스냅샷에서. 제어기 lic_provider."""
+        """제어기 lic_provider — 내 **솔브 라이선스 사용수**(elec_solve_hfss). poller 스냅샷에서.
+
+        electronics_desktop(=열린 데스크톱)가 아니라 solve feature를 기준으로 묶는다:
+        데스크톱은 450까지 오버슛해도 되고, 매 순간 솔브를 target~ceiling(100~150)에 둔다.
+        solve 필드가 없으면(구버전/파싱실패) 0 → max(0, len(_active))로 _active가 가드.
+        """
         if self.resource_poller is None:
             return 0
         lic = self.resource_poller.snapshot().get("license") or {}
         try:
-            return int(lic.get("mine") or 0)
+            return int(lic.get("solve_mine") or 0)
         except (TypeError, ValueError):
             return 0
 
@@ -151,12 +156,9 @@ class ControlPlane:
                 lic_provider=self._lic_mine, target=self.license_target, ceiling=self.license_ceiling,
             )
             self.license_controller = controller
-            # 추세 영속에 AEDT 명목(켜놓은 전체)/유효(솔브중=라이선스)를 함께 기록.
+            # 추세의 AEDT 명목(열린 데스크톱)/유효(솔브중)는 _history_point가 lmstat 실측으로 채운다.
+            # (제어기 내부 ping 집계는 솔브 사이 idle 워커를 놓쳐 과소계상되므로 extra_provider로 덮지 않는다.)
             if self.resource_poller is not None:
-                self.resource_poller.extra_provider = lambda: {
-                    "nominal_aedt": controller.nominal(),
-                    "effective_aedt": controller.status()["active_permits"],
-                }
                 self.resource_poller.aedt_provider = controller.per_job  # 컨테이너(잡)별 pyaedt 수 → 부하 탭
             license_server = start_license_ctrl_server(controller=controller, port=self.license_ctrl_port)
             for server in (dashboard, intake_server, ingest_server, bulk_server, lease_server, license_server):

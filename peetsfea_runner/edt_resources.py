@@ -33,13 +33,19 @@ for n in $(squeue --me -h -o '%N %T %j' 2>/dev/null | awk -v p="$P" '$2=="RUNNIN
 done
 echo '###LIC'
 LM=/opt/ohpc/pub/Electronics/v252/licensingclient/linx64/lmutil
-"$LM" lmstat -a -c 1055@license-server 2>/dev/null | \
-  awk '/Users of electronics_desktop:/{f=1} /Users of/ && !/electronics_desktop/{f=0} f{print}' > /tmp/_edtlic.$$ 2>/dev/null
-iss=$(grep -oP 'Total of \K[0-9]+(?= licenses issued)' /tmp/_edtlic.$$ 2>/dev/null | head -1)
-use=$(grep -oP 'Total of \K[0-9]+(?= licenses in use)' /tmp/_edtlic.$$ 2>/dev/null | head -1)
-mine=$(grep -c "$(whoami)" /tmp/_edtlic.$$ 2>/dev/null)
-rm -f /tmp/_edtlic.$$ 2>/dev/null
-echo "${iss:-0}|${use:-0}|${mine:-0}"
+ME=$(whoami)
+# lmstat 1회 호출 후 두 feature를 추출: electronics_desktop(=열린 데스크톱)·elec_solve_hfss(=실제 솔브중).
+# 제어기는 solve(=elec_solve_hfss)를 100~150 밴드로 묶는다(데스크톱은 오버슛 허용). 대시보드는 둘 다 표시.
+LMALL=$("$LM" lmstat -a -c 1055@license-server 2>/dev/null)
+sect() { printf '%s\n' "$LMALL" | awk -v feat="$1" '/Users of /{f=($0 ~ ("Users of " feat ":"))?1:0} f{print}'; }
+D=$(sect electronics_desktop)
+S=$(sect elec_solve_hfss)
+iss=$(printf '%s' "$D" | grep -oP 'Total of \K[0-9]+(?= licenses issued)' | head -1)
+use=$(printf '%s' "$D" | grep -oP 'Total of \K[0-9]+(?= licenses in use)' | head -1)
+mine=$(printf '%s' "$D" | grep -c "$ME")
+suse=$(printf '%s' "$S" | grep -oP 'Total of \K[0-9]+(?= licenses in use)' | head -1)
+smine=$(printf '%s' "$S" | grep -c "$ME")
+echo "${iss:-0}|${use:-0}|${mine:-0}|${suse:-0}|${smine:-0}"
 """
 
 
@@ -84,7 +90,13 @@ def parse_remote(text: str) -> dict[str, Any]:
         elif section == "###LIC":
             parts = line.split("|")
             if len(parts) >= 3:
-                snap["license"] = {"feature": "electronics_desktop", "issued": _i(parts[0]), "in_use": _i(parts[1]), "mine": _i(parts[2])}
+                lic = {"feature": "electronics_desktop", "issued": _i(parts[0]), "in_use": _i(parts[1]), "mine": _i(parts[2])}
+                # solve feature(elec_solve_hfss): 실제 솔브중 수. 제어기 기준값 + 대시보드 '유효 AEDT'.
+                if len(parts) >= 5:
+                    lic["solve_feature"] = "elec_solve_hfss"
+                    lic["solve_in_use"] = _i(parts[3])
+                    lic["solve_mine"] = _i(parts[4])
+                snap["license"] = lic
     snap["counts"] = {
         "running": sum(1 for j in snap["jobs"] if j["state"] == "RUNNING"),
         "pending": sum(1 for j in snap["jobs"] if j["state"] == "PENDING"),
@@ -127,6 +139,10 @@ def _history_point(snap: dict[str, Any]) -> dict[str, Any]:
         "cpus": cpus,                 # 우리 잡 할당 코어 합(부하 분모)
         "mem_used_mb": mem_used,
         "mem_total_mb": mem_total,
+        # AEDT 추세는 lmstat 실측 기준: 명목=열린 데스크톱(electronics_desktop), 유효=솔브중(elec_solve_hfss).
+        # (제어기 내부 ping 집계는 솔브 사이 idle 워커를 놓쳐 과소계상되므로 실측을 쓴다.)
+        "nominal_aedt": int(lic.get("mine") or 0),
+        "effective_aedt": int(lic.get("solve_mine") or 0),
     }
 
 
