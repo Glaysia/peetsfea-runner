@@ -87,6 +87,10 @@ class SlurmJobLauncher:
     # 이미 사용한 baseline seed 프런티어를 반환(store.max_baseline_seed). 제출 시 이 위로 seed epoch를 잡아
     # 재램프해도 워커가 새 설계공간을 탐색(이미 푼 seed 재탕 방지). None이면 epoch=0(기존 동작).
     seed_epoch_provider: Callable[[], int] | None = None
+    # 롤링 라이프사이클: 잡 출생 시 제어기가 LUT로 결정한 컨테이너 수 N을 주입(EDT_JOB_CONTAINERS).
+    # None이면 미주입(orchestrator가 /job_plan 조회 또는 기본값). job_ttl_seconds=잡 수명(orchestrator self-exit).
+    container_count_provider: Callable[[], int] | None = None
+    job_ttl_seconds: int = 1800
     _avoid: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
     def _seed_epoch(self) -> int:
@@ -114,6 +118,15 @@ class SlurmJobLauncher:
         # node_based: 특정 노드에 핀(과적재 방지). 파티션은 노드가 속한 파티션으로 함께 지정.
         nodelist_line = f"#SBATCH --nodelist={node}\n" if node else ""
         seed_epoch = self._seed_epoch()  # 사용한 seed 위로 시작점 advance(재램프 재탕 방지)
+        # 롤링: 잡 출생 시 제어기 LUT로 N(컨테이너 수) 결정 → 주입. 실패 시 미주입(orchestrator 폴백).
+        n_line = ""
+        if self.container_count_provider is not None:
+            try:
+                n = int(self.container_count_provider())
+                if n > 0:
+                    n_line = f"export EDT_JOB_CONTAINERS={n}\n"
+            except Exception:  # noqa: BLE001 — 제어기 조회 실패가 잡 제출을 막으면 안 됨.
+                n_line = ""
         return (
             "#!/bin/bash\n"
             f"#SBATCH --job-name={self.job_name_prefix}-{job_index}\n"
@@ -130,6 +143,9 @@ class SlurmJobLauncher:
             f"export EDT_GPU_COUNT={gpus}\n"
             # EDT_BASELINE_SEED_EPOCH: entrypoint가 seed_base에 더해 재램프마다 새 설계공간을 탐색(재탕 방지).
             f"export EDT_BASELINE_SEED_EPOCH={seed_epoch}\n"
+            # 롤링 라이프사이클: orchestrator가 N개 컨테이너를 stagger 가동 후 TTL에 self-exit.
+            f"export EDT_JOB_TTL_SEC={self.job_ttl_seconds}\n"
+            f"{n_line}"
             f"{self.job_command}\n"
         )
 

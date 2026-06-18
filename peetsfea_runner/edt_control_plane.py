@@ -172,11 +172,16 @@ class ControlPlane:
             self.license_controller = controller
             if self.resource_poller is not None:
                 self.resource_poller.aedt_provider = controller.per_job  # 컨테이너(잡)별 pyaedt 수 → 부하 탭
-                # 컨테이너 스케줄러: solve(lmstat) 밴드 100~150을 잡별 컨테이너 target으로 actuate(LB).
+                # 롤링 제어기: 잡 출생 시 LUT(지령 solve=100, 이상점 12, 최대 20)로 컨테이너 수 N 결정.
                 self.container_scheduler = ContainerScheduler(
                     snapshot_provider=self.resource_poller.snapshot,
-                    target=self.license_target, ceiling=self.license_ceiling,
                 )
+                # 와이어링: 런처는 출생 시 N을 주입, orchestrator는 보고 기반 살아있는 컨테이너 수로 롤링 교체.
+                if self.orchestrator is not None:
+                    lc = getattr(self.orchestrator.launcher, "container_count_provider", "missing")
+                    if lc != "missing":
+                        self.orchestrator.launcher.container_count_provider = self.container_scheduler.decide_n
+                    self.orchestrator.live_count_provider = self.container_scheduler.live_count
             license_server = start_license_ctrl_server(
                 controller=controller, scheduler=self.container_scheduler, port=self.license_ctrl_port
             )

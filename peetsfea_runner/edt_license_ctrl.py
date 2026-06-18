@@ -151,83 +151,70 @@ class LicenseController:
 
 @dataclass
 class ContainerScheduler:
-    """컨테이너 수 제어기 — 동시 solve(lmstat solve_mine)를 target~ceiling 밴드로 묶되 actuator가
-    permit이 아니라 **컨테이너 spawn/안전종료**다.
+    """롤링 라이프사이클 제어기 — 잡 **출생 시** LUT로 그 잡의 컨테이너 수 N을 결정(분모/LB 없음).
 
-      solve < target  → 가장 한가한 노드의 잡 target↑ (LB: CPU 낮은 노드 우선; 다 90%↑면 free-RAM 큰 노드)
-      solve > ceiling → 가장 바쁜 노드의 잡 target↓ (→ 오케스트레이터가 youngest 컨테이너를 SIGTERM 안전종료)
+      지령(setpoint) solve=100에서 이상점 N=ideal(12). 100미만이면 더 밀고(최대 cap=20),
+      100~overshoot(120)은 오버슈팅 허용(N을 ideal→1로 완만히), overshoot 초과면 N=1.
 
-    잡당 max_per_job(20) 상한. 1컨테이너=1솔브=종료라 누수 0; 오버슈팅은 컨테이너 수로 흡수(콜드스타트 듀티 보상)."""
+    1컨테이너=1솔브=종료(respawn 없음)라 잡은 시간이 지나며 드레인. orchestrator가 살아있는 컨테이너 수를
+    /orch_report로 보고 → JobOrchestrator가 '가장 적게 남은 잡'을 골라 15분 주기로 교체(stagger)."""
 
     snapshot_provider: Callable[[], Mapping[str, Any]]   # poller.snapshot
-    target: int = 100
-    ceiling: int = 150
-    max_per_job: int = 20
-    min_per_job: int = 2
-    step: int = 3
-    _job_target: dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    setpoint: int = 100
+    ideal: int = 12
+    cap: int = 20
+    overshoot: int = 120
+    report_ttl_seconds: float = 60.0
+    clock: Callable[[], float] = time.monotonic
+    _reports: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
-    @staticmethod
-    def _job_node_map(snap: Mapping[str, Any]) -> dict[int, str]:
-        out: dict[int, str] = {}
-        for j in snap.get("jobs") or []:
-            if j.get("state") != "RUNNING":
-                continue
-            try:
-                ji = int(str(j.get("name") or "").rsplit("-", 1)[-1])
-            except ValueError:
-                continue
-            out[ji] = str(j.get("node") or "")
-        return out
-
-    @staticmethod
-    def _cpu(node: str, nodes: Mapping[str, Any]) -> float:
-        nd = nodes.get(node) or {}
-        ct = nd.get("cputot") or 0
-        return (nd.get("cpuload") or 0.0) / ct if ct else 0.0
-
-    @staticmethod
-    def _freeram(node: str, nodes: Mapping[str, Any]) -> int:
-        return (nodes.get(node) or {}).get("memfree_mb") or 0
-
-    def tick(self) -> None:
+    def current_solve(self) -> int:
         try:
             snap = self.snapshot_provider() or {}
-        except Exception:  # noqa: BLE001 — 스냅샷 실패가 스케줄러를 죽이면 안 됨.
-            return
-        jn = self._job_node_map(snap)
-        nodes = snap.get("nodes") or {}
-        eff = int((snap.get("license") or {}).get("solve_mine") or 0)
-        with self._lock:
-            for ji in jn:
-                self._job_target.setdefault(ji, self.min_per_job)
-            for ji in [j for j in self._job_target if j not in jn]:
-                self._job_target.pop(ji, None)
-            if not jn:
-                return
-            if eff < self.target:
-                cands = [ji for ji in jn if self._job_target[ji] < self.max_per_job]
-                if cands:
-                    if all(self._cpu(jn[ji], nodes) > 0.9 for ji in cands):
-                        best = max(cands, key=lambda ji: self._freeram(jn[ji], nodes))
-                    else:
-                        best = min(cands, key=lambda ji: self._cpu(jn[ji], nodes))
-                    self._job_target[best] = min(self.max_per_job, self._job_target[best] + self.step)
-            elif eff > self.ceiling:
-                cands = [ji for ji in jn if self._job_target[ji] > self.min_per_job]
-                if cands:
-                    worst = max(cands, key=lambda ji: self._cpu(jn[ji], nodes))
-                    self._job_target[worst] = max(self.min_per_job, self._job_target[worst] - self.step)
+        except Exception:  # noqa: BLE001 — 스냅샷 실패가 제어기를 죽이면 안 됨.
+            return 0
+        return int((snap.get("license") or {}).get("solve_mine") or 0)
 
-    def plan(self, job_index: int) -> int:
+    def decide_n(self, solve: int | None = None) -> int:
+        """LUT: 현재 동시 솔브 → 새 잡의 컨테이너 수 N."""
+        s = self.current_solve() if solve is None else int(solve)
+        if s <= self.setpoint:
+            n = self.ideal + 0.08 * (self.setpoint - s)          # 100→12, 0→20
+        elif s <= self.overshoot:
+            n = self.ideal - 0.55 * (s - self.setpoint)          # 100→12, 120→1
+        else:
+            n = 1.0                                              # 120↑ 정지
+        return max(1, min(self.cap, int(round(n))))
+
+    def report(self, slurm_id: str, live: int, **extra: Any) -> None:
+        """orchestrator가 살아있는 컨테이너 수 보고."""
+        sid = str(slurm_id or "")
+        if not sid:
+            return
         with self._lock:
-            return self._job_target.get(int(job_index), self.min_per_job)
+            self._reports[sid] = {"live": int(live), "ts": self.clock(), **extra}
+
+    def live_count(self, slurm_id: str) -> int:
+        """slurm_id의 살아있는 컨테이너 수. 미보고/만료면 -1(아직 모름 → 교체 후보 제외용)."""
+        with self._lock:
+            r = self._reports.get(str(slurm_id))
+            if not r or (self.clock() - r["ts"]) > self.report_ttl_seconds:
+                return -1
+            return int(r["live"])
+
+    def tick(self) -> None:
+        """오래된(죽은 orchestrator) 보고 정리."""
+        now = self.clock()
+        with self._lock:
+            for sid in [s for s, r in self._reports.items() if now - r["ts"] > self.report_ttl_seconds]:
+                self._reports.pop(sid, None)
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            return {"job_target": dict(self._job_target), "total": sum(self._job_target.values()),
-                    "target": self.target, "ceiling": self.ceiling, "max_per_job": self.max_per_job}
+            reps = {s: r["live"] for s, r in self._reports.items()}
+        return {"setpoint": self.setpoint, "ideal": self.ideal, "cap": self.cap, "overshoot": self.overshoot,
+                "solve": self.current_solve(), "decide_n": self.decide_n(), "reports": reps}
 
 
 def start_license_ctrl_server(
@@ -259,18 +246,28 @@ def start_license_ctrl_server(
                     st["scheduler"] = scheduler.status()
                 _write_json(self, 200, st)
                 return
-            if parsed.path == "/container_plan":
-                if scheduler is None:
-                    _write_json(self, 200, {"target": 0})
-                    return
-                raw = parse_qs(parsed.query).get("job", ["0"])[0]
-                ji = int(raw) if raw.lstrip("-").isdigit() else 0
-                _write_json(self, 200, {"job": ji, "target": scheduler.plan(ji)})
+            if parsed.path in ("/job_plan", "/container_plan"):
+                n = scheduler.decide_n() if scheduler is not None else 0
+                _write_json(self, 200, {"n": n})
                 return
             _write_json(self, 404, {"error": "not_found"})
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
+            # orchestrator 보고(form-encoded): 살아있는 컨테이너 수 → 가장 적게 남은 잡 선택용.
+            if path == "/orch_report":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    q = parse_qs(self.rfile.read(length).decode("utf-8")) if length else {}
+                    if scheduler is not None:
+                        scheduler.report(
+                            q.get("slurm", [""])[0], int(q.get("live", ["0"])[0] or 0),
+                            target=int(q.get("target", ["0"])[0] or 0), age=int(q.get("age", ["0"])[0] or 0),
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+                _write_json(self, 200, {"ok": True})
+                return
             body = self._body()
             worker_id = str(body.get("worker_id") or "")
             if not worker_id:

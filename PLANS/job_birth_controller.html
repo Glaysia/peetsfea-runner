@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>제어 로직 — 15분 롤링 교체 · 30분 잡 · 100 수렴</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",sans-serif}
+  .wrap{max-width:880px;margin:0 auto;padding:32px 22px 70px}
+  h1{font-size:23px;line-height:1.35;margin:0 0 6px}
+  h2{font-size:18px;margin:30px 0 10px;padding-top:13px;border-top:1px solid var(--bd)}
+  .sub{color:var(--mut);margin:0 0 20px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 18px;margin:12px 0}
+  code{background:#1f2630;padding:1.5px 6px;border-radius:5px;font-size:13px;color:#ffa657}
+  pre{background:#010409;border:1px solid var(--bd);border-radius:8px;padding:14px 16px;overflow:auto;font-size:14px;line-height:1.6}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14px}
+  th,td{border:1px solid var(--bd);padding:7px 10px;text-align:left}
+  th{background:#1f2630}
+  .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+  ul{margin:6px 0;padding-left:22px}li{margin:4px 0}
+  .flow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:10px 0}
+  .box{background:#1f2630;border:1px solid var(--bd);border-radius:7px;padding:7px 11px;font-size:13px}
+  .arr{color:var(--mut);font-weight:700}
+  .big{font-size:21px;font-weight:700}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>제어 로직 — 15분 롤링 교체 · 30분 잡 · 동시 솔브 100 수렴</h1>
+<p class="sub">컨테이너 1솔브=죽음 · 잡당 최대 20 · 로드밸런싱 없음 · 2026-06-19</p>
+
+<h2>1. 모델 한눈에</h2>
+<ul>
+<li><b>컨테이너 = 1 솔브 = 죽음.</b> 재가동(respawn) 없음 → 잡의 살아있는 컨테이너는 시간이 지나며 <b>줄어든다(드레인)</b>.</li>
+<li><b>잡 = 출생 시 컨테이너 N개(≤20)</b> 가동. 수명 <b>최대 30분</b>.</li>
+<li><b>제어 루프 = 최대 15분 주기</b>로 롤링 교체. 항상 ~9잡 유지.</li>
+<li>목표: <b>동시 솔브 100에 수렴.</b> 로드밸런싱 없음(SLURM 배치에 맡김).</li>
+</ul>
+
+<h2>2. 제어 루프 (핵심)</h2>
+<div class="flow">
+  <span class="box">15분(또는 더 빨리)마다</span><span class="arr">→</span>
+  <span class="box">살아있는 컨테이너 <b>가장 적게 남은 잡</b> 선택</span><span class="arr">→</span>
+  <span class="box bad">그 잡 안전종료</span><span class="arr">→</span>
+  <span class="box">제어기 <b>N 결정</b></span><span class="arr">→</span>
+  <span class="box ok">새 30분 잡(N) 제출</span>
+</div>
+<pre>제어 틱 주기 = 최대 15분.
+  단 어떤 잡의 컨테이너가 다 끝나(드레인) 자리가 비면 15분 전이라도 즉시 틱.
+
+매 틱:
+  J = 살아있는 컨테이너가 가장 적은 RUNNING 잡   # 가장 많이 끝난 잡(손실 최소)
+  safe_stop(J)                                   # 남은 소수 컨테이너만 안전종료
+  N = decide_N()                                 # 아래 공식
+  submit_job(ttl=30min, containers=N)</pre>
+<ul>
+<li><b>가장 적게 남은 잡을 끔</b> → 거의 끝난 잡이라 중단해도 in-flight 손실 최소.</li>
+<li><b>잡 수명 30분</b> = 하드 상한(그 전에 틱으로 교체되거나 드레인되면 더 일찍 종료). 종료 시 AEDT·pyaedt·터널 소멸 → 누수 회수.</li>
+<li>틱마다 1개 종료 + 1개 출생 → <b>출생/사망이 시간축에 분산(stagger)</b> → gRPC 동시 herd 제거.</li>
+</ul>
+
+<h2>3. N 결정 — LUT (잡 출생 시)</h2>
+<p>지령(setpoint) <b>solve=100</b>에서 <b>이상점 N=12</b>(잡당 12개 = 9×12≈108). <b>100~120 오버슈팅은 좋음</b>(밴드), 120↑은 정지. 최대 20.</p>
+<pre>solve = 현재 동시 솔브 수            # 실측 elec_solve_hfss (우리)
+
+if   solve &lt;= 100:  N = 12 + 0.08*(100 - solve)   # 100→12, 0→20  (밑일수록 더 밀기)
+elif solve &lt;= 120:  N = 12 - 0.55*(solve - 100)   # 100→12, 120→1 (오버슈팅 100~120 허용)
+else            :  N = 1                           # 120↑ 오버슈팅 정지
+N = clamp(round(N), 1, 20)</pre>
+<table>
+<tr><th>solve</th><th>0</th><th>40</th><th>60</th><th>80</th><th>100</th><th>110</th><th>115</th><th>120</th><th>130</th></tr>
+<tr><th>N</th><td class="big">20</td><td class="big">17</td><td class="big">15</td><td class="big">14</td><td class="big ok">12</td><td class="big">7</td><td class="big">4</td><td class="big">1</td><td class="big">1</td></tr>
+</table>
+<ul>
+<li><b>100 미만</b>: 12보다 크게(최대 20) 밀어 올림 — 멀수록 세게.</li>
+<li><b>100~120</b>: 12에서 1로 완만히 줄이며 오버슈팅 허용(이 구간 체류 OK).</li>
+<li><b>120 초과</b>: 최소 1 — 더 안 밀어 120 근처서 멈춤.</li>
+</ul>
+
+<h2>4. herd 방지 (컨테이너 출생 stagger)</h2>
+<div class="card">
+잡이 N개를 <b>한꺼번에</b> 켜면 그 노드에서 AEDT N개 동시 기동 → 방금 본 gRPC 행 재발.
+→ orchestrator는 N개를 <b>1개씩 간격 두고</b> 가동(노드당 콜드스타트중 ≤2~3).
+</div>
+
+<h2>5. 구현 포인트</h2>
+<table>
+<tr><th>레이어</th><th>변경</th></tr>
+<tr><td><b>제어기(루프)</b></td><td>최대 15분 주기 틱(잡 드레인 시 조기 발동). 폴러로 잡별 살아있는 컨테이너 수 집계 → 최소 잡 선택·중단, <code>decide_N()</code>로 새 잡 제출.</td></tr>
+<tr><td><b>orchestrator</b></td><td>출생 시 N 받아 <b>1솔브 컨테이너 N개</b> stagger 가동(respawn 없음). <code>EDT_JOB_TTL_SEC=1800</code> 또는 제어기 종료신호 시 진행 솔브 마치고 안전종료 → 잡 exit. /enroot 정리 trap 유지.</td></tr>
+<tr><td><b>keeper</b></td><td>잡 9개 유지를 제어 루프가 담당(종료 1 + 제출 1). 일괄 재시작 금지.</td></tr>
+</table>
+
+<p class="mut" style="margin-top:24px">— 설계 확정. 이대로 구현·배포·모니터링.</p>
+
+</div>
+</body>
+</html>
