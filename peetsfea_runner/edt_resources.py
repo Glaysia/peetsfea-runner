@@ -53,6 +53,12 @@ mine=$(printf '%s' "$D" | grep -c "$ME")
 suse=$(printf '%s' "$S" | grep -oP 'Total of \K[0-9]+(?= licenses in use)' | head -1)
 smine=$(printf '%s' "$S" | grep -c "$ME")
 echo "${iss:-0}|${use:-0}|${mine:-0}|${suse:-0}|${smine:-0}"
+# 노드별 우리 체크아웃: 데스크톱·솔브를 host별로 집계(컨테이너=노드라 카드의 '솔브중'을 lmstat 실측으로).
+# lmstat 체크아웃 라인은 "  harry261 nib112.hpc …" → $1=user, $2=host. host의 숫자만 뽑아 n<NNN>로 정규화.
+echo '###LICNODE'
+{ printf '%s\n' "$D" | awk -v me="$ME" '$1==me{h=$2;sub(/\..*/,"",h);print "D",h}'
+  printf '%s\n' "$S" | awk -v me="$ME" '$1==me{h=$2;sub(/\..*/,"",h);print "S",h}'; } \
+| awk '{if($1=="D")d[$2]++; else s[$2]++; seen[$2]=1} END{for(h in seen)print h"|"d[h]+0"|"s[h]+0}'
 """
 
 
@@ -71,7 +77,7 @@ def parse_remote(text: str) -> dict[str, Any]:
     section = ""
     for raw in text.splitlines():
         line = raw.strip()
-        if line in ("###JOBS", "###NODES", "###LIC"):
+        if line in ("###JOBS", "###NODES", "###LIC", "###LICNODE"):
             section = line
             continue
         if not line:
@@ -104,6 +110,16 @@ def parse_remote(text: str) -> dict[str, Any]:
                     lic["solve_in_use"] = _i(parts[3])
                     lic["solve_mine"] = _i(parts[4])
                 snap["license"] = lic
+        elif section == "###LICNODE":
+            # host|desktop|solve. host(nib112) → 노드키(n112)로 정규화해 nodes에 병합(컨테이너 솔브중 실측).
+            parts = line.split("|")
+            if len(parts) >= 3:
+                digits = "".join(c for c in parts[0] if c.isdigit())
+                if digits:
+                    node = "n" + digits
+                    nd = snap["nodes"].setdefault(node, {})
+                    nd["desktop"] = _i(parts[1])
+                    nd["solve"] = _i(parts[2])
     snap["counts"] = {
         "running": sum(1 for j in snap["jobs"] if j["state"] == "RUNNING"),
         "pending": sum(1 for j in snap["jobs"] if j["state"] == "PENDING"),
