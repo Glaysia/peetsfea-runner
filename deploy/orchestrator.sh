@@ -36,6 +36,8 @@ PORT=${EDT_INGEST_PORT:-7876}; BULK=${EDT_BULK_PORT:-7877}
 LEASE=${EDT_PRIORITY_LEASE_PORT:-7878}; LIC=${EDT_LICENSE_CTRL_PORT:-7879}
 SSHD=${EDT_ORCH_SSHD_PORT:-0}   # >0이면 잡 오케스트레이터 sshd를 gate:SSHD로 -R 노출(라이브 디버깅)
 INGEST_URL="http://127.0.0.1:$PORT/ingest"; LEASE_URL="http://127.0.0.1:$LEASE/lease"; LIC_URL="http://127.0.0.1:$LIC"
+[ -n "${EDT_NO_PERMIT:-}" ] && LIC_URL=""   # 파일럿/제어기 없을 때: permit 비활성(컨테이너가 자유 솔브)
+CLOG=$DEPLOY/clogs; mkdir -p "$CLOG"        # 컨테이너별 로그(디버깅; gpfs라 게이트에서 읽힘)
 case "${EDT_PARTITION:-}" in gpu*) NVD=all ;; *) NVD=void ;; esac
 
 # --- compute node → gate 정터널 (결과/산출물/lease/permit) + 선택적 sshd 역노출 ---
@@ -91,7 +93,7 @@ run_one() {
         ldconfig -p | grep -q libGL.so.1 || { apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq libgl1 libglu1-mesa libxrender1 libxext6 libsm6 >/dev/null 2>&1; }
         export PATH=/mnt/AnsysEM:$PATH
         exec "$VENVPY" -m peetsfea_runner.edt_entrypoint
-      ' >/dev/null 2>&1
+      ' > "$CLOG/${SLURM_JOB_ID}-${slot}.log" 2>&1
     enroot remove -f "$C" >/dev/null 2>&1
     rm -rf "$CHOME" 2>/dev/null || true
   ) &
