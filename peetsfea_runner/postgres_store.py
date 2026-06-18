@@ -454,13 +454,13 @@ class PostgresResultStore:
                 take = min(int(k), int(remaining))
                 offset = int(total) - int(remaining)
                 new_remaining = int(remaining) - take
-                if new_remaining <= 0:
-                    connection.execute("DELETE FROM priority_sweeps WHERE request_id = %s", [rid])
-                else:
-                    connection.execute(
-                        "UPDATE priority_sweeps SET remaining_count = %s WHERE request_id = %s",
-                        [new_remaining, rid],
-                    )
+                # 다 빨려도 행을 삭제하지 않고 remaining=0으로 남긴다 → lineage가 total/leased/inflight를
+                # 영속 추적(다 빨린 직후~첫 결과 도착 전 sweep도 큐 탭에 inflight로 보이게). lease는
+                # remaining>0만 집는다(아래 SELECT 조건)므로 0행은 재배분되지 않는다.
+                connection.execute(
+                    "UPDATE priority_sweeps SET remaining_count = %s WHERE request_id = %s",
+                    [new_remaining, rid],
+                )
         return {
             "request_id": rid,
             "sweep_toml_text": sweep,
@@ -491,6 +491,8 @@ class PostgresResultStore:
         ]
 
     def priority_lineage(self, *, limit: int | None = 200) -> dict[str, Any]:
+        """sweep별 들어온/대기/분배 + 파생 출력(성공/실패) 집계. lease가 행을 삭제하지 않고 remaining=0으로
+        남기므로(priority_lease_chunk 참고), 다 빨려 진행 중인 sweep도 큐 탭에 inflight로 영속 표시된다."""
         self.initialize()
         lim = f" LIMIT {int(limit)}" if limit is not None else ""
         with self._locked_connect() as connection:

@@ -449,12 +449,11 @@ class SingleSimulationResultStore:
                 take = min(int(k), int(remaining))
                 offset = int(total) - int(remaining)  # 이미 분배된 수 = seed 오프셋
                 new_remaining = int(remaining) - take
-                if new_remaining <= 0:
-                    connection.execute("DELETE FROM priority_sweeps WHERE request_id = ?", [rid])
-                else:
-                    connection.execute(
-                        "UPDATE priority_sweeps SET remaining_count = ? WHERE request_id = ?", [new_remaining, rid]
-                    )
+                # 다 빨려도 행 유지(remaining=0) → lineage가 inflight/leased를 영속 추적. lease SELECT는
+                # remaining>0만 집으므로 0행은 재배분 안 됨(PostgresResultStore와 동일 동작).
+                connection.execute(
+                    "UPDATE priority_sweeps SET remaining_count = ? WHERE request_id = ?", [new_remaining, rid]
+                )
                 connection.execute("COMMIT")
             except Exception:
                 connection.execute("ROLLBACK")
