@@ -513,6 +513,21 @@ class SingleSimulationResultStore:
             for r in rows
         ]
 
+    def settle_priority_sweeps(self) -> None:
+        """서비스 종료로 사라진 미처리 intake 정리(web 시작 시). sweep을 실제 완료수로 정착(total=done,
+        remaining=0 → '대기/진행중(추정)' phantom 0). 완료 결과는 안 건드림. 완료 0인 sweep은 삭제."""
+        self.initialize()
+        with self._locked_connect() as connection:
+            connection.execute(
+                "UPDATE priority_sweeps SET "
+                "  total_count = COALESCE((SELECT count(*) FROM single_simulation_results r "
+                "    WHERE r.request_id >= priority_sweeps.request_id || '-' "
+                "      AND r.request_id < priority_sweeps.request_id || '.' "
+                "      AND r.terminal_state IS NOT NULL AND r.terminal_state <> ''), 0), "
+                "  remaining_count = 0"
+            )
+            connection.execute("DELETE FROM priority_sweeps WHERE total_count = 0")
+
     def priority_lineage(self, *, limit: int | None = 200) -> dict[str, Any]:
         """입력큐 계보 — 들어온/대기/분배 수 + 입력큐에서 파생된 출력(성공/실패) 집계.
 

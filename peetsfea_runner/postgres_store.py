@@ -519,6 +519,21 @@ class PostgresResultStore:
             for r in rows
         ]
 
+    def settle_priority_sweeps(self) -> None:
+        """서비스 종료로 **사라진 미처리 intake**를 정리(web 시작 시 호출). 각 sweep을 **실제 완료된 수**로
+        정착시킨다: total_count=완료(done), remaining_count=0 → lineage의 '대기/진행중(추정)' phantom이 0.
+        완료 결과(single_simulation_results)는 안 건드린다. 완료 0(완전 증발)인 sweep은 행 삭제."""
+        self.initialize()
+        with self._locked_connect() as connection:
+            connection.execute(
+                "UPDATE priority_sweeps ps SET "
+                "  total_count = COALESCE((SELECT count(*) FROM single_simulation_results r "
+                "    WHERE r.request_id >= ps.request_id || '-' AND r.request_id < ps.request_id || '.' "
+                "    AND r.terminal_state IS NOT NULL AND r.terminal_state <> ''), 0), "
+                "  remaining_count = 0"
+            )
+            connection.execute("DELETE FROM priority_sweeps WHERE total_count = 0")
+
     def priority_lineage(self, *, limit: int | None = 200) -> dict[str, Any]:
         """sweep별 들어온/대기/분배 + 파생 출력(성공/실패) 집계. lease가 행을 삭제하지 않고 remaining=0으로
         남기므로(priority_lease_chunk 참고), 다 빨려 진행 중인 sweep도 큐 탭에 inflight로 영속 표시된다."""

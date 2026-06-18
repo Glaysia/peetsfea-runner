@@ -295,6 +295,12 @@ def build_control_plane(
     # 결과 DB(11GB)는 web 역할(대시보드/ingest/intake/lease)만 초기화·소유 — 단일 writer 락 경합 회피.
     if run_web:
         store.initialize()
+        # 서비스 종료로 사라진 미처리 intake 정리 — 전 세션의 priority_sweeps를 실제 완료수로 정착(대기/진행중
+        # phantom 제거; 완료 결과는 보존). web이 큐/lease를 소유하므로 시작 시 1회.
+        try:
+            store.settle_priority_sweeps()
+        except Exception:  # noqa: BLE001 — 정리 실패가 기동을 막으면 안 된다.
+            pass
     # control(keeper)측 폴러는 결과 DB가 아니라 **전용 소형 자원 DB**에 시계열을 영속한다.
     # 그래야 web의 무거운 쿼리/락과 분리되고, keeper 프로세스가 11GB DB를 안 연다.
     resource_poller = None
