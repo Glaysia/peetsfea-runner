@@ -94,6 +94,7 @@ class ControlPlane:
     license_poll_seconds: float = 60.0
     dashboard_peetsfea_version: str = ""  # 대시보드 표시 버전 필터(빈 값=전 버전).
     resource_poller: ResourcePoller | None = None  # control(keeper)측: 컨테이너별 실시간 부하 폴러.
+    resources_store: SingleSimulationResultStore | None = None  # control측: 자원 시계열 전용 소형 DB.
     resource_provider: RemoteResourceProvider | None = None  # web측: control의 자원 엔드포인트 프록시.
     resource_port: int = DEFAULT_RESOURCE_PORT
     enable_ingest_tunnel: bool = True  # 테스트에선 ssh 역터널 비활성.
@@ -157,9 +158,18 @@ class ControlPlane:
             license_server = start_license_ctrl_server(controller=controller, port=self.license_ctrl_port)
             self._servers.append(license_server)
             threading.Thread(target=license_server.serve_forever, daemon=True, name="LicenseServer").start()
-            # 자원 백채널(:7882): web 대시보드가 폴러 스냅샷/시계열을 HTTP 프록시로 읽는다.
+            # 자원 백채널(:7882): web 대시보드가 폴러 스냅샷 + 전용 자원 DB의 영속 시계열을 HTTP 프록시로 읽는다.
             if self.resource_poller is not None:
-                resource_server = start_resource_server(poller=self.resource_poller, port=self.resource_port)
+                _rstore = self.resources_store
+                resource_server = start_resource_server(
+                    poller=self.resource_poller,
+                    port=self.resource_port,
+                    history_fetch=(
+                        (lambda since_ts=None: _rstore.fetch_resource_history(since_ts=since_ts))
+                        if _rstore is not None
+                        else None
+                    ),
+                )
                 self._servers.append(resource_server)
                 threading.Thread(target=resource_server.serve_forever, daemon=True, name="ResourceServer").start()
             # 제어 루프(1분): solve 갱신 + ceiling 초과 시 youngest abort 표시.
@@ -174,9 +184,16 @@ class ControlPlane:
 
         # --- web 데이터 플레인(대시보드/intake/ingest/bulk) — 무거운 DB·I/O 측 ---
         if self.run_web:
-            # 자원 프로바이더: 같은 프로세스에 폴러가 있으면(all 모드) 직접, 없으면(web 전용) control에 HTTP 프록시.
+            # 자원 프로바이더: 같은 프로세스에 폴러가 있으면(all 모드) 라이브는 폴러 직접·추세는 자원DB 영속,
+            # 없으면(web 전용) control(:7882)에 HTTP 프록시. history는 둘 다 since_ts를 받는다.
             if self.resource_poller is not None:
-                provider, history = self.resource_poller.snapshot, self.resource_poller.history
+                provider = self.resource_poller.snapshot
+                _rs, _rp = self.resources_store, self.resource_poller
+                history = (
+                    (lambda since_ts=None: _rs.fetch_resource_history(since_ts=since_ts))
+                    if _rs is not None
+                    else (lambda since_ts=None: _rp.history())
+                )
             elif self.resource_provider is not None:
                 provider, history = self.resource_provider.snapshot, self.resource_provider.history
             else:
@@ -257,6 +274,7 @@ def build_control_plane(
     # control(keeper)측 폴러는 결과 DB가 아니라 **전용 소형 자원 DB**에 시계열을 영속한다.
     # 그래야 web의 무거운 쿼리/락과 분리되고, keeper 프로세스가 11GB DB를 안 연다.
     resource_poller = None
+    resources_store = None
     resource_provider = None
     if run_keeper:
         resources_db = config.resources_db_path or config.db_path.with_suffix(".resources.duckdb")
@@ -302,6 +320,7 @@ def build_control_plane(
         license_poll_seconds=config.license_poll_seconds,
         dashboard_peetsfea_version=config.dashboard_peetsfea_version,
         resource_poller=resource_poller,  # keeper측에만 존재(전용 자원 DB로 영속).
+        resources_store=resources_store,  # keeper측 자원 시계열 DB(영속 history 서빙용).
         resource_provider=resource_provider,  # web 전용 프로세스에서 control 자원 엔드포인트 프록시.
         resource_port=config.resource_port,
         run_web=run_web,

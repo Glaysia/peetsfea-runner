@@ -169,7 +169,7 @@ def start_dashboard_server(
     host: str = "127.0.0.1",
     port: int = 8080,
     resource_provider: ResourceProvider | None = None,
-    history_provider: Callable[[], list[dict[str, Any]]] | None = None,
+    history_provider: Callable[[float | None], list[dict[str, Any]]] | None = None,
     peetsfea_version: str | None = None,
 ) -> ThreadingHTTPServer:
     # 표시 버전 필터(설정 시 모든 결과 뷰가 이 버전만 노출). 빈 값이면 전 버전. `/api/versions`는 항상 전 분포.
@@ -204,15 +204,16 @@ def start_dashboard_server(
             elif path == "/api/resources":
                 self._json(200, dict(resource_provider()) if resource_provider else {"ok": False, "jobs": [], "nodes": {}, "license": {}, "counts": {}})
             elif path == "/api/resources/history":
-                # DB 영속(web 재시작·12h 넘어 보존)을 우선, 비었으면 인메모리 폴백.
+                # 추세는 control(keeper)의 전용 자원 DB(history_provider)를 우선 — 분리 후 결과 DB엔 자원 시계열이 없다.
+                # history_provider가 비면 결과 DB의 옛 자원 스냅샷(분리 전 데이터)으로 폴백.
                 since_raw = query.get("since", [None])[0]
                 try:
                     since_ts = float(since_raw) if since_raw else None
                 except ValueError:
                     since_ts = None
-                points = store.fetch_resource_history(since_ts=since_ts)
-                if not points and history_provider:
-                    points = history_provider()
+                points = history_provider(since_ts) if history_provider else []
+                if not points:
+                    points = store.fetch_resource_history(since_ts=since_ts)
                 self._json(200, {"points": points})
             elif path == "/api/timeseries":
                 bucket = int(query.get("bucket", ["15"])[0] or 15)

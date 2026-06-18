@@ -195,7 +195,7 @@ def test_dashboard_timeseries_and_history_endpoints(tmp_path: Path) -> None:
     _seed(store, "s0", 1.5, 12)  # finished_at 2026-06-16T00:10:00
     hist = [{"ts": 1.0, "running": 8, "pending": 1, "lic_mine": 80, "lic_inuse": 120,
              "load": 30.0, "cpus": 320, "mem_used_mb": 1000, "mem_total_mb": 4000}]
-    server = start_dashboard_server(store=store, port=0, history_provider=lambda: hist)
+    server = start_dashboard_server(store=store, port=0, history_provider=lambda since_ts=None: hist)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     try:

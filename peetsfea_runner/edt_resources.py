@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 # argv -> (returncode, stdout)
 CommandRunner = Callable[[list[str]], "tuple[int, str]"]
@@ -255,13 +255,20 @@ class ResourcePoller:
 
 
 def start_resource_server(
-    *, poller: ResourcePoller, host: str = "127.0.0.1", port: int = DEFAULT_RESOURCE_PORT
+    *,
+    poller: ResourcePoller,
+    history_fetch: Callable[[float | None], list[dict[str, Any]]] | None = None,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_RESOURCE_PORT,
 ) -> ThreadingHTTPServer:
-    """control 프로세스의 자원 백채널. GET /resources(스냅샷) · /resources/history · /health.
+    """control 프로세스의 자원 백채널. GET /resources(스냅샷) · /resources/history?since= · /health.
 
     폴러를 무거운 데이터플레인(web)과 분리해 별도 프로세스에서 돌리고, web 대시보드는
     `RemoteResourceProvider`로 이 엔드포인트를 프록시한다. 그래야 web이 OOM/fd-고갈로
     허덕여도 텔레메트리(폴러)가 질식하지 않는다(차트 빈 구간 해소).
+
+    `history_fetch`(전용 자원 DB의 fetch_resource_history)가 주어지면 영속 시계열을 서빙하고,
+    없으면 인메모리 ring(폴러)로 폴백한다 → 대시보드 추세가 재시작/12h를 넘어 보존된다.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -282,11 +289,20 @@ def start_resource_server(
                 pass
 
         def do_GET(self) -> None:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
             if path == "/resources":
                 self._json(200, poller.snapshot())
             elif path == "/resources/history":
-                self._json(200, {"points": poller.history()})
+                since_raw = parse_qs(parsed.query).get("since", [None])[0]
+                try:
+                    since_ts = float(since_raw) if since_raw else None
+                except (TypeError, ValueError):
+                    since_ts = None
+                points = history_fetch(since_ts) if history_fetch is not None else None
+                if not points:
+                    points = poller.history()  # 영속이 비었으면(or 미설정) 인메모리 폴백.
+                self._json(200, {"points": points})
             elif path == "/health":
                 self._json(200, {"status": "ok"})
             else:
@@ -314,8 +330,11 @@ class RemoteResourceProvider:
         data = self._get("/resources")
         return data if isinstance(data, dict) else _empty_snapshot()
 
-    def history(self) -> list[dict[str, Any]]:
-        data = self._get("/resources/history")
+    def history(self, since_ts: float | None = None) -> list[dict[str, Any]]:
+        path = "/resources/history"
+        if since_ts is not None:
+            path += "?" + urlencode({"since": since_ts})
+        data = self._get(path)
         if isinstance(data, dict) and isinstance(data.get("points"), list):
             return data["points"]
         return []
