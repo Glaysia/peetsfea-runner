@@ -101,6 +101,26 @@ def test_failure_records_failed_and_recovers(tmp_path: Path) -> None:
     assert backend.reclaims == 1 and backend.kills == 0
 
 
+def test_consecutive_failures_force_restart_session(tmp_path: Path) -> None:
+    """연속 실패 → 손상된 warm 세션을 새 AEDT로 치유(force_restart). 실패 폭주 근본 차단."""
+    def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int, **_: Any) -> dict[str, Any]:
+        raise RuntimeError("corrupted session")
+
+    queue = TomlQueue()
+    queue.extend(QueueItem(f"req_{i}", "x = 1\n", seed=i) for i in range(3))
+    slots = _slots(1)
+    disp, recorded = _dispatcher(slots, queue, primitive, tmp_path, force_restart_after_failures=2)
+
+    disp.run()
+
+    assert len(recorded) == 3 and all(e["terminal_state"] == "failed" for e in recorded)
+    backend = slots[0].backend
+    assert isinstance(backend, FakeBackend)
+    # 1회차 실패 → reclaim(재부착). 2회차(연속) → force_restart(kill+재기동). 3회차 → 다시 reclaim(스트릭 리셋됨).
+    assert backend.kills == 1
+    assert backend.reclaims == 2
+
+
 def test_backstop_aborts_hung_sim(tmp_path: Path) -> None:
     def primitive(text: str, *, output_dir: Path, seed: int, mode: str, grpc_port: int, aedt_pid: int, **_: Any) -> dict[str, Any]:
         time.sleep(0.6)  # 백스톱(0.3s)보다 오래 → 미반환
