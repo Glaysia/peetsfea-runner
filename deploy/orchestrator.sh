@@ -3,7 +3,7 @@
 #
 #   1컨테이너 = 시뮬 1건 후 완전 종료(enroot remove) → AEDT·pyaedt 소멸 → 누수 OS회수. 재사용/재시작 없음.
 #   동시 컨테이너 수 = 제어기(:7879 /container_plan?job=N)가 지정. solve<100이면 제어기가 target↑, >150이면
-#   target↓(→ 여기서 가장 최근 컨테이너를 SIGTERM 안전종료, 강종 금지). 잡당 ≤20(EDT_MAX_PER_JOB).
+#   target↓(→ 여기서 가장 최근 컨테이너를 SIGTERM 안전종료, 강종 금지). 잡당 ≤20(제어기 cap).
 #   permit 게이팅 없음(제어기가 컨테이너 수로 직접 제어). 터널 1개/잡(host netns 공유).
 # 주의: set -u 금지 — 컴퓨트노드 구버전 bash에서 빈 연관배열 접근(${#C_PID[@]}, ${!C_PID[@]})이
 # "unbound variable"로 잡을 즉사시킨다. 모든 변수는 ${VAR:-default}로 방어.
@@ -118,7 +118,7 @@ fetch_target() {  # 제어기 지령. 실패 시 기본 4.
 while [ $STOP -eq 0 ]; do
   reap
   TGT=$(fetch_target)
-  CAP=${EDT_MAX_PER_JOB:-20}; [ "$TGT" -gt "$CAP" ] && TGT=$CAP
+  [ "$TGT" -gt 20 ] && TGT=20
   cur=${#C_PID[@]}
   if [ "$cur" -lt "$TGT" ]; then
     spawn_one          # 한 번에 1개(스태거) — 콜드스타트 thundering 회피

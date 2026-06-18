@@ -176,7 +176,6 @@ class ControlPlane:
                 self.container_scheduler = ContainerScheduler(
                     snapshot_provider=self.resource_poller.snapshot,
                     target=self.license_target, ceiling=self.license_ceiling,
-                    max_per_job=int(os.environ.get("EDT_MAX_PER_JOB", "20") or 20),
                 )
             license_server = start_license_ctrl_server(
                 controller=controller, scheduler=self.container_scheduler, port=self.license_ctrl_port

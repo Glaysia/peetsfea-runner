@@ -204,10 +204,6 @@ class ContainerScheduler:
                 self._job_target.setdefault(ji, self.min_per_job)
             for ji in [j for j in self._job_target if j not in jn]:
                 self._job_target.pop(ji, None)
-            # cap 하향 시 기존 target도 즉시 클램프(orchestrator가 youngest 컨테이너 안전종료로 흡수).
-            for ji in list(self._job_target):
-                if self._job_target[ji] > self.max_per_job:
-                    self._job_target[ji] = self.max_per_job
             if not jn:
                 return
             if eff < self.target:
