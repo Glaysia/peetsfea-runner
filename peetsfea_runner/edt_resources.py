@@ -32,12 +32,24 @@ P=peetsfea-edt
 echo '###JOBS'
 squeue --me -h -o '%i|%j|%T|%M|%N|%P|%C' 2>/dev/null | awk -F'|' -v p="$P" '$2 ~ p'
 echo '###NODES'
-for n in $(squeue --me -h -o '%N %T %j' 2>/dev/null | awk -v p="$P" '$2=="RUNNING" && $3 ~ p{print $1}' | sort -u); do
-  # 필드별 독립 추출(순서 무관). 하나의 순서고정 정규식은 노드마다 필드 순서/유무가 달라 대부분 실패했다.
-  L=$(scontrol show node "$n" -o 2>/dev/null)
-  g() { printf '%s' "$L" | grep -oP "$1=\K[^ ]+" | head -1; }
-  echo "$n|$(g CPULoad)|$(g CPUAlloc)|$(g CPUTot)|$(g FreeMem)|$(g RealMemory)"
+# 노드별: scontrol(노드 전체 CPULoad/메모리) + srun --overlap로 **내 계정 프로세스 CPU 합(%)** 분리 측정.
+# CPULoad는 노드 전체 loadavg(모든 유저)라 타 유저 부하가 섞인다 → 내 프로세스만 따로 재서 분리.
+# 노드별 병렬(임시파일로 수집 후 cat) — 파이프라인 while 안 `&`는 wait가 안 먹어 출력이 샌다.
+NPAIRS=$(squeue --me -h -o '%N|%T|%j|%i' 2>/dev/null | awk -F'|' -v p="$P" '$2=="RUNNING" && $3 ~ p{print $1"|"$4}' | sort -u)
+NTMP=$(mktemp -d)
+for pair in $NPAIRS; do
+  n=${pair%%|*}; jid=${pair##*|}
+  (
+    # 필드별 독립 추출(순서 무관). 하나의 순서고정 정규식은 노드마다 필드 순서/유무가 달라 대부분 실패했다.
+    L=$(scontrol show node "$n" -o 2>/dev/null)
+    g() { printf '%s' "$L" | grep -oP "$1=\K[^ ]+" | head -1; }
+    # 내 유저 프로세스 %cpu 합(ssh 불가 → srun --overlap 정공법). timeout으로 한 노드가 폴 전체를 막지 않게.
+    mc=$(timeout 8 srun --jobid="$jid" --overlap -N1 -n1 --mem=80M --time=1 bash -c 'ps -u "$(whoami)" -o %cpu= 2>/dev/null | awk "{s+=\$1} END{print s+0}"' 2>/dev/null)
+    echo "$n|$(g CPULoad)|$(g CPUAlloc)|$(g CPUTot)|$(g FreeMem)|$(g RealMemory)|${mc:-0}" > "$NTMP/$n"
+  ) &
 done
+wait
+cat "$NTMP"/* 2>/dev/null; rm -rf "$NTMP"
 echo '###LIC'
 LM=/opt/ohpc/pub/Electronics/v252/licensingclient/linx64/lmutil
 ME=$(whoami)
@@ -94,11 +106,13 @@ def parse_remote(text: str) -> dict[str, Any]:
             if len(parts) >= 6:
                 node, load, cpualloc, cputot, freemem, realmem = parts[:6]
                 snap["nodes"][node] = {
-                    "cpuload": _f(load),
+                    "cpuload": _f(load),                                    # 노드 전체 loadavg(모든 유저)
                     "cpualloc": _i(cpualloc),
                     "cputot": _i(cputot),
                     "memfree_mb": _i(freemem),
                     "memtotal_mb": _i(realmem),
+                    # 내 계정 프로세스 CPU(코어 환산 = %합/100). cpuload와 분리: 타유저부하 = cpuload - mycpu.
+                    "mycpu": (_f(parts[6]) / 100.0) if len(parts) >= 7 else 0.0,
                 }
         elif section == "###LIC":
             parts = line.split("|")
@@ -149,6 +163,7 @@ def _history_point(snap: dict[str, Any]) -> dict[str, Any]:
     lic = snap.get("license") or {}
     counts = snap.get("counts") or {}
     load = sum(float(n.get("cpuload") or 0) for n in nodes.values())
+    myload = sum(float(n.get("mycpu") or 0) for n in nodes.values())   # 내 프로세스 CPU 합(코어)
     cpus = sum(int(j.get("cpus") or 0) for j in jobs if j.get("state") == "RUNNING")
     mem_used = sum((int(n.get("memtotal_mb") or 0) - int(n.get("memfree_mb") or 0)) for n in nodes.values())
     mem_total = sum(int(n.get("memtotal_mb") or 0) for n in nodes.values())
@@ -158,7 +173,8 @@ def _history_point(snap: dict[str, Any]) -> dict[str, Any]:
         "pending": int(counts.get("pending") or 0),
         "lic_mine": int(lic.get("mine") or 0),
         "lic_inuse": int(lic.get("in_use") or 0),
-        "load": round(load, 1),       # 우리 노드들의 node-wide CPULoad 합
+        "load": round(load, 1),       # 우리 노드들의 node-wide CPULoad 합(모든 유저)
+        "myload": round(myload, 1),   # 그 중 내 계정 프로세스 CPU 합(코어) — 노드부하와 분리
         "cpus": cpus,                 # 우리 잡 할당 코어 합(부하 분모)
         "mem_used_mb": mem_used,
         "mem_total_mb": mem_total,

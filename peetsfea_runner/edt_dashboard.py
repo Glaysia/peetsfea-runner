@@ -365,7 +365,7 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
   </div>
   <div class="card"><div class="k">처리량 — 성공 / 실패 (적층) · GPU 사용(선)</div><div id="tsThroughput"></div></div>
   <div class="grid c2" style="margin-top:10px">
-    <div class="card"><div class="k">CPU 부하 — 우리 노드 합 / 할당 코어 합 (선)</div><div id="tsCpu"></div></div>
+    <div class="card"><div class="k">CPU 부하 — 노드 전체(전체유저) / 내 프로세스 / 할당 코어 (선)</div><div id="tsCpu"></div></div>
     <div class="card"><div class="k">메모리 — 우리 노드 사용 GB (선)</div><div id="tsMem"></div></div>
     <div class="card"><div class="k">동시 잡 — RUNNING / PENDING (선)</div><div id="tsJobs"></div></div>
     <div class="card"><div class="k">라이선스 — 내 점유 / 전체 사용 (선)</div><div id="tsLic"></div></div>
@@ -445,18 +445,19 @@ async function containers(){const r=await f('/api/resources');
   const apj=r.aedt_per_job||{};
   $('#contgrid').innerHTML=jobs.map(j=>{const nd=(r.nodes||{})[j.node]||{};
     const load=nd.cpuload||0,memU=(nd.memtotal_mb||0)-(nd.memfree_mb||0),memT=nd.memtotal_mb||1;
+    const mycpu=nd.mycpu||0, others=Math.max(0,load-mycpu);     // 내 프로세스 CPU(코어) vs 타유저(노드부하-내것)
     const ae=apj[String(j.name||'').split('-').pop()]||{};   // 잡 이름 peetsfea-edt-{jidx} → 제어기 per_job
     const ct=nd.cputot||0,alloc=nd.cpualloc||0;                 // ct=물리 전체, alloc=노드 전체 할당(공유)
     const mine=parseInt(j.cpus||'0',10)||0;                     // 이 잡(컨테이너)에 할당된 코어
-    // 부하 막대 기준은 '우리 잡 할당 코어'(mine). load는 노드 전역값이지만, 노드 물리(ct=256 등)로 나누면
-    // 우리가 만재여도 작아 보이는 착시가 생긴다. mine 기준이면 우리 컨테이너의 체감 가동률에 가깝다.
+    // 내 CPU 막대 기준은 '우리 잡 할당 코어'(mine) — 우리 컨테이너의 체감 가동률. 노드 막대는 물리(ct).
     const base=mine||ct||1;
-    const lc=load/base>1.1?'#f85149':load/base>.75?'#d29922':'#3fb950';
+    const mc=mycpu/base>1.05?'#f85149':mycpu/base>.7?'#d29922':'#3fb950';
+    const lc=load/(ct||base)>0.9?'#f85149':load/(ct||base)>.6?'#d29922':'#3fb950';
     return `<div class="cont"><div class="top"><span class="node">${esc(j.node||'?')}</span>
       <span class="meta">${esc(j.partition)} · ${esc(j.time)} · ${esc(j.name)}</span></div>
       <div class="lbl"><span>pyaedt (솔브중 / 켜짐)</span><span><b style="color:#3fb950">${nd.solve!=null?nd.solve:(ae.active||0)}</b> / ${nd.desktop!=null?nd.desktop:(ae.nominal||0)}</span></div>
-      <div class="lbl"><span>부하 / 우리 할당</span><span>${load.toFixed(1)} / ${mine} 코어</span></div>${bar(load,base,lc)}
-      <div class="lbl muted"><span>노드(공유) 전역</span><span>load ${load.toFixed(1)} · 할당 ${alloc}/${ct} 물리코어</span></div>
+      <div class="lbl"><span>내 CPU (내 프로세스) / 할당</span><span><b style="color:#3fb950">${mycpu.toFixed(1)}</b> / ${mine} 코어</span></div>${bar(mycpu,base,mc)}
+      <div class="lbl muted"><span>노드 전체 / 타유저</span><span>${load.toFixed(1)} / ${others.toFixed(1)} 코어 · 물리 ${ct}</span></div>${bar(load,ct||base,lc)}
       <div class="lbl"><span>메모리(노드)</span><span>${(memU/1024).toFixed(0)} / ${(memT/1024).toFixed(0)} GB</span></div>${bar(memU,memT,'#58a6ff')}
       </div>`}).join('')||'<span class="muted">RUNNING 컨테이너 없음</span>';
   if(pend.length)$('#contgrid').innerHTML+=`<div class="cont muted">+ PENDING ${pend.length}개 (${pend.map(p=>p.partition).join(', ')})</div>`;
@@ -551,7 +552,7 @@ async function trends(){TS_WIN_MIN=+(($('#tswin')&&$('#tswin').value)||30);
   const hp=(hist.points||[]).filter(p=>(+p.ts||0)>=startSec);
   $('#tssub').textContent=`${TS_WIN_LABEL[TS_WIN_MIN]||TS_WIN_MIN+'분'} · 버킷 ${TS_BUCKET_MIN}분 · 결과 ${tp.length} · 자원 ${hp.length} (지금 기준 상대시간)`;
   tsStack('tsThroughput',tp);
-  tsLines('tsCpu',hp,[{key:'load',color:'#58a6ff',label:'노드부하합'},{key:'cpus',color:'#d29922',label:'할당코어합'}],'ts');
+  tsLines('tsCpu',hp,[{key:'load',color:'#58a6ff',label:'노드부하합(전체)'},{key:'myload',color:'#3fb950',label:'내부하합'},{key:'cpus',color:'#d29922',label:'할당코어합'}],'ts');
   tsLines('tsMem',hp.map(p=>({ts:p.ts,gb:Math.round((p.mem_used_mb||0)/1024)})),[{key:'gb',color:'#58a6ff',label:'사용 GB'}],'ts');
   tsLines('tsJobs',hp,[{key:'running',color:'#3fb950',label:'RUNNING'},{key:'pending',color:'#d29922',label:'PENDING'}],'ts');
   tsLines('tsLic',hp,[{key:'lic_mine',color:'#b392f0',label:'내 점유'},{key:'lic_inuse',color:'#58a6ff',label:'전체 사용'}],'ts');
