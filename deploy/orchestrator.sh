@@ -30,6 +30,15 @@ if [ -n "$RUNNING_JIDS" ]; then
   done
 fi
 
+# /enroot 여유 가드 — 타 유저가 채운 포화 노드(n001/n113류)에 떨어지면 우리 솔브가 No-space로 폭사한다.
+# 여유가 임계 미만이면 이 노드는 스킵(클린 종료) → keeper가 잡 수 유지하려 재제출 → 다른 노드 배치.
+ENROOT_FREE_GB=$(df -BG /enroot 2>/dev/null | tail -1 | awk '{gsub(/G/,"",$4); print $4+0}')
+ENROOT_MIN_GB=${EDT_ENROOT_MIN_GB:-80}
+if [ -n "$ENROOT_FREE_GB" ] && [ "$ENROOT_FREE_GB" -lt "$ENROOT_MIN_GB" ] 2>/dev/null; then
+  echo "[orch] /enroot free=${ENROOT_FREE_GB}G < ${ENROOT_MIN_GB}G — 포화 노드, 스킵 종료"
+  exit 0
+fi
+
 GATE=${EDT_GATE_HOST:-gate1}
 PORT=${EDT_INGEST_PORT:-7876}; BULK=${EDT_BULK_PORT:-7877}
 LEASE=${EDT_PRIORITY_LEASE_PORT:-7878}; LIC=${EDT_LICENSE_CTRL_PORT:-7879}
