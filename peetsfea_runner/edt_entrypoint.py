@@ -220,15 +220,13 @@ def main() -> int:
 
         def record(envelope: Mapping[str, Any]) -> None:
             sink.record(envelope)  # 결과 JSON → 로컬 단일 DB(:7876)
-            out = envelope.get("output_dir")
-            if isinstance(out, str) and out:
-                # 성공: 산출물(project_dir)을 :7877로 전송 → 아카이브(bulk가 보낸 뒤 자체 삭제).
-                if bulk is not None and envelope.get("terminal_state") == "success":
+            # 성공한 시뮬의 산출물(project_dir)을 :7877로 전송 → 아카이브 + gpfs 절약.
+            # 실패 산출물 정리는 record(=솔브 도중)에서 하면 peetsfea의 telemetry 쓰기와 레이스(FileNotFound)다.
+            # → orchestrator가 **컨테이너 완전 종료 후** 컨테이너별 output 디렉토리째 삭제(reap).
+            if bulk is not None and envelope.get("terminal_state") == "success":
+                out = envelope.get("output_dir")
+                if isinstance(out, str) and out:
                     bulk.push(str(envelope.get("request_id") or ""), Path(out))
-                # **실패/abort 포함 항상** 산출물 디렉토리 즉시 삭제 — per-solve 컨테이너가 /enroot(노드로컬)에
-                # 산출물을 쌓아 'No space left'를 일으키던 문제 차단. bulk가 이미 지웠으면 멱등(ignore_errors).
-                import shutil
-                shutil.rmtree(out, ignore_errors=True)
 
     service = build_steady_state_service(config, record=record)
     # EDT_PRIORITY_TOML: 고정 후보를 우선순위 레인에 시드(검증/단발 처리용; baseline보다 먼저 소비).

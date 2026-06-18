@@ -51,7 +51,7 @@ keep_tunnel() { while true; do start_tunnel; wait "$TUNNEL_PID"; sleep 5; done; 
 keep_tunnel & KEEP_PID=$!
 
 STOP=0
-declare -A C_PID C_NAME C_CHOME   # id -> bg pid / 컨테이너명 / CHOME (id는 단조증가 = spawn 순서)
+declare -A C_PID C_NAME C_CHOME C_OUT   # id -> bg pid / 컨테이너명 / CHOME / 컨테이너별 output (id 단조증가=spawn 순서)
 NEXTID=0
 JOB_BASE=$(( ${EDT_BASELINE_SEED_EPOCH:-0} + ${EDT_JOB_INDEX:-0} * 10000000 ))
 COUNTER=0
@@ -67,8 +67,8 @@ trap cleanup EXIT INT TERM
 spawn_one() {
   local id=$NEXTID; NEXTID=$((NEXTID+1))
   local seed=$(( JOB_BASE + COUNTER )); COUNTER=$((COUNTER+1))
-  local C="edt-$SLURM_JOB_ID-$id-$$" CHOME=$JOBDIR/h-$id
-  rm -rf "$CHOME"; mkdir -p "$CHOME/tmp"; cp -a "$HOME/Ansoft" "$CHOME/Ansoft" 2>/dev/null || mkdir -p "$CHOME/Ansoft"
+  local C="edt-$SLURM_JOB_ID-$id-$$" CHOME=$JOBDIR/h-$id COUT=$OUT/c-$id
+  rm -rf "$CHOME" "$COUT"; mkdir -p "$CHOME/tmp" "$COUT/work"; cp -a "$HOME/Ansoft" "$CHOME/Ansoft" 2>/dev/null || mkdir -p "$CHOME/Ansoft"
   enroot create --name "$C" "$IMG" >/dev/null 2>&1
   enroot start --root --rw \
     --mount "$ANSB/AnsysEM:/mnt/AnsysEM" --mount "$ANSB:/ansys_inc/v252" \
@@ -76,7 +76,7 @@ spawn_one() {
     --env ANSYSEM_ROOT252=/mnt/AnsysEM --env ANS_IGNOREOS=1 --env "NVIDIA_VISIBLE_DEVICES=$NVD" \
     --env "ANSYSLMD_LICENSE_FILE=${ANSYSLMD_LICENSE_FILE:-}" \
     --env "HOME=$CHOME" --env "TMPDIR=$CHOME/tmp" \
-    --env "EDT_OUTPUT_ROOT=$OUT" --env "EDT_RESULT_INGEST_URL=$INGEST_URL" --env "EDT_WORK_DIR=$OUT/work-$id" \
+    --env "EDT_OUTPUT_ROOT=$COUT" --env "EDT_RESULT_INGEST_URL=$INGEST_URL" --env "EDT_WORK_DIR=$COUT/work" \
     --env "EDT_BULK_PORT=$BULK" --env "EDT_BULK_HOST=127.0.0.1" \
     --env "EDT_PRIORITY_LEASE_URL=$LEASE_URL" --env "EDT_LICENSE_CTRL_URL=" \
     --env "EDT_REFERENCE_SWEEP=$REF" --env "EDT_PARTITION=${EDT_PARTITION:-}" --env "VENVPY=$VENVPY" \
@@ -87,15 +87,16 @@ spawn_one() {
       export PATH=/mnt/AnsysEM:$PATH
       exec "$VENVPY" -m peetsfea_runner.edt_entrypoint
     ' > "$CLOG/${SLURM_JOB_ID}-${id}.log" 2>&1 &
-  C_PID[$id]=$!; C_NAME[$id]=$C; C_CHOME[$id]=$CHOME
+  C_PID[$id]=$!; C_NAME[$id]=$C; C_CHOME[$id]=$CHOME; C_OUT[$id]=$COUT
 }
 reap() {  # 끝난(1솔브 후 exit) 컨테이너를 추적에서 제거 + enroot/스크래치 청소
   for id in "${!C_PID[@]}"; do
     if ! kill -0 "${C_PID[$id]}" 2>/dev/null; then
       wait "${C_PID[$id]}" 2>/dev/null||true
       enroot remove -f "${C_NAME[$id]}" >/dev/null 2>&1||true
-      rm -rf "${C_CHOME[$id]}" 2>/dev/null||true
-      unset "C_PID[$id]" "C_NAME[$id]" "C_CHOME[$id]"
+      # 컨테이너 완전 종료 후 → CHOME + 컨테이너별 output 통째 삭제(누수 0). 솔브 도중이 아니라 레이스 없음.
+      rm -rf "${C_CHOME[$id]}" "${C_OUT[$id]}" 2>/dev/null||true
+      unset "C_PID[$id]" "C_NAME[$id]" "C_CHOME[$id]" "C_OUT[$id]"
     fi
   done
 }
