@@ -261,6 +261,17 @@ class SingleSimulationResultStore:
             columns = [column[0] for column in result.description]
             return dict(zip(columns, row, strict=True))
 
+    def max_baseline_seed(self) -> int:
+        """이미 사용한 baseline seed 최대값(request_id=`base-{seed}-{i}`의 {seed} 파싱; 없으면 -1).
+        런처가 이 위로 다음 ramp seed epoch를 잡아 재램프 시 설계 재탕을 막는다. (PostgresResultStore와 동일.)"""
+        self.initialize()
+        with self._locked_connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(max(TRY_CAST(split_part(request_id,'-',2) AS BIGINT)), -1) "
+                "FROM single_simulation_results WHERE request_id LIKE 'base-%'"
+            ).fetchone()
+        return int(row[0]) if row and row[0] is not None else -1
+
     def state_counts(self, *, peetsfea_version: str | None = None) -> dict[str, int]:
         """terminal_state별 건수(경량 집계 — 전체 행을 끌어오지 않음). 대시보드 요약용."""
         self.initialize()

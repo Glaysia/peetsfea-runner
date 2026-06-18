@@ -252,6 +252,20 @@ class PostgresResultStore:
             columns = [c.name for c in cur.description]
             return dict(zip(columns, row, strict=True))
 
+    def max_baseline_seed(self) -> int:
+        """이미 사용한 baseline seed의 최대값. request_id=`base-{seed}-{i}`에서 {seed}를 파싱한 max(없으면 -1).
+
+        런처(keeper)가 이 값 위로 다음 ramp의 seed epoch를 잡아, 재램프해도 **이미 푼 설계를 재탕하지 않고**
+        새 공간을 탐색하게 한다(수천억 공간에서 재램프마다 같은 낮은 seed를 재계산하던 낭비 제거)."""
+        self.initialize()
+        with self._locked_connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(max((split_part(request_id,'-',2))::bigint), -1) "
+                "FROM single_simulation_results "
+                "WHERE request_id LIKE 'base-%%' AND split_part(request_id,'-',2) ~ '^[0-9]+$'"
+            ).fetchone()
+        return int(row[0]) if row and row[0] is not None else -1
+
     def state_counts(self, *, peetsfea_version: str | None = None) -> dict[str, int]:
         self.initialize()
         where = " WHERE peetsfea_version = %s" if peetsfea_version else ""

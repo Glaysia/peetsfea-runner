@@ -293,6 +293,8 @@ def build_control_plane(
         ssh_host=config.ssh_host,
         job_command=config.job_command,
         node_based=config.node_based_jobs,
+        # 재램프 시 이미 푼 baseline seed를 재탕하지 않게: store의 used-seed 프런티어 위로 seed epoch를 advance.
+        seed_epoch_provider=store.max_baseline_seed,
     )
     orchestrator = JobOrchestrator(
         launcher=job_launcher,

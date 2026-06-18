@@ -42,6 +42,31 @@ def test_submit_parses_slurm_id_and_sends_sbatch_script() -> None:
     assert "export EDT_PARTITION=cpu2" in script
 
 
+def test_seed_epoch_injected_from_provider() -> None:
+    # 재램프 재탕 방지: 런처가 used-seed 프런티어+1을 EDT_BASELINE_SEED_EPOCH로 sbatch에 주입.
+    runner = FakeRunner()
+    runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")
+    launcher = SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0, seed_epoch_provider=lambda: 415000000)
+    launcher.submit(0)
+    assert "export EDT_BASELINE_SEED_EPOCH=415000001" in runner.calls[-1][1]  # type: ignore[operator]
+
+
+def test_seed_epoch_defaults_zero_without_provider() -> None:
+    runner = FakeRunner()
+    runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")
+    _launcher(runner).submit(0)
+    assert "export EDT_BASELINE_SEED_EPOCH=0" in runner.calls[-1][1]  # type: ignore[operator]
+
+
+def test_seed_epoch_provider_failure_falls_back_to_zero() -> None:
+    runner = FakeRunner()
+    runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")
+    def boom() -> int:
+        raise RuntimeError("store down")
+    SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0, seed_epoch_provider=boom).submit(0)
+    assert "export EDT_BASELINE_SEED_EPOCH=0" in runner.calls[-1][1]  # type: ignore[operator]
+
+
 def test_cpus_per_partition_cpu2_48_other_32() -> None:
     runner = FakeRunner()
     runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")

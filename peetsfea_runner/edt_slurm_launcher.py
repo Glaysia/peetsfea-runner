@@ -84,7 +84,19 @@ class SlurmJobLauncher:
     avoid_cooldown_seconds: float = 300.0
     clock: Clock = time.monotonic
     command_runner: CommandRunner = subprocess_runner
+    # 이미 사용한 baseline seed 프런티어를 반환(store.max_baseline_seed). 제출 시 이 위로 seed epoch를 잡아
+    # 재램프해도 워커가 새 설계공간을 탐색(이미 푼 seed 재탕 방지). None이면 epoch=0(기존 동작).
+    seed_epoch_provider: Callable[[], int] | None = None
     _avoid: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+
+    def _seed_epoch(self) -> int:
+        """다음 잡의 baseline seed 시작 오프셋. 사용한 최대 seed 바로 위(프런티어+1)에서 시작 → 재탕 0."""
+        if self.seed_epoch_provider is None:
+            return 0
+        try:
+            return max(0, int(self.seed_epoch_provider()) + 1)
+        except Exception:  # noqa: BLE001 — store 조회 실패가 잡 제출을 막으면 안 됨(0으로 폴백).
+            return 0
 
     def _ssh(self, remote: str, *, input_text: str | None = None) -> CommandResult:
         argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", self.ssh_host, remote]
@@ -101,6 +113,7 @@ class SlurmJobLauncher:
         gres_line = f"#SBATCH --gres=gpu:{gpus}\n" if gpus > 0 else ""
         # node_based: 특정 노드에 핀(과적재 방지). 파티션은 노드가 속한 파티션으로 함께 지정.
         nodelist_line = f"#SBATCH --nodelist={node}\n" if node else ""
+        seed_epoch = self._seed_epoch()  # 사용한 seed 위로 시작점 advance(재램프 재탕 방지)
         return (
             "#!/bin/bash\n"
             f"#SBATCH --job-name={self.job_name_prefix}-{job_index}\n"
@@ -115,6 +128,8 @@ class SlurmJobLauncher:
             f"export EDT_PARTITION={partition}\n"
             # EDT_GPU_COUNT: 컨테이너 supervisor가 워커별 CUDA_VISIBLE_DEVICES=index%N 핀닝에 사용(GPU 분산).
             f"export EDT_GPU_COUNT={gpus}\n"
+            # EDT_BASELINE_SEED_EPOCH: entrypoint가 seed_base에 더해 재램프마다 새 설계공간을 탐색(재탕 방지).
+            f"export EDT_BASELINE_SEED_EPOCH={seed_epoch}\n"
             f"{self.job_command}\n"
         )
 

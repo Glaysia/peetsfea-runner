@@ -91,6 +91,15 @@ def test_keep_best_success_not_overwritten_by_failure(tmp_path: Path) -> None:
     assert store.fetch_result("base-7")["design_id"] == "d7b"  # type: ignore[index]
 
 
+def test_max_baseline_seed(tmp_path: Path) -> None:
+    # 재램프 재탕 방지용: base-{seed}-{i}에서 {seed} 최대를 파싱. baseline 아닌 건 무시. 없으면 -1.
+    store = SingleSimulationResultStore(tmp_path / "results.duckdb")
+    assert store.max_baseline_seed() == -1
+    for rid in ("base-299000000-0", "base-415000000-1", "base-62000000-0", "sweep-9-5", "prio-0"):
+        store.record_envelope({"request_id": rid, "terminal_state": "success", "result": {}})
+    assert store.max_baseline_seed() == 415000000  # sweep/prio 제외, base 최대
+
+
 def test_timeseries_buckets_success_fail_gpu(tmp_path: Path) -> None:
     store = SingleSimulationResultStore(tmp_path / "results.duckdb")
     def rec(rid: str, fin: str, state: str, gpu: bool) -> None:

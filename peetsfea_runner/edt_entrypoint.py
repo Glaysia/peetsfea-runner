@@ -155,7 +155,10 @@ def run_supervisor(slot_count: int) -> int:
     # 잡 인덱스로 seed 대역을 잡마다 분리: 잡 j의 워커들은 [j*slot_count*stride, (j+1)*slot_count*stride).
     # 이게 없으면 모든 잡의 worker i가 같은 seed를 탐색 → N배 중복 계산·서로 덮어씀(고질적 낭비).
     job_index = int(os.environ.get("EDT_JOB_INDEX", "0"))
-    seed_base = job_index * slot_count * seed_stride
+    # EDT_BASELINE_SEED_EPOCH: 런처(keeper)가 store의 used-seed 프런티어 위로 잡아 주입. 재램프해도 이 위에서
+    # 시작해 **이미 푼 설계를 재탕하지 않고** 새 공간을 탐색한다(0이면 기존 동작). 잡 band는 job_index로 분리.
+    seed_epoch = int(os.environ.get("EDT_BASELINE_SEED_EPOCH", "0"))
+    seed_base = seed_epoch + job_index * slot_count * seed_stride
     stop = threading.Event()
 
     def _on_signal(signum: int, frame: FrameType | None) -> None:
