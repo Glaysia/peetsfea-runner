@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="ko"><head><meta charset="utf-8">
+<title>재설계 — 단일 web 모놀리스 → 백엔드 분리(컨트롤/데이터/서빙 + Postgres)</title>
+<style>
+:root{--bg:#0d1117;--pan:#161b22;--ln:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14.5px/1.65 -apple-system,"Noto Sans KR",Segoe UI,sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:32px 22px 90px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:18px;margin:30px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--ln)}
+h3{font-size:15px;margin:18px 0 6px;color:var(--acc)}
+.sub{color:var(--mut);font-size:13px;margin-bottom:8px}
+code{background:#0b0f14;border:1px solid var(--ln);border-radius:5px;padding:1px 6px;font:12.5px ui-monospace,Menlo,monospace}
+pre{background:#0b0f14;border:1px solid var(--ln);border-radius:9px;padding:13px 15px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,monospace;white-space:pre}
+table{width:100%;border-collapse:collapse;margin:8px 0;font-size:13.5px}
+th,td{border:1px solid var(--ln);padding:7px 10px;text-align:left;vertical-align:top}
+th{background:var(--pan);color:var(--mut);font-weight:600}
+.card{background:var(--pan);border:1px solid var(--ln);border-radius:11px;padding:14px 18px;margin:12px 0}
+.bad{color:var(--bad)}.ok{color:var(--ok)}.warn{color:var(--warn)}.mut{color:var(--mut)}
+ul{margin:6px 0 6px 4px;padding-left:20px}li{margin:3px 0}
+.pill{display:inline-block;font-size:11px;padding:1px 9px;border-radius:11px;font-weight:700;background:rgba(210,153,34,.16);color:var(--warn)}
+.ok-b{color:var(--ok);font-weight:700}
+</style></head><body><div class="wrap">
+
+<h1>재설계 — web 모놀리스 → 백엔드 분리 <span class="pill">미구현 · dev · 19:00 착수</span></h1>
+<div class="sub">작성 2026-06-18 · 계기: 대시보드 텔레메트리 결측(차트 빈 구간) 근본진단 → 단일 web 프로세스 자원 고갈 · <b>구현·배포 안 함</b></div>
+
+<div class="card">
+<b>한 줄.</b> 지금은 <b>web 프로세스 하나</b>가 대시보드·ingest·벌크·intake·lease·라이선스·자원폴러·DuckDB를 전부 겸해 <b>같은 2.7GB 메모리·1024 fd를 공유</b>한다. 이걸 <b>관심사별 프로세스로 분리</b>하고 <b>OLTP는 Postgres 백엔드, OLAP/export는 DuckDB(콜드), 대용량 산출물은 파일시스템</b>으로 三분한다. 핵심 원칙: <span class="ok-b">감시(텔레메트리)·제어를 무거운 데이터플레인과 다른 fault domain에 둔다.</span>
+</div>
+
+<h2>1. 현 구조의 문제 (진단 결과)</h2>
+<ul>
+<li><b>단일 web 프로세스</b>(<code>edt_control_plane</code>, EDT_ROLE=web)가 <b>전부</b>: 대시보드:8080 · intake:7875 · ingest:7876 · 벌크/아카이브추출:7877 · lease:7878 · 라이선스:7879 · 자원폴러(20s ssh) · 역터널 · <b>DuckDB 호스팅(단일 writer 락)</b>.</li>
+<li><b>DuckDB 오용</b>: 임베디드 분석 DB(단일프로세스·단일writer)를 11GB 규모의 <b>동시 운영 store</b>로 사용 → 무거운 분석쿼리에서 <code>OutOfMemoryException</code>(2.7GB 한도).</li>
+<li><b>벌크 추출이 fd 다발 오픈</b> → 순간 <code>Too many open files</code>(1024).</li>
+<li class="bad"><b>치명적 결합</b>: 자원폴러(감시)가 같은 프로세스라, DB/HTTP/벌크 부하에 질식 → 폴러의 <code>subprocess.run(ssh)</code> 실패 → 빈 스냅샷 → <b>대시보드 전 지표 0-dip</b>(실제 잡은 정상인데 측정만 실패). "감시 도구가 감시 대상과 운명을 공유"하는 구조 결함.</li>
+</ul>
+<p class="mut">즉 DuckDB 결함이 아니라 <b>임베디드 DB를 동시 운영 백엔드로 쓴 미스매치 + 모놀리스 결합</b>. 초기 규모엔 맞았으나 11GB·300/h·동시 ingest+대시보드+벌크로 추월당함.</p>
+
+<h2>2. 설계 원칙</h2>
+<ul>
+<li><b>Fault domain 분리</b>: 컨트롤·텔레메트리(저지연·경량)를 데이터플레인(무거운 I/O)과 다른 프로세스로. 감시는 절대 감시 대상과 한 프로세스에 두지 않는다.</li>
+<li><b>OLTP / OLAP 분리</b>: 핫 운영데이터는 <b>client-server DB(Postgres, MVCC)</b> — 동시 read/write가 서로 안 막힘. 콜드 분석·parquet export는 <b>DuckDB가 parquet/archive 위에서</b>(라이브 store 아님).</li>
+<li><b>대용량은 DB 밖</b>: aedtresults 산출물은 파일시스템 ArchiveStore, DB엔 참조만(현행 유지).</li>
+<li><b>프로세스별 자원 경계</b>: 각 systemd 유닛에 <code>LimitNOFILE</code>·<code>MemoryMax</code> 지정 → 한 서비스가 호스트를 못 말아먹음.</li>
+<li><b>쓰기 단일화·백프레셔</b>: ingest writer를 분리하되 Postgres 풀로 동시성 확보. 대시보드는 read 전용 연결.</li>
+<li><b>현행 토폴로지 보존</b>: 슈퍼컴 워커의 역터널 push(:7876/:7877), keeper의 sbatch 오케스트레이션은 그대로 — 수신측만 Postgres로.</li>
+</ul>
+
+<h2>3. 목표 아키텍처</h2>
+<pre>
+            ┌──── 컨트롤 플레인 (경량·저지연, 데이터플레인과 격리) ────┐
+ 슈퍼컴      │  peetsfea-control                                         │
+ workers     │   intake:7875  lease:7878  license:7879                  │
+   │         │   resource-poller(ssh→gate)   reverse-tunnels            │
+   │ 역터널  └───────────────────────────────┬──────────────────────────┘
+   │                                         │ 큐·라이선스·스냅샷 write/read (가벼움)
+   ▼                                         ▼
+ ┌── 데이터 플레인 (무거운 write·I/O) ─┐   ┌──────── Postgres (백엔드, MVCC) ────────┐
+ │ peetsfea-ingest                     │   │  sim_results / resource_snapshots /     │
+ │  result:7876  bulk:7877             │──▶│  priority_queue   (동시 read+write OK)  │
+ │  archive 추출(fd↑, 격리)            │   └──────▲──────────────────────────────────┘
+ └─────────────────────────────────────┘          │ read-only 연결 풀
+ ┌── 서빙 플레인 (read 전용) ──────────┐  read     │
+ │ peetsfea-dashboard :8080            │───────────┘
+ │  summary/results/trends             │
+ │  /results.parquet → DuckDB(콜드)    │  ← parquet/archive 위에서 분석, 라이브 DB 아님
+ └─────────────────────────────────────┘
+ ┌── 오케스트레이션 ──┐
+ │ peetsfea-keeper    │  sbatch/scancel/squeue (현행 유지, DB 무관)
+ └────────────────────┘
+ 대용량 산출물(aedtresults): 파일시스템 ArchiveStore (DB엔 참조만) — 현행 유지
+</pre>
+
+<table>
+<tr><th>프로세스</th><th>역할</th><th>포트</th><th>DB</th><th>자원특성</th></tr>
+<tr><td><code>peetsfea-control</code></td><td>intake·lease·라이선스·폴러·터널</td><td>7875/7878/7879</td><td>가벼운 read/write</td><td>저지연, 격리 필수</td></tr>
+<tr><td><code>peetsfea-ingest</code></td><td>결과·벌크 수신, archive 추출</td><td>7876/7877</td><td>write 위주</td><td>fd↑·디스크↑(격리)</td></tr>
+<tr><td><code>peetsfea-dashboard</code></td><td>대시보드·API·parquet export</td><td>8080</td><td>read-only</td><td>메모리↑ 쿼리(격리)</td></tr>
+<tr><td><code>peetsfea-keeper</code></td><td>SLURM 오케스트레이터</td><td>—</td><td>없음</td><td>현행 유지</td></tr>
+<tr><td><b>Postgres</b></td><td>핫 운영데이터 store</td><td>5432(local)</td><td>—</td><td>자체 메모리/fd 관리</td></tr>
+</table>
+
+<h2>4. 데이터 배치 (三분)</h2>
+<ul>
+<li><b>Postgres(핫·OLTP)</b>: <code>sim_results</code>(메타+telemetry, 대용량 json은 참조), <code>resource_snapshots</code>(시계열), <code>priority_queue/sweeps</code>. MVCC라 ingest 쓰기와 대시보드 읽기가 서로 차단 안 함 → DuckDB 단일락·OOM 문제 소멸.</li>
+<li><b>파일시스템 ArchiveStore(대용량)</b>: aedtresults 산출물 — 현행 그대로, DB엔 경로 참조만.</li>
+<li><b>DuckDB/parquet(콜드·OLAP)</b>: 다운로드/대규모 분석은 Postgres에서 parquet로 export하거나, archive parquet 위에서 DuckDB로. <b>라이브 운영 store 역할에서 은퇴</b>.</li>
+</ul>
+
+<h2>5. 마이그레이션 단계 (19:00 착수 순서)</h2>
+<ol>
+<li><b>Postgres 기동</b>: 로컬 systemd(또는 컨테이너), <code>peetsfea</code> DB·롤·연결풀. 자원경계 설정.</li>
+<li><b>스키마 이식</b>: DuckDB 테이블 → Postgres DDL(타입 매핑, 인덱스: ts·terminal_state·version). <code>single_simulation_store</code>를 Postgres 백엔드로 추상화(드라이버 교체 가능하게).</li>
+<li><b>데이터 이관</b>: 기존 11GB DuckDB → Postgres(핫 구간만; 콜드는 parquet 아카이브로). COPY/배치.</li>
+<li><b>서비스 분리</b>: <code>edt_control_plane</code>의 web 역할을 3개 유닛(control/ingest/dashboard)으로 split. 각 systemd 유닛 + <code>LimitNOFILE</code>/<code>MemoryMax</code>.</li>
+<li><b>폴러 이전</b>: 자원폴러를 control 프로세스로(데이터플레인과 격리). 스냅샷은 Postgres에 write.</li>
+<li><b>컷오버</b>: 워커 역터널 수신을 ingest 유닛으로, 대시보드를 read-only 연결로. 검증 후 <b>DuckDB-store 폐기</b>(export 전용만 잔존).</li>
+<li><b>fd/메모리 회귀검증</b>: 부하 중 텔레메트리 결측 0 확인.</li>
+</ol>
+
+<h2>6. 경량 대안 (운영부담 줄이려면)</h2>
+<ul>
+<li><b>SQLite(WAL)</b>: client-server는 아니나 WAL 모드로 동시 reader + 단일 writer 가능 → DuckDB보다 OLTP 적합. 다만 분석쿼리·확장성은 Postgres만 못함.</li>
+<li><b>DuckDB-owner 단일 프로세스</b>: DuckDB를 유지하되 <b>DB 전용 프로세스</b> 뒤에 두고 모두 IPC/HTTP로 질의 → 메모리·fd가 한 곳에 갇힘. 프로세스 분리만으로 결합 문제 일부 완화(중간 단계).</li>
+<li>→ 권장: <b>프로세스 분리는 필수</b>(원칙 2). store는 Postgres가 정석이나, 1차로 "프로세스 분리 + DuckDB-owner"만 해도 텔레메트리 결측은 사라짐. 시간/부담 보고 단계 선택.</li>
+</ul>
+
+<h2>7. 리스크 / 고려사항</h2>
+<ul>
+<li><b>단일 노드</b>(5950x): Postgres 동거 OK, 자체 자원관리가 오히려 격리에 유리.</li>
+<li><b>+1 서비스(Postgres) 운영부담</b> ↔ 안정성 이득. 백업/마이그레이션 절차 필요.</li>
+<li><b>이관 중 무중단</b>: dual-write 또는 짧은 점검창. 진행 중 결과 유실 방지(역터널 버퍼).</li>
+<li><b>스키마 호환</b>: <code>single_simulation_store</code> API를 백엔드 추상화로 감싸 드라이버 교체 — 호출부(대시보드/ingest) 변경 최소화.</li>
+<li><b>현행 보존</b>: keeper·slot_service·역터널·ArchiveStore·라이선스 제어 로직은 그대로(수신측 store만 교체).</li>
+</ul>
+
+<h2>8. 범위</h2>
+<ul>
+<li><b>지금은 미구현</b> — 설계 문서. <b>19:00에 사용자 호출로 착수.</b></li>
+<li>착수 시 5장 순서. 1차 목표: 프로세스 분리 + 폴러 격리(텔레메트리 결측 제거). 2차: Postgres 백엔드 이관.</li>
+<li>응급 패치(LimitNOFILE 상향·DuckDB 메모리·/tmp parquet 정리)는 이 재설계 전 임시 완충으로 선택 적용 가능.</li>
+</ul>
+
+</div></body></html>
