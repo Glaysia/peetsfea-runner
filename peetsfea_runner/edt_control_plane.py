@@ -42,7 +42,7 @@ from .edt_resources import (
 from .edt_result_ingest import DEFAULT_INGEST_PORT, start_result_ingest_server
 from .edt_slurm_launcher import SlurmJobLauncher
 from .edt_ssh_tunnel import SshTunnel, reverse_tunnel_argv
-from .single_simulation_store import DbPriorityQueue, SingleSimulationResultStore
+from .single_simulation_store import DbPriorityQueue, SingleSimulationResultStore, make_result_store
 
 
 @dataclass(slots=True)
@@ -267,7 +267,7 @@ def build_control_plane(
     run_web: bool = True,
     run_keeper: bool = True,
 ) -> ControlPlane:
-    store = SingleSimulationResultStore(db_path=config.db_path)
+    store = make_result_store(config.db_path)  # EDT_STORE_BACKEND=postgres면 PostgresResultStore.
     # 결과 DB(11GB)는 web 역할(대시보드/ingest/intake/lease)만 초기화·소유 — 단일 writer 락 경합 회피.
     if run_web:
         store.initialize()
@@ -278,7 +278,7 @@ def build_control_plane(
     resource_provider = None
     if run_keeper:
         resources_db = config.resources_db_path or config.db_path.with_suffix(".resources.duckdb")
-        resources_store = SingleSimulationResultStore(db_path=resources_db)
+        resources_store = make_result_store(resources_db)  # PG 백엔드면 같은 PG(resource_snapshots 테이블).
         resources_store.initialize()
         resource_poller = ResourcePoller(
             ssh_host=config.ssh_host,

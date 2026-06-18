@@ -1,29 +1,32 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-import duckdb
+import psycopg
 
 
-# DuckDB는 한 프로세스에서 같은 파일을 동시에 두 번 connect하면 "Unique file handle conflict"로 죽는다.
-# web은 멀티스레드(ingest 쓰기 + 대시보드 읽기 + lease + 자원기록)라 파일별 lock으로 모든 접근을 직렬화한다.
-_DB_LOCKS: dict[str, threading.RLock] = {}
-_DB_CONNS: dict[str, "duckdb.DuckDBPyConnection"] = {}  # 경로별 단일 영속 연결(프로세스당 파일당 1개)
-_DB_LOCKS_GUARD = threading.Lock()
+_DEFAULT_DSN = "host=127.0.0.1 port=5433 dbname=peetsfea user=peets"
 
 
-def _db_lock(db_path: Path) -> threading.RLock:
-    key = str(db_path)
-    with _DB_LOCKS_GUARD:
-        lock = _DB_LOCKS.get(key)
+# psycopg3 connection은 스레드 안전하지 않다(동일 연결을 두 스레드가 동시에 쓰면 깨진다).
+# DuckDB store와 동일하게 DSN별 단일 영속 연결 + RLock으로 모든 접근을 직렬화한다.
+_PG_LOCKS: dict[str, threading.RLock] = {}
+_PG_CONNS: dict[str, "psycopg.Connection"] = {}
+_PG_LOCKS_GUARD = threading.Lock()
+
+
+def _pg_lock(dsn: str) -> threading.RLock:
+    with _PG_LOCKS_GUARD:
+        lock = _PG_LOCKS.get(dsn)
         if lock is None:
             lock = threading.RLock()
-            _DB_LOCKS[key] = lock
+            _PG_LOCKS[dsn] = lock
         return lock
 
 
@@ -36,34 +39,23 @@ def _mapping(value: Any) -> Mapping[str, Any]:
 
 
 @dataclass(slots=True)
-class SingleSimulationResultStore:
-    db_path: Path
+class PostgresResultStore:
+    """`SingleSimulationResultStore`(DuckDB)와 동일한 공개 메서드 시그니처/반환형을 가진 Postgres 백엔드.
 
-    def __post_init__(self) -> None:
-        self.db_path = Path(self.db_path).expanduser().resolve()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    psycopg3 기반. DSN별 단일 영속 연결 + RLock으로 직렬화(연결은 스레드 안전하지 않음).
+    autocommit=True로 단순화하고, 트랜잭션이 필요한 곳(record_envelope/lease)은 명시적 BEGIN/COMMIT 또는
+    FOR UPDATE 행잠금으로 keep-best/원자성을 보장한다.
+    """
+
+    dsn: str = field(default_factory=lambda: os.environ.get("EDT_PG_DSN", _DEFAULT_DSN))
 
     @contextmanager
-    def _locked_connect(self) -> "Iterator[duckdb.DuckDBPyConnection]":
-        """파일별 lock으로 직렬화된 **경로별 단일 영속 연결**. 매 호출 open/close churn은 고부하에서
-        DuckDB를 크래시(NULL unique_ptr)시키므로, 프로세스당 파일당 연결 1개를 열어 재사용한다
-        (직렬 접근은 lock이 보장; 같은 경로 store 다중 인스턴스도 연결을 공유해 'already attached' 방지)."""
-        key = str(self.db_path)
-        with _db_lock(self.db_path):
-            conn = _DB_CONNS.get(key)
-            if conn is None:
-                conn = duckdb.connect(key)
-                # 메모리 한도 — 너무 낮으면(과거 3GB) 11GB DB의 무거운 쿼리가 디스크로 spill하고, spill 블록
-                # 파일이 fd 한도(유저서비스 1024)를 터뜨려 DuckDB가 FATAL(invalidated)로 죽었다. 머신 RAM이
-                # 넉넉하므로(46GB) 한도를 크게 잡아 **spill 자체를 없앤다**. EDT_DB_MEMORY_LIMIT로 조절.
-                import os
-
-                try:
-                    conn.execute(f"PRAGMA memory_limit='{os.environ.get('EDT_DB_MEMORY_LIMIT', '24GB')}'")
-                    conn.execute(f"PRAGMA threads={os.environ.get('EDT_DB_THREADS', '4')}")
-                except Exception:  # noqa: BLE001 — pragma 미지원 버전이어도 동작은 해야 함.
-                    pass
-                _DB_CONNS[key] = conn
+    def _locked_connect(self) -> "Iterator[psycopg.Connection]":
+        with _pg_lock(self.dsn):
+            conn = _PG_CONNS.get(self.dsn)
+            if conn is None or conn.closed:
+                conn = psycopg.connect(self.dsn, autocommit=True)
+                _PG_CONNS[self.dsn] = conn
             yield conn
 
     def initialize(self) -> None:
@@ -71,72 +63,78 @@ class SingleSimulationResultStore:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS single_simulation_results (
-                    request_id VARCHAR PRIMARY KEY,
-                    account_id VARCHAR,
-                    host_alias VARCHAR,
-                    partition VARCHAR,
-                    node VARCHAR,
-                    remote_job_id VARCHAR,
-                    remote_api_session_id VARCHAR,
-                    input_toml_hash VARCHAR,
-                    peetsfea_version VARCHAR,
-                    mode VARCHAR,
-                    seed BIGINT,
-                    design_id VARCHAR,
-                    point_hash VARCHAR,
-                    dimension_count BIGINT,
-                    free_owner_paths_json VARCHAR,
-                    point_values_json VARCHAR,
-                    terminal_state VARCHAR,
-                    started_at VARCHAR,
-                    finished_at VARCHAR,
-                    setup_pass_counts_json VARCHAR,
-                    solve_telemetry_json VARCHAR,
-                    csv_text_by_report_json VARCHAR,
-                    csv_paths_json VARCHAR,
-                    artifact_references_json VARCHAR,
-                    error_stage VARCHAR,
-                    error_type VARCHAR,
-                    error_message VARCHAR,
-                    result_json VARCHAR,
-                    envelope_json VARCHAR
+                    request_id text PRIMARY KEY,
+                    account_id text,
+                    host_alias text,
+                    partition text,
+                    node text,
+                    remote_job_id text,
+                    remote_api_session_id text,
+                    input_toml_hash text,
+                    peetsfea_version text,
+                    mode text,
+                    seed bigint,
+                    design_id text,
+                    point_hash text,
+                    dimension_count bigint,
+                    free_owner_paths_json text,
+                    point_values_json text,
+                    terminal_state text,
+                    started_at text,
+                    finished_at text,
+                    setup_pass_counts_json text,
+                    solve_telemetry_json text,
+                    csv_text_by_report_json text,
+                    csv_paths_json text,
+                    artifact_references_json text,
+                    error_stage text,
+                    error_type text,
+                    error_message text,
+                    result_json text,
+                    envelope_json text
                 )
                 """
             )
-            # 라이선스/자원 시계열(대시보드 추세 탭). web 재시작·12h ring buffer 한계를 넘어 영속.
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS ssr_started_at_idx ON single_simulation_results (started_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS ssr_terminal_state_idx ON single_simulation_results (terminal_state)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS ssr_peetsfea_version_idx ON single_simulation_results (peetsfea_version)"
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS resource_snapshots (
-                    ts DOUBLE,
-                    running BIGINT,
-                    pending BIGINT,
-                    lic_mine BIGINT,
-                    lic_inuse BIGINT,
-                    load DOUBLE,
-                    cpus BIGINT,
-                    mem_used_mb BIGINT,
-                    mem_total_mb BIGINT,
-                    nominal_aedt BIGINT,
-                    effective_aedt BIGINT
+                    ts double precision,
+                    running bigint,
+                    pending bigint,
+                    lic_mine bigint,
+                    lic_inuse bigint,
+                    load double precision,
+                    cpus bigint,
+                    mem_used_mb bigint,
+                    mem_total_mb bigint,
+                    nominal_aedt bigint,
+                    effective_aedt bigint
                 )
                 """
             )
-            # 기존(구 스키마) 테이블 마이그레이션 — AEDT 명목/유효 컬럼 추가.
             for _col in ("nominal_aedt", "effective_aedt"):
-                connection.execute(f"ALTER TABLE resource_snapshots ADD COLUMN IF NOT EXISTS {_col} BIGINT")
-            # 우선순위 큐(intake :7875 적재 / lease :7878 분배). **sweep 요청** 단위로 저장 —
-            # 무거운 cadquery 샘플링은 web이 아니라 컨테이너 워커가 lease 후 수행(baseline과 대칭).
-            # row 1개 = "이 sweep을 count개 시뮬", remaining_count를 chunk lease가 차감.
+                connection.execute(
+                    f"ALTER TABLE resource_snapshots ADD COLUMN IF NOT EXISTS {_col} bigint"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS priority_sweeps (
-                    request_id VARCHAR PRIMARY KEY,
-                    sweep_toml_text VARCHAR,
-                    seed BIGINT,
-                    mode VARCHAR,
-                    total_count BIGINT,
-                    remaining_count BIGINT,
-                    created_at DOUBLE
+                    request_id text PRIMARY KEY,
+                    sweep_toml_text text,
+                    seed bigint,
+                    mode text,
+                    total_count bigint,
+                    remaining_count bigint,
+                    created_at double precision
                 )
                 """
             )
@@ -180,29 +178,18 @@ class SingleSimulationResultStore:
             "envelope_json": _json_dumps(envelope),
         }
         columns = tuple(row)
-        placeholders = ", ".join("?" for _ in columns)
+        placeholders = ", ".join("%s" for _ in columns)
+        # keep-best: 이미 'success'가 있으면 비-success로 덮어쓰지 않는다.
+        # ON CONFLICT DO UPDATE ... WHERE (기존이 success가 아니거나 신규가 success일 때만 갱신).
+        update_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c != "request_id")
+        sql = (
+            f"INSERT INTO single_simulation_results ({', '.join(columns)}) VALUES ({placeholders}) "
+            f"ON CONFLICT (request_id) DO UPDATE SET {update_set} "
+            "WHERE single_simulation_results.terminal_state <> 'success' "
+            "OR EXCLUDED.terminal_state = 'success'"
+        )
         with self._locked_connect() as connection:
-            connection.execute("BEGIN TRANSACTION")
-            try:
-                # keep-best: 같은 request_id에 이미 'success'가 있으면, 비-success로 덮어쓰지 않는다.
-                # (잡 재시작 시 같은 seed를 재탐색하다 실패하면 누적된 성공 데이터가 유실되는 고질적 버그 방지.)
-                if row["terminal_state"] != "success":
-                    existing = connection.execute(
-                        "SELECT terminal_state FROM single_simulation_results WHERE request_id = ?",
-                        [request_id],
-                    ).fetchone()
-                    if existing is not None and existing[0] == "success":
-                        connection.execute("ROLLBACK")
-                        return
-                connection.execute("DELETE FROM single_simulation_results WHERE request_id = ?", [request_id])
-                connection.execute(
-                    f"INSERT INTO single_simulation_results ({', '.join(columns)}) VALUES ({placeholders})",
-                    [row[column] for column in columns],
-                )
-                connection.execute("COMMIT")
-            except Exception:
-                connection.execute("ROLLBACK")
-                raise
+            connection.execute(sql, [row[column] for column in columns])
 
     def fetch_rows(
         self,
@@ -212,47 +199,45 @@ class SingleSimulationResultStore:
         peetsfea_version: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """결과 행 조회(대시보드/CSV용, 읽기 전용). `peetsfea_version`은 표시용 버전 필터."""
         self.initialize()
         clauses: list[str] = []
         params: list[Any] = []
         if since:
-            clauses.append("started_at >= ?")
+            clauses.append("started_at >= %s")
             params.append(since)
         if terminal_state:
-            clauses.append("terminal_state = ?")
+            clauses.append("terminal_state = %s")
             params.append(terminal_state)
         if peetsfea_version:
-            clauses.append("peetsfea_version = ?")
+            clauses.append("peetsfea_version = %s")
             params.append(peetsfea_version)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT * FROM single_simulation_results{where} ORDER BY finished_at"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         with self._locked_connect() as connection:
-            result = connection.execute(sql, params)
-            columns = [column[0] for column in result.description]
-            return [dict(zip(columns, row, strict=True)) for row in result.fetchall()]
+            cur = connection.execute(sql, params)
+            columns = [c.name for c in cur.description]
+            return [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
 
     def fetch_result(self, request_id: str, *, peetsfea_version: str | None = None) -> dict[str, Any] | None:
         self.initialize()
-        sql = "SELECT * FROM single_simulation_results WHERE request_id = ?"
+        sql = "SELECT * FROM single_simulation_results WHERE request_id = %s"
         params: list[Any] = [request_id]
         if peetsfea_version:
-            sql += " AND peetsfea_version = ?"
+            sql += " AND peetsfea_version = %s"
             params.append(peetsfea_version)
         with self._locked_connect() as connection:
-            result = connection.execute(sql, params)
-            row = result.fetchone()
+            cur = connection.execute(sql, params)
+            row = cur.fetchone()
             if row is None:
                 return None
-            columns = [column[0] for column in result.description]
+            columns = [c.name for c in cur.description]
             return dict(zip(columns, row, strict=True))
 
     def state_counts(self, *, peetsfea_version: str | None = None) -> dict[str, int]:
-        """terminal_state별 건수(경량 집계 — 전체 행을 끌어오지 않음). 대시보드 요약용."""
         self.initialize()
-        where = " WHERE peetsfea_version = ?" if peetsfea_version else ""
+        where = " WHERE peetsfea_version = %s" if peetsfea_version else ""
         params: list[Any] = [peetsfea_version] if peetsfea_version else []
         with self._locked_connect() as connection:
             rows = connection.execute(
@@ -262,7 +247,6 @@ class SingleSimulationResultStore:
         return {str(state): int(n) for state, n in rows}
 
     def version_counts(self) -> dict[str, int]:
-        """peetsfea_version별 건수(경량 집계). 대시보드 `/api/versions`용 — 전 버전 분포 노출."""
         self.initialize()
         with self._locked_connect() as connection:
             rows = connection.execute(
@@ -272,15 +256,14 @@ class SingleSimulationResultStore:
         return {str(v): int(n) for v, n in rows}
 
     def count_since(self, since: str, *, terminal_state: str | None = None, peetsfea_version: str | None = None) -> int:
-        """`finished_at >= since` 건수(처리량 추정용). 선택적으로 상태/버전 필터."""
         self.initialize()
-        clauses = ["finished_at >= ?"]
+        clauses = ["finished_at >= %s"]
         params: list[Any] = [since]
         if terminal_state:
-            clauses.append("terminal_state = ?")
+            clauses.append("terminal_state = %s")
             params.append(terminal_state)
         if peetsfea_version:
-            clauses.append("peetsfea_version = ?")
+            clauses.append("peetsfea_version = %s")
             params.append(peetsfea_version)
         sql = "SELECT count(*) FROM single_simulation_results WHERE " + " AND ".join(clauses)
         with self._locked_connect() as connection:
@@ -288,26 +271,34 @@ class SingleSimulationResultStore:
         return int(row[0]) if row else 0
 
     def timeseries(self, *, bucket_minutes: int = 15, since: str | None = None, peetsfea_version: str | None = None) -> list[dict[str, Any]]:
-        """`finished_at` 시간버킷 집계 — 처리량/성공/실패/GPU(대시보드 시계열용, 서버측 집계).
+        """`finished_at` 시간버킷 집계 — DuckDB time_bucket과 동일한 버킷 라벨(UTC ISO 분)/카운트.
 
-        무거운 행 전송 없이 DuckDB `time_bucket`으로 버킷별 카운트만 반환. 버킷 라벨은 UTC ISO(분).
+        PG에는 time_bucket이 없으므로 `to_timestamp(floor(epoch/secs)*secs)`로 동일 버킷을 만든 뒤
+        `to_char(... , 'YYYY-MM-DD"T"HH24:MI')`로 DuckDB strftime('%Y-%m-%dT%H:%M')와 같은 라벨을 만든다.
         """
         self.initialize()
-        bm = max(1, int(bucket_minutes))  # SQL 인터폴레이션 전 정수화(인젝션 방지)
-        clauses = ["finished_at != ''"]
+        bm = max(1, int(bucket_minutes))
+        secs = bm * 60
+        clauses = ["finished_at <> ''"]
         params: list[Any] = []
         if since:
-            clauses.append("finished_at >= ?")
+            clauses.append("finished_at >= %s")
             params.append(since)
         if peetsfea_version:
-            clauses.append("peetsfea_version = ?")
+            clauses.append("peetsfea_version = %s")
             params.append(peetsfea_version)
         where = " AND ".join(clauses)
+        # finished_at(텍스트 ISO) → timestamp → epoch → 버킷 floor → 라벨. DuckDB와 동일하게 naive(UTC) 처리.
+        bucket_expr = (
+            "to_char("
+            "to_timestamp(floor(extract(epoch FROM finished_at::timestamp) / " + str(secs) + ") * " + str(secs) + ")"
+            " AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI')"
+        )
         sql = (
-            "SELECT strftime(time_bucket(INTERVAL '" + str(bm) + " minutes', finished_at::TIMESTAMP), '%Y-%m-%dT%H:%M') AS b, "
+            "SELECT " + bucket_expr + " AS b, "
             "sum(CASE WHEN terminal_state='success' THEN 1 ELSE 0 END), "
-            "sum(CASE WHEN terminal_state!='success' THEN 1 ELSE 0 END), "
-            "sum(CASE WHEN solve_telemetry_json LIKE '%\"gpu_used\": true%' THEN 1 ELSE 0 END), "
+            "sum(CASE WHEN terminal_state<>'success' THEN 1 ELSE 0 END), "
+            "sum(CASE WHEN solve_telemetry_json LIKE '%%\"gpu_used\": true%%' THEN 1 ELSE 0 END), "
             "count(*) FROM single_simulation_results WHERE " + where + " GROUP BY 1 ORDER BY 1"
         )
         with self._locked_connect() as connection:
@@ -320,15 +311,14 @@ class SingleSimulationResultStore:
     def fetch_solve_telemetry(
         self, *, terminal_state: str = "success", peetsfea_version: str | None = None, limit: int | None = 5000
     ) -> list[dict[str, Any]]:
-        """build_summary용 경량 조회 — partition + solve_telemetry_json만(리포트 원문 등 무거운 컬럼 제외)."""
         self.initialize()
         clauses: list[str] = []
         params: list[Any] = []
         if terminal_state:
-            clauses.append("terminal_state = ?")
+            clauses.append("terminal_state = %s")
             params.append(terminal_state)
         if peetsfea_version:
-            clauses.append("peetsfea_version = ?")
+            clauses.append("peetsfea_version = %s")
             params.append(peetsfea_version)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT partition, solve_telemetry_json FROM single_simulation_results{where} ORDER BY finished_at"
@@ -347,33 +337,56 @@ class SingleSimulationResultStore:
         peetsfea_version: str | None = None,
         limit: int | None = None,
     ) -> None:
-        """결과를 **DuckDB COPY로 parquet(zstd) 직접 내보내기**(서버측; web 메모리에 전 행 적재 안 함).
+        """Postgres에는 native parquet이 없어 DuckDB의 postgres 확장으로 ATTACH 후 COPY로 내보낸다.
 
-        무거운 중복 컬럼(envelope_json·result_json)은 제외. JSON 컬럼(point_values_json 등)은 그대로 둔다.
+        DuckDB store와 동일하게 envelope_json/result_json 제외, finished_at 정렬. 확장 설치 실패(오프라인 등)
+        시에는 예외를 잡아 로그만 남기고 조용히 반환한다(우회 불가시 graceful fallback).
         """
         self.initialize()
         clauses: list[str] = []
         params: list[Any] = []
         if since:
-            clauses.append("started_at >= ?")
+            clauses.append("started_at >= %s")
             params.append(since)
         if terminal_state:
-            clauses.append("terminal_state = ?")
+            clauses.append("terminal_state = %s")
             params.append(terminal_state)
         if peetsfea_version:
-            clauses.append("peetsfea_version = ?")
+            clauses.append("peetsfea_version = %s")
             params.append(peetsfea_version)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         limit_sql = f" LIMIT {int(limit)}" if limit is not None else ""
-        dest_sql = str(dest).replace("'", "''")  # 경로는 서버 임시파일(사용자 입력 아님); 따옴표만 방어 이스케이프
-        sql = (
-            "COPY (SELECT * EXCLUDE (envelope_json, result_json) FROM single_simulation_results"
-            f"{where} ORDER BY finished_at{limit_sql}) TO '{dest_sql}' (FORMAT PARQUET, COMPRESSION 'zstd')"
-        )
-        with self._locked_connect() as connection:
-            connection.execute(sql, params)
+        dest_sql = str(dest).replace("'", "''")
+        attach_dsn = self.dsn.replace("'", "''")
+        # 파라미터 바인딩을 DuckDB COPY에 그대로 쓰기 위해 리터럴로 안전 이스케이프(작은따옴표 방어).
+        lit_clauses: list[str] = []
+        if since:
+            lit_clauses.append("started_at >= '" + str(since).replace("'", "''") + "'")
+        if terminal_state:
+            lit_clauses.append("terminal_state = '" + str(terminal_state).replace("'", "''") + "'")
+        if peetsfea_version:
+            lit_clauses.append("peetsfea_version = '" + str(peetsfea_version).replace("'", "''") + "'")
+        lit_where = (" WHERE " + " AND ".join(lit_clauses)) if lit_clauses else ""
+        try:
+            import duckdb
 
-    # --- 라이선스/자원 시계열 영속 (대시보드 추세 탭; web 재시작·12h 넘어 보존) ----------------
+            con = duckdb.connect()
+            try:
+                con.execute("INSTALL postgres; LOAD postgres;")
+                con.execute(f"ATTACH '{attach_dsn}' AS pg (TYPE postgres, READ_ONLY)")
+                con.execute(
+                    "COPY (SELECT * EXCLUDE (envelope_json, result_json) FROM pg.single_simulation_results"
+                    f"{lit_where} ORDER BY finished_at{limit_sql}) TO '{dest_sql}' "
+                    "(FORMAT PARQUET, COMPRESSION 'zstd')"
+                )
+            finally:
+                con.close()
+        except Exception as exc:  # noqa: BLE001 — 오프라인 등으로 postgres 확장 불가시 graceful fallback.
+            import logging
+
+            logging.getLogger(__name__).warning("export_parquet via duckdb postgres failed: %s", exc)
+
+    # --- 라이선스/자원 시계열 영속 --------------------------------------------------------------
 
     _RESOURCE_COLS = (
         "ts", "running", "pending", "lic_mine", "lic_inuse", "load", "cpus", "mem_used_mb", "mem_total_mb",
@@ -381,20 +394,18 @@ class SingleSimulationResultStore:
     )
 
     def record_resource_snapshot(self, point: Mapping[str, Any]) -> None:
-        """`ResourcePoller`의 history 포인트 1개를 영속(폴링마다 호출)."""
         self.initialize()
         row = [float(point.get("ts") or 0.0)] + [int(point.get(c) or 0) for c in self._RESOURCE_COLS[1:5]]
         row += [float(point.get("load") or 0.0)] + [int(point.get(c) or 0) for c in self._RESOURCE_COLS[6:]]
-        placeholders = ", ".join("?" for _ in self._RESOURCE_COLS)
+        placeholders = ", ".join("%s" for _ in self._RESOURCE_COLS)
         with self._locked_connect() as connection:
             connection.execute(
                 f"INSERT INTO resource_snapshots ({', '.join(self._RESOURCE_COLS)}) VALUES ({placeholders})", row
             )
 
     def fetch_resource_history(self, *, since_ts: float | None = None, limit: int | None = None) -> list[dict[str, Any]]:
-        """자원 시계열(오래된→최신). `since_ts`(epoch)로 범위 제한. 대시보드 `/api/resources/history`용."""
         self.initialize()
-        where = " WHERE ts >= ?" if since_ts is not None else ""
+        where = " WHERE ts >= %s" if since_ts is not None else ""
         params: list[Any] = [float(since_ts)] if since_ts is not None else []
         sql = f"SELECT {', '.join(self._RESOURCE_COLS)} FROM resource_snapshots{where} ORDER BY ts"
         if limit is not None:
@@ -404,61 +415,52 @@ class SingleSimulationResultStore:
         return [dict(zip(self._RESOURCE_COLS, r, strict=True)) for r in rows]
 
     def prune_resource_snapshots(self, *, before_ts: float) -> int:
-        """`before_ts`(epoch)보다 오래된 자원 스냅샷 삭제(무한 성장 방지). 삭제 건수 반환."""
         self.initialize()
         with self._locked_connect() as connection:
-            n = connection.execute("SELECT count(*) FROM resource_snapshots WHERE ts < ?", [float(before_ts)]).fetchone()
-            connection.execute("DELETE FROM resource_snapshots WHERE ts < ?", [float(before_ts)])
+            n = connection.execute(
+                "SELECT count(*) FROM resource_snapshots WHERE ts < %s", [float(before_ts)]
+            ).fetchone()
+            connection.execute("DELETE FROM resource_snapshots WHERE ts < %s", [float(before_ts)])
         return int(n[0]) if n else 0
 
-    # --- 우선순위 큐 영속 (intake :7875 sweep 적재 / lease :7878 chunk 분배) ------------------
+    # --- 우선순위 큐 영속 ----------------------------------------------------------------------
 
     def priority_enqueue_sweep(
         self, *, request_id: str, sweep_toml_text: str, seed: int, count: int, mode: str, now: float
     ) -> None:
-        """sweep 요청 1줄 적재(intake; 샘플링 없음). 같은 request_id는 무시."""
         self.initialize()
         with self._locked_connect() as connection:
             connection.execute(
-                "INSERT OR IGNORE INTO priority_sweeps "
+                "INSERT INTO priority_sweeps "
                 "(request_id, sweep_toml_text, seed, mode, total_count, remaining_count, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (request_id) DO NOTHING",
                 [request_id, sweep_toml_text, int(seed), mode, int(count), int(count), float(now)],
             )
 
     def priority_lease_chunk(self, k: int) -> dict[str, Any] | None:
-        """가장 오래된 미완료 sweep에서 최대 k개 분배(원자적). 컨테이너 워커가 받아 k개 샘플링·솔브.
-
-        반환 `{request_id, sweep_toml_text, seed_base, mode, count}` 또는 None. `seed_base`는 이미 분배된
-        오프셋(total-remaining)을 더해 chunk마다 다른 후보가 나오게 한다. remaining=0이면 행 삭제.
-        """
         self.initialize()
         if k <= 0:
             return None
         with self._locked_connect() as connection:
-            connection.execute("BEGIN TRANSACTION")
-            try:
-                row = connection.execute(
+            with connection.transaction():
+                cur = connection.execute(
                     "SELECT request_id, sweep_toml_text, seed, mode, total_count, remaining_count "
-                    "FROM priority_sweeps WHERE remaining_count > 0 ORDER BY created_at LIMIT 1"
-                ).fetchone()
+                    "FROM priority_sweeps WHERE remaining_count > 0 ORDER BY created_at LIMIT 1 FOR UPDATE"
+                )
+                row = cur.fetchone()
                 if row is None:
-                    connection.execute("COMMIT")
                     return None
                 rid, sweep, seed, mode, total, remaining = row
                 take = min(int(k), int(remaining))
-                offset = int(total) - int(remaining)  # 이미 분배된 수 = seed 오프셋
+                offset = int(total) - int(remaining)
                 new_remaining = int(remaining) - take
                 if new_remaining <= 0:
-                    connection.execute("DELETE FROM priority_sweeps WHERE request_id = ?", [rid])
+                    connection.execute("DELETE FROM priority_sweeps WHERE request_id = %s", [rid])
                 else:
                     connection.execute(
-                        "UPDATE priority_sweeps SET remaining_count = ? WHERE request_id = ?", [new_remaining, rid]
+                        "UPDATE priority_sweeps SET remaining_count = %s WHERE request_id = %s",
+                        [new_remaining, rid],
                     )
-                connection.execute("COMMIT")
-            except Exception:
-                connection.execute("ROLLBACK")
-                raise
         return {
             "request_id": rid,
             "sweep_toml_text": sweep,
@@ -468,14 +470,12 @@ class SingleSimulationResultStore:
         }
 
     def priority_depth(self) -> int:
-        """대기 중 후보 총수(= 미완료 sweep들의 remaining_count 합)."""
         self.initialize()
         with self._locked_connect() as connection:
             row = connection.execute("SELECT COALESCE(sum(remaining_count), 0) FROM priority_sweeps").fetchone()
         return int(row[0]) if row else 0
 
     def priority_list(self, *, limit: int | None = 200) -> list[dict[str, Any]]:
-        """대기 중 sweep 요청 조회(pop 안 함; toml 본문 제외). 대시보드 입력큐 탭용."""
         self.initialize()
         sql = (
             "SELECT request_id, total_count, remaining_count, created_at FROM priority_sweeps "
@@ -491,12 +491,6 @@ class SingleSimulationResultStore:
         ]
 
     def priority_lineage(self, *, limit: int | None = 200) -> dict[str, Any]:
-        """입력큐 계보 — 들어온/대기/분배 수 + 입력큐에서 파생된 출력(성공/실패) 집계.
-
-        결과는 워커가 `{sweep_request_id}-{seed}`로 기록(edt_priority_lease)하므로, request_id(PK)의
-        **prefix 범위스캔**(`>= rid||'-'` AND `< rid||'.'`)으로 sweep↔결과를 연결한다. 컨테이너 무수정.
-        진행 중(inflight)은 (분배−완료) 근사(결과가 아직 안 들어온 분; at-most-once 유실 포함 가능).
-        """
         self.initialize()
         lim = f" LIMIT {int(limit)}" if limit is not None else ""
         with self._locked_connect() as connection:
@@ -536,51 +530,4 @@ class SingleSimulationResultStore:
         }
 
 
-@dataclass
-class DbPriorityQueue:
-    """DB 영속 우선순위 큐(sweep 요청 단위). IntakeService가 sweep을 적재, lease 서버가 chunk를 분배.
-
-    무거운 샘플링은 web이 아니라 컨테이너 워커가 lease 후 수행. web 재시작에도 미처리 요청이 남는다.
-    """
-
-    store: SingleSimulationResultStore
-    clock: Any = None  # () -> float; None이면 time.time
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
-
-    def _now(self) -> float:
-        import time
-
-        return (self.clock or time.time)()
-
-    def enqueue_sweep(self, *, request_id: str, sweep_toml_text: str, seed: int, count: int, mode: str = "full") -> None:
-        self.store.priority_enqueue_sweep(
-            request_id=request_id, sweep_toml_text=sweep_toml_text, seed=seed, count=count, mode=mode, now=self._now()
-        )
-
-    def lease_chunk(self, k: int) -> dict[str, Any] | None:
-        with self._lock:  # 한 web 프로세스 내 동시 lease 직렬화(중복 분배 방지)
-            return self.store.priority_lease_chunk(k)
-
-    def depth(self) -> int:
-        return self.store.priority_depth()
-
-    def list_requests(self, *, limit: int | None = 200) -> list[dict[str, Any]]:
-        return self.store.priority_list(limit=limit)
-
-
-def make_result_store(db_path: "Path | str") -> Any:
-    """결과 스토어 팩토리. `EDT_STORE_BACKEND=postgres`면 `PostgresResultStore`, 아니면 DuckDB store.
-
-    Postgres 백엔드는 db_path를 사용하지 않고 DSN(`EDT_PG_DSN`)으로 연결한다. 동일 공개 API를 가지므로
-    호출부(ingest/대시보드/lease)는 무수정으로 백엔드를 교체할 수 있다.
-    """
-    import os
-
-    if os.environ.get("EDT_STORE_BACKEND", "duckdb") == "postgres":
-        from .postgres_store import PostgresResultStore
-
-        return PostgresResultStore()
-    return SingleSimulationResultStore(db_path=Path(db_path))
-
-
-__all__ = ["DbPriorityQueue", "SingleSimulationResultStore", "make_result_store"]
+__all__ = ["PostgresResultStore"]
