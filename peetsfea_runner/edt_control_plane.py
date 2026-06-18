@@ -30,7 +30,12 @@ from .edt_archive import ArchiveStore
 from .edt_bulk_transfer import DEFAULT_BULK_PORT, start_bulk_transfer_server
 from .edt_dashboard import start_dashboard_server
 from .edt_intake import IntakeService, start_intake_server
-from .edt_license_ctrl import DEFAULT_LICENSE_CTRL_PORT, LicenseController, start_license_ctrl_server
+from .edt_license_ctrl import (
+    DEFAULT_LICENSE_CTRL_PORT,
+    ContainerScheduler,
+    LicenseController,
+    start_license_ctrl_server,
+)
 from .edt_orchestrator import JobLauncher, JobOrchestrator
 from .edt_priority_lease import DEFAULT_PRIORITY_LEASE_PORT, start_priority_lease_server
 from .edt_resources import (
@@ -103,6 +108,7 @@ class ControlPlane:
     run_web: bool = True
     run_keeper: bool = True
     license_controller: LicenseController | None = field(default=None, init=False, repr=False)
+    container_scheduler: ContainerScheduler | None = field(default=None, init=False, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _servers: list[ThreadingHTTPServer] = field(default_factory=list, init=False, repr=False)
     _tunnels: list[SshTunnel] = field(default_factory=list, init=False, repr=False)
@@ -126,13 +132,24 @@ class ControlPlane:
             return 0
 
     def _license_poll_loop(self) -> None:
+        # 컨테이너 스케줄러는 ~10s마다 tick(폴러 캐시 스냅샷 읽기, 가벼움). 라이선스 제어기 poll(lmstat ssh, 무거움)은
+        # license_poll_seconds마다. 콜드스타트 lag을 감안해 step·tick은 보수적(과spawn 방지) — 라이브 튜닝 대상.
+        import time as _t
+        last_ctrl = 0.0
         while not self._stop.is_set():
-            if self.license_controller is not None:
+            now = _t.monotonic()
+            if self.license_controller is not None and (now - last_ctrl) >= self.license_poll_seconds:
                 try:
                     self.license_controller.poll()
                 except Exception:  # noqa: BLE001 — 제어 루프가 데몬을 죽이면 안 된다.
                     pass
-            self._stop.wait(self.license_poll_seconds)
+                last_ctrl = now
+            if self.container_scheduler is not None:
+                try:
+                    self.container_scheduler.tick()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._stop.wait(10.0)
 
     def run(self) -> None:
         """서버 기동 + 오케스트레이터 상시 유지 루프. SIGTERM/SIGINT까지."""
@@ -155,7 +172,14 @@ class ControlPlane:
             self.license_controller = controller
             if self.resource_poller is not None:
                 self.resource_poller.aedt_provider = controller.per_job  # 컨테이너(잡)별 pyaedt 수 → 부하 탭
-            license_server = start_license_ctrl_server(controller=controller, port=self.license_ctrl_port)
+                # 컨테이너 스케줄러: solve(lmstat) 밴드 100~150을 잡별 컨테이너 target으로 actuate(LB).
+                self.container_scheduler = ContainerScheduler(
+                    snapshot_provider=self.resource_poller.snapshot,
+                    target=self.license_target, ceiling=self.license_ceiling,
+                )
+            license_server = start_license_ctrl_server(
+                controller=controller, scheduler=self.container_scheduler, port=self.license_ctrl_port
+            )
             self._servers.append(license_server)
             threading.Thread(target=license_server.serve_forever, daemon=True, name="LicenseServer").start()
             # 자원 백채널(:7882): web 대시보드가 폴러 스냅샷 + 전용 자원 DB의 영속 시계열을 HTTP 프록시로 읽는다.

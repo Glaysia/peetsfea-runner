@@ -24,7 +24,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 DEFAULT_LICENSE_CTRL_PORT = 7879
 
@@ -149,10 +149,92 @@ class LicenseController:
             }
 
 
+@dataclass
+class ContainerScheduler:
+    """컨테이너 수 제어기 — 동시 solve(lmstat solve_mine)를 target~ceiling 밴드로 묶되 actuator가
+    permit이 아니라 **컨테이너 spawn/안전종료**다.
+
+      solve < target  → 가장 한가한 노드의 잡 target↑ (LB: CPU 낮은 노드 우선; 다 90%↑면 free-RAM 큰 노드)
+      solve > ceiling → 가장 바쁜 노드의 잡 target↓ (→ 오케스트레이터가 youngest 컨테이너를 SIGTERM 안전종료)
+
+    잡당 max_per_job(40) 상한. 1컨테이너=1솔브=종료라 누수 0; 오버슈팅은 컨테이너 수로 흡수(콜드스타트 듀티 보상)."""
+
+    snapshot_provider: Callable[[], Mapping[str, Any]]   # poller.snapshot
+    target: int = 100
+    ceiling: int = 150
+    max_per_job: int = 40
+    min_per_job: int = 2
+    step: int = 3
+    _job_target: dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    @staticmethod
+    def _job_node_map(snap: Mapping[str, Any]) -> dict[int, str]:
+        out: dict[int, str] = {}
+        for j in snap.get("jobs") or []:
+            if j.get("state") != "RUNNING":
+                continue
+            try:
+                ji = int(str(j.get("name") or "").rsplit("-", 1)[-1])
+            except ValueError:
+                continue
+            out[ji] = str(j.get("node") or "")
+        return out
+
+    @staticmethod
+    def _cpu(node: str, nodes: Mapping[str, Any]) -> float:
+        nd = nodes.get(node) or {}
+        ct = nd.get("cputot") or 0
+        return (nd.get("cpuload") or 0.0) / ct if ct else 0.0
+
+    @staticmethod
+    def _freeram(node: str, nodes: Mapping[str, Any]) -> int:
+        return (nodes.get(node) or {}).get("memfree_mb") or 0
+
+    def tick(self) -> None:
+        try:
+            snap = self.snapshot_provider() or {}
+        except Exception:  # noqa: BLE001 — 스냅샷 실패가 스케줄러를 죽이면 안 됨.
+            return
+        jn = self._job_node_map(snap)
+        nodes = snap.get("nodes") or {}
+        eff = int((snap.get("license") or {}).get("solve_mine") or 0)
+        with self._lock:
+            for ji in jn:
+                self._job_target.setdefault(ji, self.min_per_job)
+            for ji in [j for j in self._job_target if j not in jn]:
+                self._job_target.pop(ji, None)
+            if not jn:
+                return
+            if eff < self.target:
+                cands = [ji for ji in jn if self._job_target[ji] < self.max_per_job]
+                if cands:
+                    if all(self._cpu(jn[ji], nodes) > 0.9 for ji in cands):
+                        best = max(cands, key=lambda ji: self._freeram(jn[ji], nodes))
+                    else:
+                        best = min(cands, key=lambda ji: self._cpu(jn[ji], nodes))
+                    self._job_target[best] = min(self.max_per_job, self._job_target[best] + self.step)
+            elif eff > self.ceiling:
+                cands = [ji for ji in jn if self._job_target[ji] > self.min_per_job]
+                if cands:
+                    worst = max(cands, key=lambda ji: self._cpu(jn[ji], nodes))
+                    self._job_target[worst] = max(self.min_per_job, self._job_target[worst] - self.step)
+
+    def plan(self, job_index: int) -> int:
+        with self._lock:
+            return self._job_target.get(int(job_index), self.min_per_job)
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {"job_target": dict(self._job_target), "total": sum(self._job_target.values()),
+                    "target": self.target, "ceiling": self.ceiling, "max_per_job": self.max_per_job}
+
+
 def start_license_ctrl_server(
-    *, controller: LicenseController, host: str = "127.0.0.1", port: int = DEFAULT_LICENSE_CTRL_PORT
+    *, controller: LicenseController, scheduler: "ContainerScheduler | None" = None,
+    host: str = "127.0.0.1", port: int = DEFAULT_LICENSE_CTRL_PORT
 ) -> ThreadingHTTPServer:
-    """제어기 백채널. POST /permit·/release·/heartbeat (body: {worker_id, solve_started_at}). GET /health."""
+    """제어기 백채널. POST /permit·/release·/heartbeat. GET /health. GET /container_plan?job=N (스케줄러)."""
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "peetsfea-license-ctrl"
@@ -170,8 +252,20 @@ def start_license_ctrl_server(
                 return {}
 
         def do_GET(self) -> None:
-            if urlparse(self.path).path == "/health":
-                _write_json(self, 200, {"status": "ok", **controller.status()})
+            parsed = urlparse(self.path)
+            if parsed.path == "/health":
+                st = {"status": "ok", **controller.status()}
+                if scheduler is not None:
+                    st["scheduler"] = scheduler.status()
+                _write_json(self, 200, st)
+                return
+            if parsed.path == "/container_plan":
+                if scheduler is None:
+                    _write_json(self, 200, {"target": 0})
+                    return
+                raw = parse_qs(parsed.query).get("job", ["0"])[0]
+                ji = int(raw) if raw.lstrip("-").isdigit() else 0
+                _write_json(self, 200, {"job": ji, "target": scheduler.plan(ji)})
                 return
             _write_json(self, 404, {"error": "not_found"})
 
