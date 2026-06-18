@@ -12,7 +12,7 @@ ExecStart=%h/mnt/8tb/peetsfea-runner/.venv/bin/python -m peetsfea_runner.edt_con
 Environment=EDT_ROLE=keeper
 # keeper도 자원 시계열(resource_snapshots)을 OLTP store에 쓴다 → 분리 후 PG 백엔드 필요.
 Environment=EDT_STORE_BACKEND=postgres
-Environment=EDT_PG_DSN=host=127.0.0.1 port=5433 dbname=peetsfea user=peets
+Environment=EDT_PG_DSN=postgresql://peets@127.0.0.1:5433/peetsfea
 Environment=EDT_SSH_HOST=gate1-harry261
 Environment=EDT_JOB_COUNT=9
 Restart=always
