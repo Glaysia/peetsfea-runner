@@ -9,7 +9,9 @@
 - `PLANS/peetsfea_runner.md` — runner 쪽 peetsfea 연동 책임
 - `AGENTS.md` — 저장소 작업 규칙(실행=systemctl, 타입체킹, 의존성 등)
 - `docs/architecture/new-architecture.html` — 신규 아키텍처 시각화
+- `PLANS/job_birth_controller.html` — 현재 잡 출생/롤링 제어 시각화
 
 ## 비고
 - 옛 50-worker lease/worker 아키텍처를 설명하던 `SPECS/*`, roadmap, legacy docs는 혼동 방지를 위해 제거했다.
+- HTML 문서는 현역 2개만 유지한다: `docs/architecture/new-architecture.html`, `PLANS/job_birth_controller.html`.
 - 인프라/환경 사실(호스트·경로·라이선스·파티션 등)은 MASTER_PLAN **부록 A**로 보존했다.

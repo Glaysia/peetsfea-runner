@@ -59,24 +59,24 @@
 
 <header>
   <h1>peetsfea-runner — 신규 아키텍처</h1>
-  <p class="sub">edtmgr 기반 warm AEDT 풀 · 단일 계정 동시 ~100 시뮬 · 입력→시뮬→DB/대시보드→아카이브</p>
+  <p class="sub">edtmgr 기반 AEDT 오케스트레이터 · 단일 계정 동시 ~100 시뮬 · 입력→시뮬→DB/대시보드→아카이브</p>
   <p style="margin-top:10px">
     <span class="tag new">신규 아키텍처(레거시 대체)</span>
-    <span class="tag">peetsfea <b>0.3.6</b> 가동 · 0.3.7 예정</span>
-    <span class="tag ok">동시 ~88 = 컨테이너 8~9 × 슬롯 11</span>
+    <span class="tag">peetsfea <b>0.3.7</b> 계열 가동</span>
+    <span class="tag ok">롤링 잡 11개까지 보강 · 목표 solve 100</span>
   </p>
-  <p class="sub">기준 문서: <code>PLANS/MASTER_PLAN.md</code> · 실측 진단/시계열 설계: <code>PLANS/v037_ops_dashboard.html</code></p>
+  <p class="sub">기준 문서: <code>PLANS/MASTER_PLAN.md</code> · 현재 잡 출생 제어: <code>PLANS/job_birth_controller.html</code></p>
 </header>
 
 <div class="card" style="border-color:#4b3a6e">
-  <h3 style="margin-top:0;color:var(--violet)">현재 운영 실측 (2026-06-17, peetsfea 0.3.6)</h3>
-  <p class="muted" style="font-size:13.5px">아래 1~6은 최초 설계도다. <b>실가동에서 바뀐 핵심</b>은 다음과 같다(상세·실패진단은 <code>PLANS/v037_ops_dashboard.html</code>):</p>
+  <h3 style="margin-top:0;color:var(--violet)">현재 운영 핵심 (2026-06-19)</h3>
+  <p class="muted" style="font-size:13.5px">아래 1~6은 최초 설계도다. 실가동에서 바뀐 핵심은 이 문서와 <code>PLANS/job_birth_controller.html</code>에만 남긴다.</p>
   <ul style="font-size:13.5px">
-    <li><b>슬롯 = process-per-slot</b>: edtmgr warm-pool 대여 대신, 컨테이너마다 <b>단일슬롯 워커 11개를 별도 OS 프로세스</b>로 spawn(pyaedt Desktop은 프로세스 전역 싱글톤이라 1프로세스=1AEDT). baseline 전역 샘플링으로 <b>자기공급</b>(Intake 없이도 상시 시뮬).</li>
-    <li><b>단일 로컬 DB 토폴로지</b>: 슈퍼컴엔 DB 없음. 컨테이너가 결과를 gate 경유 <b>역터널(:7876 JSON, :7877 대용량)</b>로 로컬 데몬에 push. 컨트롤 플레인은 로컬 systemd <code>--user</code>.</li>
-    <li><b>GPU 자동 가속</b>: gpu* 파티션에 <code>--gres=gpu:2</code> + 워커별 <code>CUDA_VISIBLE_DEVICES</code> 핀닝. 실측 성공의 41%가 GPU(RTX3090) 사용.</li>
-    <li><b>파티션 = cpu2 + gpu1만</b>: gpu2/3/4/6은 타 유저 점유로 예상시작 13~36h(영구 PENDING) → 여유 있는 두 파티션으로 제한해 8~9잡 즉시 가동.</li>
-    <li><b>잡 수명 15h</b>(10h×1.5), <b>seed 대역 잡별 분리</b>(중복탐색 제거), <b>keep-best</b>(성공 보호).</li>
+    <li><b>1솔브 = 1 enroot 컨테이너</b>: 잡 내부 서브 오케스트레이터가 N개의 단명 컨테이너를 stagger 가동한다. 각 컨테이너는 <code>EDT_SLOT_COUNT=1</code>, <code>EDT_MAX_SIMS=1</code>로 1건 처리 후 종료한다.</li>
+    <li><b>잡 출생 제어</b>: 잡 1~7개는 1분마다 +1 순증, 정상 단계는 10분마다 최소-live 잡 1개를 내리고 최대 4개를 제출해 11개까지 보강한다.</li>
+    <li><b>N 결정</b>: 새 잡은 현재 <code>elec_solve_hfss</code> 실측을 보고 LUT로 컨테이너 수를 정한다. 100 근처는 N=12, 120 초과는 N=1로 밀도를 낮춘다.</li>
+    <li><b>데이터 플레인</b>: 슈퍼컴엔 DB 없음. 컨테이너가 결과를 gate 경유 역터널(:7876 JSON, :7877 대용량)로 로컬 데몬에 push한다.</li>
+    <li><b>운영 파티션</b>: 제출 런처는 cpu2/gpu1을 우선 사용하고, gpu* 잡은 <code>--gres=gpu:2</code>와 <code>CUDA_VISIBLE_DEVICES</code> 핀닝으로 GPU를 분산한다.</li>
   </ul>
 </div>
 
@@ -237,7 +237,7 @@
   </div>
   <div class="card">
     <h3>대시보드 :8080 <span class="tag ok">가동</span></h3>
-    <p>결과 DB + <b>컨테이너별 실시간 부하</b>(ResourcePoller: scontrol·lmstat 폴링)를 <b>읽기 전용</b> 시각화(개요·컨테이너 부하·입출력·실패 탭). <b class="tag warn">0.3.7</b>: x축=시간 <b>시계열 탭</b>(처리량·CPU/GPU/RAM·큐·라이선스) — 설계 <code>PLANS/v037_ops_dashboard.html</code>.</p>
+    <p>결과 DB + <b>컨테이너별 실시간 부하</b>(ResourcePoller: scontrol·lmstat 폴링)를 <b>읽기 전용</b> 시각화한다. 개요, 컨테이너 부하, 입출력 데이터셋, 실패, 자원 시계열을 이 한 화면에서 본다.</p>
   </div>
   <div class="card">
     <h3>아카이브 <span class="tag new">신규</span></h3>
