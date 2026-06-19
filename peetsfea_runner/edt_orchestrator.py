@@ -178,6 +178,22 @@ class JobOrchestrator:
                     return True
         return False
 
+    def _cancel_stuck_pending_jobs(self) -> int:
+        """PENDING reason이 None 계열이 아니면 cap과 무관하게 즉시 큐에서 제거한다."""
+        cancelled = 0
+        for i in list(self._jobs):
+            handle = self._jobs[i]
+            if not self.launcher.is_alive(handle) or self._is_running(handle):
+                continue
+            if not _pending_is_stuck(self._pending_reason(handle)):
+                continue
+            self._cancel_pending(handle)
+            self._avoid_node(handle)
+            del self._jobs[i]
+            self.cancellations += 1
+            cancelled += 1
+        return cancelled
+
     def _current_solve(self) -> int:
         if self.solve_provider is None:
             return 0
@@ -208,6 +224,7 @@ class JobOrchestrator:
         with self._lock:
             now = self.clock()
             self._cleanup_finished_and_expired(now)
+            self._cancel_stuck_pending_jobs()
             if not force_tick and (now - self._last_control) < self.control_period_seconds:
                 return
 

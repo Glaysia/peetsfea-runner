@@ -113,6 +113,23 @@ def test_managed_loop_caps_squeue_at_fifteen() -> None:
     assert orch.running_count() == 15
 
 
+def test_managed_loop_cancels_non_none_pending_reason_every_poll() -> None:
+    orch, launcher, clock = _managed()
+    orch.ensure_running()
+    stuck = orch.handles()[0]
+    launcher.reason[stuck.slurm_id] = "Priority"
+
+    clock.t = 10.0
+    orch.poll()
+
+    assert launcher.cancels == 1
+    assert launcher.kills == 0
+    assert stuck.node in launcher.avoided
+    assert launcher.alive[stuck.slurm_id] is False
+    assert launcher.submits == 4
+    assert orch.running_count() == 3
+
+
 def test_managed_loop_stuck_at_cap_replaces_one_job() -> None:
     orch, launcher, clock = _managed()
     orch.ensure_running()
@@ -131,8 +148,8 @@ def test_managed_loop_stuck_at_cap_replaces_one_job() -> None:
     orch.poll()
 
     assert launcher.kills == before_kills + 1
-    assert launcher.cancels == 0
-    assert launcher.submits == before_submits + 1
+    assert launcher.cancels == 1
+    assert launcher.submits == before_submits + 2
     assert orch.running_count() == 15
 
 

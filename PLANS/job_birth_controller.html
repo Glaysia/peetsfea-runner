@@ -38,6 +38,7 @@
 <li><b>잡 = 출생 시 컨테이너 N개(≤20)</b> 가동. 수명 <b>최대 20분</b>.</li>
 <li><b>제어 루프는 잡 수 구간을 보지 않는다.</b> 4분마다 같은 행동을 반복한다.</li>
 <li><b>squeue 상한은 15개</b>이며, 정상상태 목표는 <b>RUNNING 10개 + PENDING 5개</b>다.</li>
+<li><b>PENDING 버퍼는 reason=None만 인정한다.</b> PENDING 잡의 REASON이 빈값/None/null/(null)/pending이 아니면 즉시 stuck으로 보고 취소한다.</li>
 <li>목표: <b>동시 솔브 100에 수렴.</b> 잡 제출은 노드별 균등 분산이 필요하다.</li>
 </ul>
 
@@ -48,7 +49,13 @@
   <span class="box ok">새 잡 4개 제출</span><span class="arr">→</span>
   <span class="box">squeue 최대 15</span>
 </div>
-<pre>every 4 minutes:
+<pre>every poll:
+    for job in pending_jobs:
+        if pending_reason(job) not in {"", "None", "null", "(null)", "pending"}:
+            cancel_pending_job(job)          # Priority/Resources/ReqNodeNotAvail 등은 즉시 제거
+            avoid_node_if_known(job)
+
+every 4 minutes:
     if squeue_count >= 15 and queue_is_stuck:
         stop_oldest_running_job()
         submit_jobs(1, spread="node-even")
@@ -65,6 +72,7 @@ target steady state:
 <li><b>잡 수 구간 없음:</b> 램프/정상 단계를 나누지 않고 매 tick 같은 루틴을 실행한다.</li>
 <li><b>종료 후보:</b> 현재 켜져 있는 RUNNING 잡 중 가장 오래된 잡 1개를 내린다.</li>
 <li><b>제출:</b> 매 tick 새 잡 4개를 요청하되, 후보 노드를 한쪽으로 몰지 않고 노드별로 균등 분산한다.</li>
+<li><b>PENDING 필터:</b> REASON이 <code>None</code> 계열인 잡만 정상 대기열로 남긴다. <code>Priority</code>, <code>Resources</code>, <code>ReqNodeNotAvail</code> 등은 정상 버퍼가 아니므로 cap과 무관하게 바로 <code>scancel</code>한다.</li>
 <li><b>stuck 회복:</b> squeue가 15개로 꽉 찼는데 진행이 막히면 가장 늙은 잡 1개를 내리고 추가 잡 1개만 요청한다.</li>
 <li><b>잡 수명 20분</b> = 하드 상한(그 전에 틱 교체/드레인되면 더 일찍 종료). 종료 시 AEDT·pyaedt·터널 소멸 → 누수 회수.</li>
 <li>새 잡마다 컨테이너 수 N은 출생 시 LUT(§3)로 결정.</li>
@@ -109,7 +117,7 @@ else             : N = 10</pre>
 <h2>6. 구현 포인트</h2>
 <table>
 <tr><th>레이어</th><th>변경</th></tr>
-<tr><td><b>제어기(루프)</b></td><td>잡 수 구간을 보지 않고 <b>4분마다 가장 늙은 잡 1개 종료 + 새 잡 4개 제출</b>. squeue 총량은 15개로 제한하고, stuck 시 1개 종료 + 1개 요청.</td></tr>
+<tr><td><b>제어기(루프)</b></td><td>잡 수 구간을 보지 않고 <b>4분마다 가장 늙은 잡 1개 종료 + 새 잡 4개 제출</b>. squeue 총량은 15개로 제한한다. PENDING reason이 None 계열이 아니면 즉시 취소하고, cap 15에서 stuck이면 1개 종료 + 1개 요청.</td></tr>
 <tr><td><b>orchestrator</b></td><td>출생 시 N 받아 <b>1솔브 컨테이너 N개</b> stagger 가동(respawn 없음). <code>EDT_JOB_TTL_SEC=1200</code> 또는 제어기 종료신호 시 진행 솔브 마치고 안전종료 → 잡 exit. /enroot 정리 trap 유지.</td></tr>
 <tr><td><b>keeper</b></td><td>노드별 균등 분산으로 제출하고, 정상상태 RUNNING 10 + PENDING 5를 유지한다. 12분마다 solve &gt;150 포화 감압을 수행한다.</td></tr>
 </table>
