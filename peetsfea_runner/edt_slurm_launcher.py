@@ -90,7 +90,7 @@ class SlurmJobLauncher:
     # 롤링 라이프사이클: 잡 출생 시 제어기가 LUT로 결정한 컨테이너 수 N을 주입(EDT_JOB_CONTAINERS).
     # None이면 미주입(orchestrator가 /job_plan 조회 또는 기본값). job_ttl_seconds=잡 수명(orchestrator self-exit).
     container_count_provider: Callable[[], int] | None = None
-    job_ttl_seconds: int = 1800
+    job_ttl_seconds: int = 1200  # 잡 수명 20분 (롤링 교체 10분 주기와 짝)
     _avoid: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
     def _seed_epoch(self) -> int:

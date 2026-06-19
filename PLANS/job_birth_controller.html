@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>제어 로직 — 15분 롤링 교체 · 30분 잡 · 100 수렴</title>
+<title>제어 로직 — 10분 롤링 교체 · 20분 잡 · 100 수렴</title>
 <style>
   :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
   *{box-sizing:border-box}
@@ -29,36 +29,36 @@
 <body>
 <div class="wrap">
 
-<h1>제어 로직 — 15분 롤링 교체 · 30분 잡 · 동시 솔브 100 수렴</h1>
+<h1>제어 로직 — 10분 롤링 교체 · 20분 잡 · 동시 솔브 100 수렴</h1>
 <p class="sub">컨테이너 1솔브=죽음 · 잡당 최대 20 · 로드밸런싱 없음 · 2026-06-19</p>
 
 <h2>1. 모델 한눈에</h2>
 <ul>
 <li><b>컨테이너 = 1 솔브 = 죽음.</b> 재가동(respawn) 없음 → 잡의 살아있는 컨테이너는 시간이 지나며 <b>줄어든다(드레인)</b>.</li>
-<li><b>잡 = 출생 시 컨테이너 N개(≤20)</b> 가동. 수명 <b>최대 30분</b>.</li>
-<li><b>제어 루프 = 최대 15분 주기</b>로 롤링 교체. 항상 ~9잡 유지.</li>
+<li><b>잡 = 출생 시 컨테이너 N개(≤20)</b> 가동. 수명 <b>최대 20분</b>.</li>
+<li><b>제어 루프 = 10분 주기</b>로 롤링 교체. 항상 ~9잡 유지.</li>
 <li>목표: <b>동시 솔브 100에 수렴.</b> 로드밸런싱 없음(SLURM 배치에 맡김).</li>
 </ul>
 
 <h2>2. 제어 루프 (핵심)</h2>
 <div class="flow">
-  <span class="box">15분(또는 더 빨리)마다</span><span class="arr">→</span>
+  <span class="box">10분마다(또는 드레인 시)</span><span class="arr">→</span>
   <span class="box">살아있는 컨테이너 <b>가장 적게 남은 잡</b> 선택</span><span class="arr">→</span>
   <span class="box bad">그 잡 안전종료</span><span class="arr">→</span>
   <span class="box">제어기 <b>N 결정</b></span><span class="arr">→</span>
-  <span class="box ok">새 30분 잡(N) 제출</span>
+  <span class="box ok">새 20분 잡(N) 제출</span>
 </div>
-<pre>제어 틱 주기 = 최대 15분.
-  단 어떤 잡의 컨테이너가 다 끝나(드레인) 자리가 비면 15분 전이라도 즉시 틱.
+<pre>제어 틱 주기 = 10분(어떤 잡이 드레인되면 더 빨리).
+  9잡일 때: 최소 컨테이너 잡 1개 탈락 + 1개 제출. 9 미만이면 9까지 채움(최대 2개).
 
 매 틱:
   J = 살아있는 컨테이너가 가장 적은 RUNNING 잡   # 가장 많이 끝난 잡(손실 최소)
   safe_stop(J)                                   # 남은 소수 컨테이너만 안전종료
   N = decide_N()                                 # 아래 공식
-  submit_job(ttl=30min, containers=N)</pre>
+  submit_job(ttl=20min, containers=N)</pre>
 <ul>
 <li><b>가장 적게 남은 잡을 끔</b> → 거의 끝난 잡이라 중단해도 in-flight 손실 최소.</li>
-<li><b>잡 수명 30분</b> = 하드 상한(그 전에 틱으로 교체되거나 드레인되면 더 일찍 종료). 종료 시 AEDT·pyaedt·터널 소멸 → 누수 회수.</li>
+<li><b>잡 수명 20분</b> = 하드 상한(그 전에 틱으로 교체되거나 드레인되면 더 일찍 종료). 종료 시 AEDT·pyaedt·터널 소멸 → 누수 회수.</li>
 <li>틱마다 1개 종료 + 1개 출생 → <b>출생/사망이 시간축에 분산(stagger)</b> → gRPC 동시 herd 제거.</li>
 </ul>
 
@@ -83,14 +83,14 @@ N = clamp(round(N), 1, 20)</pre>
 <h2>4. herd 방지 (컨테이너 출생 stagger)</h2>
 <div class="card">
 잡이 N개를 <b>한꺼번에</b> 켜면 그 노드에서 AEDT N개 동시 기동 → 방금 본 gRPC 행 재발.
-→ orchestrator는 N개를 <b>1개씩 간격 두고</b> 가동(노드당 콜드스타트중 ≤2~3).
+→ orchestrator는 N개를 <b>1개씩 간격 두고</b> 가동(노드당 동시 콜드스타트 ≤ EDT_COLD_CAP=10).
 </div>
 
 <h2>5. 구현 포인트</h2>
 <table>
 <tr><th>레이어</th><th>변경</th></tr>
-<tr><td><b>제어기(루프)</b></td><td>최대 15분 주기 틱(잡 드레인 시 조기 발동). 폴러로 잡별 살아있는 컨테이너 수 집계 → 최소 잡 선택·중단, <code>decide_N()</code>로 새 잡 제출.</td></tr>
-<tr><td><b>orchestrator</b></td><td>출생 시 N 받아 <b>1솔브 컨테이너 N개</b> stagger 가동(respawn 없음). <code>EDT_JOB_TTL_SEC=1800</code> 또는 제어기 종료신호 시 진행 솔브 마치고 안전종료 → 잡 exit. /enroot 정리 trap 유지.</td></tr>
+<tr><td><b>제어기(루프)</b></td><td>10분 주기 틱(잡 드레인 시 조기 발동). 폴러로 잡별 살아있는 컨테이너 수 집계 → 최소 잡 선택·중단, <code>decide_N()</code>로 새 잡 제출.</td></tr>
+<tr><td><b>orchestrator</b></td><td>출생 시 N 받아 <b>1솔브 컨테이너 N개</b> stagger 가동(respawn 없음). <code>EDT_JOB_TTL_SEC=1200</code> 또는 제어기 종료신호 시 진행 솔브 마치고 안전종료 → 잡 exit. /enroot 정리 trap 유지.</td></tr>
 <tr><td><b>keeper</b></td><td>잡 9개 유지를 제어 루프가 담당(종료 1 + 제출 1). 일괄 재시작 금지.</td></tr>
 </table>
 

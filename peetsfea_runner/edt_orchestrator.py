@@ -61,7 +61,7 @@ class JobOrchestrator:
     # 롤링 교체(최대 roll_period_seconds=15분 주기, 잡 드레인 시 더 빨리): **살아있는 컨테이너가 가장 적은**
     # RUNNING 잡을 안전종료 → 빈 슬롯을 새 잡(제어기 LUT로 N 결정)으로 채움 → 출생/사망 stagger(herd 차단).
     # live_count_provider(slurm_id) = 제어기 보고 기반 살아있는 컨테이너 수(-1=미보고). None이면 롤 비활성.
-    roll_period_seconds: float = 900.0
+    roll_period_seconds: float = 600.0  # 10분마다 살아있는 컨테이너 가장 적은 잡 1개 탈락 → 9 유지하게 채움
     live_count_provider: Callable[[str], int] | None = None
     submitted: int = field(default=0, init=False)
     restarts: int = field(default=0, init=False)  # 죽어서 재기동한 횟수
