@@ -64,7 +64,7 @@
   <p style="margin-top:10px">
     <span class="tag new">현행 운영 기준</span>
     <span class="tag warn">상시 예열 풀 폐기</span>
-    <span class="tag ok">squeue 15 · RUNNING 10 + PENDING 5</span>
+    <span class="tag ok">squeue 15 · avg RUNNING 9 · AEDT 120</span>
   </p>
   <p class="sub">기준 문서: <code>PLANS/MASTER_PLAN.md</code> · 현재 잡 출생 제어: <code>PLANS/job_birth_controller.html</code></p>
 </header>
@@ -74,12 +74,12 @@
   <ul style="font-size:13.5px">
     <li><b>한 번 돌고 완전히 꺼진다</b>: 단일 컨테이너는 <code>EDT_SLOT_COUNT=1</code>, <code>EDT_MAX_SIMS=1</code>로 1건만 처리하고 종료한다. 프로세스, pyaedt 세션, 임시 디렉터리, 마운트 상태를 다음 솔브로 가져가지 않는다.</li>
     <li><b>상시 예열 풀은 현행에서 쓰지 않는다</b>: edtmgr로 AEDT를 계속 붙잡아 두는 방식보다, 매 솔브마다 프로세스와 컨테이너를 닫아 누수와 세션 오염을 끊는 것을 우선한다.</li>
-    <li><b>잡 출생 제어</b>: 잡 수 구간을 나누지 않고 2분마다 홀짝 tick을 실행한다. 홀수 tick은 새 잡 4개 제출만, 짝수 tick은 가장 늙은 RUNNING 잡 1개 종료만 수행한다. squeue는 최대 15개, 정상 목표는 RUNNING 10 + PENDING 5다.</li>
+    <li><b>잡 출생 제어</b>: 잡 수 구간을 나누지 않고 2분마다 홀짝 tick을 실행한다. 홀수 tick은 새 잡 4개 제출만, 짝수 tick은 가장 늙은 RUNNING 잡 1개 종료만 수행한다. 단 RUNNING 9개 미만이면 짝수 tick 종료를 건너뛴다.</li>
     <li><b>PENDING 정리</b>: PENDING reason이 빈값/None/null/(null)/pending이 아니면 정상 대기열로 보지 않는다. Priority/Resources/ReqNodeNotAvail 등은 cap과 무관하게 즉시 취소한다.</li>
     <li><b>N 결정</b>: 새 잡은 현재 <code>elec_solve_hfss</code> 실측을 보고 계단형 LUT로 컨테이너 수를 정한다. 0~90은 20, 100은 15, 이후 10 solve마다 1씩 낮춰 150 이상은 10으로 둔다.</li>
     <li><b>포화 감압</b>: 2분 루프 여섯 번마다 라이선스 사용량을 확인하고, solve가 150을 넘으면 가장 늙은 RUNNING 잡 1개를 추가로 내린다.</li>
     <li><b>데이터 플레인</b>: 슈퍼컴엔 DB 없음. 컨테이너가 결과를 gate 경유 역터널(:7876 JSON, :7877 대용량)로 로컬 데몬에 push한다.</li>
-    <li><b>운영 파티션</b>: 제출 런처는 cpu2/gpu1을 우선 사용하고, gpu* 잡은 <code>--gres=gpu:2</code>와 <code>CUDA_VISIBLE_DEVICES</code> 핀닝으로 GPU를 분산한다.</li>
+    <li><b>운영 파티션</b>: 제출 런처는 <code>cpu2,gpu1,gpu2,gpu3</code>를 사용한다. gpu* 잡은 <code>--gres=gpu:1</code>, <code>--cpus-per-task=24</code>, <code>--mem=384G</code>로 백필 폭을 넓힌다.</li>
   </ul>
 </div>
 
@@ -121,7 +121,7 @@
     <rect x="814" y="26" width="202" height="76" rx="9" fill="#1f232c" stroke="#2c313c"></rect>
     <text x="828" y="52" class="svglabel">SLURM squeue</text>
     <text x="828" y="72" class="svgsub">최대 15</text>
-    <text x="828" y="88" class="svgsub">RUNNING 10 + PENDING 5(None만)</text>
+    <text x="828" y="88" class="svgsub">avg RUNNING 9 · PENDING None만</text>
     <line x1="772" y1="64" x2="812" y2="64" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
 
     <rect x="24" y="140" width="700" height="318" rx="12" fill="#15181f" stroke="#2c313c"></rect>
@@ -189,12 +189,12 @@
 <table>
   <tr><th>단위</th><th>현행 값</th><th>비고</th></tr>
   <tr><td>계정(account)</td><td>1개</td><td>단일 계정 기준. 다계정 확장은 현재 범위 밖.</td></tr>
-  <tr><td>잡(SLURM sbatch)</td><td>squeue 최대 15개</td><td>정상 목표는 RUNNING 10개 + PENDING 5개. PENDING은 reason None 계열만 인정하며, Priority/Resources 등은 즉시 취소. 제출은 노드별 균등 분산.</td></tr>
+  <tr><td>잡(SLURM sbatch)</td><td>squeue 최대 15개</td><td>평균 RUNNING 9개와 AEDT/solve 120개를 목표로 한다. PENDING은 reason None 계열만 인정하며, Priority/Resources 등은 즉시 취소. 제출은 노드별 균등 분산.</td></tr>
   <tr><td>잡 수명</td><td>최대 20분</td><td>2분 홀짝 루프에서 더 일찍 내려갈 수 있다. 종료 시 진행 중 컨테이너와 AEDT도 같이 정리된다.</td></tr>
   <tr><td>컨테이너 수 N</td><td>잡 출생 시 10~20개</td><td>현재 solve 실측을 LUT로 읽어 결정. 컨테이너 출생은 stagger로 분산.</td></tr>
   <tr><td>AEDT 실행 단위</td><td>컨테이너당 1회</td><td><code>EDT_SLOT_COUNT=1</code>, <code>EDT_MAX_SIMS=1</code>. 완료 후 재사용 없이 종료.</td></tr>
   <tr><td>동시 실행 목표</td><td>solve 100 근처</td><td>과포화는 LUT와 12분 감압으로 낮춘다. solve &gt;150이면 가장 늙은 잡을 추가 종료.</td></tr>
-  <tr><td>워커 GPU</td><td>gpu1: 2 (gres)</td><td>워커별 <code>CUDA_VISIBLE_DEVICES=idx%2</code> 핀닝 · cpu2는 CPU only.</td></tr>
+  <tr><td>워커 GPU</td><td>gpu*: 1 (gres)</td><td>gpu 파티션은 <code>gpu:1</code>, 24 CPU, 384G로 요청한다. cpu2는 CPU only.</td></tr>
 </table>
 
 <h2>3. 왜 완전 종료인가</h2>
@@ -235,7 +235,8 @@ every 2 minutes:
     if tick_number is odd:
         submit_jobs(4, spread="node-even", squeue_cap=15)
     else:
-        stop_oldest_running_job()
+        if running_jobs >= 9:
+            stop_oldest_running_job()
 
 every sixth tick:
     if license_solve_in_use > 150:

@@ -14,7 +14,8 @@
 - 매 2분마다 짝수 tick은 가장 늙은 RUNNING 잡 1개 종료만 수행한다.
 - 제출은 노드별 균등 분산이 필요하다.
 - `squeue` 총량 상한은 15개다.
-- 정상상태 목표는 RUNNING 10개 + PENDING 5개다.
+- 최근 운영 목표는 평균 RUNNING 9개 + 평균 AEDT/solve 120개다.
+- RUNNING 9개 미만이면 짝수 tick의 가장 늙은 잡 종료를 건너뛴다.
 - `squeue`가 15개로 꽉 찬 상태에서 stuck이면 가장 늙은 RUNNING 잡 1개 종료 + 새 잡 1개 요청으로 회복한다.
 - 잡 TTL은 최대 20분으로 유지한다.
 - 2분 루프 6회마다, 즉 12분마다 포화 제어를 평가한다.
@@ -31,7 +32,7 @@
 
 ## 주요 수정 대상
 - `peetsfea_runner/edt_orchestrator.py`: 1~7 램프/10분 롤링/최소-live 제거, 2분 홀짝 루프 구현.
-- `peetsfea_runner/edt_slurm_launcher.py`: squeue 15, node-even 제출, stuck 회복에 필요한 상태/API 보강.
+- `peetsfea_runner/edt_slurm_launcher.py`: squeue 15, node-even 제출, cpu2/gpu1/gpu2/gpu3 후보, gpu:1 백필 요청, stuck 회복에 필요한 상태/API 보강.
 - `peetsfea_runner/edt_control_plane.py` 및 resource provider: solve 실측을 LUT/포화 제어에 공급.
 - `tests/test_edt_orchestrator.py`, `tests/test_edt_slurm_launcher.py`: 새 정책 기준으로 갱신.
 

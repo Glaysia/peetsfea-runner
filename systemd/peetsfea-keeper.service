@@ -1,5 +1,5 @@
 [Unit]
-Description=Peets FEA — 컨테이너 유지 (4분 잡 출생 제어 + 단명 enroot 컨테이너)
+Description=Peets FEA — 컨테이너 유지 (2분 홀짝 잡 제어 + 단명 enroot 컨테이너)
 After=network-online.target peetsfea-pg.service
 Wants=network-online.target peetsfea-pg.service
 

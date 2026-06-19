@@ -67,26 +67,27 @@ def test_seed_epoch_provider_failure_falls_back_to_zero() -> None:
     assert "export EDT_BASELINE_SEED_EPOCH=0" in runner.calls[-1][1]  # type: ignore[operator]
 
 
-def test_cpus_per_partition_cpu2_48_other_32() -> None:
+def test_cpus_per_partition_cpu2_48_other_24() -> None:
     runner = FakeRunner()
     runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")
     # cpu2 → 48
     _launcher(runner, partitions=("cpu2",)).submit(0)
     assert "#SBATCH --cpus-per-task=48" in runner.calls[-1][1]  # type: ignore[operator]
-    # 그 외(gpu4) → 32
+    # 그 외(gpu4) → 24
     _launcher(runner, partitions=("gpu4",)).submit(0)
-    assert "#SBATCH --cpus-per-task=32" in runner.calls[-1][1]  # type: ignore[operator]
+    assert "#SBATCH --cpus-per-task=24" in runner.calls[-1][1]  # type: ignore[operator]
     assert "#SBATCH --partition=gpu4" in runner.calls[-1][1]  # type: ignore[operator]
+    assert "#SBATCH --mem=384G" in runner.calls[-1][1]  # type: ignore[operator]
 
 
 def test_gpu_partition_requests_gres_cpu2_does_not() -> None:
     runner = FakeRunner()
     runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")
-    # gpu* → --gres=gpu:2 요청 + EDT_GPU_COUNT=2 (백필 가능 + 워커 GPU 핀닝)
+    # gpu* → --gres=gpu:1 요청 + EDT_GPU_COUNT=1 (백필 가능성 우선)
     _launcher(runner, partitions=("gpu1",)).submit(0)
     gpu_script = runner.calls[-1][1]
-    assert "#SBATCH --gres=gpu:2" in gpu_script  # type: ignore[operator]
-    assert "export EDT_GPU_COUNT=2" in gpu_script  # type: ignore[operator]
+    assert "#SBATCH --gres=gpu:1" in gpu_script  # type: ignore[operator]
+    assert "export EDT_GPU_COUNT=1" in gpu_script  # type: ignore[operator]
     # cpu2 → gres 없음(GPU 없는 노드), EDT_GPU_COUNT=0
     _launcher(runner, partitions=("cpu2",)).submit(0)
     cpu_script = runner.calls[-1][1]
@@ -100,14 +101,23 @@ def test_random_partition_distribution() -> None:
     # 전 파티션을 chooser로 순회 — 분배가 파티션 인자로 반영되는지.
     launcher = SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0)
     seen = set()
-    seq = iter(["cpu2", "gpu1", "gpu2", "gpu6"])
+    seq = iter(["cpu2", "gpu1", "gpu2", "gpu3"])
     launcher.partition_chooser = lambda parts: next(seq)
     for _ in range(4):
         launcher.submit(0)
         seen.add(runner.calls[-1][1].split("--partition=")[1].split("\n")[0])  # type: ignore[union-attr]
-    assert {"cpu2", "gpu1", "gpu2", "gpu6"} <= seen
+    assert {"cpu2", "gpu1", "gpu2", "gpu3"} <= seen
     # 기본 파티션 후보에서 cpu1·gpu5 제외 확인
+    assert {"gpu2", "gpu3"} <= set(SlurmJobLauncher().partitions)
     assert "cpu1" not in SlurmJobLauncher().partitions and "gpu5" not in SlurmJobLauncher().partitions
+
+
+def test_mem_override_applies_to_all_partitions_for_verify_scripts() -> None:
+    runner = FakeRunner()
+    runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")
+    launcher = SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0, partitions=("gpu1",), mem="32G")
+    launcher.submit(0)
+    assert "#SBATCH --mem=32G" in runner.calls[-1][1]  # type: ignore[operator]
 
 
 def test_submit_failure_raises() -> None:
@@ -197,7 +207,7 @@ def test_node_based_weighted_cpu2_vs_gpu() -> None:
     SlurmJobLauncher(command_runner=r2, clock=lambda: 0.0, partitions=("cpu2", "gpu1"),
                      node_based=True, cpu2_weight=0.7, rng=lambda: 0.9).submit(0)
     s2 = _last_script(r2)
-    assert "--nodelist=n010" in s2 and "--partition=gpu1" in s2 and "--gres=gpu:2" in s2
+    assert "--nodelist=n010" in s2 and "--partition=gpu1" in s2 and "--gres=gpu:1" in s2
 
 
 def test_node_based_prefers_idle_over_mix() -> None:

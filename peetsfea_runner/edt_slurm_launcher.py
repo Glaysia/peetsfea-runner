@@ -27,10 +27,9 @@ _ACTIVE_STATES = frozenset({"RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "
 _SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 
 # 잡을 랜덤 분배하는 파티션(MASTER_PLAN §2.10 / Q5: 파티션별 성능 통계 자연 수집).
-# cpu2 + gpu1만 사용. 실측(2026-06-17): gpu2/gpu3/gpu4/gpu6은 타 유저 점유로 내 잡 예상시작이 13~36시간 뒤라
-# 사실상 영구 PENDING(처리량 1/3). cpu2(idle+mix 다수)와 gpu1(idle 2+mix 8, RTX3090)은 여유가 있어 즉시 스케줄된다.
-# gpu1으로 GPU 가속도 유지. 다른 파티션이 한가해지면 다시 추가 가능.
-DEFAULT_PARTITIONS: tuple[str, ...] = ("cpu2", "gpu1")
+# 최근 2시간(2026-06-19) 관측상 평균 RUNNING job이 4~5개에 묶였다. job당 AEDT 수는 충분하므로
+# cpu2/gpu1에 더해 MIX 여유가 보이는 gpu2/gpu3까지 후보를 넓혀 평균 RUNNING job 9개를 목표로 한다.
+DEFAULT_PARTITIONS: tuple[str, ...] = ("cpu2", "gpu1", "gpu2", "gpu3")
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,15 +61,17 @@ class SlurmJobLauncher:
     partitions: tuple[str, ...] = DEFAULT_PARTITIONS
     time_limit: str = "10:00:00"
     # cpus-per-task: cpu2 노드는 256코어지만 QOS cpu2_limit이 노드당 cpu=64로 하드캡(MaxTRESPerNode).
-    # 48로 운영(여유). 그 외 파티션(QOS normal)은 무제한이라 32.
+    # 48로 운영(여유). GPU 파티션은 MIX 노드 백필 확률을 높이기 위해 24로 낮춘다.
     cpus_cpu2: int = 48
-    cpus_other: int = 32
+    cpus_other: int = 24
     # gpu* 파티션은 노드당 GPU 4개. --gres=gpu:N을 요청해야 컨테이너가 GPU를 보고(peetsfea 0.3.6 자동감지),
     # 안 그러면 0 GPU 할당 → CPU fallback(느림). cpu2는 GPU 없으니 요청 안 한다.
-    # 2로 둔다: gpu:4를 요구하면 공유 클러스터에서 한 노드에 GPU 4개 동시확보가 어려워 잡이 무한 PENDING(백필 불가).
-    # gpu:2면 mix 노드의 빈 GPU에 백필돼 잡이 실제로 뜬다. 워커는 CUDA_VISIBLE_DEVICES=idx%2로 두 GPU에 분산.
-    gres_gpu_count: int = 2
-    mem: str = "480G"  # 전 파티션 노드 ≥768GB라 적재 가능
+    # gpu:2도 MIX 노드에서 자주 PENDING이 된다. 평균 RUNNING job 확보가 우선이라 gpu:1로 낮춰 백필 폭을 넓힌다.
+    gres_gpu_count: int = 1
+    mem_cpu2: str = "480G"
+    mem_other: str = "384G"
+    # 호환 override: 검증 스크립트가 mem="32G"처럼 직접 지정하면 파티션별 기본값보다 우선한다.
+    mem: str | None = None
     job_name_prefix: str = "peetsfea-edt"
     job_command: str = "echo placeholder-job; sleep 60"  # 실서비스는 enroot+entrypoint로 교체
     partition_chooser: Callable[[Sequence[str]], str] = random.choice
@@ -115,8 +116,14 @@ class SlurmJobLauncher:
     def _gpu_count_for(self, partition: str) -> int:
         return self.gres_gpu_count if partition.startswith("gpu") else 0
 
+    def _mem_for(self, partition: str) -> str:
+        if self.mem is not None:
+            return self.mem
+        return self.mem_cpu2 if partition == "cpu2" else self.mem_other
+
     def _sbatch_script(self, job_index: int, partition: str, cpus: int, *, node: str | None = None) -> str:
         gpus = self._gpu_count_for(partition)
+        mem = self._mem_for(partition)
         gres_line = f"#SBATCH --gres=gpu:{gpus}\n" if gpus > 0 else ""
         # node_based: 특정 노드에 핀(과적재 방지). 파티션은 노드가 속한 파티션으로 함께 지정.
         nodelist_line = f"#SBATCH --nodelist={node}\n" if node else ""
@@ -139,7 +146,7 @@ class SlurmJobLauncher:
             "#SBATCH --nodes=1 --ntasks=1\n"
             f"#SBATCH --cpus-per-task={cpus}\n"
             f"{gres_line}"
-            f"#SBATCH --mem={self.mem}\n"
+            f"#SBATCH --mem={mem}\n"
             f"export EDT_JOB_INDEX={job_index}\n"
             f"export EDT_PARTITION={partition}\n"
             # EDT_GPU_COUNT: 컨테이너 supervisor가 워커별 CUDA_VISIBLE_DEVICES=index%N 핀닝에 사용(GPU 분산).

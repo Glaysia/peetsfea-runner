@@ -60,6 +60,7 @@ class JobOrchestrator:
     squeue_cap: int = 15
     running_target: int = 10
     pending_target: int = 5
+    running_low_watermark: int = 9
     saturation_every_ticks: int = 6
     saturation_solve_ceiling: int = 150
     solve_provider: Callable[[], int] | None = None
@@ -157,6 +158,9 @@ class JobOrchestrator:
             if self.launcher.is_alive(h) and self._is_running(h)
         ]
 
+    def _running_item_count(self) -> int:
+        return len(self._running_items())
+
     def _oldest_running(self) -> tuple[int, JobHandle] | None:
         running = self._running_items()
         if not running:
@@ -243,7 +247,7 @@ class JobOrchestrator:
                 self._stuck_at_cap_recovery_pending = False
             elif next_tick % 2 == 1:
                 self._submit_until(self.squeue_cap, self.submit_batch_jobs)
-            else:
+            elif self._running_item_count() >= self.running_low_watermark:
                 self._stop_oldest_running()
             self._last_control = now
             self._control_ticks = next_tick
