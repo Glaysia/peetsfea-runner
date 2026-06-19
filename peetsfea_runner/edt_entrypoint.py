@@ -55,7 +55,14 @@ def _config_from_env() -> tuple[EdtServiceConfig, int]:
     work_dir = Path(work_dir_env).expanduser() if work_dir_env else output_root / "work"
     slot_count = int(os.environ.get("EDT_SLOT_COUNT", str(SLOTS_PER_CONTAINER)))
     ref_env = os.environ.get("EDT_REFERENCE_SWEEP")
-    reference_sweep_text = Path(ref_env).expanduser().read_text(encoding="utf-8") if ref_env else None
+    # Adaptive TOML registry mode: the server leases built-in/custom TOMLs by ratio.
+    # Workers must not run a separate built-in refiller, or the built-in TOML becomes a hidden extra lane.
+    use_registry_lease = bool(os.environ.get("EDT_PRIORITY_LEASE_URL"))
+    reference_sweep_text = (
+        Path(ref_env).expanduser().read_text(encoding="utf-8")
+        if ref_env and not use_registry_lease
+        else None
+    )
     max_sims = int(os.environ.get("EDT_MAX_SIMS", "0"))
     import socket
 

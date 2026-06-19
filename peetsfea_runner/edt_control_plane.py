@@ -3,7 +3,7 @@
 제어 호스트(systemd `--user` 서비스)가 돌리는 상시 루프:
 - **오케스트레이터:** HTML 정책 기준으로 2분마다 홀수 tick은 새 잡 제출, 짝수 tick은 oldest 종료를 수행한다.
   잡 내부에서는 `deploy/orchestrator.sh`가 1솔브 단명 enroot 컨테이너 N개를 stagger 가동한다.
-- **Intake :7875:** sweep 우선순위 요청 수신(우선순위 분배는 후속 — 현재는 baseline 자기공급이 핵심).
+- **Adaptive TOML Registry :7875:** built-in + custom TOML active pool과 ratio를 영속 관리한다.
 - **대시보드 :8080:** 결과 DB read-only 조회 + `results.csv`.
 - **아카이브:** 완료 project_dir를 20GB 묶음 압축, 2TB FIFO.
 
@@ -29,7 +29,6 @@ from .constants import ARCHIVE_BUFFER_BYTES, JOBS_PER_ACCOUNT
 from .edt_archive import ArchiveStore
 from .edt_bulk_transfer import DEFAULT_BULK_PORT, start_bulk_transfer_server
 from .edt_dashboard import start_dashboard_server
-from .edt_intake import IntakeService, start_intake_server
 from .edt_license_ctrl import (
     DEFAULT_LICENSE_CTRL_PORT,
     ContainerScheduler,
@@ -47,7 +46,8 @@ from .edt_resources import (
 from .edt_result_ingest import DEFAULT_INGEST_PORT, start_result_ingest_server
 from .edt_slurm_launcher import SlurmJobLauncher
 from .edt_ssh_tunnel import SshTunnel, reverse_tunnel_argv
-from .single_simulation_store import DbPriorityQueue, SingleSimulationResultStore, make_result_store
+from .edt_toml_registry import TomlRegistryService, load_default_builtin_toml_text, start_toml_registry_server
+from .single_simulation_store import DbTomlRegistry, SingleSimulationResultStore, make_result_store
 
 
 @dataclass(slots=True)
@@ -60,7 +60,7 @@ class ControlPlaneConfig:
     # 잡 내부 서브 오케스트레이터: 1솔브 단명 enroot 컨테이너 N개를 띄우고 respawn 없이 종료.
     job_command: str = "bash $HOME/edt-deploy/orchestrator.sh"
     dashboard_port: int = 8080
-    intake_port: int = 7875
+    intake_port: int = 7875  # historical env name; this now serves Adaptive TOML Registry.
     ingest_port: int = DEFAULT_INGEST_PORT  # 슈퍼컴 전용 결과 백채널(역터널로만 도달).
     bulk_port: int = DEFAULT_BULK_PORT  # 슈퍼컴 전용 대용량 산출물 백채널(역터널로만 도달).
     priority_lease_port: int = DEFAULT_PRIORITY_LEASE_PORT  # 슈퍼컴 전용 우선순위 분배 백채널(역터널로만 도달).
@@ -78,13 +78,14 @@ class ControlPlaneConfig:
     # 대시보드는 이 포트로 프록시한다. 같은 호스트의 로컬 루프백.
     resource_port: int = DEFAULT_RESOURCE_PORT
     resources_db_path: Path | None = None  # control측 자원 시계열 전용 소형 DB(미지정 시 db_path 옆 .resources).
+    builtin_toml_path: Path | None = None
 
 
 @dataclass
 class ControlPlane:
     orchestrator: JobOrchestrator
     store: SingleSimulationResultStore
-    intake: IntakeService
+    toml_registry: TomlRegistryService
     archive_store: ArchiveStore
     dashboard_port: int
     intake_port: int
@@ -235,14 +236,16 @@ class ControlPlane:
                 store=self.store, port=self.dashboard_port, resource_provider=provider, history_provider=history,
                 peetsfea_version=self.dashboard_peetsfea_version,
             )
-            intake_server = start_intake_server(service=self.intake, port=self.intake_port)
+            toml_registry_server = start_toml_registry_server(service=self.toml_registry, port=self.intake_port)
             # 결과 ingest(:7876): 슈퍼컴 컨테이너가 역터널로 push → 로컬 단일 DB.
             ingest_server = start_result_ingest_server(store=self.store, port=self.ingest_port)
             # 대용량 산출물(:7877): project_dir tar.gz 스트림 수신 → 추출 → ArchiveStore.
             bulk_server = start_bulk_transfer_server(archive_store=self.archive_store, port=self.bulk_port)
-            # 우선순위 분배(:7878): intake(:7875)가 채운 레인을 워커들에 lease로 분배.
-            lease_server = start_priority_lease_server(queue=self.intake.queue, port=self.priority_lease_port)
-            for server in (dashboard, intake_server, ingest_server, bulk_server, lease_server):
+            # TOML lease(:7878): registry(:7875)의 active pool에서 ratio 기반으로 워커에 분배.
+            lease_server = start_priority_lease_server(
+                queue=self.toml_registry, port=self.priority_lease_port
+            )
+            for server in (dashboard, toml_registry_server, ingest_server, bulk_server, lease_server):
                 self._servers.append(server)
                 threading.Thread(target=server.serve_forever, daemon=True, name=type(server).__name__).start()
             # 역터널: ingest/bulk/lease(라이선스는 control측). 전부 슈퍼컴 전용.
@@ -304,8 +307,7 @@ def build_control_plane(
     # 결과 DB(11GB)는 web 역할(대시보드/ingest/intake/lease)만 초기화·소유 — 단일 writer 락 경합 회피.
     if run_web:
         store.initialize()
-        # 서비스 종료로 사라진 미처리 intake 정리 — 전 세션의 priority_sweeps를 실제 완료수로 정착(대기/진행중
-        # phantom 제거; 완료 결과는 보존). web이 큐/lease를 소유하므로 시작 시 1회.
+        # 레거시 priority_sweeps 정리. 새 Adaptive TOML registry는 finite intake 큐가 아니므로 정리 대상이 아니다.
         try:
             store.settle_priority_sweeps()
         except Exception:  # noqa: BLE001 — 정리 실패가 기동을 막으면 안 된다.
@@ -341,12 +343,21 @@ def build_control_plane(
         job_count=config.job_count,
         sequential_ramp=config.sequential_ramp,
     )
-    # 호스트측 Intake 큐 — DB 영속(web 재시작에도 미처리 우선순위 항목 보존). lease :7878이 같은 큐를 분배.
-    intake = IntakeService(queue=DbPriorityQueue(store=store))
+    builtin_toml_text = (
+        load_default_builtin_toml_text(config.builtin_toml_path)
+        if run_web
+        else "spec_version = 'keeper-only-placeholder'\n"
+    )
+    toml_registry = TomlRegistryService(
+        registry=DbTomlRegistry(store=store),
+        builtin_toml_text=builtin_toml_text,
+    )
+    if run_web:
+        toml_registry.initialize()
     return ControlPlane(
         orchestrator=orchestrator,
         store=store,
-        intake=intake,
+        toml_registry=toml_registry,
         archive_store=archive_store,
         dashboard_port=config.dashboard_port,
         intake_port=config.intake_port,
@@ -404,6 +415,9 @@ def main() -> int:
         license_poll_seconds=float(os.environ.get("EDT_LICENSE_POLL_SECONDS", "60")),
         dashboard_peetsfea_version=os.environ.get("EDT_DASHBOARD_PEETSFEA_VERSION", "").strip(),
         resource_port=int(os.environ.get("EDT_RESOURCE_PORT", str(DEFAULT_RESOURCE_PORT))),
+        builtin_toml_path=Path(os.environ["EDT_BUILTIN_TOML_PATH"]).expanduser()
+        if os.environ.get("EDT_BUILTIN_TOML_PATH")
+        else None,
     )
     run_control_plane(config, run_web=run_web, run_keeper=run_keeper)
     return 0

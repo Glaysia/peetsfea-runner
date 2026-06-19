@@ -1,4 +1,4 @@
-"""우선순위 lease :7878 — 슈퍼컴 전용 백채널 (컨트롤플레인 sweep 큐 → 컨테이너 워커).
+"""TOML lease :7878 — 슈퍼컴 전용 백채널 (컨트롤플레인 registry → 컨테이너 워커).
 
 토폴로지는 결과 ingest(:7876)와 동일: gate 경유 ssh 터널 + loopback 바인딩(외부 도달 불가, 인증 불필요).
 7878도 7875 사용자가 모르는 슈퍼컴 전용 통로다(7875=공개 sweep intake가 채우고, 7878=워커가 당겨감).
@@ -38,10 +38,20 @@ ChunkSampler = Callable[[str, int, int], list[str]]
 def start_priority_lease_server(
     *, queue: Any, host: str = "127.0.0.1", port: int = DEFAULT_PRIORITY_LEASE_PORT
 ) -> ThreadingHTTPServer:
-    """sweep chunk 분배 서버. `GET /lease?n=K` → chunk(최대 K), `GET /health` → 대기 후보 수.
+    """TOML chunk 분배 서버. `GET /lease?n=K` → chunk(최대 K), `GET /health` → 상태.
 
-    `queue`는 `lease_chunk(n) -> dict|None`, `depth() -> int`를 가진 객체(DbPriorityQueue).
+    `queue`는 `lease_chunk(n) -> dict|None`를 가진 객체다. 새 런타임은 DbTomlRegistry를,
+    레거시 테스트/호환 경로는 DbPriorityQueue를 넣을 수 있다.
     """
+
+    def health_payload() -> dict[str, object]:
+        active_count = getattr(queue, "active_count", None)
+        if callable(active_count):
+            return {"status": "ok", "active_tomls": int(active_count())}
+        depth = getattr(queue, "depth", None)
+        if callable(depth):
+            return {"status": "ok", "priority_depth": int(depth())}
+        return {"status": "ok"}
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "peetsfea-priority-lease"
@@ -52,7 +62,7 @@ def start_priority_lease_server(
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path == "/health":
-                _write_json(self, 200, {"status": "ok", "priority_depth": queue.depth()})
+                _write_json(self, 200, health_payload())
                 return
             if parsed.path == "/lease":
                 raw = parse_qs(parsed.query).get("n", ["1"])[0]

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import random
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, cast
 
 import duckdb
+
+from .version_filter import peetsfea_version_filter_clause
 
 
 # DuckDB는 한 프로세스에서 같은 파일을 동시에 두 번 connect하면 "Unique file handle conflict"로 죽는다.
@@ -143,6 +146,21 @@ class SingleSimulationResultStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS adaptive_tomls (
+                    id VARCHAR PRIMARY KEY,
+                    name VARCHAR,
+                    toml_text VARCHAR,
+                    kind VARCHAR,
+                    active BOOLEAN,
+                    ratio DOUBLE,
+                    next_seed BIGINT,
+                    created_at DOUBLE,
+                    updated_at DOUBLE
+                )
+                """
+            )
 
     def record_envelope(self, envelope: Mapping[str, Any]) -> None:
         self.initialize()
@@ -231,9 +249,12 @@ class SingleSimulationResultStore:
         if terminal_state:
             clauses.append("terminal_state = ?")
             params.append(terminal_state)
-        if peetsfea_version:
-            clauses.append("peetsfea_version = ?")
-            params.append(peetsfea_version)
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="?"
+        )
+        if version_clause:
+            clauses.append(version_clause)
+            params.extend(version_params)
         if request_id_prefix:  # 출처 필터(데이터셋 탭): base-=baseline, sweep-=intake, prio-=static
             clauses.append("request_id LIKE ?")
             params.append(request_id_prefix.replace("%", "") + "%")
@@ -250,9 +271,12 @@ class SingleSimulationResultStore:
         self.initialize()
         sql = "SELECT * FROM single_simulation_results WHERE request_id = ?"
         params: list[Any] = [request_id]
-        if peetsfea_version:
-            sql += " AND peetsfea_version = ?"
-            params.append(peetsfea_version)
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="?"
+        )
+        if version_clause:
+            sql += " AND " + version_clause
+            params.extend(version_params)
         with self._locked_connect() as connection:
             result = connection.execute(sql, params)
             row = result.fetchone()
@@ -275,8 +299,11 @@ class SingleSimulationResultStore:
     def state_counts(self, *, peetsfea_version: str | None = None) -> dict[str, int]:
         """terminal_state별 건수(경량 집계 — 전체 행을 끌어오지 않음). 대시보드 요약용."""
         self.initialize()
-        where = " WHERE peetsfea_version = ?" if peetsfea_version else ""
-        params: list[Any] = [peetsfea_version] if peetsfea_version else []
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="?"
+        )
+        where = " WHERE " + version_clause if version_clause else ""
+        params: list[Any] = list(version_params)
         with self._locked_connect() as connection:
             rows = connection.execute(
                 "SELECT terminal_state, count(*) FROM single_simulation_results" + where + " GROUP BY 1",
@@ -302,9 +329,12 @@ class SingleSimulationResultStore:
         if terminal_state:
             clauses.append("terminal_state = ?")
             params.append(terminal_state)
-        if peetsfea_version:
-            clauses.append("peetsfea_version = ?")
-            params.append(peetsfea_version)
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="?"
+        )
+        if version_clause:
+            clauses.append(version_clause)
+            params.extend(version_params)
         sql = "SELECT count(*) FROM single_simulation_results WHERE " + " AND ".join(clauses)
         with self._locked_connect() as connection:
             row = connection.execute(sql, params).fetchone()
@@ -322,9 +352,12 @@ class SingleSimulationResultStore:
         if since:
             clauses.append("finished_at >= ?")
             params.append(since)
-        if peetsfea_version:
-            clauses.append("peetsfea_version = ?")
-            params.append(peetsfea_version)
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="?"
+        )
+        if version_clause:
+            clauses.append(version_clause)
+            params.extend(version_params)
         where = " AND ".join(clauses)
         sql = (
             "SELECT strftime(time_bucket(INTERVAL '" + str(bm) + " minutes', finished_at::TIMESTAMP), '%Y-%m-%dT%H:%M') AS b, "
@@ -350,9 +383,12 @@ class SingleSimulationResultStore:
         if terminal_state:
             clauses.append("terminal_state = ?")
             params.append(terminal_state)
-        if peetsfea_version:
-            clauses.append("peetsfea_version = ?")
-            params.append(peetsfea_version)
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="?"
+        )
+        if version_clause:
+            clauses.append(version_clause)
+            params.extend(version_params)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         # 거대 solve_telemetry_json 대신 추출 컬럼만(로드당 ~880MB → ~수십KB). ingest/백필이 채움.
         sql = f"SELECT partition, elapsed_ms, gpu_used FROM single_simulation_results{where}"
@@ -384,9 +420,12 @@ class SingleSimulationResultStore:
         if terminal_state:
             clauses.append("terminal_state = ?")
             params.append(terminal_state)
-        if peetsfea_version:
-            clauses.append("peetsfea_version = ?")
-            params.append(peetsfea_version)
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="?"
+        )
+        if version_clause:
+            clauses.append(version_clause)
+            params.extend(version_params)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         limit_sql = f" LIMIT {int(limit)}" if limit is not None else ""
         dest_sql = str(dest).replace("'", "''")  # 경로는 서버 임시파일(사용자 입력 아님); 따옴표만 방어 이스케이프
@@ -575,6 +614,146 @@ class SingleSimulationResultStore:
             "items": items,
         }
 
+    # --- Adaptive TOML registry ---------------------------------------------------------------
+
+    def toml_registry_bootstrap_builtin(
+        self, *, toml_text: str, now: float, name: str = "built-in widest TOML"
+    ) -> None:
+        self.initialize()
+        with self._locked_connect() as connection:
+            row = connection.execute("SELECT id FROM adaptive_tomls WHERE id = 'builtin-widest'").fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO adaptive_tomls "
+                    "(id, name, toml_text, kind, active, ratio, next_seed, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 'built_in', true, NULL, 0, ?, ?)",
+                    ["builtin-widest", name, toml_text, float(now), float(now)],
+                )
+            else:
+                connection.execute(
+                    "UPDATE adaptive_tomls SET name = ?, toml_text = ?, kind = 'built_in', active = true, "
+                    "updated_at = ? WHERE id = 'builtin-widest'",
+                    [name, toml_text, float(now)],
+                )
+
+    def toml_registry_list(self) -> list[dict[str, Any]]:
+        self.initialize()
+        with self._locked_connect() as connection:
+            rows = connection.execute(
+                "SELECT id, name, toml_text, kind, active, ratio, next_seed, created_at, updated_at "
+                "FROM adaptive_tomls ORDER BY CASE WHEN kind = 'built_in' THEN 0 ELSE 1 END, created_at, id"
+            ).fetchall()
+        return [
+            {
+                "id": str(r[0]),
+                "name": str(r[1] or ""),
+                "toml_text": str(r[2] or ""),
+                "kind": str(r[3] or ""),
+                "active": bool(r[4]),
+                "ratio": None if r[5] is None else float(r[5]),
+                "next_seed": int(r[6] or 0),
+                "created_at": float(r[7] or 0.0),
+                "updated_at": float(r[8] or 0.0),
+            }
+            for r in rows
+        ]
+
+    def toml_registry_add_custom(self, *, name: str, toml_text: str, active: bool, now: float) -> dict[str, Any]:
+        self.initialize()
+        with self._locked_connect() as connection:
+            rows = connection.execute("SELECT id FROM adaptive_tomls WHERE kind = 'custom' ORDER BY id").fetchall()
+            existing = {str(r[0]) for r in rows}
+            if len(existing) >= 6:
+                raise ValueError("custom TOML limit exceeded")
+            toml_id = next(f"custom-{i}" for i in range(1, 7) if f"custom-{i}" not in existing)
+            connection.execute(
+                "INSERT INTO adaptive_tomls "
+                "(id, name, toml_text, kind, active, ratio, next_seed, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'custom', ?, NULL, 0, ?, ?)",
+                [toml_id, name, toml_text, bool(active), float(now), float(now)],
+            )
+            connection.execute("UPDATE adaptive_tomls SET ratio = NULL")
+        return next(t for t in self.toml_registry_list() if t["id"] == toml_id)
+
+    def toml_registry_delete_custom(self, toml_id: str) -> bool:
+        self.initialize()
+        if toml_id == "builtin-widest":
+            return False
+        with self._locked_connect() as connection:
+            row = connection.execute(
+                "SELECT kind FROM adaptive_tomls WHERE id = ?", [toml_id]
+            ).fetchone()
+            if row is None or str(row[0]) != "custom":
+                return False
+            connection.execute("DELETE FROM adaptive_tomls WHERE id = ?", [toml_id])
+            connection.execute("UPDATE adaptive_tomls SET ratio = NULL")
+        return True
+
+    def toml_registry_set_active(self, toml_id: str, active: bool, *, now: float) -> bool:
+        self.initialize()
+        if toml_id == "builtin-widest":
+            return False
+        with self._locked_connect() as connection:
+            row = connection.execute(
+                "SELECT kind FROM adaptive_tomls WHERE id = ?", [toml_id]
+            ).fetchone()
+            if row is None or str(row[0]) != "custom":
+                return False
+            connection.execute(
+                "UPDATE adaptive_tomls SET active = ?, ratio = NULL, updated_at = ? WHERE id = ?",
+                [bool(active), float(now), toml_id],
+            )
+            connection.execute("UPDATE adaptive_tomls SET ratio = NULL")
+        return True
+
+    def toml_registry_set_ratios(self, ratios: Mapping[str, float] | None, *, now: float) -> None:
+        self.initialize()
+        with self._locked_connect() as connection:
+            if ratios is None:
+                connection.execute("UPDATE adaptive_tomls SET ratio = NULL, updated_at = ?", [float(now)])
+                return
+            connection.execute("UPDATE adaptive_tomls SET ratio = NULL")
+            for toml_id, ratio in ratios.items():
+                connection.execute(
+                    "UPDATE adaptive_tomls SET ratio = ?, updated_at = ? WHERE id = ? AND active = true",
+                    [float(ratio), float(now), toml_id],
+                )
+
+    def toml_registry_reserve_chunk(self, *, toml_id: str, count: int) -> dict[str, Any] | None:
+        self.initialize()
+        if count <= 0:
+            return None
+        with self._locked_connect() as connection:
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                row = connection.execute(
+                    "SELECT id, name, toml_text, kind, next_seed FROM adaptive_tomls "
+                    "WHERE id = ? AND active = true",
+                    [toml_id],
+                ).fetchone()
+                if row is None:
+                    connection.execute("COMMIT")
+                    return None
+                seed_base = int(row[4] or 0)
+                connection.execute(
+                    "UPDATE adaptive_tomls SET next_seed = ? WHERE id = ?",
+                    [seed_base + int(count), toml_id],
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        return {
+            "request_id": f"toml-{row[0]}",
+            "toml_id": str(row[0]),
+            "toml_name": str(row[1] or ""),
+            "toml_kind": str(row[3] or ""),
+            "sweep_toml_text": str(row[2] or ""),
+            "seed_base": seed_base,
+            "mode": "full",
+            "count": int(count),
+        }
+
 
 @dataclass
 class DbPriorityQueue:
@@ -608,6 +787,76 @@ class DbPriorityQueue:
         return self.store.priority_list(limit=limit)
 
 
+@dataclass
+class DbTomlRegistry:
+    """DB-backed Adaptive TOML registry used by :7875 and :7878 lease."""
+
+    store: Any
+    rng: random.Random = field(default_factory=random.Random, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def bootstrap_builtin_toml(
+        self, *, toml_text: str, now: float, name: str = "built-in widest TOML"
+    ) -> None:
+        self.store.toml_registry_bootstrap_builtin(toml_text=toml_text, now=now, name=name)
+
+    def list_tomls(self) -> list[dict[str, Any]]:
+        return cast(list[dict[str, Any]], self.store.toml_registry_list())
+
+    def add_custom_toml(self, *, name: str, toml_text: str, active: bool, now: float) -> dict[str, Any]:
+        try:
+            return cast(
+                dict[str, Any],
+                self.store.toml_registry_add_custom(
+                    name=name, toml_text=toml_text, active=active, now=now
+                ),
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+    def delete_custom_toml(self, toml_id: str) -> bool:
+        return bool(self.store.toml_registry_delete_custom(toml_id))
+
+    def set_toml_active(self, toml_id: str, active: bool, *, now: float) -> bool:
+        return bool(self.store.toml_registry_set_active(toml_id, active, now=now))
+
+    def set_toml_ratios(self, ratios: Mapping[str, float] | None, *, now: float) -> None:
+        self.store.toml_registry_set_ratios(ratios, now=now)
+
+    def active_count(self) -> int:
+        return len([t for t in self.list_tomls() if bool(t.get("active"))])
+
+    def lease_chunk(self, k: int) -> dict[str, Any] | None:
+        if k <= 0:
+            return None
+        with self._lock:
+            active = [t for t in self.list_tomls() if bool(t.get("active"))]
+            if not active:
+                return None
+            selected = self._choose(active)
+            return cast(
+                dict[str, Any] | None,
+                self.store.toml_registry_reserve_chunk(toml_id=str(selected["id"]), count=int(k)),
+            )
+
+    def _choose(self, active: list[dict[str, Any]]) -> dict[str, Any]:
+        if all(t.get("ratio") is not None for t in active):
+            weights = [float(t["ratio"]) for t in active]
+        else:
+            weights = [1.0 for _ in active]
+        total = sum(weights)
+        if total <= 0:
+            weights = [1.0 for _ in active]
+            total = float(len(active))
+        mark = self.rng.random() * total
+        cumulative = 0.0
+        for entry, weight in zip(active, weights, strict=True):
+            cumulative += weight
+            if mark <= cumulative:
+                return entry
+        return active[-1]
+
+
 def make_result_store(db_path: "Path | str") -> Any:
     """결과 스토어 팩토리. `EDT_STORE_BACKEND=postgres`면 `PostgresResultStore`, 아니면 DuckDB store.
 
@@ -623,4 +872,4 @@ def make_result_store(db_path: "Path | str") -> Any:
     return SingleSimulationResultStore(db_path=Path(db_path))
 
 
-__all__ = ["DbPriorityQueue", "SingleSimulationResultStore", "make_result_store"]
+__all__ = ["DbPriorityQueue", "DbTomlRegistry", "SingleSimulationResultStore", "make_result_store"]

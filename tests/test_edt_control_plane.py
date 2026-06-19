@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 from peetsfea_runner.edt_control_plane import ControlPlaneConfig, build_control_plane
-from peetsfea_runner.edt_intake import IntakeService
+from peetsfea_runner.edt_toml_registry import TomlRegistryService
 from peetsfea_runner.edt_orchestrator import JobHandle, JobLauncher
 
 
@@ -33,7 +33,7 @@ def test_build_control_plane_wires_orchestrator_store_intake(tmp_path: Path) -> 
     cp = build_control_plane(config, launcher=launcher)
 
     assert cp.orchestrator.job_count == 9
-    assert isinstance(cp.intake, IntakeService)
+    assert isinstance(cp.toml_registry, TomlRegistryService)
     assert cp.dashboard_port == 8080 and cp.intake_port == 7875
     assert config.job_command.endswith("orchestrator.sh")
 

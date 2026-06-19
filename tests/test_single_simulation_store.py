@@ -119,3 +119,30 @@ def test_timeseries_buckets_success_fail_gpu(tmp_path: Path) -> None:
     assert b1["success"] == 1 and b1["gpu"] == 1
     # since 필터
     assert len(store.timeseries(bucket_minutes=15, since="2026-06-16T10:15:00+00:00")) == 1
+
+
+def test_peetsfea_038_patch_versions_are_one_family(tmp_path: Path) -> None:
+    store = SingleSimulationResultStore(tmp_path / "results.duckdb")
+    for rid, version in (
+        ("a", "0.3.8"),
+        ("b", "0.3.8.1"),
+        ("c", "0.3.8.2"),
+        ("d", "0.3.9"),
+        ("e", "0.3.80"),
+    ):
+        store.record_envelope(
+            {
+                "request_id": rid,
+                "terminal_state": "success",
+                "peetsfea_version": version,
+                "finished_at": "2026-06-16T10:02:00+00:00",
+                "result": {"solve_telemetry": {"elapsed_ms": 1000}},
+            }
+        )
+
+    rows = store.fetch_rows(peetsfea_version="0.3.8")
+    assert {r["request_id"] for r in rows} == {"a", "b", "c"}
+    assert store.state_counts(peetsfea_version="0.3.8") == {"success": 3}
+    assert store.count_since("2026-06-16T10:00:00+00:00", peetsfea_version="0.3.8.1") == 3
+    assert len(store.fetch_solve_telemetry(peetsfea_version="0.3.8.2")) == 3
+    assert store.fetch_result("e", peetsfea_version="0.3.8") is None

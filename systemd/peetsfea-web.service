@@ -21,7 +21,7 @@ Environment=EDT_SSH_HOST=gate1-harry261
 Environment=EDT_DASHBOARD_PORT=8080
 Environment=EDT_INTAKE_PORT=7875
 # 대시보드에 노출할 결과 버전(빈 값=전 버전). 버전 채택 바뀌면 여기만 고치고 web만 재시작.
-Environment=EDT_DASHBOARD_PEETSFEA_VERSION=0.3.7
+Environment=EDT_DASHBOARD_PEETSFEA_VERSION=0.3.8
 Restart=always
 RestartSec=10
 # web teardown은 터널/서버 정지 + 아카이브 flush(45s 시한). scancel 없음 → 짧게 끝난다.

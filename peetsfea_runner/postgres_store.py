@@ -10,6 +10,8 @@ from typing import Any, Iterator, Mapping
 
 import psycopg
 
+from .version_filter import peetsfea_version_filter_clause
+
 
 _DEFAULT_DSN = "host=127.0.0.1 port=5433 dbname=peetsfea user=peets"
 
@@ -146,6 +148,21 @@ class PostgresResultStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS adaptive_tomls (
+                    id text PRIMARY KEY,
+                    name text,
+                    toml_text text,
+                    kind text,
+                    active boolean,
+                    ratio double precision,
+                    next_seed bigint,
+                    created_at double precision,
+                    updated_at double precision
+                )
+                """
+            )
 
     def record_envelope(self, envelope: Mapping[str, Any]) -> None:
         self.initialize()
@@ -222,9 +239,12 @@ class PostgresResultStore:
         if terminal_state:
             clauses.append("terminal_state = %s")
             params.append(terminal_state)
-        if peetsfea_version:
-            clauses.append("peetsfea_version = %s")
-            params.append(peetsfea_version)
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="%s"
+        )
+        if version_clause:
+            clauses.append(version_clause)
+            params.extend(version_params)
         if request_id_prefix:  # 출처 필터(데이터셋 탭): base-=baseline, sweep-=intake, prio-=static
             clauses.append("request_id LIKE %s")
             params.append(request_id_prefix.replace("%", "") + "%")
@@ -244,9 +264,12 @@ class PostgresResultStore:
         self.initialize()
         sql = "SELECT * FROM single_simulation_results WHERE request_id = %s"
         params: list[Any] = [request_id]
-        if peetsfea_version:
-            sql += " AND peetsfea_version = %s"
-            params.append(peetsfea_version)
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="%s"
+        )
+        if version_clause:
+            sql += " AND " + version_clause
+            params.extend(version_params)
         with self._locked_connect() as connection:
             cur = connection.execute(sql, params)
             row = cur.fetchone()
@@ -274,8 +297,11 @@ class PostgresResultStore:
 
     def state_counts(self, *, peetsfea_version: str | None = None) -> dict[str, int]:
         self.initialize()
-        where = " WHERE peetsfea_version = %s" if peetsfea_version else ""
-        params: list[Any] = [peetsfea_version] if peetsfea_version else []
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="%s"
+        )
+        where = " WHERE " + version_clause if version_clause else ""
+        params: list[Any] = list(version_params)
         with self._locked_connect() as connection:
             rows = connection.execute(
                 "SELECT terminal_state, count(*) FROM single_simulation_results" + where + " GROUP BY 1",
@@ -299,9 +325,12 @@ class PostgresResultStore:
         if terminal_state:
             clauses.append("terminal_state = %s")
             params.append(terminal_state)
-        if peetsfea_version:
-            clauses.append("peetsfea_version = %s")
-            params.append(peetsfea_version)
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="%s"
+        )
+        if version_clause:
+            clauses.append(version_clause)
+            params.extend(version_params)
         sql = "SELECT count(*) FROM single_simulation_results WHERE " + " AND ".join(clauses)
         with self._locked_connect() as connection:
             row = connection.execute(sql, params).fetchone()
@@ -321,9 +350,12 @@ class PostgresResultStore:
         if since:
             clauses.append("finished_at >= %s")
             params.append(since)
-        if peetsfea_version:
-            clauses.append("peetsfea_version = %s")
-            params.append(peetsfea_version)
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="%s"
+        )
+        if version_clause:
+            clauses.append(version_clause)
+            params.extend(version_params)
         where = " AND ".join(clauses)
         # finished_at(텍스트 ISO) → timestamp → epoch → 버킷 floor → 라벨. DuckDB와 동일하게 naive(UTC) 처리.
         bucket_expr = (
@@ -354,9 +386,12 @@ class PostgresResultStore:
         if terminal_state:
             clauses.append("terminal_state = %s")
             params.append(terminal_state)
-        if peetsfea_version:
-            clauses.append("peetsfea_version = %s")
-            params.append(peetsfea_version)
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="%s"
+        )
+        if version_clause:
+            clauses.append(version_clause)
+            params.extend(version_params)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         # 거대 solve_telemetry_json 대신 추출 컬럼만(로드당 ~880MB → ~수십KB). ingest/백필이 채움.
         sql = f"SELECT partition, elapsed_ms, gpu_used FROM single_simulation_results{where}"
@@ -390,9 +425,12 @@ class PostgresResultStore:
         if terminal_state:
             clauses.append("terminal_state = %s")
             params.append(terminal_state)
-        if peetsfea_version:
-            clauses.append("peetsfea_version = %s")
-            params.append(peetsfea_version)
+        version_clause, version_params = peetsfea_version_filter_clause(
+            "peetsfea_version", peetsfea_version, placeholder="%s"
+        )
+        if version_clause:
+            clauses.append(version_clause)
+            params.extend(version_params)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         limit_sql = f" LIMIT {int(limit)}" if limit is not None else ""
         try:
@@ -583,6 +621,146 @@ class PostgresResultStore:
             "sweeps": int(tot[0]), "submitted": submitted, "waiting": waiting, "leased": leased_all,
             "ok": ok_sum, "fail": fail_sum, "done": done_all, "inflight": max(0, leased_all - done_all),
             "items": items,
+        }
+
+    # --- Adaptive TOML registry ---------------------------------------------------------------
+
+    def toml_registry_bootstrap_builtin(
+        self, *, toml_text: str, now: float, name: str = "built-in widest TOML"
+    ) -> None:
+        self.initialize()
+        with self._locked_connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO adaptive_tomls
+                  (id, name, toml_text, kind, active, ratio, next_seed, created_at, updated_at)
+                VALUES (%s, %s, %s, 'built_in', true, NULL, 0, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                  name = EXCLUDED.name,
+                  toml_text = EXCLUDED.toml_text,
+                  kind = 'built_in',
+                  active = true,
+                  updated_at = EXCLUDED.updated_at
+                """,
+                ["builtin-widest", name, toml_text, float(now), float(now)],
+            )
+
+    def toml_registry_list(self) -> list[dict[str, Any]]:
+        self.initialize()
+        with self._locked_connect() as connection:
+            rows = connection.execute(
+                "SELECT id, name, toml_text, kind, active, ratio, next_seed, created_at, updated_at "
+                "FROM adaptive_tomls ORDER BY CASE WHEN kind = 'built_in' THEN 0 ELSE 1 END, created_at, id"
+            ).fetchall()
+        return [
+            {
+                "id": str(r[0]),
+                "name": str(r[1] or ""),
+                "toml_text": str(r[2] or ""),
+                "kind": str(r[3] or ""),
+                "active": bool(r[4]),
+                "ratio": None if r[5] is None else float(r[5]),
+                "next_seed": int(r[6] or 0),
+                "created_at": float(r[7] or 0.0),
+                "updated_at": float(r[8] or 0.0),
+            }
+            for r in rows
+        ]
+
+    def toml_registry_add_custom(self, *, name: str, toml_text: str, active: bool, now: float) -> dict[str, Any]:
+        self.initialize()
+        with self._locked_connect() as connection:
+            with connection.transaction():
+                rows = connection.execute(
+                    "SELECT id FROM adaptive_tomls WHERE kind = 'custom' ORDER BY id FOR UPDATE"
+                ).fetchall()
+                existing = {str(r[0]) for r in rows}
+                if len(existing) >= 6:
+                    raise ValueError("custom TOML limit exceeded")
+                toml_id = next(f"custom-{i}" for i in range(1, 7) if f"custom-{i}" not in existing)
+                connection.execute(
+                    "INSERT INTO adaptive_tomls "
+                    "(id, name, toml_text, kind, active, ratio, next_seed, created_at, updated_at) "
+                    "VALUES (%s, %s, %s, 'custom', %s, NULL, 0, %s, %s)",
+                    [toml_id, name, toml_text, bool(active), float(now), float(now)],
+                )
+                connection.execute("UPDATE adaptive_tomls SET ratio = NULL")
+        return next(t for t in self.toml_registry_list() if t["id"] == toml_id)
+
+    def toml_registry_delete_custom(self, toml_id: str) -> bool:
+        self.initialize()
+        if toml_id == "builtin-widest":
+            return False
+        with self._locked_connect() as connection:
+            with connection.transaction():
+                row = connection.execute(
+                    "SELECT kind FROM adaptive_tomls WHERE id = %s FOR UPDATE", [toml_id]
+                ).fetchone()
+                if row is None or str(row[0]) != "custom":
+                    return False
+                connection.execute("DELETE FROM adaptive_tomls WHERE id = %s", [toml_id])
+                connection.execute("UPDATE adaptive_tomls SET ratio = NULL")
+        return True
+
+    def toml_registry_set_active(self, toml_id: str, active: bool, *, now: float) -> bool:
+        self.initialize()
+        if toml_id == "builtin-widest":
+            return False
+        with self._locked_connect() as connection:
+            with connection.transaction():
+                row = connection.execute(
+                    "SELECT kind FROM adaptive_tomls WHERE id = %s FOR UPDATE", [toml_id]
+                ).fetchone()
+                if row is None or str(row[0]) != "custom":
+                    return False
+                connection.execute(
+                    "UPDATE adaptive_tomls SET active = %s, ratio = NULL, updated_at = %s WHERE id = %s",
+                    [bool(active), float(now), toml_id],
+                )
+                connection.execute("UPDATE adaptive_tomls SET ratio = NULL")
+        return True
+
+    def toml_registry_set_ratios(self, ratios: Mapping[str, float] | None, *, now: float) -> None:
+        self.initialize()
+        with self._locked_connect() as connection:
+            with connection.transaction():
+                if ratios is None:
+                    connection.execute("UPDATE adaptive_tomls SET ratio = NULL, updated_at = %s", [float(now)])
+                    return
+                connection.execute("UPDATE adaptive_tomls SET ratio = NULL")
+                for toml_id, ratio in ratios.items():
+                    connection.execute(
+                        "UPDATE adaptive_tomls SET ratio = %s, updated_at = %s WHERE id = %s AND active = true",
+                        [float(ratio), float(now), toml_id],
+                    )
+
+    def toml_registry_reserve_chunk(self, *, toml_id: str, count: int) -> dict[str, Any] | None:
+        self.initialize()
+        if count <= 0:
+            return None
+        with self._locked_connect() as connection:
+            with connection.transaction():
+                row = connection.execute(
+                    "SELECT id, name, toml_text, kind, next_seed FROM adaptive_tomls "
+                    "WHERE id = %s AND active = true FOR UPDATE",
+                    [toml_id],
+                ).fetchone()
+                if row is None:
+                    return None
+                seed_base = int(row[4] or 0)
+                connection.execute(
+                    "UPDATE adaptive_tomls SET next_seed = %s WHERE id = %s",
+                    [seed_base + int(count), toml_id],
+                )
+        return {
+            "request_id": f"toml-{row[0]}",
+            "toml_id": str(row[0]),
+            "toml_name": str(row[1] or ""),
+            "toml_kind": str(row[3] or ""),
+            "sweep_toml_text": str(row[2] or ""),
+            "seed_base": seed_base,
+            "mode": "full",
+            "count": int(count),
         }
 
 

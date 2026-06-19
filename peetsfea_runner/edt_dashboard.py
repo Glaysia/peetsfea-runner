@@ -25,6 +25,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .single_simulation_store import SingleSimulationResultStore
+from .version_filter import normalize_peetsfea_version_filter
 
 # 운영 리소스 스냅샷 제공자(없으면 빈 스냅샷). edt_resources.ResourcePoller.snapshot 와이어링.
 ResourceProvider = Callable[[], Mapping[str, Any]]
@@ -173,7 +174,7 @@ def start_dashboard_server(
     peetsfea_version: str | None = None,
 ) -> ThreadingHTTPServer:
     # 표시 버전 필터(설정 시 모든 결과 뷰가 이 버전만 노출). 빈 값이면 전 버전. `/api/versions`는 항상 전 분포.
-    version_filter = (peetsfea_version or "").strip() or None
+    version_filter = normalize_peetsfea_version_filter(peetsfea_version)
 
     def _query_rows(query: dict[str, list[str]], default_state: str | None = None) -> list[dict[str, Any]]:
         since = query.get("since", [None])[0]
