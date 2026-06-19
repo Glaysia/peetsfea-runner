@@ -60,10 +60,11 @@
 
 <header>
   <h1>peetsfea-runner — 현행 아키텍처</h1>
-  <p class="sub">1솔브 = 1 enroot 컨테이너 · AEDT 실행 후 완전 종료 · 2분 홀짝 잡 제어 루프 · 입력→시뮬→DB/대시보드→아카이브</p>
+  <p class="sub">1솔브 = 1 enroot 컨테이너 · AEDT 실행 후 완전 종료 · 2분 홀짝 잡 제어 루프 · Adaptive TOML Registry · 입력→시뮬→DB/대시보드→아카이브</p>
   <p style="margin-top:10px">
     <span class="tag new">현행 운영 기준</span>
     <span class="tag warn">상시 예열 풀 폐기</span>
+    <span class="tag new">Adaptive TOML</span>
     <span class="tag ok">squeue 15 · avg RUNNING 9 · AEDT 120</span>
   </p>
   <p class="sub">기준 문서: <code>PLANS/MASTER_PLAN.md</code> · 현재 잡 출생 제어: <code>PLANS/job_birth_controller.html</code></p>
@@ -77,6 +78,7 @@
     <li><b>잡 출생 제어</b>: 잡 수 구간을 나누지 않고 2분마다 홀짝 tick을 실행한다. 홀수 tick은 새 잡 4개 제출만, 짝수 tick은 가장 늙은 RUNNING 잡 1개 종료만 수행한다. 단 RUNNING 9개 미만이면 짝수 tick 종료를 건너뛴다.</li>
     <li><b>PENDING 정리</b>: PENDING reason이 빈값/None/null/(null)/pending이 아니면 정상 대기열로 보지 않는다. Priority/Resources/ReqNodeNotAvail 등은 cap과 무관하게 즉시 취소한다.</li>
     <li><b>N 결정</b>: 새 잡은 현재 <code>elec_solve_hfss</code> 실측을 보고 계단형 LUT로 컨테이너 수를 정한다. 0~90은 20, 100은 15, 이후 10 solve마다 1씩 낮춰 150 이상은 10으로 둔다.</li>
+    <li><b>Adaptive TOML</b>: 모든 TOML은 동등한 후보 소스다. 가장 넓은 built-in TOML은 항상 active이며 등록 해제할 수 없고, custom TOML은 최대 6개까지 등록한다. active 상태와 ratio는 서버 재시작 후에도 복구한다.</li>
     <li><b>포화 감압</b>: 2분 루프 여섯 번마다 라이선스 사용량을 확인하고, solve가 150을 넘으면 가장 늙은 RUNNING 잡 1개를 추가로 내린다.</li>
     <li><b>데이터 플레인</b>: 슈퍼컴엔 DB 없음. 컨테이너가 결과를 gate 경유 역터널(:7876 JSON, :7877 대용량)로 로컬 데몬에 push한다.</li>
     <li><b>운영 파티션</b>: 제출 런처는 <code>cpu2,gpu1,gpu2,gpu3</code>를 사용한다. gpu* 잡은 <code>--gres=gpu:1</code>, <code>--cpus-per-task=24</code>, <code>--mem=384G</code>로 백필 폭을 넓힌다.</li>
@@ -102,14 +104,14 @@
     </defs>
 
     <rect x="24" y="26" width="218" height="76" rx="9" fill="#1f232c" stroke="#4b3a6e"></rect>
-    <text x="38" y="52" class="svglabel">Intake :7875</text>
-    <text x="38" y="72" class="svgsub">sweep toml + 개수 N</text>
-    <text x="38" y="88" class="svgsub">랜덤 샘플 fixed toml 적재</text>
+    <text x="38" y="52" class="svglabel">Adaptive TOML Registry :7875</text>
+    <text x="38" y="72" class="svgsub">built-in + custom 최대 6</text>
+    <text x="38" y="88" class="svgsub">active/ratio 영속화</text>
 
     <rect x="288" y="26" width="210" height="76" rx="9" fill="#1f232c" stroke="#2c313c"></rect>
-    <text x="302" y="52" class="svglabel">로컬 대기 큐</text>
-    <text x="302" y="72" class="svgsub">fixed toml</text>
-    <text x="302" y="88" class="svgsub">잡/컨테이너가 하나씩 소비</text>
+    <text x="302" y="52" class="svglabel">ratio scheduler</text>
+    <text x="302" y="72" class="svgsub">active TOML weighted pick</text>
+    <text x="302" y="88" class="svgsub">후보 1개 샘플 후 소비</text>
     <line x1="242" y1="64" x2="286" y2="64" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
 
     <rect x="548" y="26" width="224" height="76" rx="9" fill="#1f232c" stroke="#4b3a6e"></rect>
@@ -131,7 +133,7 @@
 
     <rect x="46" y="186" width="428" height="242" rx="10" fill="#181b22" stroke="#3a4252"></rect>
     <text x="60" y="210" class="svglabel">RUNNING job — 서브 오케스트레이터</text>
-    <text x="60" y="230" class="svgsub">출생 시 LUT로 N 결정 · 컨테이너 stagger 가동</text>
+    <text x="60" y="230" class="svgsub">출생 시 LUT로 N 결정 · active TOML 샘플</text>
 
     <rect x="64" y="252" width="180" height="58" rx="7" fill="#1f232c" stroke="#2f5e3a"></rect>
     <text x="76" y="276" class="svgmono">container_01</text>
@@ -143,7 +145,7 @@
 
     <rect x="64" y="332" width="390" height="74" rx="8" fill="#13161c" stroke="#2c313c"></rect>
     <text x="78" y="356" class="svglabel" style="fill:#7ee787">단명 컨테이너 수명주기</text>
-    <text x="78" y="376" class="svgmono">spawn → AEDT cold start → solve 1 → push result</text>
+    <text x="78" y="376" class="svgmono">spawn → TOML pick → AEDT cold start → solve 1</text>
     <text x="78" y="394" class="svgmono">exit → enroot remove → OS가 누수 회수</text>
 
     <rect x="494" y="186" width="214" height="242" rx="10" fill="#181b22" stroke="#3a4252"></rect>
@@ -192,7 +194,8 @@
   <tr><td>잡(SLURM sbatch)</td><td>squeue 최대 15개</td><td>평균 RUNNING 9개와 AEDT/solve 120개를 목표로 한다. PENDING은 reason None 계열만 인정하며, Priority/Resources 등은 즉시 취소. 제출은 노드별 균등 분산.</td></tr>
   <tr><td>잡 수명</td><td>최대 20분</td><td>2분 홀짝 루프에서 더 일찍 내려갈 수 있다. 종료 시 진행 중 컨테이너와 AEDT도 같이 정리된다.</td></tr>
   <tr><td>컨테이너 수 N</td><td>잡 출생 시 10~20개</td><td>현재 solve 실측을 LUT로 읽어 결정. 컨테이너 출생은 stagger로 분산.</td></tr>
-  <tr><td>AEDT 실행 단위</td><td>컨테이너당 1회</td><td><code>EDT_SLOT_COUNT=1</code>, <code>EDT_MAX_SIMS=1</code>. 완료 후 재사용 없이 종료.</td></tr>
+  <tr><td>TOML 후보 소스</td><td>active TOML pool</td><td>가장 넓은 built-in TOML은 항상 active. custom TOML은 최대 6개. active/ratio 상태는 영속.</td></tr>
+  <tr><td>AEDT 실행 단위</td><td>컨테이너당 1회</td><td><code>EDT_SLOT_COUNT=1</code>, <code>EDT_MAX_SIMS=1</code>. active TOML에서 후보 1개를 샘플하고 완료 후 재사용 없이 종료.</td></tr>
   <tr><td>동시 실행 목표</td><td>solve 100 근처</td><td>과포화는 LUT와 12분 감압으로 낮춘다. solve &gt;150이면 가장 늙은 잡을 추가 종료.</td></tr>
   <tr><td>워커 GPU</td><td>gpu*: 1 (gres)</td><td>gpu 파티션은 <code>gpu:1</code>, 24 CPU, 384G로 요청한다. cpu2는 CPU only.</td></tr>
 </table>
@@ -244,7 +247,25 @@ every sixth tick:
   <p class="muted">세부 정책과 LUT 표는 <code>PLANS/job_birth_controller.html</code>을 기준으로 한다.</p>
 </div>
 
-<h2>5. 자원 / 파일시스템 / 라이선스</h2>
+<h2>5. Adaptive TOML Registry</h2>
+<div class="card">
+  <p>서버는 TOML 파일을 매번 제출받아 대기 큐에 고정 후보를 쌓는 제출형 모델을 쓰지 않는다. 등록된 TOML 목록,
+  active 여부, ratio를 영속 상태로 관리하고, 컨테이너 시작 시 ratio scheduler가 active TOML 하나를 고른다.</p>
+  <table>
+    <tr><th>규칙</th><th>현행 기준</th></tr>
+    <tr><td>built-in widest TOML</td><td>항상 존재하고 항상 active. 등록 해제, 비활성화, 삭제 불가.</td></tr>
+    <tr><td>custom TOML</td><td>최대 6개까지 등록. active 등록/해제 가능.</td></tr>
+    <tr><td>ratio</td><td>active TOML 전체 기준 합계 100. 미설정 시 active TOML끼리 균등 분산.</td></tr>
+    <tr><td>영속성</td><td>서버 재시작 후 active pool과 ratio를 복구한다.</td></tr>
+  </table>
+  <pre>GET    /api/tomls
+POST   /api/tomls/custom
+DELETE /api/tomls/custom/{id}
+PATCH  /api/tomls/{id}/active
+PUT    /api/tomls/ratios</pre>
+</div>
+
+<h2>6. 자원 / 파일시스템 / 라이선스</h2>
 <div class="card">
   <ul>
     <li><code>/dev/shm</code>, <code>/tmp</code> 직접 사용 금지 → 잡 전용 <code>job_tmpfs</code> / <code>job_disk</code> 사용.</li>
@@ -254,11 +275,11 @@ every sixth tick:
   </ul>
 </div>
 
-<h2>6. 부가 서비스</h2>
+<h2>7. 부가 서비스</h2>
 <div class="grid c3">
   <div class="card">
-    <h3>Intake :7875 <span class="tag new">신규</span></h3>
-    <p>peetsfea sweep toml + 개수 N 수신 → 랜덤 샘플 fixed toml × N → 대기 큐 적재 → 컨테이너가 하나씩 소비.</p>
+    <h3>Adaptive TOML Registry :7875 <span class="tag new">신규</span></h3>
+    <p>built-in widest TOML + custom 최대 6개를 관리한다. active 등록/해제와 ratio 설정을 받고, 상태를 영속화한다.</p>
   </div>
   <div class="card">
     <h3>대시보드 :8080 <span class="tag ok">가동</span></h3>
@@ -270,13 +291,13 @@ every sixth tick:
   </div>
 </div>
 
-<h2>7. 현재 구현 기준</h2>
+<h2>8. 현재 구현 기준</h2>
 <div class="card">
   <div class="phase now">
     <div class="n">1</div>
     <div>
       <h4>컨테이너 생애 <span class="tag ok">핵심</span></h4>
-      <p class="muted">잡 내부 서브 오케스트레이터가 N개 컨테이너를 stagger로 띄운다. 각 컨테이너는 fixed toml 1개를 처리하고 결과 push 후 종료한다.</p>
+      <p class="muted">잡 내부 서브 오케스트레이터가 N개 컨테이너를 stagger로 띄운다. 각 컨테이너는 active TOML pool에서 ratio 기반으로 후보 1개를 샘플하고 결과 push 후 종료한다.</p>
     </div>
   </div>
   <div class="phase now">
@@ -297,7 +318,7 @@ every sixth tick:
 
 <footer>
   기준 문서: <code>PLANS/MASTER_PLAN.md</code> · 현재 잡 출생 제어: <code>PLANS/job_birth_controller.html</code> ·
-  현행 운영 원칙: 단명 컨테이너, 완전 종료, squeue 기반 완충.
+  현행 운영 원칙: 단명 컨테이너, 완전 종료, squeue 기반 완충, Adaptive TOML Registry.
 </footer>
 
 </div>

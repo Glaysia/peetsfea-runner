@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>제어 로직 — 2분 홀짝 잡 제어 루프 · squeue 15 · 100 수렴</title>
+<title>제어 로직 — 2분 홀짝 잡 제어 루프 · Adaptive TOML · squeue 15</title>
 <style>
   :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
   *{box-sizing:border-box}
@@ -29,8 +29,8 @@
 <body>
 <div class="wrap">
 
-<h1>제어 로직 — 2분 홀짝 잡 제어 루프 · 동시 솔브 100 수렴</h1>
-<p class="sub">컨테이너 1솔브=죽음 · squeue 최대 15 · 평균 RUNNING 9 + AEDT 120 목표 · 2026-06-19</p>
+<h1>제어 로직 — 2분 홀짝 잡 제어 루프 · Adaptive TOML</h1>
+<p class="sub">컨테이너 1솔브=죽음 · 영속 active TOML pool · squeue 최대 15 · 평균 RUNNING 9 + AEDT 120 목표 · 2026-06-19</p>
 
 <h2>1. 모델 한눈에</h2>
 <ul>
@@ -39,6 +39,7 @@
 <li><b>제어 루프는 잡 수 구간을 보지 않는다.</b> 2분마다 홀수/짝수 tick 행동을 번갈아 실행한다.</li>
 <li><b>squeue 상한은 15개</b>이며, 최근 목표는 <b>평균 RUNNING 9개 + AEDT/solve 120개</b>다.</li>
 <li><b>PENDING 버퍼는 reason=None만 인정한다.</b> PENDING 잡의 REASON이 빈값/None/null/(null)/pending이 아니면 즉시 stuck으로 보고 취소한다.</li>
+<li><b>Adaptive TOML은 영속 active pool로 관리한다.</b> 서버가 켜진 뒤 일회성 제출을 받는 구조가 아니라, 등록된 TOML과 비율을 계속 유지한다.</li>
 <li>목표: <b>동시 솔브 100에 수렴.</b> 잡 제출은 노드별 균등 분산이 필요하다.</li>
 </ul>
 
@@ -157,18 +158,52 @@ therefore:
     reduce GPU job request size
     add low-water guard for RUNNING jobs < 9</pre>
 
-<h2>6. herd 방지 (컨테이너 출생 stagger)</h2>
+<h2>6. Adaptive TOML 규약 — 영속 active pool + ratio scheduling</h2>
+<div class="card">
+서버는 더 이상 TOML 파일을 일회성으로 받아 고정 후보를 쌓는 제출형 모델로 동작하지 않는다.
+등록된 TOML 목록, 활성 여부, 비율을 서버 상태로 영속화하고, 컨테이너가 시작될 때 active TOML pool에서
+비율 기반으로 하나를 고른 뒤 해당 TOML에서 후보 1개를 샘플한다.
+</div>
+<ul>
+<li><b>모든 TOML은 동등한 후보 소스</b>다. 별도 우선 처리나 보조 소비 규칙을 두지 않는다.</li>
+<li><b>가장 넓은 built-in TOML은 항상 존재하고 항상 active</b>다. 이 TOML은 등록 해제, 비활성화, 삭제 대상이 아니다.</li>
+<li><b>custom TOML은 최대 6개</b>까지 서버에 등록할 수 있다. 6개를 초과하는 등록 요청은 거부한다.</li>
+<li><b>active 상태와 ratio는 영속 상태</b>다. 서버가 꺼졌다 켜져도 이전 active pool과 비율을 복구해야 한다.</li>
+<li><b>ratio는 active TOML 전체 기준</b>으로 해석한다. 명시 비율은 합계 100을 요구하고, 비율이 없으면 active TOML끼리 균등 분산한다.</li>
+<li><b>inactive custom TOML</b>은 샘플링 대상에서 제외하며, ratio 0 또는 ratio 미설정 상태로 취급한다.</li>
+</ul>
+<table>
+<tr><th>API</th><th>동작</th><th>제약</th></tr>
+<tr><td><code>GET /api/tomls</code></td><td>built-in + custom TOML 목록, active 여부, ratio, 저장 상태를 반환한다.</td><td>읽기 전용.</td></tr>
+<tr><td><code>POST /api/tomls/custom</code></td><td>custom TOML을 서버에 등록한다.</td><td>custom 총량 6개 초과 금지.</td></tr>
+<tr><td><code>DELETE /api/tomls/custom/{id}</code></td><td>custom TOML을 등록 해제한다.</td><td>built-in TOML에는 허용하지 않는다.</td></tr>
+<tr><td><code>PATCH /api/tomls/{id}/active</code></td><td>custom TOML의 active 상태를 바꾼다.</td><td>built-in TOML은 항상 active.</td></tr>
+<tr><td><code>PUT /api/tomls/ratios</code></td><td>active TOML별 비율을 저장한다.</td><td>active 대상 합계 100. 누락 시 균등 분산으로 되돌릴 수 있어야 한다.</td></tr>
+</table>
+<pre>active_tomls = [built_in_widest] + enabled_custom_tomls
+
+if ratios_are_set:
+    require sum(ratio[t] for t in active_tomls) == 100
+else:
+    ratio = evenly_distribute(active_tomls)
+
+selected_toml = weighted_choice(active_tomls, ratio)
+candidate = sample_one_candidate(selected_toml, seed)
+run_one_container(candidate)</pre>
+
+<h2>7. herd 방지 (컨테이너 출생 stagger)</h2>
 <div class="card">
 잡이 N개를 <b>한꺼번에</b> 켜면 그 노드에서 AEDT N개 동시 기동 → 방금 본 gRPC 행 재발.
 → orchestrator는 N개를 <b>1개씩 간격 두고</b> 가동(노드당 동시 콜드스타트 ≤ EDT_COLD_CAP=10).
 </div>
 
-<h2>7. 구현 포인트</h2>
+<h2>8. 구현 포인트</h2>
 <table>
 <tr><th>레이어</th><th>변경</th></tr>
 <tr><td><b>제어기(루프)</b></td><td>잡 수 구간을 보지 않고 <b>2분마다 홀수 tick은 새 잡 4개 제출, 짝수 tick은 가장 늙은 잡 1개 종료</b>. 단 RUNNING 9개 미만이면 짝수 tick 종료를 건너뛴다. squeue 총량은 15개로 제한한다. PENDING reason이 None 계열이 아니면 즉시 취소하고, cap 15에서 stuck이면 1개 종료 + 1개 요청.</td></tr>
-<tr><td><b>orchestrator</b></td><td>출생 시 N 받아 <b>1솔브 컨테이너 N개</b> stagger 가동(respawn 없음). <code>EDT_JOB_TTL_SEC=1200</code> 또는 제어기 종료신호 시 진행 솔브 마치고 안전종료 → 잡 exit. /enroot 정리 trap 유지.</td></tr>
+<tr><td><b>orchestrator</b></td><td>출생 시 N 받아 <b>1솔브 컨테이너 N개</b> stagger 가동(respawn 없음). 각 컨테이너는 active TOML pool에서 ratio 기반으로 후보를 1개 샘플한다. <code>EDT_JOB_TTL_SEC=1200</code> 또는 제어기 종료신호 시 진행 솔브 마치고 안전종료 → 잡 exit. /enroot 정리 trap 유지.</td></tr>
 <tr><td><b>keeper</b></td><td>노드별 균등 분산으로 제출하고, 평균 RUNNING 9 + AEDT/solve 120을 목표로 한다. 2분 tick 여섯 번마다 solve &gt;150 포화 감압을 수행한다.</td></tr>
+<tr><td><b>TOML registry</b></td><td>가장 넓은 built-in TOML + custom 최대 6개를 관리한다. active 상태와 ratio를 영속화하고, 서버 재시작 후 같은 pool을 복원한다.</td></tr>
 </table>
 
 <p class="mut" style="margin-top:24px">— 설계 확정. 이대로 구현·배포·모니터링.</p>
