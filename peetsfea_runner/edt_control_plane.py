@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import FrameType
+from typing import Any
 
 # 종료 시 아카이브 flush(대용량 tar.gz 압축)에 줄 최대 시간. 초과하면 다음 기동에 위임(systemd 'failed' 방지).
 SHUTDOWN_FLUSH_DEADLINE_SECONDS = 45.0
@@ -178,9 +179,9 @@ class ControlPlane:
                 )
                 # 와이어링: 런처는 출생 시 N을 주입, orchestrator는 보고 기반 살아있는 컨테이너 수로 롤링 교체.
                 if self.orchestrator is not None:
-                    lc = getattr(self.orchestrator.launcher, "container_count_provider", "missing")
-                    if lc != "missing":
-                        self.orchestrator.launcher.container_count_provider = self.container_scheduler.decide_n
+                    launcher = self.orchestrator.launcher
+                    if isinstance(launcher, SlurmJobLauncher):
+                        launcher.container_count_provider = self.container_scheduler.decide_n
                     self.orchestrator.live_count_provider = self.container_scheduler.live_count
             license_server = start_license_ctrl_server(
                 controller=controller, scheduler=self.container_scheduler, port=self.license_ctrl_port
@@ -190,14 +191,15 @@ class ControlPlane:
             # 자원 백채널(:7882): web 대시보드가 폴러 스냅샷 + 전용 자원 DB의 영속 시계열을 HTTP 프록시로 읽는다.
             if self.resource_poller is not None:
                 _rstore = self.resources_store
+                history_fetch: Callable[[float | None], list[dict[str, Any]]] | None = None
+                if _rstore is not None:
+                    def history_fetch(since_ts: float | None = None) -> list[dict[str, Any]]:
+                        return _rstore.fetch_resource_history(since_ts=since_ts)
+
                 resource_server = start_resource_server(
                     poller=self.resource_poller,
                     port=self.resource_port,
-                    history_fetch=(
-                        (lambda since_ts=None: _rstore.fetch_resource_history(since_ts=since_ts))
-                        if _rstore is not None
-                        else None
-                    ),
+                    history_fetch=history_fetch,
                 )
                 self._servers.append(resource_server)
                 threading.Thread(target=resource_server.serve_forever, daemon=True, name="ResourceServer").start()
@@ -215,14 +217,17 @@ class ControlPlane:
         if self.run_web:
             # 자원 프로바이더: 같은 프로세스에 폴러가 있으면(all 모드) 라이브는 폴러 직접·추세는 자원DB 영속,
             # 없으면(web 전용) control(:7882)에 HTTP 프록시. history는 둘 다 since_ts를 받는다.
+            provider: Callable[[], dict[str, Any]] | None
+            history: Callable[[float | None], list[dict[str, Any]]] | None
             if self.resource_poller is not None:
                 provider = self.resource_poller.snapshot
                 _rs, _rp = self.resources_store, self.resource_poller
-                history = (
-                    (lambda since_ts=None: _rs.fetch_resource_history(since_ts=since_ts))
-                    if _rs is not None
-                    else (lambda since_ts=None: _rp.history())
-                )
+                if _rs is not None:
+                    def history(since_ts: float | None = None) -> list[dict[str, Any]]:
+                        return _rs.fetch_resource_history(since_ts=since_ts)
+                else:
+                    def history(since_ts: float | None = None) -> list[dict[str, Any]]:
+                        return _rp.history()
             elif self.resource_provider is not None:
                 provider, history = self.resource_provider.snapshot, self.resource_provider.history
             else:

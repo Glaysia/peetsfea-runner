@@ -198,3 +198,35 @@ def test_sequential_ramp_keeps_waiting_on_none_reason() -> None:
     orch.poll()  # reason='None'(곧 시작) → 취소 안 하고 대기
     assert orch.cancellations == 0
     assert launcher.submits == 1  # 직전 잡 대기 중 → 추가 제출 없음
+
+
+def test_roll_stops_one_and_refills_four_from_eight_jobs() -> None:
+    launcher = SeqFakeLauncher()
+    clock = FakeClock()
+    live: dict[str, int] = {}
+    orch = JobOrchestrator(launcher=launcher, clock=clock, job_count=9, sequential_ramp=True)
+    orch.ramp_interval_seconds = 0.0
+
+    orch.ensure_running()
+    for _ in range(7):
+        orch.poll()
+    launcher.mark_running()
+    assert orch.running_count() == 8
+
+    handles = orch.handles()
+    victim = handles[0]
+    for handle in handles:
+        live[handle.slurm_id] = 5
+    live[victim.slurm_id] = 0
+
+    orch.live_count_provider = lambda slurm_id: live.get(slurm_id, 0)
+    orch._last_roll = 1.0  # noqa: SLF001 - 다음 poll이 실제 롤링 tick이 되게 한다.
+    clock.t = orch.roll_period_seconds + 1.0
+
+    before_submits = launcher.submits
+    orch.poll()
+
+    assert launcher.kills == 1
+    assert launcher.alive[victim.slurm_id] is False
+    assert launcher.submits == before_submits + 4
+    assert orch.running_count() == 11

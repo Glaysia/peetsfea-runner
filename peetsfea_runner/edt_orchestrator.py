@@ -60,11 +60,12 @@ class JobOrchestrator:
     sequential_ramp: bool = False
     # 2단계 제어 루프 (PLANS/job_birth_controller.html):
     #   잡 ≤ job_count-2 (≤7): 램프 — ramp_interval_seconds(1분)마다 새 잡 1개 제출(탈락 없음, 순증).
-    #   잡 ≥ job_count-1 (8~9): 정상 — roll_period_seconds(10분)마다 살아있는 컨테이너가 **가장 적은** RUNNING
-    #     잡 1개 안전종료 → 빈 슬롯을 새 잡으로 채워 job_count(9) 유지(8개→2제출, 9개→1제출).
+    #   잡 ≥ job_count-1 (8~): 정상 — roll_period_seconds(10분)마다 살아있는 컨테이너가 **가장 적은** RUNNING
+    #     잡 1개 안전종료 → 기본 4개까지 새 잡 제출(8개→1탈락→4제출=11개 보강).
     # live_count_provider(slurm_id)=제어기 보고 기반 살아있는 컨테이너 수(-1=미보고). None이면 롤 비활성(램프만).
     ramp_interval_seconds: float = 30.0  # poll 주기(60s) 아래 → 램프 단계 매 poll 1개씩(=poll 주기 = 1분/잡)
     roll_period_seconds: float = 600.0
+    roll_refill_jobs: int = 4
     live_count_provider: Callable[[str], int] | None = None
     submitted: int = field(default=0, init=False)
     restarts: int = field(default=0, init=False)  # 죽어서 재기동한 횟수
@@ -79,9 +80,16 @@ class JobOrchestrator:
         self._jobs[job_index] = self.launcher.submit(job_index)
         self.submitted += 1
 
-    def _submit_empty_slot(self) -> bool:
+    def _rolling_target(self) -> int:
+        """정상 단계 보강 목표. live 보고가 없으면 기존 9잡 유지로 폴백한다."""
+        if self.live_count_provider is None:
+            return self.job_count
+        return self.job_count + max(0, self.roll_refill_jobs - 2)
+
+    def _submit_empty_slot(self, *, limit: int | None = None) -> bool:
         """가장 낮은 빈 슬롯 1개에 새 잡 제출. 제출하면 True(가용 노드 없음 등 실패 시 False)."""
-        for i in range(self.job_count):
+        upper = self.job_count if limit is None else max(self.job_count, limit)
+        for i in range(upper):
             if i not in self._jobs:
                 try:
                     self._submit(i)
@@ -89,6 +97,15 @@ class JobOrchestrator:
                 except Exception:  # noqa: BLE001 — 가용 노드 없음 등: 다음 사이클 재시도.
                     return False
         return False
+
+    def _submit_until(self, target: int, max_submissions: int) -> int:
+        """target까지, 단 이번 tick에서는 max_submissions개까지만 제출한다."""
+        submitted = 0
+        while len(self._jobs) < target and submitted < max_submissions:
+            if not self._submit_empty_slot(limit=target):
+                break
+            submitted += 1
+        return submitted
 
     def ensure_running(self) -> None:
         """비어 있는 잡 슬롯을 채운다(콜드 스타트/누락 보충)."""
@@ -140,7 +157,7 @@ class JobOrchestrator:
         (fn if callable(fn) else self.launcher.kill)(handle)
 
     def _ramp_poll(self) -> None:
-        """2단계 제어 1회. 잡 ≤7: 1분마다 +1 순증(램프). 8~9: 10분마다 최소-컨테이너 잡 1탈락 + 9까지 채움(정상)."""
+        """2단계 제어 1회. 잡 ≤7: 1분마다 +1 순증. 정상 단계: 최소-컨테이너 잡 1탈락 + 최대 4개 보강."""
         with self._lock:
             now = self.clock()
             # --- 정리: 죽음/TTL만료/막힌 PENDING ---
@@ -172,8 +189,9 @@ class JobOrchestrator:
                         self._last_submit = now
                 return
 
-            # 8~9: 정상 — 10분마다 최소-컨테이너 RUNNING 잡 1탈락
-            if self.live_count_provider is not None and (now - self._last_roll) >= self.roll_period_seconds:
+            # 8+: 정상 — 10분마다 최소-컨테이너 RUNNING 잡 1탈락
+            live_count_provider = self.live_count_provider
+            if live_count_provider is not None and (now - self._last_roll) >= self.roll_period_seconds:
                 if self._last_roll == 0.0:
                     self._last_roll = now  # 첫 정상 진입 직후엔 한 주기 대기(즉시 탈락 방지)
                 else:
@@ -181,7 +199,7 @@ class JobOrchestrator:
                                if self.launcher.is_alive(h) and self._is_running(h)]
                     if running:
                         def lc(h: JobHandle) -> int:
-                            v = self.live_count_provider(h.slurm_id)
+                            v = live_count_provider(h.slurm_id)
                             return v if v >= 0 else 10 ** 9  # 미보고(방금 뜬 잡)는 후보 제외
 
                         i, h = min(running, key=lambda ih: lc(ih[1]))
@@ -189,9 +207,11 @@ class JobOrchestrator:
                         del self._jobs[i]
                         self.expiries += 1
                     self._last_roll = now
-            # 9까지 채움(탈락/자연종료로 빈 슬롯): 폴당 1개씩, PENDING 없을 때 → 8개면 2폴에 걸쳐 2제출, 9개면 1제출.
-            if len(self._jobs) < self.job_count and not waiting:
-                self._submit_empty_slot()
+            # 정상 단계 보강: 스케줄러가 붙어 있으면 기본 11개까지, 한 tick 최대 4개 제출.
+            # 즉 8개에서 1개 내린 경우 7→11로 4개를 바로 채운다. 스케줄러가 없으면 기존 9개 유지.
+            target = self._rolling_target()
+            if len(self._jobs) < target and not waiting:
+                self._submit_until(target, self.roll_refill_jobs)
 
     def running_count(self) -> int:
         with self._lock:

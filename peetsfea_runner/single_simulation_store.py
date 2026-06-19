@@ -564,6 +564,8 @@ class SingleSimulationResultStore:
                 "ok": ok_i, "fail": fail_i, "done": done, "inflight": max(0, leased - done),
                 "created_at": float(created or 0.0),
             })
+        if tot is None:
+            tot = (0, 0, 0)
         submitted, waiting = int(tot[1]), int(tot[2])
         leased_all = submitted - waiting
         done_all = ok_sum + fail_sum

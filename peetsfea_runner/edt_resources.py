@@ -15,7 +15,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -367,8 +367,9 @@ class RemoteResourceProvider:
         if since_ts is not None:
             path += "?" + urlencode({"since": since_ts})
         data = self._get(path)
-        if isinstance(data, dict) and isinstance(data.get("points"), list):
-            return data["points"]
+        points = data.get("points") if isinstance(data, dict) else None
+        if isinstance(points, list):
+            return [dict(point) for point in points if isinstance(point, Mapping)]
         return []
 
 

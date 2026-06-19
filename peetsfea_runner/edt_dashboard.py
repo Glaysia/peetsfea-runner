@@ -20,6 +20,7 @@ import datetime
 import json
 from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -260,7 +261,7 @@ def start_dashboard_server(
             os.close(fd)
             try:
                 # pyarrow 인프로세스 export(DuckDB 은퇴) — dest 파일 하나만 열고 닫아 fd 누수 없음.
-                store.export_parquet(tmp, since=since, terminal_state=state, peetsfea_version=version_filter, limit=limit)
+                store.export_parquet(Path(tmp), since=since, terminal_state=state, peetsfea_version=version_filter, limit=limit)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
                 self.send_header("Content-Length", str(os.path.getsize(tmp)))

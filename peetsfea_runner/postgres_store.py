@@ -234,7 +234,10 @@ class PostgresResultStore:
             sql += f" LIMIT {int(limit)}"
         with self._locked_connect() as connection:
             cur = connection.execute(sql, params)
-            columns = [c.name for c in cur.description]
+            description = cur.description
+            if description is None:
+                return []
+            columns = [c.name for c in description]
             return [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
 
     def fetch_result(self, request_id: str, *, peetsfea_version: str | None = None) -> dict[str, Any] | None:
@@ -249,7 +252,10 @@ class PostgresResultStore:
             row = cur.fetchone()
             if row is None:
                 return None
-            columns = [c.name for c in cur.description]
+            description = cur.description
+            if description is None:
+                return None
+            columns = [c.name for c in description]
             return dict(zip(columns, row, strict=True))
 
     def max_baseline_seed(self) -> int:
@@ -413,7 +419,9 @@ class PostgresResultStore:
                 params,
             ).fetchall()
         columns: dict[str, list[Any]] = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
-        pq.write_table(pa.table(columns) if columns else pa.table({}), str(dest), compression="zstd")
+        pq.write_table(  # type: ignore[no-untyped-call]  # pyarrow parquet writer has no typed stub.
+            pa.table(columns) if columns else pa.table({}), str(dest), compression="zstd"
+        )
 
     # --- 라이선스/자원 시계열 영속 --------------------------------------------------------------
 
@@ -566,6 +574,8 @@ class PostgresResultStore:
                 "ok": ok_i, "fail": fail_i, "done": done, "inflight": max(0, leased - done),
                 "created_at": float(created or 0.0),
             })
+        if tot is None:
+            tot = (0, 0, 0)
         submitted, waiting = int(tot[1]), int(tot[2])
         leased_all = submitted - waiting
         done_all = ok_sum + fail_sum
