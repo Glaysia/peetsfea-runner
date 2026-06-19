@@ -37,12 +37,12 @@ def test_build_control_plane_wires_orchestrator_store_intake(tmp_path: Path) -> 
     assert cp.dashboard_port == 8080 and cp.intake_port == 7875
     assert config.job_command.endswith("orchestrator.sh")
 
-    # HTML 기준 관리 루프: 시작 시 4개를 요청하고, tick마다 oldest stop + 새 잡 요청으로 squeue 15를 넘기지 않는다.
+    # HTML 기준 관리 루프: 시작 시 4개를 요청하고, 2분 홀짝 tick으로 squeue 15를 넘기지 않는다.
     assert cp.orchestrator.sequential_ramp is True
     cp.orchestrator.control_period_seconds = 0.0
     cp.orchestrator.ensure_running()
     assert launcher.submits == 4
-    for _ in range(5):
+    for _ in range(8):
         cp.orchestrator.poll()
     assert cp.orchestrator.running_count() == 15
 

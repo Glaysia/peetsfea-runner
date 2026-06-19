@@ -87,14 +87,21 @@ def test_managed_startup_submits_four_jobs_immediately() -> None:
     assert orch.running_count() == 4
 
 
-def test_managed_loop_waits_until_four_minute_tick() -> None:
+def test_managed_loop_waits_until_two_minute_tick() -> None:
     orch, launcher, clock = _managed()
     orch.ensure_running()
     launcher.mark_running()
-    clock.t = 239.0
+    clock.t = 119.0
     orch.poll()
     assert launcher.submits == 4
     assert launcher.kills == 0
+    clock.t = 120.0
+    orch.poll()
+    assert launcher.kills == 1
+    assert launcher.submits == 4
+    assert orch.running_count() == 3
+
+    launcher.mark_running()
     clock.t = 240.0
     orch.poll()
     assert launcher.kills == 1
@@ -105,11 +112,11 @@ def test_managed_loop_waits_until_four_minute_tick() -> None:
 def test_managed_loop_caps_squeue_at_fifteen() -> None:
     orch, launcher, clock = _managed()
     orch.ensure_running()
-    for tick in range(1, 6):
+    for tick in range(1, 9):
         launcher.mark_running()
         clock.t = tick * orch.control_period_seconds
         orch.poll()
-    assert launcher.submits == 20
+    assert launcher.submits == 19
     assert orch.running_count() == 15
 
 
@@ -133,7 +140,7 @@ def test_managed_loop_cancels_non_none_pending_reason_every_poll() -> None:
 def test_managed_loop_stuck_at_cap_replaces_one_job() -> None:
     orch, launcher, clock = _managed()
     orch.ensure_running()
-    for tick in range(1, 5):
+    for tick in range(1, 9):
         launcher.mark_running()
         clock.t = tick * orch.control_period_seconds
         orch.poll()
@@ -149,11 +156,11 @@ def test_managed_loop_stuck_at_cap_replaces_one_job() -> None:
 
     assert launcher.kills == before_kills + 1
     assert launcher.cancels == 1
-    assert launcher.submits == before_submits + 2
-    assert orch.running_count() == 15
+    assert launcher.submits == before_submits + 1
+    assert orch.running_count() == 14
 
 
-def test_managed_loop_saturation_every_third_tick_stops_extra_oldest_job() -> None:
+def test_managed_loop_saturation_every_sixth_tick_stops_extra_oldest_job() -> None:
     clock = FakeClock()
     holder = {"solve": 151}
     launcher = FakeLauncher(clock)
@@ -165,12 +172,13 @@ def test_managed_loop_saturation_every_third_tick_stops_extra_oldest_job() -> No
         solve_provider=lambda: holder["solve"],
     )
     orch.ensure_running()
-    launcher.mark_running()
-    clock.t = orch.control_period_seconds
-    orch.poll()
+    for tick in range(1, 5):
+        launcher.mark_running()
+        clock.t = tick * orch.control_period_seconds
+        orch.poll()
     before_kills = launcher.kills
     launcher.mark_running()
-    clock.t = 2 * orch.control_period_seconds
+    clock.t = 5 * orch.control_period_seconds
     orch.poll()
     assert launcher.kills == before_kills + 2
     assert orch.saturation_reductions == 1

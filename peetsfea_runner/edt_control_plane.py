@@ -1,7 +1,7 @@
 """컨트롤 플레인 — 정상상태 동시 ~100 연속 가동.
 
 제어 호스트(systemd `--user` 서비스)가 돌리는 상시 루프:
-- **오케스트레이터:** HTML 정책 기준으로 4분마다 가장 오래된 RUNNING 잡을 내리고 새 잡을 요청한다.
+- **오케스트레이터:** HTML 정책 기준으로 2분마다 홀수 tick은 새 잡 제출, 짝수 tick은 oldest 종료를 수행한다.
   잡 내부에서는 `deploy/orchestrator.sh`가 1솔브 단명 enroot 컨테이너 N개를 stagger 가동한다.
 - **Intake :7875:** sweep 우선순위 요청 수신(우선순위 분배는 후속 — 현재는 baseline 자기공급이 핵심).
 - **대시보드 :8080:** 결과 DB read-only 조회 + `results.csv`.

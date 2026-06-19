@@ -1,8 +1,9 @@
 """SLURM 잡 출생 제어 루프.
 
 현행 정책은 HTML 문서(`PLANS/job_birth_controller.html`)가 기준이다. 관리 루프는 잡 수 구간을 나누지
-않고 4분마다 가장 오래된 RUNNING 잡을 하나 내린 뒤 새 잡 4개를 요청한다. 전체 squeue 상한은 15개이며,
-과포화(solve > 150)는 12분마다 가장 오래된 RUNNING 잡 하나를 추가로 내리는 방식으로 감압한다.
+않고 2분마다 홀수 tick은 새 잡 4개 제출, 짝수 tick은 가장 오래된 RUNNING 잡 1개 종료를 번갈아 수행한다.
+전체 squeue 상한은 15개이며, 과포화(solve > 150)는 12분마다 가장 오래된 RUNNING 잡 하나를 추가로
+내리는 방식으로 감압한다.
 """
 
 from __future__ import annotations
@@ -54,12 +55,12 @@ class JobOrchestrator:
     max_lifetime_seconds: float = float(JOB_MAX_LIFETIME_SECONDS)
     # 기존 설정명 호환용. True면 HTML 기준 관리 루프를 사용한다.
     sequential_ramp: bool = False
-    control_period_seconds: float = 240.0
+    control_period_seconds: float = 120.0
     submit_batch_jobs: int = 4
     squeue_cap: int = 15
     running_target: int = 10
     pending_target: int = 5
-    saturation_every_ticks: int = 3
+    saturation_every_ticks: int = 6
     saturation_solve_ceiling: int = 150
     solve_provider: Callable[[], int] | None = None
     submitted: int = field(default=0, init=False)
@@ -70,6 +71,7 @@ class JobOrchestrator:
     _jobs: dict[int, JobHandle] = field(default_factory=dict, init=False, repr=False)
     _last_control: float = field(default=float("-inf"), init=False)
     _control_ticks: int = field(default=0, init=False)
+    _stuck_at_cap_recovery_pending: bool = field(default=False, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def _submit(self, job_index: int) -> None:
@@ -98,7 +100,7 @@ class JobOrchestrator:
         return submitted
 
     def ensure_running(self) -> None:
-        """초기 기동. 관리 루프는 첫 tick을 즉시 실행해 새 잡 4개를 요청한다."""
+        """초기 기동. 관리 루프는 첫 홀수 tick을 즉시 실행해 새 잡 4개를 요청한다."""
         if self.sequential_ramp:
             self._managed_poll(force_tick=True)
             return
@@ -108,7 +110,7 @@ class JobOrchestrator:
                     self._submit(i)
 
     def poll(self) -> None:
-        """전 잡 1회 점검. 관리 루프는 4분 tick에서만 출생률을 바꾼다."""
+        """전 잡 1회 점검. 관리 루프는 2분 tick에서만 출생률을 바꾼다."""
         if self.sequential_ramp:
             self._managed_poll()
             return
@@ -220,23 +222,31 @@ class JobOrchestrator:
             self.expiries += 1
 
     def _managed_poll(self, *, force_tick: bool = False) -> None:
-        """HTML 기준 제어 1회. 4분마다 oldest stop + submit 4, squeue cap은 15."""
+        """HTML 기준 제어 1회. 2분마다 홀수 submit 4 / 짝수 oldest stop, squeue cap은 15."""
         with self._lock:
             now = self.clock()
             self._cleanup_finished_and_expired(now)
-            self._cancel_stuck_pending_jobs()
+            was_at_cap = self._active_count() >= self.squeue_cap
+            cancelled_stuck = self._cancel_stuck_pending_jobs()
+            if was_at_cap and cancelled_stuck > 0:
+                self._stuck_at_cap_recovery_pending = True
             if not force_tick and (now - self._last_control) < self.control_period_seconds:
                 return
 
-            stuck_at_cap = self._active_count() >= self.squeue_cap and self._queue_is_stuck()
+            stuck_at_cap = self._stuck_at_cap_recovery_pending or (
+                self._active_count() >= self.squeue_cap and self._queue_is_stuck()
+            )
+            next_tick = self._control_ticks + 1
             if stuck_at_cap:
                 self._stop_oldest_running()
                 self._submit_until(self.squeue_cap, 1)
+                self._stuck_at_cap_recovery_pending = False
+            elif next_tick % 2 == 1:
+                self._submit_until(self.squeue_cap, self.submit_batch_jobs)
             else:
                 self._stop_oldest_running()
-                self._submit_until(self.squeue_cap, self.submit_batch_jobs)
             self._last_control = now
-            self._control_ticks += 1
+            self._control_ticks = next_tick
 
             if (
                 self.saturation_every_ticks > 0
