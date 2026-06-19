@@ -63,7 +63,7 @@ class JobOrchestrator:
     #   잡 ≥ job_count-1 (8~9): 정상 — roll_period_seconds(10분)마다 살아있는 컨테이너가 **가장 적은** RUNNING
     #     잡 1개 안전종료 → 빈 슬롯을 새 잡으로 채워 job_count(9) 유지(8개→2제출, 9개→1제출).
     # live_count_provider(slurm_id)=제어기 보고 기반 살아있는 컨테이너 수(-1=미보고). None이면 롤 비활성(램프만).
-    ramp_interval_seconds: float = 60.0
+    ramp_interval_seconds: float = 30.0  # poll 주기(60s) 아래 → 램프 단계 매 poll 1개씩(=poll 주기 = 1분/잡)
     roll_period_seconds: float = 600.0
     live_count_provider: Callable[[str], int] | None = None
     submitted: int = field(default=0, init=False)
@@ -163,11 +163,11 @@ class JobOrchestrator:
                         self.cancellations += 1
 
             n = len(self._jobs)
-            # 아직 안 뜬(PENDING) 잡 있으면 그게 RUNNING 될 때까지 새 제출 보류(노드 과적재·중복 제출 방지).
+            # 아직 안 뜬(PENDING) 잡 있으면 그게 RUNNING 될 때까지 새 제출 보류(노드 과적재 방지) — 정상 단계 채움에만 적용.
             waiting = any(self.launcher.is_alive(h) and not self._is_running(h) for h in self._jobs.values())
 
-            if n <= self.job_count - 2:  # ≤7: 램프 — 1분마다 +1 (탈락 없음, 순증)
-                if not waiting and (now - self._last_submit) >= self.ramp_interval_seconds:
+            if n <= self.job_count - 2:  # ≤7: 램프 — poll 주기마다 +1 순증. **직전 잡 RUNNING 안 기다림**(stall 방지).
+                if (now - self._last_submit) >= self.ramp_interval_seconds:
                     if self._submit_empty_slot():
                         self._last_submit = now
                 return

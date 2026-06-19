@@ -134,26 +134,23 @@ class SeqFakeLauncher(JobLauncher):
 
 
 def test_sequential_ramp_one_at_a_time() -> None:
+    # 램프 순증: ramp_interval(여기 30s)마다 1개씩. **직전 잡 RUNNING 안 기다림**(PENDING이어도 순증, stall 방지).
     launcher = SeqFakeLauncher()
     clock = FakeClock()
-    orch = JobOrchestrator(launcher=launcher, clock=clock, job_count=3, sequential_ramp=True)
+    orch = JobOrchestrator(launcher=launcher, clock=clock, job_count=9, sequential_ramp=True)
     orch.ensure_running()
-    assert launcher.submits == 1  # 첫 제출은 즉시(램프)
+    assert launcher.submits == 1  # 첫 제출은 즉시
     orch.poll()
-    assert launcher.submits == 1  # 직전 잡 아직 PENDING → 다음 제출 안 함
-    launcher.mark_running()  # 잡0 RUNNING
-    clock.t += 60  # 램프 1분 경과
+    assert launcher.submits == 1  # 아직 ramp_interval 안 지남(타이머) → 제출 안 함
+    clock.t += 60
     orch.poll()
-    assert launcher.submits == 2  # 이제 다음 제출(1분+RUNNING)
-    launcher.mark_running()
+    assert launcher.submits == 2  # 경과 → +1 (직전 PENDING이어도 순증)
     clock.t += 60
     orch.poll()
     assert launcher.submits == 3
-    launcher.mark_running()
     clock.t += 60
     orch.poll()
-    assert launcher.submits == 3  # 목표 도달 → 더 제출 안 함
-    assert orch.running_count() == 3
+    assert launcher.submits == 4  # 램프 단계(≤7)는 RUNNING 안 기다리고 계속 순증
 
 
 def test_sequential_ramp_waits_when_no_node() -> None:
