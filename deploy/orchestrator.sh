@@ -13,7 +13,16 @@ ANSB=/opt/ohpc/pub/Electronics/v252
 DEPLOY=$HOME/edt-deploy
 VENVPY=$DEPLOY/venv/bin/python
 IMG=$HOME/runtime/enroot/aedt.sqsh
-REF=$DEPLOY/venv/lib/python3.12/site-packages/peetsfea/data/0.3.x_sweep.toml
+resolve_peetsfea_toml() {
+  RESOLVED_TOML=$("$VENVPY" -m peetsfea_runner.peetsfea_data "$1")
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$RESOLVED_TOML" ]; then
+    echo "[orch] failed to resolve peetsfea $1 TOML"
+    exit 1
+  fi
+}
+resolve_peetsfea_toml sweep
+REF=$RESOLVED_TOML
 JOBDIR=/enroot/${USER}_${SLURM_JOB_ID}
 OUT=$JOBDIR/run_out
 CLOG=$DEPLOY/clogs; mkdir -p "$OUT" "$CLOG"

@@ -1,4 +1,4 @@
-"""실 프리미티브 e2e — 내 디스패처가 peetsfea 0.3.3 진짜 프리미티브를 warm ansysedt에 물려 실 solve.
+"""실 프리미티브 e2e — 내 디스패처가 peetsfea 진짜 프리미티브를 warm ansysedt에 물려 실 solve.
 
 GOAL §7의 마지막 조각: `_solve_primitive`(스텁) 대신 **peetsfea 진짜 프리미티브**
 (`run_ssw_random_sample_reports_from_toml_text(..., grpc_port=...)`)를 SlotDispatcher로 호출.
@@ -27,10 +27,11 @@ from peetsfea_runner.edt_aedt_backend import RealEdtBackend, default_ansysedt_ex
 from peetsfea_runner.edt_dispatcher import SlotDispatcher  # noqa: E402
 from peetsfea_runner.edt_queue import QueueItem, TomlQueue  # noqa: E402
 from peetsfea_runner.edtmgr import EdtManager  # noqa: E402
+from peetsfea_runner.peetsfea_data import load_peetsfea_data_toml_text  # noqa: E402
 
 
 def main() -> int:
-    candidate = (Path(peetsfea.__file__).resolve().parent / "data" / "0.3.5_fixed.toml").read_text(encoding="utf-8")
+    candidate = load_peetsfea_data_toml_text("fixed")
     print(f"[real-e2e] peetsfea {peetsfea.__version__}, fixed candidate {len(candidate)} bytes", flush=True)
 
     work = Path(__file__).resolve().parent.parent / "build" / "e2e_real"

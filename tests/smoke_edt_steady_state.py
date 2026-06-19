@@ -1,7 +1,7 @@
 """실 steady-state e2e (Phase 3+4) — build_steady_state_service를 실 AEDT로 1건 검증.
 
 2-레인 큐(baseline 실 peetsfea 샘플) → admission(실 psutil 부하 게이트) → 디스패처 →
-edtmgr warm ansysedt → peetsfea 0.3.4 진짜 프리미티브 실 solve → 결과 DB 기록.
+edtmgr warm ansysedt → peetsfea 진짜 프리미티브 실 solve → 결과 DB 기록.
 1슬롯·baseline 작게(batch 3)로 1건만 돌려 와이어링이 실제로 흐르는지 본다.
 
     PEETS_SMOKE_PYTHON=/py312/bin/python PEETS_SMOKE_CONDA_MOUNT=$HOME/miniconda3/envs/py312:/py312 \
@@ -22,10 +22,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import peetsfea  # noqa: E402
 
 from peetsfea_runner.edt_service import EdtServiceConfig, build_steady_state_service  # noqa: E402
+from peetsfea_runner.peetsfea_data import load_peetsfea_data_toml_text  # noqa: E402
 
 
 def main() -> int:
-    fixed = (Path(peetsfea.__file__).resolve().parent / "data" / "0.3.5_fixed.toml").read_text(encoding="utf-8")
+    fixed = load_peetsfea_data_toml_text("fixed")
     work = Path(__file__).resolve().parent.parent / "build" / "e2e_steady"
     config = EdtServiceConfig(
         output_root=work / "out",

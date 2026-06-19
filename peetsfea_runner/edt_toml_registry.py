@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
+from .peetsfea_data import load_peetsfea_data_toml_text
+
 BUILTIN_TOML_ID = "builtin-widest"
 MAX_CUSTOM_TOMLS = 6
 
@@ -60,14 +62,7 @@ def light_toml_validator(toml_text: str) -> None:
 def load_default_builtin_toml_text(path: Path | None = None) -> str:
     if path is not None:
         return path.expanduser().read_text(encoding="utf-8")
-
-    import peetsfea
-
-    data_dir = Path(peetsfea.__file__).resolve().parent / "data"
-    candidates = sorted(data_dir.glob("*_sweep.toml"))
-    if not candidates:
-        raise FileNotFoundError(f"no *_sweep.toml found in {data_dir}")
-    return candidates[-1].read_text(encoding="utf-8")
+    return load_peetsfea_data_toml_text("sweep")
 
 
 @dataclass

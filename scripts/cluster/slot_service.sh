@@ -1,7 +1,7 @@
 #!/bin/bash
 # Production 슬롯 서비스 — 잡 컨테이너가 entrypoint로 build_steady_state_service를 무한 가동.
 # baseline 전역 샘플링으로 슬롯 자기공급(요청 없어도 계속 시뮬). SIGTERM(=scancel)까지.
-# GPU 노출(NVIDIA_VISIBLE_DEVICES=all): peetsfea 0.3.6이 GPU 접근 가능하면 알아서 켠다.
+# GPU 노출(NVIDIA_VISIBLE_DEVICES=all): peetsfea가 GPU 접근 가능하면 알아서 켠다.
 # 잡이 --gres=gpu로 GPU를 받으면 EDT_GPU_COUNT가 SLURM env로 들어오고, supervisor가 워커별로 GPU에 분산 핀닝한다.
 #
 # 결과 전송: 슈퍼컴엔 DB 없음. 결과 envelope를 로컬 데몬(:7876)으로 push한다.
@@ -14,8 +14,16 @@ echo "[slot] NODE=$(hostname) JOB=$SLURM_JOB_ID PART=$EDT_PARTITION LIC=$ANSYSLM
 ANSB=/opt/ohpc/pub/Electronics/v252
 DEPLOY=$HOME/edt-deploy
 VENVPY=$DEPLOY/venv/bin/python
-# 0.3.6은 spec 파일명이 버전무관(0.3.x_sweep.toml)으로 바뀌었다.
-REF=$DEPLOY/venv/lib/python3.12/site-packages/peetsfea/data/0.3.x_sweep.toml
+resolve_peetsfea_toml() {
+  RESOLVED_TOML=$("$VENVPY" -m peetsfea_runner.peetsfea_data "$1")
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$RESOLVED_TOML" ]; then
+    echo "[slot] failed to resolve peetsfea $1 TOML"
+    exit 1
+  fi
+}
+resolve_peetsfea_toml sweep
+REF=$RESOLVED_TOML
 # 무거운 AEDT 산출물은 노드 로컬 스크래치 /enroot/{USER}_{JOB}에 쓴다(gpfs $HOME 쿼터 회피, job_workspace 설계).
 # gpfs $HOME에 쓰면 88 워커 aedt가 per-user 쿼터를 터뜨린다. /enroot는 노드 로컬·대용량·잡 종료 시 삭제.
 JOBDIR=/enroot/${USER}_${SLURM_JOB_ID}

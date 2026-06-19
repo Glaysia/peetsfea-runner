@@ -1,7 +1,7 @@
 """Phase 1 와이어링 — 슬롯 10개(RealEdtBackend) + 큐 + 디스패처 + 결과 DB.
 
 systemd user 서비스(또는 컨테이너 진입점)가 호출하는 빌더. 큐는 디렉토리에서 수동 시드한다
-(7875 인테이크는 Phase 4). 실제 시뮬은 peetsfea 0.3.2 프리미티브를 grpc_port와 함께 호출한다.
+(7875 인테이크는 Phase 4). 실제 시뮬은 peetsfea 프리미티브를 grpc_port와 함께 호출한다.
 """
 
 from __future__ import annotations

@@ -5,7 +5,16 @@ ANSB=/opt/ohpc/pub/Electronics/v252
 DEPLOY=$HOME/edt-deploy
 VENVPY=$DEPLOY/venv/bin/python
 # 검증용: 고정 후보(우선순위 레인, ~14분 확정 solve). baseline은 끈다(random 무거운 후보 회피).
-FIXED=$DEPLOY/venv/lib/python3.12/site-packages/peetsfea/data/0.3.5_fixed.toml
+resolve_peetsfea_toml() {
+  RESOLVED_TOML=$("$VENVPY" -m peetsfea_runner.peetsfea_data "$1")
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$RESOLVED_TOML" ]; then
+    echo "[job] failed to resolve peetsfea $1 TOML"
+    exit 1
+  fi
+}
+resolve_peetsfea_toml fixed
+FIXED=$RESOLVED_TOML
 OUT=$DEPLOY/run_out/$SLURM_JOB_ID
 mkdir -p "$OUT/work"
 C=edt-job-$SLURM_JOB_ID
