@@ -58,10 +58,13 @@ class JobOrchestrator:
     # sequential_ramp=True면 **한 번에 한 잡씩**: 직전 잡이 RUNNING 된 뒤에야 다음 잡을 제출(노드 과적재·동시
     # 콜드스타트 폭주 방지). poll/ensure_running 호출당 최대 1개 제출, 가용 노드 없으면 그냥 대기.
     sequential_ramp: bool = False
-    # 롤링 교체(최대 roll_period_seconds=15분 주기, 잡 드레인 시 더 빨리): **살아있는 컨테이너가 가장 적은**
-    # RUNNING 잡을 안전종료 → 빈 슬롯을 새 잡(제어기 LUT로 N 결정)으로 채움 → 출생/사망 stagger(herd 차단).
-    # live_count_provider(slurm_id) = 제어기 보고 기반 살아있는 컨테이너 수(-1=미보고). None이면 롤 비활성.
-    roll_period_seconds: float = 600.0  # 10분마다 살아있는 컨테이너 가장 적은 잡 1개 탈락 → 9 유지하게 채움
+    # 2단계 제어 루프 (PLANS/job_birth_controller.html):
+    #   잡 ≤ job_count-2 (≤7): 램프 — ramp_interval_seconds(1분)마다 새 잡 1개 제출(탈락 없음, 순증).
+    #   잡 ≥ job_count-1 (8~9): 정상 — roll_period_seconds(10분)마다 살아있는 컨테이너가 **가장 적은** RUNNING
+    #     잡 1개 안전종료 → 빈 슬롯을 새 잡으로 채워 job_count(9) 유지(8개→2제출, 9개→1제출).
+    # live_count_provider(slurm_id)=제어기 보고 기반 살아있는 컨테이너 수(-1=미보고). None이면 롤 비활성(램프만).
+    ramp_interval_seconds: float = 60.0
+    roll_period_seconds: float = 600.0
     live_count_provider: Callable[[str], int] | None = None
     submitted: int = field(default=0, init=False)
     restarts: int = field(default=0, init=False)  # 죽어서 재기동한 횟수
@@ -69,38 +72,23 @@ class JobOrchestrator:
     cancellations: int = field(default=0, init=False)  # 막힌 PENDING(Resources/Priority 등) 취소 후 다른 노드로 넘긴 횟수
     _jobs: dict[int, JobHandle] = field(default_factory=dict, init=False, repr=False)
     _last_roll: float = field(default=0.0, init=False)
+    _last_submit: float = field(default=float("-inf"), init=False)  # 첫 램프 제출은 즉시(1분 게이트 통과)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
-
-    def _roll(self, now: float) -> None:
-        """롤링 교체 1회: 풀(job_count) 상태에서 roll_period 경과 또는 드레인된 잡이 있으면,
-        살아있는 컨테이너가 가장 적은 RUNNING 잡을 안전종료(빈 슬롯은 같은 사이클의 제출 로직이 채움)."""
-        if self.live_count_provider is None:
-            return
-        running = [(i, h) for i, h in self._jobs.items()
-                   if self.launcher.is_alive(h) and self._is_running(h)]
-        if len(running) < self.job_count:
-            return  # 아직 램프 중 — 롤 안 함
-
-        def lc(h: JobHandle) -> int:
-            v = self.live_count_provider(h.slurm_id)
-            return v if v >= 0 else 10 ** 9  # 미보고(방금 뜬 잡)는 후보 제외
-
-        drained = any(lc(h) == 0 for _, h in running)
-        due = (now - self._last_roll) >= self.roll_period_seconds
-        if not (due or drained):
-            return
-        if self._last_roll == 0.0:  # 첫 풀 도달 직후엔 한 주기 대기(즉시 롤 방지)
-            self._last_roll = now
-            return
-        i, h = min(running, key=lambda ih: lc(ih[1]))
-        self.launcher.kill(h)  # 안전종료(SIGTERM → orchestrator trap drain)
-        del self._jobs[i]
-        self._last_roll = now
-        self.expiries += 1
 
     def _submit(self, job_index: int) -> None:
         self._jobs[job_index] = self.launcher.submit(job_index)
         self.submitted += 1
+
+    def _submit_empty_slot(self) -> bool:
+        """가장 낮은 빈 슬롯 1개에 새 잡 제출. 제출하면 True(가용 노드 없음 등 실패 시 False)."""
+        for i in range(self.job_count):
+            if i not in self._jobs:
+                try:
+                    self._submit(i)
+                    return True
+                except Exception:  # noqa: BLE001 — 가용 노드 없음 등: 다음 사이클 재시도.
+                    return False
+        return False
 
     def ensure_running(self) -> None:
         """비어 있는 잡 슬롯을 채운다(콜드 스타트/누락 보충)."""
@@ -152,20 +140,19 @@ class JobOrchestrator:
         (fn if callable(fn) else self.launcher.kill)(handle)
 
     def _ramp_poll(self) -> None:
-        """순차 램프 1회: 죽은/만료/막힌 PENDING 정리 후, 대기 잡이 없고 목표 미달이면 **한 개만** 제출."""
+        """2단계 제어 1회. 잡 ≤7: 1분마다 +1 순증(램프). 8~9: 10분마다 최소-컨테이너 잡 1탈락 + 9까지 채움(정상)."""
         with self._lock:
             now = self.clock()
+            # --- 정리: 죽음/TTL만료/막힌 PENDING ---
             for i in list(self._jobs):
                 handle = self._jobs[i]
                 if not self.launcher.is_alive(handle):
                     del self._jobs[i]
-                    self.restarts += 1  # 죽음 → 다음 램프에서 재제출
+                    self.restarts += 1
                 elif (now - handle.started_at) >= self.max_lifetime_seconds:
                     self.launcher.kill(handle)
                     del self._jobs[i]
                     self.expiries += 1
-            # 막힌 PENDING 취소: REASON이 None/곧시작이 아니라 Resources/Priority 등이면 그 노드는 한동안 안 빈다
-            # → 잡을 취소하고 그 노드를 회피 등록 → 다음 제출에서 다른 노드로 넘어간다.
             for i in list(self._jobs):
                 handle = self._jobs[i]
                 if self.launcher.is_alive(handle) and not self._is_running(handle):
@@ -174,19 +161,37 @@ class JobOrchestrator:
                         self._avoid_node(handle)
                         del self._jobs[i]
                         self.cancellations += 1
-            self._roll(now)  # 롤링 교체: 가장 적게 남은 잡 안전종료(빈 슬롯은 아래서 새 잡으로 채움)
-            if len(self._jobs) >= self.job_count:
+
+            n = len(self._jobs)
+            # 아직 안 뜬(PENDING) 잡 있으면 그게 RUNNING 될 때까지 새 제출 보류(노드 과적재·중복 제출 방지).
+            waiting = any(self.launcher.is_alive(h) and not self._is_running(h) for h in self._jobs.values())
+
+            if n <= self.job_count - 2:  # ≤7: 램프 — 1분마다 +1 (탈락 없음, 순증)
+                if not waiting and (now - self._last_submit) >= self.ramp_interval_seconds:
+                    if self._submit_empty_slot():
+                        self._last_submit = now
                 return
-            # 아직 (정상) RUNNING 대기 중인 잡이 있으면 그게 뜰 때까지 대기 — 한 번에 하나씩.
-            if any(self.launcher.is_alive(h) and not self._is_running(h) for h in self._jobs.values()):
-                return
-            for i in range(self.job_count):
-                if i not in self._jobs:
-                    try:
-                        self._submit(i)
-                    except Exception:  # noqa: BLE001 — 가용 노드 없음 등: 이번 사이클은 건너뛰고 다음에 재시도.
-                        pass
-                    return
+
+            # 8~9: 정상 — 10분마다 최소-컨테이너 RUNNING 잡 1탈락
+            if self.live_count_provider is not None and (now - self._last_roll) >= self.roll_period_seconds:
+                if self._last_roll == 0.0:
+                    self._last_roll = now  # 첫 정상 진입 직후엔 한 주기 대기(즉시 탈락 방지)
+                else:
+                    running = [(i, h) for i, h in self._jobs.items()
+                               if self.launcher.is_alive(h) and self._is_running(h)]
+                    if running:
+                        def lc(h: JobHandle) -> int:
+                            v = self.live_count_provider(h.slurm_id)
+                            return v if v >= 0 else 10 ** 9  # 미보고(방금 뜬 잡)는 후보 제외
+
+                        i, h = min(running, key=lambda ih: lc(ih[1]))
+                        self.launcher.kill(h)  # 안전종료(SIGTERM → orchestrator trap drain)
+                        del self._jobs[i]
+                        self.expiries += 1
+                    self._last_roll = now
+            # 9까지 채움(탈락/자연종료로 빈 슬롯): 폴당 1개씩, PENDING 없을 때 → 8개면 2폴에 걸쳐 2제출, 9개면 1제출.
+            if len(self._jobs) < self.job_count and not waiting:
+                self._submit_empty_slot()
 
     def running_count(self) -> int:
         with self._lock:

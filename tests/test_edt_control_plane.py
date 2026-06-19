@@ -36,12 +36,13 @@ def test_build_control_plane_wires_orchestrator_store_intake(tmp_path: Path) -> 
     assert isinstance(cp.intake, IntakeService)
     assert cp.dashboard_port == 8080 and cp.intake_port == 7875
 
-    # 순차 램프(기본): 한 번에 하나씩 — 직전 잡이 RUNNING 된 뒤 다음. FakeLauncher는 제출 즉시 alive(=running 폴백).
+    # 2단계 제어: 램프(≤7)는 1분마다 1개씩. 와이어링 검증이라 간격을 0으로 둬 즉시 9까지 채운다.
     assert cp.orchestrator.sequential_ramp is True
+    cp.orchestrator.ramp_interval_seconds = 0.0
     cp.orchestrator.ensure_running()
     assert launcher.submits == 1  # 처음엔 한 개만
     for _ in range(8):
-        cp.orchestrator.poll()  # 하나씩 차근차근 올림
+        cp.orchestrator.poll()  # 하나씩 차근차근 올림(램프 7→ 정상 8~9 채움)
     assert launcher.submits == 9
     assert cp.orchestrator.running_count() == 9
 

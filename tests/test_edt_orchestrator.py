@@ -135,18 +135,22 @@ class SeqFakeLauncher(JobLauncher):
 
 def test_sequential_ramp_one_at_a_time() -> None:
     launcher = SeqFakeLauncher()
-    orch = JobOrchestrator(launcher=launcher, clock=FakeClock(), job_count=3, sequential_ramp=True)
+    clock = FakeClock()
+    orch = JobOrchestrator(launcher=launcher, clock=clock, job_count=3, sequential_ramp=True)
     orch.ensure_running()
-    assert launcher.submits == 1  # 한 개만 제출
+    assert launcher.submits == 1  # 첫 제출은 즉시(램프)
     orch.poll()
     assert launcher.submits == 1  # 직전 잡 아직 PENDING → 다음 제출 안 함
     launcher.mark_running()  # 잡0 RUNNING
+    clock.t += 60  # 램프 1분 경과
     orch.poll()
-    assert launcher.submits == 2  # 이제 다음 제출
+    assert launcher.submits == 2  # 이제 다음 제출(1분+RUNNING)
     launcher.mark_running()
+    clock.t += 60
     orch.poll()
     assert launcher.submits == 3
     launcher.mark_running()
+    clock.t += 60
     orch.poll()
     assert launcher.submits == 3  # 목표 도달 → 더 제출 안 함
     assert orch.running_count() == 3
@@ -176,11 +180,13 @@ def test_sequential_ramp_refills_after_death() -> None:
 
 def test_sequential_ramp_cancels_stuck_pending_and_moves_on() -> None:
     launcher = SeqFakeLauncher()
-    orch = JobOrchestrator(launcher=launcher, clock=FakeClock(), job_count=2, sequential_ramp=True)
+    clock = FakeClock()
+    orch = JobOrchestrator(launcher=launcher, clock=clock, job_count=2, sequential_ramp=True)
     orch.ensure_running()
     assert launcher.submits == 1
     stuck = orch.handles()[0]
     launcher.reason[stuck.slurm_id] = "Resources"  # 노드가 한동안 안 비는 막힌 PENDING
+    clock.t += 60  # 램프 간격 경과(취소 후 재제출 허용)
     orch.poll()  # 막힌 잡 취소 + 노드 회피 + 다른 노드로 재제출
     assert orch.cancellations == 1
     assert launcher.cancels == 1 and launcher.kills == 0  # PENDING은 plain scancel(cancel), TERM(kill) 아님
