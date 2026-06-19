@@ -234,7 +234,7 @@ class ControlPlane:
                 provider = history = None
             dashboard = start_dashboard_server(
                 store=self.store, port=self.dashboard_port, resource_provider=provider, history_provider=history,
-                peetsfea_version=self.dashboard_peetsfea_version,
+                peetsfea_version=self.dashboard_peetsfea_version, toml_registry=self.toml_registry,
             )
             toml_registry_server = start_toml_registry_server(service=self.toml_registry, port=self.intake_port)
             # 결과 ingest(:7876): 슈퍼컴 컨테이너가 역터널로 push → 로컬 단일 DB.

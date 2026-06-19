@@ -13,7 +13,8 @@ from peetsfea_runner.edt_dashboard import (
     build_summary,
     start_dashboard_server,
 )
-from peetsfea_runner.single_simulation_store import SingleSimulationResultStore
+from peetsfea_runner.edt_toml_registry import TomlRegistryService
+from peetsfea_runner.single_simulation_store import DbTomlRegistry, SingleSimulationResultStore
 
 
 def _seed(store: SingleSimulationResultStore, rid: str, k_in: float, passes: int) -> None:
@@ -36,6 +37,16 @@ def _seed(store: SingleSimulationResultStore, rid: str, k_in: float, passes: int
             },
         }
     )
+
+
+def _toml_registry(store: SingleSimulationResultStore) -> TomlRegistryService:
+    service = TomlRegistryService(
+        registry=DbTomlRegistry(store=store),
+        builtin_toml_text="spec_version = 'builtin'\n",
+        clock=lambda: 10.0,
+    )
+    service.initialize()
+    return service
 
 
 def test_export_parquet_filters_and_excludes(tmp_path: Path) -> None:
@@ -183,6 +194,46 @@ def test_dashboard_api_endpoints_and_resources(tmp_path: Path) -> None:
         assert res["counts"]["running"] == 1 and res["nodes"]["n003"]["cpuload"] == 4.0
         results = json.load(urllib.request.urlopen(base + "/api/results?state=success", timeout=3))
         assert results["rows"][0]["request_id"] == "s0" and "in_coil_w" in results["rows"][0]
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_dashboard_toml_cards_and_api_proxy(tmp_path: Path) -> None:
+    import json
+
+    store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
+    store.initialize()
+    registry = _toml_registry(store)
+    server = start_dashboard_server(store=store, port=0, toml_registry=registry)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        page = urllib.request.urlopen(base + "/", timeout=3).read().decode()
+        assert 'data-t="toml"' in page
+        assert "TOML registry" in page
+        assert "입력큐" not in page
+
+        listed = json.load(urllib.request.urlopen(base + "/api/tomls", timeout=3))
+        assert listed["active_count"] == 1
+        req = urllib.request.Request(
+            base + "/api/tomls/custom",
+            data=json.dumps({"name": "narrow", "toml_text": "spec_version = 'narrow'\n"}).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        created = json.load(urllib.request.urlopen(req, timeout=3))
+        custom_id = created["toml"]["id"]
+        req = urllib.request.Request(
+            base + "/api/tomls/ratios",
+            data=json.dumps({"ratios": {"builtin-widest": 60, custom_id: 40}}).encode(),
+            method="PUT",
+            headers={"Content-Type": "application/json"},
+        )
+        json.load(urllib.request.urlopen(req, timeout=3))
+        listed = json.load(urllib.request.urlopen(base + "/api/tomls", timeout=3))
+        assert listed["active_count"] == 2 and listed["ratios_set"] is True
     finally:
         server.shutdown()
         t.join(timeout=5)

@@ -25,6 +25,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .single_simulation_store import SingleSimulationResultStore
+from .edt_toml_registry import TomlRegistryRequestError, TomlRegistryService
 from .version_filter import normalize_peetsfea_version_filter
 
 # 운영 리소스 스냅샷 제공자(없으면 빈 스냅샷). edt_resources.ResourcePoller.snapshot 와이어링.
@@ -172,6 +173,7 @@ def start_dashboard_server(
     resource_provider: ResourceProvider | None = None,
     history_provider: Callable[[float | None], list[dict[str, Any]]] | None = None,
     peetsfea_version: str | None = None,
+    toml_registry: TomlRegistryService | None = None,
 ) -> ThreadingHTTPServer:
     # 표시 버전 필터(설정 시 모든 결과 뷰가 이 버전만 노출). 빈 값이면 전 버전. `/api/versions`는 항상 전 분포.
     version_filter = normalize_peetsfea_version_filter(peetsfea_version)
@@ -228,12 +230,17 @@ def start_dashboard_server(
                 limit = int(query.get("limit", ["200"])[0] or 200)
                 rows = _query_rows({**query, "limit": [str(limit)]}, default_state="success")
                 self._json(200, {"rows": [_row_to_io(r) for r in rows]})
+            elif path == "/api/tomls":
+                if toml_registry is None:
+                    self._json(503, {"error": "toml_registry_unavailable"})
+                    return
+                self._json(200, toml_registry.list_tomls())
             elif path == "/api/queue":
-                # 우선순위 입력큐(intake :7875가 채우고 lease :7878이 분배). DB(priority_queue) 기반.
+                # 레거시 sweep queue 조회. 새 운영 화면은 /api/tomls 카드 UI를 사용한다.
                 limit = int(query.get("limit", ["300"])[0] or 300)
                 self._json(200, {"depth": store.priority_depth(), "items": store.priority_list(limit=limit)})
             elif path == "/api/queue/lineage":
-                # 입력큐 계보: 들어온/대기/분배 + 파생 출력(request_id prefix-join). 컨테이너 무관.
+                # 레거시 sweep queue lineage. 새 운영 화면은 /api/tomls 카드 UI를 사용한다.
                 limit = int(query.get("limit", ["200"])[0] or 200)
                 self._json(200, store.priority_lineage(limit=limit))
             elif path == "/api/failures":
@@ -247,8 +254,62 @@ def start_dashboard_server(
             else:
                 self._json(404, {"error": "not_found"})
 
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            if toml_registry is not None and parsed.path == "/api/tomls/custom":
+                self._handle_toml(lambda: toml_registry.register_custom(self._read_json()))
+                return
+            self._json(404, {"error": "not_found"})
+
+        def do_DELETE(self) -> None:
+            parsed = urlparse(self.path)
+            prefix = "/api/tomls/custom/"
+            if toml_registry is not None and parsed.path.startswith(prefix):
+                toml_id = parsed.path[len(prefix):]
+                self._handle_toml(lambda: toml_registry.unregister_custom(toml_id))
+                return
+            self._json(404, {"error": "not_found"})
+
+        def do_PATCH(self) -> None:
+            parsed = urlparse(self.path)
+            prefix = "/api/tomls/"
+            suffix = "/active"
+            if toml_registry is not None and parsed.path.startswith(prefix) and parsed.path.endswith(suffix):
+                toml_id = parsed.path[len(prefix):-len(suffix)]
+                self._handle_toml(lambda: toml_registry.set_active(toml_id, self._read_json()))
+                return
+            self._json(404, {"error": "not_found"})
+
+        def do_PUT(self) -> None:
+            parsed = urlparse(self.path)
+            if toml_registry is not None and parsed.path == "/api/tomls/ratios":
+                self._handle_toml(lambda: toml_registry.set_ratios(self._read_json()))
+                return
+            self._json(404, {"error": "not_found"})
+
         def _json(self, status: int, payload: Mapping[str, Any]) -> None:
             self._send(status, "application/json", json.dumps(payload, default=str).encode("utf-8"))
+
+        def _read_json(self) -> Mapping[str, Any]:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as exc:
+                raise TomlRegistryRequestError("Content-Length must be an integer") from exc
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise TomlRegistryRequestError(f"invalid JSON body: {exc}") from exc
+            if not isinstance(payload, Mapping):
+                raise TomlRegistryRequestError("JSON body must be an object")
+            return payload
+
+        def _handle_toml(self, fn: Callable[[], Mapping[str, Any]]) -> None:
+            try:
+                self._json(200, fn())
+            except TomlRegistryRequestError as exc:
+                self._json(exc.status, {"error": "bad_request", "message": str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"error": type(exc).__name__, "message": str(exc)})
 
         def _export_parquet(self, query: dict[str, list[str]]) -> None:
             import os
@@ -312,6 +373,15 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:var(--mut);font-size:12px;margin-bot
 .card{background:var(--pan);border:1px solid var(--ln);border-radius:10px;padding:12px 14px}
 .card .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
 .card .v{font-size:24px;font-weight:700;margin-top:3px}
+.tomlgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.tomlcard{background:var(--pan);border:1px solid var(--ln);border-radius:10px;padding:13px 14px;display:flex;flex-direction:column;gap:10px}
+.tomlcard.off{opacity:.66}.tomlhead{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.tomlname{font-weight:700;font-size:15px;word-break:break-word}.pill{display:inline-block;border:1px solid var(--ln);border-radius:999px;padding:1px 7px;font-size:11px;color:var(--mut);white-space:nowrap}
+.pill.on{color:var(--ok);border-color:#2f5e3a}.pill.lock{color:var(--warn);border-color:#5e4a2f}
+.tomlmeta{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:12px}.tomlmeta span:nth-child(odd){color:var(--mut)}
+.tomlactions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.tomlratio{width:92px}
+textarea{background:#0d1117;color:var(--fg);border:1px solid var(--ln);border-radius:8px;padding:9px 10px;font:12.5px/1.45 "SF Mono",Consolas,monospace;width:100%;min-height:280px}
+.tomlpreview{background:#0d1117;border:1px solid var(--ln);border-radius:8px;padding:8px;max-height:96px;overflow:hidden;font:11px/1.35 "SF Mono",Consolas,monospace;color:var(--mut);white-space:pre-wrap}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px}
 .grid.c2{grid-template-columns:repeat(2,1fr)}
 .cont{background:var(--pan);border:1px solid var(--ln);border-radius:10px;padding:12px 14px}
@@ -343,7 +413,7 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
   <div class="tab" data-t="containers">컨테이너 부하</div>
   <div class="tab" data-t="trends">추세</div>
   <div class="tab" data-t="dataset">입출력 데이터셋</div>
-  <div class="tab" data-t="queue">입력큐</div>
+  <div class="tab" data-t="toml">TOML</div>
   <div class="tab" data-t="failures">실패</div>
 </div>
 
@@ -378,7 +448,7 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
 <div id="dataset" class="page hide">
   <div class="tools">
     <select id="dstate"><option value="success">success</option><option value="">전체</option><option value="aborted">aborted</option></select>
-    <select id="dorigin"><option value="">전체 출처</option><option value="sweep-">intake(입력큐)</option><option value="base-">baseline</option><option value="prio-">static</option></select>
+    <select id="dorigin"><option value="">전체 출처</option><option value="toml-">TOML registry</option><option value="base-">legacy baseline</option><option value="sweep-">legacy sweep</option><option value="prio-">static</option></select>
     <input id="dsearch" placeholder="검색(노드/설계id/입력값)"/>
     <button onclick="loadDataset()">새로고침</button>
     <a href="/results.parquet" download>Parquet 다운로드 ↓</a>
@@ -387,14 +457,15 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
   <div style="overflow:auto;max-height:70vh"><table id="dtable"><thead></thead><tbody></tbody></table></div>
 </div>
 
-<div id="queue" class="page hide">
+<div id="toml" class="page hide">
   <div class="tools">
-    <button onclick="loadQueue()">새로고침</button>
-    <span class="muted">intake(:7875) 적재 → lease(:7878) 분배. DB 영속(재시작 보존).</span>
-    <span class="muted" id="qcount"></span>
+    <button onclick="loadTomls()">새로고침</button>
+    <button onclick="openTomlRegister()">custom TOML 등록</button>
+    <button onclick="saveTomlRatios()">ratio 저장</button>
+    <button onclick="resetTomlRatios()">ratio 균등</button>
+    <span class="muted" id="tomlcount"></span>
   </div>
-  <div class="cards" id="qcards"></div>
-  <div style="overflow:auto;max-height:66vh"><table id="qtable"><thead></thead><tbody></tbody></table></div>
+  <div class="tomlgrid" id="tomlgrid"></div>
 </div>
 
 <div id="failures" class="page hide">
@@ -410,6 +481,8 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const f=(p)=>fetch(p).then(r=>r.json());
+async function api(p,opt={}){const r=await fetch(p,{headers:{'Content-Type':'application/json'},...opt});
+  const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.message||d.error||('HTTP '+r.status));return d}
 let cur='overview';
 $$('.tab').forEach(t=>t.onclick=()=>{cur=t.dataset.t;$$('.tab').forEach(x=>x.classList.toggle('on',x===t));
   $$('.page').forEach(p=>p.classList.add('hide'));$('#'+cur).classList.remove('hide');tick()});
@@ -466,8 +539,9 @@ async function containers(){const r=await f('/api/resources');
 }
 
 function dorigin(rid){rid=String(rid||'');
-  if(rid.startsWith('sweep-'))return 'intake';
-  if(rid.startsWith('base-'))return 'baseline';
+  if(rid.startsWith('toml-'))return 'toml';
+  if(rid.startsWith('base-'))return 'legacy baseline';
+  if(rid.startsWith('sweep-'))return 'legacy sweep';
   if(rid.startsWith('prio-'))return 'static';
   return '?';}
 async function loadDataset(){const st=$('#dstate').value,q=$('#dsearch').value.toLowerCase(),og=$('#dorigin').value;
@@ -560,28 +634,44 @@ async function trends(){TS_WIN_MIN=+(($('#tswin')&&$('#tswin').value)||30);
   tsLines('tsLic',hp,[{key:'lic_mine',color:'#b392f0',label:'내 점유'},{key:'lic_inuse',color:'#58a6ff',label:'전체 사용'}],'ts');
   tsLines('tsAedt',hp,[{key:'nominal_aedt',color:'#d29922',label:'명목(켜놓은 전체)'},{key:'effective_aedt',color:'#3fb950',label:'유효(솔브중)'}],'ts');}
 $('#tswin')&&($('#tswin').onchange=trends);
-async function loadQueue(){const d=await f('/api/queue/lineage');
-  const it=d.items||[];
-  $('#qcount').textContent=`${d.sweeps||0} sweep · 들어온 ${d.submitted||0} · 파생출력 ${d.done||0}`;
-  $('#qcards').innerHTML=
-    `<div class="card"><div class="k">들어온 수(입력큐 제출)</div><div class="v">${d.submitted||0}</div></div>`+
-    `<div class="card"><div class="k">대기(미분배)</div><div class="v">${d.waiting||0}</div></div>`+
-    `<div class="card"><div class="k">분배됨(lease)</div><div class="v">${d.leased||0}</div></div>`+
-    `<div class="card"><div class="k">진행 중(추정)</div><div class="v">${d.inflight||0}</div></div>`+
-    `<div class="card"><div class="k">파생 출력(완료)</div><div class="v">${d.done||0} <span class="muted" style="font-size:13px">(✓${d.ok||0} / ✗${d.fail||0})</span></div></div>`;
-  const now=Date.now()/1000;
-  $('#qtable thead').innerHTML='<tr><th>request_id (sweep)</th><th>들어온</th><th>분배</th><th>대기</th><th>파생출력(✓/✗)</th><th>진행~</th><th>나이</th></tr>';
-  $('#qtable tbody').innerHTML=it.map(r=>{const ago=Math.max(0,Math.round(now-(+r.created_at||0)));
-    const w=ago<60?ago+'s':(ago<3600?Math.round(ago/60)+'m':Math.round(ago/3600)+'h');
-    return `<tr><td>${esc(r.request_id)}</td><td>${r.total}</td><td>${r.leased}</td><td>${r.remaining}</td>`+
-      `<td>${r.done} <span class="muted">(${r.ok}/${r.fail})</span></td><td>${r.inflight}</td><td class="muted">${w}</td></tr>`;}).join('')
-    ||'<tr><td colspan="7" class="muted">입력큐 sweep 없음 (intake :7875로 sweep+count 제출 시 여기 표시)</td></tr>';
-}
-function tick(){if(cur==='overview')overview();else if(cur==='containers')containers();else if(cur==='trends')trends();else if(cur==='queue')loadQueue();}
+let TOMLS=[];
+async function loadTomls(){try{const d=await f('/api/tomls');TOMLS=d.tomls||[];
+    const active=TOMLS.filter(t=>t.active);$('#tomlcount').textContent=`active ${active.length} · custom ${TOMLS.filter(t=>t.kind==='custom').length}/6 · ratio ${d.ratios_set?'설정됨':'균등'}`;
+    $('#tomlgrid').innerHTML=TOMLS.map(tomlCard).join('')||'<div class="muted">TOML registry 응답 없음</div>';
+  }catch(e){$('#tomlcount').textContent='TOML registry 응답 없음';$('#tomlgrid').innerHTML=`<div class="cont bigbad">${esc(e.message||e)}</div>`;}}
+function tomlCard(t){const locked=t.kind==='built_in',active=!!t.active,ratio=t.ratio==null?'':Number(t.ratio).toFixed(3).replace(/\.?0+$/,'');
+  const preview=String(t.toml_text||'').slice(0,520);
+  return `<div class="tomlcard ${active?'':'off'}">
+    <div class="tomlhead"><div><div class="tomlname">${esc(t.name||t.id)}</div><div class="muted">${esc(t.id)}</div></div>
+      <div>${locked?'<span class="pill lock">built-in</span>':`<span class="pill">custom</span>`} ${active?'<span class="pill on">active</span>':'<span class="pill">inactive</span>'}</div></div>
+    <div class="tomlmeta"><span>ratio</span><span><input class="tomlratio" data-ratio="${esc(t.id)}" type="number" min="0" step="0.001" value="${esc(ratio)}" ${active?'':'disabled'}> %</span>
+      <span>next seed</span><span>${esc(t.next_seed||0)}</span><span>updated</span><span>${fmtTs(t.updated_at)}</span></div>
+    <div class="tomlpreview">${esc(preview)}${String(t.toml_text||'').length>520?'\n...':''}</div>
+    <div class="tomlactions">
+      <button onclick='showToml(${JSON.stringify(t.id)})'>보기</button>
+      ${locked?'<button disabled>항상 active</button>':`<button onclick='toggleToml(${JSON.stringify(t.id)},${active?'false':'true'})'>${active?'비활성':'활성'}</button><button onclick='deleteToml(${JSON.stringify(t.id)})'>삭제</button>`}
+    </div></div>`;}
+function fmtTs(v){const n=+v||0;if(!n)return '—';return new Date(n*1000).toLocaleString();}
+function showToml(id){const t=TOMLS.find(x=>x.id===id);if(!t)return;
+  $('#mbox').innerHTML=`<h3>${esc(t.name||t.id)}</h3><div class="muted">${esc(t.id)} · ${esc(t.kind)} · ${t.active?'active':'inactive'}</div><textarea readonly>${esc(t.toml_text||'')}</textarea>`;
+  $('#modal').style.display='flex';}
+function openTomlRegister(){$('#mbox').innerHTML=`<h3>custom TOML 등록</h3>
+  <div class="tools"><input id="newTomlName" placeholder="name"><label><input id="newTomlActive" type="checkbox" checked> active</label></div>
+  <textarea id="newTomlText" placeholder="spec_version = ..."></textarea>
+  <div class="tools" style="margin-top:10px"><button onclick="registerToml()">등록</button><span class="muted" id="newTomlMsg"></span></div>`;
+  $('#modal').style.display='flex';}
+async function registerToml(){try{await api('/api/tomls/custom',{method:'POST',body:JSON.stringify({name:$('#newTomlName').value,toml_text:$('#newTomlText').value,active:$('#newTomlActive').checked})});
+    $('#modal').style.display='none';await loadTomls();}catch(e){$('#newTomlMsg').textContent=e.message||e;}}
+async function toggleToml(id,active){try{await api('/api/tomls/'+encodeURIComponent(id)+'/active',{method:'PATCH',body:JSON.stringify({active})});await loadTomls();}catch(e){alert(e.message||e);}}
+async function deleteToml(id){if(!confirm(id+' 삭제?'))return;try{await api('/api/tomls/custom/'+encodeURIComponent(id),{method:'DELETE'});await loadTomls();}catch(e){alert(e.message||e);}}
+async function saveTomlRatios(){const ratios={};$$('input[data-ratio]').forEach(i=>{if(!i.disabled&&i.value!=='')ratios[i.dataset.ratio]=Number(i.value);});
+  try{await api('/api/tomls/ratios',{method:'PUT',body:JSON.stringify({ratios})});await loadTomls();}catch(e){alert(e.message||e);}}
+async function resetTomlRatios(){try{await api('/api/tomls/ratios',{method:'PUT',body:JSON.stringify({ratios:null})});await loadTomls();}catch(e){alert(e.message||e);}}
+function tick(){if(cur==='overview')overview();else if(cur==='containers')containers();else if(cur==='trends')trends();else if(cur==='toml')loadTomls();}
 $('#dsearch').oninput=()=>{if(cur==='dataset')loadDataset()};
 $('#dorigin').onchange=()=>{if(cur==='dataset')loadDataset()};
 $('#dstate').onchange=()=>{if(cur==='dataset')loadDataset()};
-tick();loadDataset();setInterval(()=>{if(cur==='overview'||cur==='containers'||cur==='trends'||cur==='queue')tick()},8000);
+tick();loadDataset();setInterval(()=>{if(cur==='overview'||cur==='containers'||cur==='trends'||cur==='toml')tick()},8000);
 </script></body></html>"""
 
 
