@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>제어 로직 — 10분 롤링 교체 · 20분 잡 · 100 수렴</title>
+<title>제어 로직 — 4분 잡 제출 루프 · squeue 15 · 100 수렴</title>
 <style>
   :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
   *{box-sizing:border-box}
@@ -29,73 +29,89 @@
 <body>
 <div class="wrap">
 
-<h1>제어 로직 — 10분 롤링 교체 · 20분 잡 · 동시 솔브 100 수렴</h1>
-<p class="sub">컨테이너 1솔브=죽음 · 잡당 최대 20 · 로드밸런싱 없음 · 2026-06-19</p>
+<h1>제어 로직 — 4분 잡 제출 루프 · 동시 솔브 100 수렴</h1>
+<p class="sub">컨테이너 1솔브=죽음 · squeue 최대 15 · 정상상태 RUNNING 10 + PENDING 5 · 2026-06-19</p>
 
 <h2>1. 모델 한눈에</h2>
 <ul>
 <li><b>컨테이너 = 1 솔브 = 죽음.</b> 재가동(respawn) 없음 → 잡의 살아있는 컨테이너는 시간이 지나며 <b>줄어든다(드레인)</b>.</li>
 <li><b>잡 = 출생 시 컨테이너 N개(≤20)</b> 가동. 수명 <b>최대 20분</b>.</li>
-<li><b>제어 루프 2단계:</b> 잡 1~7개는 <b>1분마다 +1 순증</b>(탈락 없는 빠른 램프), 8개 이상은 <b>10분마다 1탈락+최대 4제출</b>(11개까지 보강).</li>
-<li>목표: <b>동시 솔브 100에 수렴.</b> 로드밸런싱 없음(SLURM 배치에 맡김).</li>
+<li><b>제어 루프는 잡 수 구간을 보지 않는다.</b> 4분마다 같은 행동을 반복한다.</li>
+<li><b>squeue 상한은 15개</b>이며, 정상상태 목표는 <b>RUNNING 10개 + PENDING 5개</b>다.</li>
+<li>목표: <b>동시 솔브 100에 수렴.</b> 잡 제출은 노드별 균등 분산이 필요하다.</li>
 </ul>
 
-<h2>2. 제어 루프 (핵심) — 잡 수에 따라 2단계</h2>
+<h2>2. 제어 루프 (핵심) — 4분마다 고정 행동</h2>
 <div class="flow">
-  <span class="box">잡 1~7개</span><span class="arr">→</span>
-  <span class="box ok">1분마다 새 잡 1개 제출(탈락 없음) — 순증</span>
-  <span class="box" style="margin-left:18px">잡 8개 이상</span><span class="arr">→</span>
-  <span class="box bad">10분마다 최소-컨테이너 잡 1탈락</span><span class="arr">+</span>
-  <span class="box ok">최대 4개 제출 → 11까지 보강</span>
+  <span class="box">매 4분</span><span class="arr">→</span>
+  <span class="box bad">가장 늙은 RUNNING 잡 1개 종료</span><span class="arr">+</span>
+  <span class="box ok">새 잡 4개 제출</span><span class="arr">→</span>
+  <span class="box">squeue 최대 15</span>
 </div>
-<pre>jobs = 현재 RUNNING 잡 수
+<pre>every 4 minutes:
+    if squeue_count >= 15 and queue_is_stuck:
+        stop_oldest_running_job()
+        submit_jobs(1, spread="node-even")
+        return
 
-if jobs &lt;= 7:                # ── 램프 단계 ── 빠르게 정상 단계로 진입
-    매 1분: submit_job(N=decide_N())     # 탈락 없음, 순증
+    stop_oldest_running_job()
+    submit_jobs(4, spread="node-even", squeue_cap=15)
 
-elif jobs >= 8:              # ── 정상 단계 ── 11까지 보강하며 롤링 교체
-    매 10분:
-        J = 살아있는 컨테이너가 가장 적은 RUNNING 잡   # 가장 많이 끝난 잡(손실 최소)
-        safe_stop(J)                                  # 1개 탈락
-        for _ in range(min(4, 12 - jobs)):            # 8개→4제출, 9개→3제출, 11개→1제출
-            submit_job(N=decide_N())                  # → 11까지 보강</pre>
+target steady state:
+    RUNNING jobs = 10
+    PENDING jobs = 5
+    squeue total = 15</pre>
 <ul>
-<li><b>램프(1~7):</b> 탈락 없이 1분당 1잡 순증 → ~7분이면 9 근처 도달(빠름).</li>
-<li><b>정상(8+):</b> 10분마다 <b>가장 적게 남은 잡</b>(거의 끝난 잡) 안전종료 → 최대 4개를 채워 11개까지 보강 + 출생/사망 stagger로 herd 제거.</li>
+<li><b>잡 수 구간 없음:</b> 램프/정상 단계를 나누지 않고 매 tick 같은 루틴을 실행한다.</li>
+<li><b>종료 후보:</b> 현재 켜져 있는 RUNNING 잡 중 가장 오래된 잡 1개를 내린다.</li>
+<li><b>제출:</b> 매 tick 새 잡 4개를 요청하되, 후보 노드를 한쪽으로 몰지 않고 노드별로 균등 분산한다.</li>
+<li><b>stuck 회복:</b> squeue가 15개로 꽉 찼는데 진행이 막히면 가장 늙은 잡 1개를 내리고 추가 잡 1개만 요청한다.</li>
 <li><b>잡 수명 20분</b> = 하드 상한(그 전에 틱 교체/드레인되면 더 일찍 종료). 종료 시 AEDT·pyaedt·터널 소멸 → 누수 회수.</li>
 <li>새 잡마다 컨테이너 수 N은 출생 시 LUT(§3)로 결정.</li>
 </ul>
 
 <h2>3. N 결정 — LUT (잡 출생 시)</h2>
-<p>지령(setpoint) <b>solve=100</b>에서 <b>이상점 N=12</b>(잡당 12개 = 9×12≈108). <b>100~120 오버슈팅은 좋음</b>(밴드), 120↑은 정지. 최대 20.</p>
+<p>새 잡의 컨테이너 수 N은 현재 <b>elec_solve_hfss</b> 실측을 보고 계단형 LUT로 정한다. 낮을수록 세게 밀고, 150 근처에서는 잡당 10개까지 낮춘다.</p>
 <pre>solve = 현재 동시 솔브 수            # 실측 elec_solve_hfss (우리)
 
-if   solve &lt;= 100:  N = 12 + 0.08*(100 - solve)   # 100→12, 0→20  (밑일수록 더 밀기)
-elif solve &lt;= 120:  N = 12 - 0.55*(solve - 100)   # 100→12, 120→1 (오버슈팅 100~120 허용)
-else            :  N = 1                           # 120↑ 오버슈팅 정지
-N = clamp(round(N), 1, 20)</pre>
+if   solve &lt;=  90: N = 20
+elif solve &lt;= 100: N = 15
+elif solve &lt;= 110: N = 14
+elif solve &lt;= 120: N = 13
+elif solve &lt;= 130: N = 12
+elif solve &lt;= 140: N = 11
+else             : N = 10</pre>
 <table>
-<tr><th>solve</th><th>0</th><th>40</th><th>60</th><th>80</th><th>100</th><th>110</th><th>115</th><th>120</th><th>130</th></tr>
-<tr><th>N</th><td class="big">20</td><td class="big">17</td><td class="big">15</td><td class="big">14</td><td class="big ok">12</td><td class="big">7</td><td class="big">4</td><td class="big">1</td><td class="big">1</td></tr>
+<tr><th>solve</th><th>0~90</th><th>100</th><th>110</th><th>120</th><th>130</th><th>140</th><th>150+</th></tr>
+<tr><th>N</th><td class="big">20</td><td class="big ok">15</td><td class="big">14</td><td class="big">13</td><td class="big">12</td><td class="big">11</td><td class="big">10</td></tr>
 </table>
 <ul>
-<li><b>100 미만</b>: 12보다 크게(최대 20) 밀어 올림 — 멀수록 세게.</li>
-<li><b>100~120</b>: 12에서 1로 완만히 줄이며 오버슈팅 허용(이 구간 체류 OK).</li>
-<li><b>120 초과</b>: 최소 1 — 더 안 밀어 120 근처서 멈춤.</li>
+<li><b>0~90</b>: 잡당 20개로 최대 밀기.</li>
+<li><b>100~150</b>: 10 solve 증가마다 N을 1씩 낮춰 과한 출생을 줄인다.</li>
+<li><b>150 이상</b>: 잡당 10개를 유지하고, 별도 포화 제어가 늙은 잡을 추가로 정리한다.</li>
 </ul>
 
-<h2>4. herd 방지 (컨테이너 출생 stagger)</h2>
+<h2>4. 포화 제어 — 12분마다 추가 감압</h2>
+<div class="card">
+4분 제어 루프 <b>세 번에 한 번</b>(= 12분마다) 라이선스 사용량을 확인한다. <b>elec_solve_hfss &gt; 150</b>이면
+현재 켜져 있는 RUNNING 잡 중 <b>가장 늙은 잡 1개를 추가로 종료</b>한다.
+</div>
+<pre>every third 4-minute tick:
+    if license_solve_in_use &gt; 150:
+        stop_oldest_running_job()</pre>
+
+<h2>5. herd 방지 (컨테이너 출생 stagger)</h2>
 <div class="card">
 잡이 N개를 <b>한꺼번에</b> 켜면 그 노드에서 AEDT N개 동시 기동 → 방금 본 gRPC 행 재발.
 → orchestrator는 N개를 <b>1개씩 간격 두고</b> 가동(노드당 동시 콜드스타트 ≤ EDT_COLD_CAP=10).
 </div>
 
-<h2>5. 구현 포인트</h2>
+<h2>6. 구현 포인트</h2>
 <table>
 <tr><th>레이어</th><th>변경</th></tr>
-<tr><td><b>제어기(루프)</b></td><td>잡 ≤7이면 <b>1분 틱에 제출 1</b>(순증). 8+면 <b>10분 틱에 최소-컨테이너 잡 탈락 1 + 최대 4제출</b>(11개까지 보강). 폴러/보고로 잡별 살아있는 컨테이너 수 집계.</td></tr>
+<tr><td><b>제어기(루프)</b></td><td>잡 수 구간을 보지 않고 <b>4분마다 가장 늙은 잡 1개 종료 + 새 잡 4개 제출</b>. squeue 총량은 15개로 제한하고, stuck 시 1개 종료 + 1개 요청.</td></tr>
 <tr><td><b>orchestrator</b></td><td>출생 시 N 받아 <b>1솔브 컨테이너 N개</b> stagger 가동(respawn 없음). <code>EDT_JOB_TTL_SEC=1200</code> 또는 제어기 종료신호 시 진행 솔브 마치고 안전종료 → 잡 exit. /enroot 정리 trap 유지.</td></tr>
-<tr><td><b>keeper</b></td><td>2단계 제어 루프가 잡을 11개까지 보강: 램프(1분/+1) → 정상(10분/탈락1+최대4제출). 일괄 재시작 금지.</td></tr>
+<tr><td><b>keeper</b></td><td>노드별 균등 분산으로 제출하고, 정상상태 RUNNING 10 + PENDING 5를 유지한다. 12분마다 solve &gt;150 포화 감압을 수행한다.</td></tr>
 </table>
 
 <p class="mut" style="margin-top:24px">— 설계 확정. 이대로 구현·배포·모니터링.</p>

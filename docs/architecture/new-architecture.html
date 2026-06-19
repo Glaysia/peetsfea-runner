@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>peetsfea-runner — 신규 아키텍처 (edtmgr / 동시 ~100)</title>
+<title>peetsfea-runner — 현행 아키텍처 (1솔브=1컨테이너)</title>
 <style>
   :root {
     --bg: #0f1116; --panel: #181b22; --panel2: #1f232c; --line: #2c313c;
@@ -28,6 +28,8 @@
   p { margin: 8px 0; }
   code { background: var(--code); padding: 1px 6px; border-radius: 4px; font-size: 13px;
          font-family: "SF Mono", "JetBrains Mono", Consolas, monospace; color: #d6deeb; }
+  pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 13px 15px;
+        overflow: auto; color: #d6deeb; font: 13px/1.55 "SF Mono", "JetBrains Mono", Consolas, monospace; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
           padding: 16px 18px; margin: 14px 0; }
   .grid { display: grid; gap: 14px; }
@@ -38,7 +40,6 @@
   table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { color: var(--muted); font-weight: 600; }
-  .path { color: var(--accent2); }
   .muted { color: var(--muted); }
   .legend span { margin-right: 16px; font-size: 13px; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
@@ -58,23 +59,24 @@
 <div class="wrap">
 
 <header>
-  <h1>peetsfea-runner — 신규 아키텍처</h1>
-  <p class="sub">edtmgr 기반 AEDT 오케스트레이터 · 단일 계정 동시 ~100 시뮬 · 입력→시뮬→DB/대시보드→아카이브</p>
+  <h1>peetsfea-runner — 현행 아키텍처</h1>
+  <p class="sub">1솔브 = 1 enroot 컨테이너 · AEDT 실행 후 완전 종료 · 4분 잡 제출 루프 · 입력→시뮬→DB/대시보드→아카이브</p>
   <p style="margin-top:10px">
-    <span class="tag new">신규 아키텍처(레거시 대체)</span>
-    <span class="tag">peetsfea <b>0.3.7</b> 계열 가동</span>
-    <span class="tag ok">롤링 잡 11개까지 보강 · 목표 solve 100</span>
+    <span class="tag new">현행 운영 기준</span>
+    <span class="tag warn">상시 예열 풀 폐기</span>
+    <span class="tag ok">squeue 15 · RUNNING 10 + PENDING 5</span>
   </p>
   <p class="sub">기준 문서: <code>PLANS/MASTER_PLAN.md</code> · 현재 잡 출생 제어: <code>PLANS/job_birth_controller.html</code></p>
 </header>
 
 <div class="card" style="border-color:#4b3a6e">
   <h3 style="margin-top:0;color:var(--violet)">현재 운영 핵심 (2026-06-19)</h3>
-  <p class="muted" style="font-size:13.5px">아래 1~6은 최초 설계도다. 실가동에서 바뀐 핵심은 이 문서와 <code>PLANS/job_birth_controller.html</code>에만 남긴다.</p>
   <ul style="font-size:13.5px">
-    <li><b>1솔브 = 1 enroot 컨테이너</b>: 잡 내부 서브 오케스트레이터가 N개의 단명 컨테이너를 stagger 가동한다. 각 컨테이너는 <code>EDT_SLOT_COUNT=1</code>, <code>EDT_MAX_SIMS=1</code>로 1건 처리 후 종료한다.</li>
-    <li><b>잡 출생 제어</b>: 잡 1~7개는 1분마다 +1 순증, 정상 단계는 10분마다 최소-live 잡 1개를 내리고 최대 4개를 제출해 11개까지 보강한다.</li>
-    <li><b>N 결정</b>: 새 잡은 현재 <code>elec_solve_hfss</code> 실측을 보고 LUT로 컨테이너 수를 정한다. 100 근처는 N=12, 120 초과는 N=1로 밀도를 낮춘다.</li>
+    <li><b>한 번 돌고 완전히 꺼진다</b>: 단일 컨테이너는 <code>EDT_SLOT_COUNT=1</code>, <code>EDT_MAX_SIMS=1</code>로 1건만 처리하고 종료한다. 프로세스, pyaedt 세션, 임시 디렉터리, 마운트 상태를 다음 솔브로 가져가지 않는다.</li>
+    <li><b>상시 예열 풀은 현행에서 쓰지 않는다</b>: edtmgr로 AEDT를 계속 붙잡아 두는 방식보다, 매 솔브마다 프로세스와 컨테이너를 닫아 누수와 세션 오염을 끊는 것을 우선한다.</li>
+    <li><b>잡 출생 제어</b>: 잡 수 구간을 나누지 않고 4분마다 가장 늙은 RUNNING 잡 1개를 내린 뒤 새 잡 4개를 요청한다. squeue는 최대 15개, 정상 목표는 RUNNING 10 + PENDING 5다.</li>
+    <li><b>N 결정</b>: 새 잡은 현재 <code>elec_solve_hfss</code> 실측을 보고 계단형 LUT로 컨테이너 수를 정한다. 0~90은 20, 100은 15, 이후 10 solve마다 1씩 낮춰 150 이상은 10으로 둔다.</li>
+    <li><b>포화 감압</b>: 4분 루프 세 번마다 라이선스 사용량을 확인하고, solve가 150을 넘으면 가장 늙은 RUNNING 잡 1개를 추가로 내린다.</li>
     <li><b>데이터 플레인</b>: 슈퍼컴엔 DB 없음. 컨테이너가 결과를 gate 경유 역터널(:7876 JSON, :7877 대용량)로 로컬 데몬에 push한다.</li>
     <li><b>운영 파티션</b>: 제출 런처는 cpu2/gpu1을 우선 사용하고, gpu* 잡은 <code>--gres=gpu:2</code>와 <code>CUDA_VISIBLE_DEVICES</code> 핀닝으로 GPU를 분산한다.</li>
   </ul>
@@ -83,12 +85,12 @@
 <h2>1. 전체 데이터 흐름</h2>
 <div class="card">
   <p class="legend">
-    <span><i class="dot" style="background:var(--violet)"></i>신규 컴포넌트</span>
-    <span><i class="dot" style="background:var(--accent)"></i>오케스트레이션</span>
-    <span><i class="dot" style="background:var(--accent2)"></i>AEDT/슬롯</span>
+    <span><i class="dot" style="background:var(--violet)"></i>제어</span>
+    <span><i class="dot" style="background:var(--accent)"></i>큐/잡</span>
+    <span><i class="dot" style="background:var(--accent2)"></i>단명 컨테이너</span>
     <span><i class="dot" style="background:var(--warn)"></i>저장/관측</span>
   </p>
-  <svg viewBox="0 0 1040 560" role="img" aria-label="아키텍처 데이터 흐름도">
+  <svg viewBox="0 0 1040 620" role="img" aria-label="현행 아키텍처 데이터 흐름도">
     <defs>
       <marker id="arw" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
         <path d="M0,0 L7,3 L0,6 Z" fill="#5ec2ff"></path>
@@ -98,178 +100,197 @@
       </marker>
     </defs>
 
-    <!-- Intake -->
-    <rect x="24" y="24" width="220" height="70" rx="9" fill="#1f232c" stroke="#4b3a6e"></rect>
-    <text x="36" y="50" class="svglabel">Intake 서비스 :7875</text>
-    <text x="36" y="70" class="svgsub">sweep toml + 개수 N</text>
-    <text x="36" y="86" class="svgsub">→ 랜덤 샘플 fixed toml × N</text>
+    <rect x="24" y="26" width="218" height="76" rx="9" fill="#1f232c" stroke="#4b3a6e"></rect>
+    <text x="38" y="52" class="svglabel">Intake :7875</text>
+    <text x="38" y="72" class="svgsub">sweep toml + 개수 N</text>
+    <text x="38" y="88" class="svgsub">랜덤 샘플 fixed toml 적재</text>
 
-    <!-- Queue -->
-    <rect x="300" y="24" width="200" height="70" rx="9" fill="#1f232c" stroke="#2c313c"></rect>
-    <text x="312" y="50" class="svglabel">대기 큐</text>
-    <text x="312" y="70" class="svgsub">fixed toml</text>
-    <text x="312" y="86" class="svgsub">슬롯 가용 시 순차 디스패치</text>
-    <line x1="244" y1="59" x2="298" y2="59" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
+    <rect x="288" y="26" width="210" height="76" rx="9" fill="#1f232c" stroke="#2c313c"></rect>
+    <text x="302" y="52" class="svglabel">로컬 대기 큐</text>
+    <text x="302" y="72" class="svgsub">fixed toml</text>
+    <text x="302" y="88" class="svgsub">잡/컨테이너가 하나씩 소비</text>
+    <line x1="242" y1="64" x2="286" y2="64" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
 
-    <!-- Account box -->
-    <rect x="24" y="130" width="700" height="300" rx="12" fill="#15181f" stroke="#2c313c"></rect>
-    <text x="40" y="154" class="svglabel">account_01 · 컨테이너 9 · 동시 ~100 (유동)</text>
-    <line x1="400" y1="94" x2="400" y2="128" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
+    <rect x="548" y="26" width="224" height="76" rx="9" fill="#1f232c" stroke="#4b3a6e"></rect>
+    <text x="562" y="52" class="svglabel" style="fill:#b392f0">keeper 제어 루프</text>
+    <text x="562" y="72" class="svgsub">4분: oldest stop + submit 4</text>
+    <text x="562" y="88" class="svgsub">12분: solve &gt;150 감압</text>
+    <line x1="498" y1="64" x2="546" y2="64" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
 
-    <!-- job_1 container -->
-    <rect x="44" y="170" width="430" height="240" rx="10" fill="#181b22" stroke="#3a4252"></rect>
-    <text x="58" y="192" class="svglabel">job_1 — enroot 컨테이너</text>
-    <text x="58" y="210" class="svgsub">runner + peetsfea-main 설치 · /enroot/{USER}_{SJOB}</text>
+    <rect x="814" y="26" width="202" height="76" rx="9" fill="#1f232c" stroke="#2c313c"></rect>
+    <text x="828" y="52" class="svglabel">SLURM squeue</text>
+    <text x="828" y="72" class="svgsub">최대 15</text>
+    <text x="828" y="88" class="svgsub">RUNNING 10 + PENDING 5</text>
+    <line x1="772" y1="64" x2="812" y2="64" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
 
-    <!-- slots -->
-    <g>
-      <rect x="58" y="224" width="180" height="54" rx="7" fill="#1f232c" stroke="#2f5e3a"></rect>
-      <text x="70" y="246" class="svgmono">slot_1: edtmgr ─ ansysedt</text>
-      <text x="70" y="266" class="svgsub">관리 pyaedt(warm·license hold)</text>
+    <rect x="24" y="140" width="700" height="318" rx="12" fill="#15181f" stroke="#2c313c"></rect>
+    <text x="40" y="166" class="svglabel">account_01 · 현행 런타임</text>
+    <text x="236" y="166" class="svgsub">잡은 노드별 균등 분산 · 잡당 N개 단명 컨테이너</text>
+    <line x1="914" y1="102" x2="650" y2="138" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
 
-      <rect x="252" y="224" width="200" height="54" rx="7" fill="#1f232c" stroke="#2f5e3a"></rect>
-      <text x="264" y="246" class="svgmono">slot_2 … slot_N (≤16)</text>
-      <text x="264" y="266" class="svgsub">warm ≥11·≤16 · 실행 7~16</text>
-    </g>
+    <rect x="46" y="186" width="428" height="242" rx="10" fill="#181b22" stroke="#3a4252"></rect>
+    <text x="60" y="210" class="svglabel">RUNNING job — 서브 오케스트레이터</text>
+    <text x="60" y="230" class="svgsub">출생 시 LUT로 N 결정 · 컨테이너 stagger 가동</text>
 
-    <!-- borrow protocol -->
-    <rect x="58" y="296" width="394" height="98" rx="8" fill="#13161c" stroke="#2c313c"></rect>
-    <text x="72" y="318" class="svglabel" style="fill:#b392f0">edtmgr 대여 프로토콜</text>
-    <text x="72" y="338" class="svgmono">acquire → {pid, grpc_port} 반환</text>
-    <text x="72" y="356" class="svgmono">시뮬 pyaedt가 같은 ansysedt grpc 접속·실행</text>
-    <text x="72" y="374" class="svgmono">done/release → 관리세션 재부착 → 다음 toml</text>
+    <rect x="64" y="252" width="180" height="58" rx="7" fill="#1f232c" stroke="#2f5e3a"></rect>
+    <text x="76" y="276" class="svgmono">container_01</text>
+    <text x="76" y="294" class="svgsub">AEDT 1 solve → exit</text>
 
-    <!-- jobs 2..9 -->
-    <rect x="492" y="170" width="216" height="240" rx="10" fill="#181b22" stroke="#3a4252"></rect>
-    <text x="506" y="192" class="svglabel">job_2 … job_9</text>
-    <text x="506" y="212" class="svgsub">각 컨테이너 ≤16</text>
-    <text x="506" y="232" class="svgsub">→ 합계 ~100 동시</text>
-    <text x="506" y="262" class="svgsub">잡 수명 10h</text>
-    <text x="506" y="280" class="svgsub">만료 시 진행 ~100개 폐기</text>
+    <rect x="258" y="252" width="196" height="58" rx="7" fill="#1f232c" stroke="#2f5e3a"></rect>
+    <text x="270" y="276" class="svgmono">container_02 … N</text>
+    <text x="270" y="294" class="svgsub">N = 10..20 · no respawn</text>
 
-    <!-- Load balancer -->
-    <rect x="760" y="170" width="256" height="80" rx="9" fill="#1f232c" stroke="#4b3a6e"></rect>
-    <text x="774" y="194" class="svglabel" style="fill:#b392f0">로드 밸런서</text>
-    <text x="774" y="212" class="svgsub">ramp-up: 적게→부하 여유 따라 증설</text>
-    <text x="774" y="228" class="svgsub">CPU·메모리 피드백(PID/EWMA)+AIMD</text>
-    <text x="774" y="244" class="svgsub">시작 스태거 · 매시간 재최적화</text>
-    <line x1="724" y1="210" x2="758" y2="210" stroke="#7ee787" stroke-width="2" marker-end="url(#arwG)"></line>
+    <rect x="64" y="332" width="390" height="74" rx="8" fill="#13161c" stroke="#2c313c"></rect>
+    <text x="78" y="356" class="svglabel" style="fill:#7ee787">단명 컨테이너 수명주기</text>
+    <text x="78" y="376" class="svgmono">spawn → AEDT cold start → solve 1 → push result</text>
+    <text x="78" y="394" class="svgmono">exit → enroot remove → OS가 누수 회수</text>
 
-    <!-- Results DB -->
-    <rect x="760" y="276" width="256" height="74" rx="9" fill="#1f232c" stroke="#5e4a2f"></rect>
-    <text x="774" y="300" class="svglabel" style="fill:#ffb454">결과 DB (DuckDB)</text>
-    <text x="774" y="320" class="svgsub">load·시뮬시간·패스·입출력 파라미터</text>
-    <text x="774" y="336" class="svgsub">슬롯/잡/계정·아카이브 참조</text>
-    <line x1="724" y1="300" x2="758" y2="300" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
+    <rect x="494" y="186" width="214" height="242" rx="10" fill="#181b22" stroke="#3a4252"></rect>
+    <text x="508" y="210" class="svglabel">다른 RUNNING 잡</text>
+    <text x="508" y="232" class="svgsub">같은 구조 반복</text>
+    <text x="508" y="258" class="svgsub">squeue 총량 15 이하</text>
+    <text x="508" y="276" class="svgsub">stuck 시 1개 내려 1개 요청</text>
+    <text x="508" y="306" class="svgsub">잡 수명 최대 20분</text>
+    <text x="508" y="324" class="svgsub">종료 시 /enroot 정리</text>
 
-    <!-- Dashboard -->
-    <rect x="760" y="376" width="256" height="64" rx="9" fill="#1f232c" stroke="#2c313c"></rect>
-    <text x="774" y="400" class="svglabel">대시보드 :8080</text>
-    <text x="774" y="420" class="svgsub">read-only 시각화 (시뮬 영향 없음)</text>
-    <line x1="888" y1="350" x2="888" y2="374" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
+    <rect x="760" y="158" width="256" height="94" rx="9" fill="#1f232c" stroke="#4b3a6e"></rect>
+    <text x="774" y="184" class="svglabel" style="fill:#b392f0">LUT + 라이선스 관측</text>
+    <text x="774" y="204" class="svgsub">solve 0~90 → N 20</text>
+    <text x="774" y="220" class="svgsub">100/110/120/130/140 → 15/14/13/12/11</text>
+    <text x="774" y="236" class="svgsub">150 이상 → N 10 · 12분 감압</text>
+    <line x1="724" y1="205" x2="758" y2="205" stroke="#7ee787" stroke-width="2" marker-end="url(#arwG)"></line>
 
-    <!-- Archive -->
-    <rect x="300" y="466" width="430" height="74" rx="9" fill="#1f232c" stroke="#5e4a2f"></rect>
-    <text x="314" y="490" class="svglabel" style="fill:#ffb454">아카이브 저장소</text>
-    <text x="314" y="510" class="svgsub">project_dir 누적 → 20GB 묶음 압축(solid)</text>
-    <text x="314" y="526" class="svgsub">2TB 초과 시 가장 오래된 묶음파일 1개 삭제</text>
-    <line x1="360" y1="410" x2="360" y2="464" stroke="#7ee787" stroke-width="2" marker-end="url(#arwG)"></line>
+    <rect x="760" y="286" width="256" height="76" rx="9" fill="#1f232c" stroke="#5e4a2f"></rect>
+    <text x="774" y="312" class="svglabel" style="fill:#ffb454">로컬 결과 수신</text>
+    <text x="774" y="332" class="svgsub">:7876 JSON · :7877 대용량</text>
+    <text x="774" y="348" class="svgsub">gate 역터널로 push</text>
+    <line x1="724" y1="330" x2="758" y2="330" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
 
-    <!-- DB from account -->
-    <line x1="724" y1="390" x2="724" y2="312" stroke="#7ee787" stroke-width="0"></line>
+    <rect x="760" y="394" width="256" height="76" rx="9" fill="#1f232c" stroke="#5e4a2f"></rect>
+    <text x="774" y="420" class="svglabel" style="fill:#ffb454">DuckDB + 대시보드</text>
+    <text x="774" y="440" class="svgsub">결과, 실패, 자원 시계열</text>
+    <text x="774" y="456" class="svgsub">read-only 관측</text>
+    <line x1="888" y1="362" x2="888" y2="392" stroke="#5ec2ff" stroke-width="2" marker-end="url(#arw)"></line>
+
+    <rect x="288" y="504" width="448" height="76" rx="9" fill="#1f232c" stroke="#5e4a2f"></rect>
+    <text x="302" y="530" class="svglabel" style="fill:#ffb454">아카이브 저장소</text>
+    <text x="302" y="550" class="svgsub">project_dir 누적 → 20GB 묶음 압축(solid)</text>
+    <text x="302" y="566" class="svgsub">2TB 초과 시 가장 오래된 묶음파일 1개 삭제</text>
+    <line x1="366" y1="428" x2="366" y2="502" stroke="#7ee787" stroke-width="2" marker-end="url(#arwG)"></line>
   </svg>
   <p class="muted" style="font-size:13px">
-    화살표: 보라=신규 서비스 경로, 파랑=제어/조회, 초록=결과/산출물. 단순화를 위해 job_1만
-    슬롯 내부를 펼쳐 표시(job_2~9 동일).
+    핵심은 장수 AEDT 세션이 아니라 완전한 소멸이다. 컨테이너는 한 번만 풀고 결과를 보낸 뒤 종료하며,
+    keeper가 잡 출생률과 squeue 완충량으로 전체 처리량을 맞춘다.
   </p>
 </div>
 
 <h2>2. 목표 토폴로지</h2>
 <table>
-  <tr><th>단위</th><th>수량</th><th>비고</th></tr>
-  <tr><td>계정(account)</td><td>1개</td><td>다계정은 아주 나중 (지금 안 함)</td></tr>
-  <tr><td>잡(SLURM sbatch)</td><td>9개 (cpu2·gpu1)</td><td>잡당 컨테이너 1개 · 여유 파티션만(타 GPU 파티션은 영구 PENDING)</td></tr>
-  <tr><td>ansysedt = 슬롯</td><td>컨테이너당 <b>11</b></td><td>process-per-slot: 단일슬롯 워커 11개를 별도 OS 프로세스로 spawn(1프로세스=1 Desktop). 180s 스태거 램프업.</td></tr>
-  <tr><td>워커 GPU</td><td>gpu1: 2 (gres)</td><td>워커별 <code>CUDA_VISIBLE_DEVICES=idx%2</code> 핀닝 · cpu2는 CPU only</td></tr>
-  <tr><td>동시 실행(running)</td><td>실측 ~88</td><td>8~9잡 × 11워커. baseline 자기공급으로 상시 만재.</td></tr>
-  <tr><td>잡 수명</td><td>15시간</td><td>만료 시 진행 폐기·재기동(드레인 없음)</td></tr>
+  <tr><th>단위</th><th>현행 값</th><th>비고</th></tr>
+  <tr><td>계정(account)</td><td>1개</td><td>단일 계정 기준. 다계정 확장은 현재 범위 밖.</td></tr>
+  <tr><td>잡(SLURM sbatch)</td><td>squeue 최대 15개</td><td>정상 목표는 RUNNING 10개 + PENDING 5개. 제출은 노드별 균등 분산.</td></tr>
+  <tr><td>잡 수명</td><td>최대 20분</td><td>4분 루프에서 더 일찍 내려갈 수 있다. 종료 시 진행 중 컨테이너와 AEDT도 같이 정리된다.</td></tr>
+  <tr><td>컨테이너 수 N</td><td>잡 출생 시 10~20개</td><td>현재 solve 실측을 LUT로 읽어 결정. 컨테이너 출생은 stagger로 분산.</td></tr>
+  <tr><td>AEDT 실행 단위</td><td>컨테이너당 1회</td><td><code>EDT_SLOT_COUNT=1</code>, <code>EDT_MAX_SIMS=1</code>. 완료 후 재사용 없이 종료.</td></tr>
+  <tr><td>동시 실행 목표</td><td>solve 100 근처</td><td>과포화는 LUT와 12분 감압으로 낮춘다. solve &gt;150이면 가장 늙은 잡을 추가 종료.</td></tr>
+  <tr><td>워커 GPU</td><td>gpu1: 2 (gres)</td><td>워커별 <code>CUDA_VISIBLE_DEVICES=idx%2</code> 핀닝 · cpu2는 CPU only.</td></tr>
 </table>
 
-<h2>3. edtmgr 동작 & 타이밍</h2>
+<h2>3. 왜 완전 종료인가</h2>
 <div class="grid c2">
   <div class="card">
-    <h3>왜 필요한가</h3>
-    <p>ansysedt는 켜고 끄는 비용이 매우 크고, 끄면 EDT 라이선스를 놓친다. edtmgr는
-    <b>별도 시뮬이 아닌 관리용 pyaedt 세션</b>을 상시 물고 있어 ansysedt를 warm으로
-    유지하고 라이선스 점유를 이어 간다.</p>
+    <h3>폐기한 방식</h3>
+    <p>AEDT를 오래 붙잡아 두는 예열 슬롯 풀은 기동 비용을 줄일 수 있지만, 실가동에서는 세션 상태,
+    pyaedt 연결, 임시 파일, 메모리 사용량이 다음 솔브로 넘어가는 위험이 더 컸다.</p>
     <ul>
-      <li><code>acquire</code> — 관리 점유만 잠깐 놓음(ansysedt는 살림) → <code>{pid, grpc_port}</code> 반환</li>
-      <li>시뮬 pyaedt가 같은 ansysedt grpc에 접속·실행</li>
-      <li><code>done/release</code> — 관리세션 재부착 → 다음 fixed toml 대기</li>
+      <li>오래 산 프로세스가 상태를 들고 있어 실패 원인 분리가 어려움.</li>
+      <li>라이선스와 gRPC 연결을 계속 물고 있어 회복 동작이 불명확함.</li>
+      <li>잡을 내렸을 때 OS가 한 번에 회수하는 경계가 흐려짐.</li>
     </ul>
   </div>
   <div class="card">
-    <h3>시간 임계값 <span class="tag">0.3.6 실값</span></h3>
-    <table>
-      <tr><th>시점</th><th>동작</th></tr>
-      <tr><td><span class="tag ok">~90분</span></td><td>소프트 목표(정보용). 실측 solve 중앙 55·p90 86분.</td></tr>
-      <tr><td><span class="tag warn">140분</span></td><td>시뮬 자체 hard abort → 마지막 완료 패스 리포트</td></tr>
-      <tr><td><span class="tag bad">150분</span></td><td>백스톱 — ansysedt SIGKILL → 재기동</td></tr>
-    </table>
-    <p class="muted">초기 98분 백스톱에선 슬로우테일이 <b>BackstopTimeout</b>으로 죽어(실패의 30%) 150분으로 상향. <b class="tag warn">0.3.7</b>: mesh 90k→40k·MaxPass 18→11로 <b>solve &lt;30분</b> 목표 → 타임아웃 소멸·임계값 하향 가능.</p>
+    <h3>현행 원칙</h3>
+    <p>콜드스타트 비용은 받아들이고, 대신 컨테이너 경계를 강하게 만든다. 한 컨테이너는 한 solve만
+    수행하고 결과 push 후 종료한다. enroot 제거까지 끝나야 해당 solve의 런타임 상태가 닫힌 것으로 본다.</p>
+    <ul>
+      <li>실패와 누수를 컨테이너 하나의 생애 안에 가둔다.</li>
+      <li>잡 교체와 squeue PENDING 버퍼로 콜드스타트 공백을 흡수한다.</li>
+      <li>정리 기준이 명확하다: AEDT 종료, pyaedt 종료, enroot 제거.</li>
+    </ul>
   </div>
 </div>
 
-<h2>4. 자원 / 파일시스템 / 라이선스</h2>
+<h2>4. 잡 출생 제어</h2>
+<div class="card">
+  <pre>every 4 minutes:
+    if squeue_count >= 15 and queue_is_stuck:
+        stop_oldest_running_job()
+        submit_jobs(1, spread="node-even")
+        return
+
+    stop_oldest_running_job()
+    submit_jobs(4, spread="node-even", squeue_cap=15)
+
+every third tick:
+    if license_solve_in_use > 150:
+        stop_oldest_running_job()</pre>
+  <p class="muted">세부 정책과 LUT 표는 <code>PLANS/job_birth_controller.html</code>을 기준으로 한다.</p>
+</div>
+
+<h2>5. 자원 / 파일시스템 / 라이선스</h2>
 <div class="card">
   <ul>
-    <li><code>/dev/shm</code>, <code>/tmp</code> <b>사용 금지</b> → 잡 전용 <code>job_tmpfs</code> / <code>job_disk</code></li>
-    <li>잡 시작 시 <code>/enroot/{USERNAME}_{SLURM_JOB_ID}</code> 생성, 잡 종료 시 삭제</li>
-    <li>라이선스는 충분 → 상한 미고려, edtmgr 관리세션으로 상시 점유만 유지</li>
+    <li><code>/dev/shm</code>, <code>/tmp</code> 직접 사용 금지 → 잡 전용 <code>job_tmpfs</code> / <code>job_disk</code> 사용.</li>
+    <li>잡 시작 시 <code>/enroot/{USERNAME}_{SLURM_JOB_ID}</code> 계열 작업 공간을 만들고, 잡 종료 trap에서 삭제.</li>
+    <li>라이선스는 상시 점유 세션이 아니라 <code>elec_solve_hfss</code> 실측 기반 LUT와 12분 포화 감압으로 제어.</li>
+    <li>슈퍼컴 쪽에는 결과 DB를 두지 않는다. 결과와 대용량 산출물은 로컬 수신 데몬으로 push한다.</li>
   </ul>
 </div>
 
-<h2>5. 부가 서비스</h2>
+<h2>6. 부가 서비스</h2>
 <div class="grid c3">
   <div class="card">
     <h3>Intake :7875 <span class="tag new">신규</span></h3>
-    <p>peetsfea sweep toml + 개수 N 수신 → 랜덤 샘플 fixed toml × N → 대기 큐 적재 → 순차 시뮬 → DB.</p>
+    <p>peetsfea sweep toml + 개수 N 수신 → 랜덤 샘플 fixed toml × N → 대기 큐 적재 → 컨테이너가 하나씩 소비.</p>
   </div>
   <div class="card">
     <h3>대시보드 :8080 <span class="tag ok">가동</span></h3>
-    <p>결과 DB + <b>컨테이너별 실시간 부하</b>(ResourcePoller: scontrol·lmstat 폴링)를 <b>읽기 전용</b> 시각화한다. 개요, 컨테이너 부하, 입출력 데이터셋, 실패, 자원 시계열을 이 한 화면에서 본다.</p>
+    <p>결과 DB + 실시간 부하(ResourcePoller: scontrol·lmstat 폴링)를 읽기 전용으로 시각화한다. 개요, 컨테이너 부하, 실패, 자원 시계열을 한 화면에서 본다.</p>
   </div>
   <div class="card">
     <h3>아카이브 <span class="tag new">신규</span></h3>
-    <p>project_directory를 누적해 <b>20GB 단위 묶음(solid) 압축</b>. 2TB 초과 시 가장 오래된 묶음파일 1개 삭제. 복원이 느려도 무방.</p>
+    <p>project_directory를 누적해 20GB 단위 묶음(solid) 압축. 2TB 초과 시 가장 오래된 묶음파일 1개 삭제. 복원이 느려도 무방.</p>
   </div>
 </div>
 
-<h2>6. 구현 단계 (각 1/6)</h2>
+<h2>7. 현재 구현 기준</h2>
 <div class="card">
   <div class="phase now">
     <div class="n">1</div>
     <div>
-      <h4>코어 단일 컨테이너 <span class="tag ok">지금 구현 = GOAL.md</span></h4>
-      <p class="muted">단일 잡/컨테이너에서 edtmgr 10 + ansysedt 10 warm + 큐의 fixed toml 순차 실행.
-      60/65분 타이밍, /enroot lifecycle, peetsfea 0.3.2 warm-AEDT 접속.</p>
+      <h4>컨테이너 생애 <span class="tag ok">핵심</span></h4>
+      <p class="muted">잡 내부 서브 오케스트레이터가 N개 컨테이너를 stagger로 띄운다. 각 컨테이너는 fixed toml 1개를 처리하고 결과 push 후 종료한다.</p>
     </div>
   </div>
-  <div class="phase"><div class="n">2</div><div><h4>9잡 / ~100 동시 오케스트레이션</h4>
-    <p class="muted">잡 9개 생애주기, 컨테이너당 ≤16 / 합 ~100 풀(유동), 10h 만료 시 폐기.</p></div></div>
-  <div class="phase"><div class="n">3</div><div><h4>로드 밸런서</h4>
-    <p class="muted">CPU/mem 피드백 제어(PID/EWMA) + 시작 스태거 + AIMD 백오프, 매시간 재최적화.</p></div></div>
-  <div class="phase"><div class="n">4</div><div><h4>Intake :7875</h4>
-    <p class="muted">sweep toml + N → 랜덤 샘플 → 큐 → 순차 시뮬 → DB.</p></div></div>
-  <div class="phase"><div class="n">5</div><div><h4>결과 DB + 대시보드 :8080</h4>
-    <p class="muted">DuckDB 스키마 확장 + read-only 대시보드.</p></div></div>
-  <div class="phase"><div class="n">6</div><div><h4>아카이브 저장소</h4>
-    <p class="muted">20GB 묶음 압축(solid) + 2TB 초과 시 오래된 묶음 삭제 + (느린) 복원.</p></div></div>
+  <div class="phase now">
+    <div class="n">2</div>
+    <div>
+      <h4>잡 생애 <span class="tag ok">핵심</span></h4>
+      <p class="muted">keeper가 4분마다 가장 늙은 RUNNING 잡을 내리고 새 잡 4개를 요청한다. squeue 15를 넘기지 않고 PENDING 5개를 완충으로 둔다.</p>
+    </div>
+  </div>
+  <div class="phase">
+    <div class="n">3</div>
+    <div>
+      <h4>관측과 저장</h4>
+      <p class="muted">결과는 로컬 DuckDB와 아카이브로 들어가며, 대시보드는 read-only 관측면으로 유지한다.</p>
+    </div>
+  </div>
 </div>
 
 <footer>
-  기준 문서: <code>PLANS/MASTER_PLAN.md</code> · Phase 1 범위: <code>GOAL.md</code> ·
-  결정 Q1~Q8 반영 · 레거시 lease/worker/bundle 파이프라인 대체.
+  기준 문서: <code>PLANS/MASTER_PLAN.md</code> · 현재 잡 출생 제어: <code>PLANS/job_birth_controller.html</code> ·
+  현행 운영 원칙: 단명 컨테이너, 완전 종료, squeue 기반 완충.
 </footer>
 
 </div>
