@@ -5,9 +5,9 @@ from typing import Final
 
 DEFAULT_SLURM_JOB_TIME_LIMIT: Final[str] = "00:45:00"
 
-# --- edtmgr / 슬롯 (Phase 1) -------------------------------------------------
-# 컨테이너당 상시 기동하는 ansysedt(=슬롯) 수.
-SLOTS_PER_CONTAINER: Final[int] = 10
+# --- AEDT 워커 ---------------------------------------------------------------
+# 현행 production 경로는 1솔브 단명 컨테이너를 사용한다. 직접 entrypoint를 실행할 때의 기본도 1로 둔다.
+SLOTS_PER_CONTAINER: Final[int] = 1
 # 타이밍은 클러스터 CPU가 로컬 PC 대비 ~1.5배 느린 것을 반영해 모두 ×1.5 (실측: 1h→1.5h).
 # 시뮬 1개 소프트 목표(~90분). 정보용(워치독 강제 아님).
 SIM_SOFT_TARGET_SECONDS: Final[int] = 90 * 60
@@ -18,14 +18,11 @@ SIM_HARD_ABORT_SECONDS: Final[int] = 140 * 60
 # edtmgr 백스톱(150분): 대여한 채 이 시간까지 미반환이면 SIGKILL 후 재기동(하드 abort 140분 + 여유).
 EDTMGR_BACKSTOP_KILL_SECONDS: Final[int] = 150 * 60
 
-# --- Phase 2: 9잡 / ~100 동시 오케스트레이션 -------------------------------
-# 계정당 SLURM 잡 수(= 컨테이너 수).
+# --- SLURM 잡 출생 제어 -----------------------------------------------------
+# 레거시 keepalive 모드의 기본 슬롯 수. 현행 관리 루프는 별도 squeue cap(15)을 사용한다.
 JOBS_PER_ACCOUNT: Final[int] = 9
-# 잡 수명(15h = 10h×1.5). 만료 시 진행 중 시뮬을 그냥 폐기(드레인 없음, Q8) 후 재기동.
-JOB_MAX_LIFETIME_SECONDS: Final[int] = 15 * 60 * 60
-# 유연 토폴로지(Phase 2/3): edtmgr가 항상 보유하는 warm 하한 / 컨테이너당 슬롯 상한.
-WARM_FLOOR_PER_CONTAINER: Final[int] = 11
-MAX_SLOTS_PER_CONTAINER: Final[int] = 16
+# 잡 수명 상한. job script의 EDT_JOB_TTL_SEC 기본값과 동일하게 20분으로 둔다.
+JOB_MAX_LIFETIME_SECONDS: Final[int] = 20 * 60
 
 # --- Phase 6: 아카이브 저장소 ------------------------------------------------
 # 묶음 압축 임계(20GB): 완료 project_dir들을 누적하다 이만큼 모이면 한 파일로 압축.

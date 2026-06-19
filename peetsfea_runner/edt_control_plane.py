@@ -1,9 +1,8 @@
-"""컨트롤 플레인 — 정상상태 동시 ~100 연속 가동 (MASTER_PLAN 운영 목표).
+"""컨트롤 플레인 — 정상상태 동시 ~100 연속 가동.
 
 제어 호스트(systemd `--user` 서비스)가 돌리는 상시 루프:
-- **오케스트레이터:** 9개 SLURM 잡(=컨테이너=슬롯 서비스)을 상시 유지. 각 잡은 entrypoint로
-  `build_steady_state_service`를 돌려 **baseline 전역 샘플링으로 슬롯을 자기공급** → 요청이 없어도
-  계속 시뮬(동시 ~100). 죽으면 재기동, 10h 만료 폐기·재기동.
+- **오케스트레이터:** HTML 정책 기준으로 4분마다 가장 오래된 RUNNING 잡을 내리고 새 잡을 요청한다.
+  잡 내부에서는 `deploy/orchestrator.sh`가 1솔브 단명 enroot 컨테이너 N개를 stagger 가동한다.
 - **Intake :7875:** sweep 우선순위 요청 수신(우선순위 분배는 후속 — 현재는 baseline 자기공급이 핵심).
 - **대시보드 :8080:** 결과 DB read-only 조회 + `results.csv`.
 - **아카이브:** 완료 project_dir를 20GB 묶음 압축, 2TB FIFO.
@@ -58,8 +57,8 @@ class ControlPlaneConfig:
     archive_buffer_bytes: int = ARCHIVE_BUFFER_BYTES  # 로컬 디스크에 맞춰 조정(FIFO 상한).
     ssh_host: str = "gate1-harry261"
     job_count: int = JOBS_PER_ACCOUNT
-    # 잡 컨테이너가 돌릴 production 슬롯 서비스 스크립트(baseline 자기공급, 무한).
-    job_command: str = "bash $HOME/edt-deploy/slot_service.sh"
+    # 잡 내부 서브 오케스트레이터: 1솔브 단명 enroot 컨테이너 N개를 띄우고 respawn 없이 종료.
+    job_command: str = "bash $HOME/edt-deploy/orchestrator.sh"
     dashboard_port: int = 8080
     intake_port: int = 7875
     ingest_port: int = DEFAULT_INGEST_PORT  # 슈퍼컴 전용 결과 백채널(역터널로만 도달).
@@ -67,7 +66,7 @@ class ControlPlaneConfig:
     priority_lease_port: int = DEFAULT_PRIORITY_LEASE_PORT  # 슈퍼컴 전용 우선순위 분배 백채널(역터널로만 도달).
     poll_interval_seconds: float = 60.0
     dashboard_peetsfea_version: str = ""  # 대시보드 표시 버전 필터(빈 값=전 버전). 예: "0.3.7".
-    # 잡 제출 전략: 노드 기반(빈 노드에 --nodelist 핀, 내 잡 도는 노드 제외) + 순차 램프(한 잡 RUNNING 후 다음).
+    # 잡 제출 전략: 노드 기반(빈 노드에 --nodelist 핀, 내 잡 도는 노드 제외) + HTML 기준 관리 루프.
     node_based_jobs: bool = True
     sequential_ramp: bool = True
     # 라이선스 피드백 제어(:7879): 전역 동시 솔브를 target~ceiling 밴드로. lic_mine은 poller에서.
@@ -173,16 +172,16 @@ class ControlPlane:
             self.license_controller = controller
             if self.resource_poller is not None:
                 self.resource_poller.aedt_provider = controller.per_job  # 컨테이너(잡)별 pyaedt 수 → 부하 탭
-                # 롤링 제어기: 잡 출생 시 LUT(지령 solve=100, 이상점 12, 최대 20)로 컨테이너 수 N 결정.
+                # 잡 출생 시 LUT로 컨테이너 수 N 결정.
                 self.container_scheduler = ContainerScheduler(
                     snapshot_provider=self.resource_poller.snapshot,
                 )
-                # 와이어링: 런처는 출생 시 N을 주입, orchestrator는 보고 기반 살아있는 컨테이너 수로 롤링 교체.
+                # 와이어링: 런처는 출생 시 N을 주입, orchestrator는 solve 실측으로 12분 포화 감압.
                 if self.orchestrator is not None:
                     launcher = self.orchestrator.launcher
                     if isinstance(launcher, SlurmJobLauncher):
                         launcher.container_count_provider = self.container_scheduler.decide_n
-                    self.orchestrator.live_count_provider = self.container_scheduler.live_count
+                    self.orchestrator.solve_provider = self.container_scheduler.current_solve
             license_server = start_license_ctrl_server(
                 controller=controller, scheduler=self.container_scheduler, port=self.license_ctrl_port
             )
@@ -203,7 +202,7 @@ class ControlPlane:
                 )
                 self._servers.append(resource_server)
                 threading.Thread(target=resource_server.serve_forever, daemon=True, name="ResourceServer").start()
-            # 제어 루프(1분): solve 갱신 + ceiling 초과 시 youngest abort 표시.
+            # 라이선스/스케줄러 백채널 루프.
             threading.Thread(target=self._license_poll_loop, daemon=True, name="license-ctrl-poll").start()
             # 라이선스 역터널만 control측: gate loopback:7879 → 로컬 제어기.
             if self.enable_ingest_tunnel:
@@ -263,7 +262,7 @@ class ControlPlane:
         try:
             while not self._stop.is_set():
                 if self.run_keeper:
-                    self.orchestrator.poll()  # 죽은 잡 재기동, 10h 만료 폐기·재기동
+                    self.orchestrator.poll()
                 self._stop.wait(self.poll_interval_seconds)
         finally:
             # 각 단계는 독립적으로 best-effort: 하나가 실패/지연해도 나머지 teardown을 막지 않는다.

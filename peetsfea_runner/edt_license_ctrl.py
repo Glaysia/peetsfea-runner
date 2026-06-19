@@ -151,19 +151,13 @@ class LicenseController:
 
 @dataclass
 class ContainerScheduler:
-    """롤링 라이프사이클 제어기 — 잡 **출생 시** LUT로 그 잡의 컨테이너 수 N을 결정(분모/LB 없음).
+    """잡 출생 시 현재 solve 실측을 계단형 LUT로 읽어 컨테이너 수 N을 결정한다.
 
-      지령(setpoint) solve=100에서 이상점 N=ideal(12). 100미만이면 더 밀고(최대 cap=20),
-      100~overshoot(120)은 오버슈팅 허용(N을 ideal→1로 완만히), overshoot 초과면 N=1.
-
-    1컨테이너=1솔브=종료(respawn 없음)라 잡은 시간이 지나며 드레인. orchestrator가 살아있는 컨테이너 수를
-    /orch_report로 보고 → JobOrchestrator가 '가장 적게 남은 잡'을 골라 15분 주기로 교체(stagger)."""
+    1컨테이너=1솔브=종료(respawn 없음)라 잡은 시간이 지나며 드레인된다. /orch_report는 관측/대시보드용이며
+    잡 교체 후보는 JobOrchestrator가 RUNNING 잡의 시작 시각으로 고른다.
+    """
 
     snapshot_provider: Callable[[], Mapping[str, Any]]   # poller.snapshot
-    setpoint: int = 100
-    ideal: int = 12
-    cap: int = 20
-    overshoot: int = 120
     report_ttl_seconds: float = 60.0
     clock: Callable[[], float] = time.monotonic
     _reports: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
@@ -179,13 +173,19 @@ class ContainerScheduler:
     def decide_n(self, solve: int | None = None) -> int:
         """LUT: 현재 동시 솔브 → 새 잡의 컨테이너 수 N."""
         s = self.current_solve() if solve is None else int(solve)
-        if s <= self.setpoint:
-            n = self.ideal + 0.08 * (self.setpoint - s)          # 100→12, 0→20
-        elif s <= self.overshoot:
-            n = self.ideal - 0.55 * (s - self.setpoint)          # 100→12, 120→1
-        else:
-            n = 1.0                                              # 120↑ 정지
-        return max(1, min(self.cap, int(round(n))))
+        if s <= 90:
+            return 20
+        if s <= 100:
+            return 15
+        if s <= 110:
+            return 14
+        if s <= 120:
+            return 13
+        if s <= 130:
+            return 12
+        if s <= 140:
+            return 11
+        return 10
 
     def report(self, slurm_id: str, live: int, **extra: Any) -> None:
         """orchestrator가 살아있는 컨테이너 수 보고."""
@@ -213,8 +213,7 @@ class ContainerScheduler:
     def status(self) -> dict[str, Any]:
         with self._lock:
             reps = {s: r["live"] for s, r in self._reports.items()}
-        return {"setpoint": self.setpoint, "ideal": self.ideal, "cap": self.cap, "overshoot": self.overshoot,
-                "solve": self.current_solve(), "decide_n": self.decide_n(), "reports": reps}
+        return {"solve": self.current_solve(), "decide_n": self.decide_n(), "reports": reps}
 
 
 def start_license_ctrl_server(
@@ -254,7 +253,7 @@ def start_license_ctrl_server(
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
-            # orchestrator 보고(form-encoded): 살아있는 컨테이너 수 → 가장 적게 남은 잡 선택용.
+            # orchestrator 보고(form-encoded): 살아있는 컨테이너 수를 관측/대시보드용으로 저장.
             if path == "/orch_report":
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
@@ -331,6 +330,7 @@ def _write_json(handler: BaseHTTPRequestHandler, status: int, payload: Mapping[s
 
 
 __all__ = [
+    "ContainerScheduler",
     "DEFAULT_LICENSE_CTRL_PORT",
     "LicenseController",
     "LicensePermitClient",

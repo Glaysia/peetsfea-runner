@@ -259,3 +259,12 @@ def test_node_based_avoids_cancelled_node() -> None:
     launcher.avoid_node("n001")           # 막힌 PENDING으로 취소됐다고 가정
     h2 = launcher.submit(1)
     assert h2.node == "n002"              # n001 회피 → 다음 노드
+
+
+def test_node_based_reserves_newly_submitted_node_for_burst_spread() -> None:
+    runner = _node_runner("n001 cpu2 idle\nn002 cpu2 idle\n", busy="")
+    launcher = SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0,
+                                partitions=("cpu2",), node_based=True, cpu2_weight=1.0)
+    h1 = launcher.submit(0)
+    h2 = launcher.submit(1)
+    assert (h1.node, h2.node) == ("n001", "n002")

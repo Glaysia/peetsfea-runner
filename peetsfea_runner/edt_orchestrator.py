@@ -1,10 +1,8 @@
-"""9잡 오케스트레이터 (Phase 2, MASTER_PLAN §1/§4).
+"""SLURM 잡 출생 제어 루프.
 
-단일 계정에서 **9개 SLURM 잡**(= enroot 컨테이너 = 슬롯 서비스)을 상시 유지한다.
-- 죽은 잡은 즉시 재기동.
-- **10h 만료** 잡은 진행 중 시뮬을 **그냥 폐기**(드레인 없음, Q8)하고 재기동.
-상태기계/타이밍만 담고, 실제 sbatch/squeue/scancel는 `JobLauncher`로 분리(테스트는 fake,
-실서비스는 `scheduler.py`의 sbatch 패턴을 쓰는 SLURM 런처).
+현행 정책은 HTML 문서(`PLANS/job_birth_controller.html`)가 기준이다. 관리 루프는 잡 수 구간을 나누지
+않고 4분마다 가장 오래된 RUNNING 잡을 하나 내린 뒤 새 잡 4개를 요청한다. 전체 squeue 상한은 15개이며,
+과포화(solve > 150)는 12분마다 가장 오래된 RUNNING 잡 하나를 추가로 내리는 방식으로 감압한다.
 """
 
 from __future__ import annotations
@@ -18,8 +16,7 @@ from .constants import JOB_MAX_LIFETIME_SECONDS, JOBS_PER_ACCOUNT
 
 Clock = Callable[[], float]
 
-# 막힌 PENDING 판정용. squeue REASON이 이 집합이면 "곧 시작/스케줄 중" → 계속 대기.
-# 그 외(Resources, Priority, ReqNodeNotAvail 등)는 그 노드가 한동안 안 비는 것 → 취소하고 다른 노드로.
+# 막힌 PENDING 판정용. squeue REASON이 이 집합이면 "곧 시작/스케줄 중"으로 본다.
 _OK_PENDING_REASONS = frozenset({"", "none", "null", "(null)", "pending"})
 
 
@@ -43,48 +40,41 @@ class JobLauncher(Protocol):
     def submit(self, job_index: int) -> JobHandle: ...
     def is_alive(self, handle: JobHandle) -> bool: ...
     def kill(self, handle: JobHandle) -> None: ...
-    # 선택: 순차 램프(sequential_ramp)는 `is_running`(RUNNING/PENDING 구분)을 쓴다. 구현이 없으면 is_alive로
-    # 폴백하므로 Protocol에 필수로 선언하지 않는다(스텁 상속 시 None 반환 폴백이 깨지는 것을 피함).
+    # 선택 API: 관리 루프는 `is_running`(RUNNING/PENDING 구분), `pending_reason`, `cancel`, `avoid_node`를
+    # 구현체가 제공하면 사용한다. 없으면 is_alive/kill 기반으로 폴백한다.
 
 
 @dataclass
 class JobOrchestrator:
-    """계정 내 9잡을 상시 유지. `ensure_running()`으로 부팅, `poll()`을 주기 호출."""
+    """계정 내 SLURM 잡 출생/사망을 제어한다."""
 
     launcher: JobLauncher
     clock: Clock
     job_count: int = JOBS_PER_ACCOUNT
     max_lifetime_seconds: float = float(JOB_MAX_LIFETIME_SECONDS)
-    # sequential_ramp=True면 **한 번에 한 잡씩**: 직전 잡이 RUNNING 된 뒤에야 다음 잡을 제출(노드 과적재·동시
-    # 콜드스타트 폭주 방지). poll/ensure_running 호출당 최대 1개 제출, 가용 노드 없으면 그냥 대기.
+    # 기존 설정명 호환용. True면 HTML 기준 관리 루프를 사용한다.
     sequential_ramp: bool = False
-    # 2단계 제어 루프 (PLANS/job_birth_controller.html):
-    #   잡 ≤ job_count-2 (≤7): 램프 — ramp_interval_seconds(1분)마다 새 잡 1개 제출(탈락 없음, 순증).
-    #   잡 ≥ job_count-1 (8~): 정상 — roll_period_seconds(10분)마다 살아있는 컨테이너가 **가장 적은** RUNNING
-    #     잡 1개 안전종료 → 기본 4개까지 새 잡 제출(8개→1탈락→4제출=11개 보강).
-    # live_count_provider(slurm_id)=제어기 보고 기반 살아있는 컨테이너 수(-1=미보고). None이면 롤 비활성(램프만).
-    ramp_interval_seconds: float = 30.0  # poll 주기(60s) 아래 → 램프 단계 매 poll 1개씩(=poll 주기 = 1분/잡)
-    roll_period_seconds: float = 600.0
-    roll_refill_jobs: int = 4
-    live_count_provider: Callable[[str], int] | None = None
+    control_period_seconds: float = 240.0
+    submit_batch_jobs: int = 4
+    squeue_cap: int = 15
+    running_target: int = 10
+    pending_target: int = 5
+    saturation_every_ticks: int = 3
+    saturation_solve_ceiling: int = 150
+    solve_provider: Callable[[], int] | None = None
     submitted: int = field(default=0, init=False)
     restarts: int = field(default=0, init=False)  # 죽어서 재기동한 횟수
-    expiries: int = field(default=0, init=False)  # 10h 만료로 폐기·재기동한 횟수
-    cancellations: int = field(default=0, init=False)  # 막힌 PENDING(Resources/Priority 등) 취소 후 다른 노드로 넘긴 횟수
+    expiries: int = field(default=0, init=False)  # TTL 만료/제어 루프 종료로 폐기한 횟수
+    cancellations: int = field(default=0, init=False)  # PENDING/비RUNNING 잡 취소 횟수
+    saturation_reductions: int = field(default=0, init=False)
     _jobs: dict[int, JobHandle] = field(default_factory=dict, init=False, repr=False)
-    _last_roll: float = field(default=0.0, init=False)
-    _last_submit: float = field(default=float("-inf"), init=False)  # 첫 램프 제출은 즉시(1분 게이트 통과)
+    _last_control: float = field(default=float("-inf"), init=False)
+    _control_ticks: int = field(default=0, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def _submit(self, job_index: int) -> None:
         self._jobs[job_index] = self.launcher.submit(job_index)
         self.submitted += 1
-
-    def _rolling_target(self) -> int:
-        """정상 단계 보강 목표. live 보고가 없으면 기존 9잡 유지로 폴백한다."""
-        if self.live_count_provider is None:
-            return self.job_count
-        return self.job_count + max(0, self.roll_refill_jobs - 2)
 
     def _submit_empty_slot(self, *, limit: int | None = None) -> bool:
         """가장 낮은 빈 슬롯 1개에 새 잡 제출. 제출하면 True(가용 노드 없음 등 실패 시 False)."""
@@ -108,9 +98,9 @@ class JobOrchestrator:
         return submitted
 
     def ensure_running(self) -> None:
-        """비어 있는 잡 슬롯을 채운다(콜드 스타트/누락 보충)."""
+        """초기 기동. 관리 루프는 첫 tick을 즉시 실행해 새 잡 4개를 요청한다."""
         if self.sequential_ramp:
-            self._ramp_poll()
+            self._managed_poll(force_tick=True)
             return
         with self._lock:
             for i in range(self.job_count):
@@ -118,9 +108,9 @@ class JobOrchestrator:
                     self._submit(i)
 
     def poll(self) -> None:
-        """전 잡 1회 점검: 죽었으면 재기동, 10h 만료면 폐기 후 재기동."""
+        """전 잡 1회 점검. 관리 루프는 4분 tick에서만 출생률을 바꾼다."""
         if self.sequential_ramp:
-            self._ramp_poll()
+            self._managed_poll()
             return
         with self._lock:
             now = self.clock()
@@ -156,62 +146,88 @@ class JobOrchestrator:
         fn = getattr(self.launcher, "cancel", None)
         (fn if callable(fn) else self.launcher.kill)(handle)
 
-    def _ramp_poll(self) -> None:
-        """2단계 제어 1회. 잡 ≤7: 1분마다 +1 순증. 정상 단계: 최소-컨테이너 잡 1탈락 + 최대 4개 보강."""
+    def _active_count(self) -> int:
+        return len(self._jobs)
+
+    def _running_items(self) -> list[tuple[int, JobHandle]]:
+        return [
+            (i, h) for i, h in self._jobs.items()
+            if self.launcher.is_alive(h) and self._is_running(h)
+        ]
+
+    def _oldest_running(self) -> tuple[int, JobHandle] | None:
+        running = self._running_items()
+        if not running:
+            return None
+        return min(running, key=lambda ih: ih[1].started_at)
+
+    def _stop_oldest_running(self) -> bool:
+        victim = self._oldest_running()
+        if victim is None:
+            return False
+        i, handle = victim
+        self.launcher.kill(handle)
+        del self._jobs[i]
+        self.expiries += 1
+        return True
+
+    def _queue_is_stuck(self) -> bool:
+        for handle in self._jobs.values():
+            if self.launcher.is_alive(handle) and not self._is_running(handle):
+                if _pending_is_stuck(self._pending_reason(handle)):
+                    return True
+        return False
+
+    def _current_solve(self) -> int:
+        if self.solve_provider is None:
+            return 0
+        try:
+            return int(self.solve_provider())
+        except Exception:  # noqa: BLE001 — solve 관측 실패가 제어 루프를 죽이면 안 된다.
+            return 0
+
+    def _cleanup_finished_and_expired(self, now: float) -> None:
+        for i in list(self._jobs):
+            handle = self._jobs[i]
+            if not self.launcher.is_alive(handle):
+                del self._jobs[i]
+                self.restarts += 1
+                continue
+            if (now - handle.started_at) < self.max_lifetime_seconds:
+                continue
+            if self._is_running(handle):
+                self.launcher.kill(handle)
+            else:
+                self._cancel_pending(handle)
+                self.cancellations += 1
+            del self._jobs[i]
+            self.expiries += 1
+
+    def _managed_poll(self, *, force_tick: bool = False) -> None:
+        """HTML 기준 제어 1회. 4분마다 oldest stop + submit 4, squeue cap은 15."""
         with self._lock:
             now = self.clock()
-            # --- 정리: 죽음/TTL만료/막힌 PENDING ---
-            for i in list(self._jobs):
-                handle = self._jobs[i]
-                if not self.launcher.is_alive(handle):
-                    del self._jobs[i]
-                    self.restarts += 1
-                elif (now - handle.started_at) >= self.max_lifetime_seconds:
-                    self.launcher.kill(handle)
-                    del self._jobs[i]
-                    self.expiries += 1
-            for i in list(self._jobs):
-                handle = self._jobs[i]
-                if self.launcher.is_alive(handle) and not self._is_running(handle):
-                    if _pending_is_stuck(self._pending_reason(handle)):
-                        self._cancel_pending(handle)  # plain scancel(PENDING은 TERM no-op)
-                        self._avoid_node(handle)
-                        del self._jobs[i]
-                        self.cancellations += 1
-
-            n = len(self._jobs)
-            # 아직 안 뜬(PENDING) 잡 있으면 그게 RUNNING 될 때까지 새 제출 보류(노드 과적재 방지) — 정상 단계 채움에만 적용.
-            waiting = any(self.launcher.is_alive(h) and not self._is_running(h) for h in self._jobs.values())
-
-            if n <= self.job_count - 2:  # ≤7: 램프 — poll 주기마다 +1 순증. **직전 잡 RUNNING 안 기다림**(stall 방지).
-                if (now - self._last_submit) >= self.ramp_interval_seconds:
-                    if self._submit_empty_slot():
-                        self._last_submit = now
+            self._cleanup_finished_and_expired(now)
+            if not force_tick and (now - self._last_control) < self.control_period_seconds:
                 return
 
-            # 8+: 정상 — 10분마다 최소-컨테이너 RUNNING 잡 1탈락
-            live_count_provider = self.live_count_provider
-            if live_count_provider is not None and (now - self._last_roll) >= self.roll_period_seconds:
-                if self._last_roll == 0.0:
-                    self._last_roll = now  # 첫 정상 진입 직후엔 한 주기 대기(즉시 탈락 방지)
-                else:
-                    running = [(i, h) for i, h in self._jobs.items()
-                               if self.launcher.is_alive(h) and self._is_running(h)]
-                    if running:
-                        def lc(h: JobHandle) -> int:
-                            v = live_count_provider(h.slurm_id)
-                            return v if v >= 0 else 10 ** 9  # 미보고(방금 뜬 잡)는 후보 제외
+            stuck_at_cap = self._active_count() >= self.squeue_cap and self._queue_is_stuck()
+            if stuck_at_cap:
+                self._stop_oldest_running()
+                self._submit_until(self.squeue_cap, 1)
+            else:
+                self._stop_oldest_running()
+                self._submit_until(self.squeue_cap, self.submit_batch_jobs)
+            self._last_control = now
+            self._control_ticks += 1
 
-                        i, h = min(running, key=lambda ih: lc(ih[1]))
-                        self.launcher.kill(h)  # 안전종료(SIGTERM → orchestrator trap drain)
-                        del self._jobs[i]
-                        self.expiries += 1
-                    self._last_roll = now
-            # 정상 단계 보강: 스케줄러가 붙어 있으면 기본 11개까지, 한 tick 최대 4개 제출.
-            # 즉 8개에서 1개 내린 경우 7→11로 4개를 바로 채운다. 스케줄러가 없으면 기존 9개 유지.
-            target = self._rolling_target()
-            if len(self._jobs) < target and not waiting:
-                self._submit_until(target, self.roll_refill_jobs)
+            if (
+                self.saturation_every_ticks > 0
+                and self._control_ticks % self.saturation_every_ticks == 0
+                and self._current_solve() > self.saturation_solve_ceiling
+            ):
+                if self._stop_oldest_running():
+                    self.saturation_reductions += 1
 
     def running_count(self) -> int:
         with self._lock:

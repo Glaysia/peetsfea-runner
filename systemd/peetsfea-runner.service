@@ -27,7 +27,7 @@ RestartSec=10
 # 그래도 'stop→failed'가 안 나게 충분한 여유를 준다(과거 120s 초과로 SIGKILL→failed 발생).
 TimeoutStopSec=200s
 # 하드 킬 대비: 잔류 peetsfea-edt 잡을 safe-scancel로 정리(raw scancel 금지 — /enroot 잔재 방지).
-# graceful SIGTERM으로 slot_service trap이 /enroot를 청소할 시간을 주고, 끝내 안 죽으면 강제 종료.
+# graceful SIGTERM으로 잡 스크립트 trap이 /enroot를 청소할 시간을 주고, 끝내 안 죽으면 강제 종료.
 # ssh가 gate $HOME에 랜딩하므로 상대경로(=gate의 ~/edt-deploy). %h(로컬 home)는 gate에서 무효라 쓰지 않는다.
 ExecStopPost=/usr/bin/ssh gate1-harry261 bash edt-deploy/safe_scancel.sh
 

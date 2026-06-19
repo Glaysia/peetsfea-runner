@@ -5,6 +5,7 @@ import threading
 import urllib.request
 
 from peetsfea_runner.edt_license_ctrl import (
+    ContainerScheduler,
     LicenseController,
     LicensePermitClient,
     start_license_ctrl_server,
@@ -147,3 +148,20 @@ def test_per_job_handles_malformed_worker_id() -> None:
     c = _ctrl(lic=0, target=100)
     c.permit("weird_id_no_prefix")
     assert c.per_job()["?"]["active"] == 1
+
+
+def test_container_scheduler_uses_html_lut() -> None:
+    scheduler = ContainerScheduler(snapshot_provider=lambda: {"license": {"solve_mine": 0}})
+    cases = [
+        (0, 20),
+        (90, 20),
+        (91, 15),
+        (100, 15),
+        (110, 14),
+        (120, 13),
+        (130, 12),
+        (140, 11),
+        (141, 10),
+        (150, 10),
+    ]
+    assert [scheduler.decide_n(solve) for solve, _ in cases] == [expected for _, expected in cases]

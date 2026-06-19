@@ -35,21 +35,21 @@ def test_build_control_plane_wires_orchestrator_store_intake(tmp_path: Path) -> 
     assert cp.orchestrator.job_count == 9
     assert isinstance(cp.intake, IntakeService)
     assert cp.dashboard_port == 8080 and cp.intake_port == 7875
+    assert config.job_command.endswith("orchestrator.sh")
 
-    # 2단계 제어: 램프(≤7)는 1분마다 1개씩. 와이어링 검증이라 간격을 0으로 둬 즉시 9까지 채운다.
+    # HTML 기준 관리 루프: 시작 시 4개를 요청하고, tick마다 oldest stop + 새 잡 요청으로 squeue 15를 넘기지 않는다.
     assert cp.orchestrator.sequential_ramp is True
-    cp.orchestrator.ramp_interval_seconds = 0.0
+    cp.orchestrator.control_period_seconds = 0.0
     cp.orchestrator.ensure_running()
-    assert launcher.submits == 1  # 처음엔 한 개만
-    for _ in range(8):
-        cp.orchestrator.poll()  # 하나씩 차근차근 올림(램프 7→ 정상 8~9 채움)
-    assert launcher.submits == 9
-    assert cp.orchestrator.running_count() == 9
+    assert launcher.submits == 4
+    for _ in range(5):
+        cp.orchestrator.poll()
+    assert cp.orchestrator.running_count() == 15
 
-    # 잡 1개 죽으면 poll에서 재기동.
+    # 죽은 잡은 정리되지만 출생은 tick 정책과 cap을 따른다.
     victim = cp.orchestrator.handles()[0]
     launcher.alive[victim.slurm_id] = False
     cp.orchestrator.poll()
     assert cp.orchestrator.restarts == 1
-    assert cp.orchestrator.running_count() == 9
+    assert cp.orchestrator.running_count() <= 15
     cp.orchestrator.shutdown()

@@ -82,6 +82,8 @@ class SlurmJobLauncher:
     rng: Callable[[], float] = random.random  # 가중 선택용(테스트 주입 가능)
     # 막힌 PENDING으로 취소된 노드를 이 시간 동안 후보에서 제외(그 노드가 한동안 안 비므로). clock 단위.
     avoid_cooldown_seconds: float = 300.0
+    # 같은 control tick에서 연속 제출할 때 squeue 반영 지연으로 같은 노드를 다시 고르지 않게 하는 짧은 로컬 예약.
+    submit_reservation_seconds: float = 60.0
     clock: Clock = time.monotonic
     command_runner: CommandRunner = subprocess_runner
     # 이미 사용한 baseline seed 프런티어를 반환(store.max_baseline_seed). 제출 시 이 위로 seed epoch를 잡아
@@ -90,8 +92,9 @@ class SlurmJobLauncher:
     # 롤링 라이프사이클: 잡 출생 시 제어기가 LUT로 결정한 컨테이너 수 N을 주입(EDT_JOB_CONTAINERS).
     # None이면 미주입(orchestrator가 /job_plan 조회 또는 기본값). job_ttl_seconds=잡 수명(orchestrator self-exit).
     container_count_provider: Callable[[], int] | None = None
-    job_ttl_seconds: int = 1200  # 잡 수명 20분 (롤링 교체 10분 주기와 짝)
+    job_ttl_seconds: int = 1200  # 잡 수명 20분
     _avoid: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _submitted_nodes: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
     def _seed_epoch(self) -> int:
         """다음 잡의 baseline seed 시작 오프셋. 사용한 최대 seed 바로 위(프런티어+1)에서 시작 → 재탕 0."""
@@ -202,6 +205,10 @@ class SlurmJobLauncher:
         now = self.clock()
         return {n for n, t in self._avoid.items() if (now - t) < self.avoid_cooldown_seconds}
 
+    def _reserved_nodes(self) -> set[str]:
+        now = self.clock()
+        return {n for n, t in self._submitted_nodes.items() if (now - t) < self.submit_reservation_seconds}
+
     def pending_reason(self, handle: JobHandle) -> str:
         """PENDING 사유(squeue %r). 'None'/빈값=곧 시작, 'Resources'/'Priority' 등=한동안 대기."""
         result = self._ssh(f"squeue -j {handle.slurm_id} -h -o %r")
@@ -211,7 +218,7 @@ class SlurmJobLauncher:
 
     def _ordered_candidates(self) -> list[tuple[str, str]]:
         """제출 후보 노드 순서: 빈 노드 중 가중 선택된 파티션을 앞에(나머지는 fallback). busy·회피 노드 제외."""
-        skip = self._busy_nodes() | self._avoided_nodes()
+        skip = self._busy_nodes() | self._avoided_nodes() | self._reserved_nodes()
         cands = [(n, p) for (n, p) in self._candidate_nodes() if n not in skip]
         if not cands:
             return []
@@ -248,6 +255,8 @@ class SlurmJobLauncher:
         match = _SUBMITTED_RE.search(result.stdout)
         if match is None:
             raise SlurmLauncherError(f"could not parse sbatch output: {result.stdout.strip()!r}")
+        if node:
+            self._submitted_nodes[node] = self.clock()
         return JobHandle(job_index=job_index, slurm_id=match.group(1), started_at=self.clock(), node=node)
 
     def is_alive(self, handle: JobHandle) -> bool:

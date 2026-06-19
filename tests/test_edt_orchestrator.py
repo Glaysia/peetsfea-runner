@@ -3,31 +3,6 @@ from __future__ import annotations
 from peetsfea_runner.edt_orchestrator import JobHandle, JobLauncher, JobOrchestrator
 
 
-class FakeLauncher(JobLauncher):
-    def __init__(self) -> None:
-        self.submits = 0
-        self.kills = 0
-        self.alive: dict[str, bool] = {}
-        self._clock_ref: FakeClock | None = None
-
-    def bind_clock(self, clock: FakeClock) -> None:
-        self._clock_ref = clock
-
-    def submit(self, job_index: int) -> JobHandle:
-        self.submits += 1
-        sid = f"slurm-{job_index}-{self.submits}"
-        self.alive[sid] = True
-        started = self._clock_ref.t if self._clock_ref is not None else 0.0
-        return JobHandle(job_index=job_index, slurm_id=sid, started_at=started)
-
-    def is_alive(self, handle: JobHandle) -> bool:
-        return self.alive.get(handle.slurm_id, False)
-
-    def kill(self, handle: JobHandle) -> None:
-        self.kills += 1
-        self.alive[handle.slurm_id] = False
-
-
 class FakeClock:
     def __init__(self) -> None:
         self.t = 0.0
@@ -36,76 +11,25 @@ class FakeClock:
         return self.t
 
 
-def _orch(job_count: int = 9, lifetime: float = 36000.0) -> tuple[JobOrchestrator, FakeLauncher, FakeClock]:
-    launcher = FakeLauncher()
-    clock = FakeClock()
-    launcher.bind_clock(clock)
-    return JobOrchestrator(launcher=launcher, clock=clock, job_count=job_count, max_lifetime_seconds=lifetime), launcher, clock
-
-
-def test_ensure_running_submits_all_jobs() -> None:
-    orch, launcher, _ = _orch(job_count=9)
-    orch.ensure_running()
-    assert launcher.submits == 9
-    assert orch.running_count() == 9
-    orch.ensure_running()  # 이미 다 떠 있으면 추가 제출 없음
-    assert launcher.submits == 9
-
-
-def test_poll_restarts_dead_job() -> None:
-    orch, launcher, _ = _orch(job_count=3)
-    orch.ensure_running()
-    dead = orch.handles()[1]
-    launcher.alive[dead.slurm_id] = False  # 잡 1개 사망
-    orch.poll()
-    assert orch.restarts == 1
-    assert launcher.submits == 4  # 3 + 재기동 1
-    assert orch.running_count() == 3  # 다시 3개
-
-
-def test_poll_expires_and_resubmits_after_lifetime() -> None:
-    orch, launcher, clock = _orch(job_count=2, lifetime=36000.0)  # 10h
-    orch.ensure_running()
-    clock.t = 36000.0  # 10h 경과
-    orch.poll()
-    assert orch.expiries == 2  # 둘 다 만료 폐기
-    assert launcher.kills == 2  # 폐기 시 kill(드레인 없음)
-    assert launcher.submits == 4  # 2 + 재제출 2
-    assert orch.running_count() == 2
-
-
-def test_shutdown_kills_all() -> None:
-    orch, launcher, _ = _orch(job_count=4)
-    orch.ensure_running()
-    orch.shutdown()
-    assert launcher.kills == 4
-    assert orch.running_count() == 0
-
-
-# --- 순차 램프(sequential_ramp): 한 잡이 RUNNING 된 뒤에야 다음 제출 ---------------
-
-class SeqFakeLauncher(JobLauncher):
-    """RUNNING/PENDING을 구분하는 fake. 새 잡은 PENDING으로 시작, mark_running()으로 RUNNING 전환."""
-
-    def __init__(self) -> None:
-        self.alive: dict[str, bool] = {}
-        self.running: dict[str, bool] = {}
-        self.reason: dict[str, str] = {}
+class FakeLauncher(JobLauncher):
+    def __init__(self, clock: FakeClock | None = None) -> None:
+        self.clock = clock
         self.submits = 0
         self.kills = 0
         self.cancels = 0
-        self.fail_submit = False
+        self.alive: dict[str, bool] = {}
+        self.running: dict[str, bool] = {}
+        self.reason: dict[str, str] = {}
         self.avoided: list[str] = []
 
     def submit(self, job_index: int) -> JobHandle:
-        if self.fail_submit:
-            raise RuntimeError("no available node")
         self.submits += 1
         sid = f"s-{job_index}-{self.submits}"
         self.alive[sid] = True
-        self.running[sid] = False  # 처음엔 PENDING
-        self.reason[sid] = "None"  # 곧 시작
-        return JobHandle(job_index=job_index, slurm_id=sid, started_at=0.0, node=f"node{self.submits}")
+        self.running[sid] = False
+        self.reason[sid] = "None"
+        started = self.clock.t + (self.submits * 0.001) if self.clock is not None else float(self.submits)
+        return JobHandle(job_index=job_index, slurm_id=sid, started_at=started, node=f"node{self.submits}")
 
     def is_alive(self, handle: JobHandle) -> bool:
         return self.alive.get(handle.slurm_id, False)
@@ -123,7 +47,7 @@ class SeqFakeLauncher(JobLauncher):
         self.kills += 1
         self.alive[handle.slurm_id] = False
 
-    def cancel(self, handle: JobHandle) -> None:  # plain scancel(PENDING 제거)
+    def cancel(self, handle: JobHandle) -> None:
         self.cancels += 1
         self.alive[handle.slurm_id] = False
 
@@ -133,100 +57,132 @@ class SeqFakeLauncher(JobLauncher):
                 self.running[sid] = True
 
 
-def test_sequential_ramp_one_at_a_time() -> None:
-    # 램프 순증: ramp_interval(여기 30s)마다 1개씩. **직전 잡 RUNNING 안 기다림**(PENDING이어도 순증, stall 방지).
-    launcher = SeqFakeLauncher()
+def _managed(clock: FakeClock | None = None, *, solve: int = 0) -> tuple[JobOrchestrator, FakeLauncher, FakeClock]:
+    clk = clock or FakeClock()
+    launcher = FakeLauncher(clk)
+    orch = JobOrchestrator(
+        launcher=launcher,
+        clock=clk,
+        job_count=9,
+        sequential_ramp=True,
+        solve_provider=lambda: solve,
+    )
+    return orch, launcher, clk
+
+
+def test_legacy_keepalive_mode_still_fills_configured_slots() -> None:
     clock = FakeClock()
-    orch = JobOrchestrator(launcher=launcher, clock=clock, job_count=9, sequential_ramp=True)
+    launcher = FakeLauncher(clock)
+    orch = JobOrchestrator(launcher=launcher, clock=clock, job_count=3)
     orch.ensure_running()
-    assert launcher.submits == 1  # 첫 제출은 즉시
-    orch.poll()
-    assert launcher.submits == 1  # 아직 ramp_interval 안 지남(타이머) → 제출 안 함
-    clock.t += 60
-    orch.poll()
-    assert launcher.submits == 2  # 경과 → +1 (직전 PENDING이어도 순증)
-    clock.t += 60
-    orch.poll()
     assert launcher.submits == 3
-    clock.t += 60
-    orch.poll()
-    assert launcher.submits == 4  # 램프 단계(≤7)는 RUNNING 안 기다리고 계속 순증
+    assert orch.running_count() == 3
 
 
-def test_sequential_ramp_waits_when_no_node() -> None:
-    launcher = SeqFakeLauncher()
-    launcher.fail_submit = True  # 가용 노드 없음(submit 예외)
-    orch = JobOrchestrator(launcher=launcher, clock=FakeClock(), job_count=2, sequential_ramp=True)
+def test_managed_startup_submits_four_jobs_immediately() -> None:
+    orch, launcher, _ = _managed()
     orch.ensure_running()
-    assert launcher.submits == 0 and orch.running_count() == 0  # 예외 삼키고 대기
+    assert launcher.submits == 4
+    assert launcher.kills == 0
+    assert orch.running_count() == 4
 
 
-def test_sequential_ramp_refills_after_death() -> None:
-    launcher = SeqFakeLauncher()
-    orch = JobOrchestrator(launcher=launcher, clock=FakeClock(), job_count=2, sequential_ramp=True)
-    orch.ensure_running(); launcher.mark_running()
-    orch.poll(); launcher.mark_running()
-    orch.poll()
-    assert orch.running_count() == 2
-    dead = orch.handles()[0]
-    launcher.alive[dead.slurm_id] = False  # 잡 1개 사망
-    orch.poll()  # 죽은 잡 drop + 새로 1개 제출
-    assert orch.restarts == 1
-    assert launcher.submits == 3
-
-
-def test_sequential_ramp_cancels_stuck_pending_and_moves_on() -> None:
-    launcher = SeqFakeLauncher()
-    clock = FakeClock()
-    orch = JobOrchestrator(launcher=launcher, clock=clock, job_count=2, sequential_ramp=True)
+def test_managed_loop_waits_until_four_minute_tick() -> None:
+    orch, launcher, clock = _managed()
     orch.ensure_running()
-    assert launcher.submits == 1
-    stuck = orch.handles()[0]
-    launcher.reason[stuck.slurm_id] = "Resources"  # 노드가 한동안 안 비는 막힌 PENDING
-    clock.t += 60  # 램프 간격 경과(취소 후 재제출 허용)
-    orch.poll()  # 막힌 잡 취소 + 노드 회피 + 다른 노드로 재제출
-    assert orch.cancellations == 1
-    assert launcher.cancels == 1 and launcher.kills == 0  # PENDING은 plain scancel(cancel), TERM(kill) 아님
-    assert stuck.node in launcher.avoided          # 취소한 노드 회피 등록
-    assert launcher.submits == 2                    # 다음 노드로 새로 제출
-
-
-def test_sequential_ramp_keeps_waiting_on_none_reason() -> None:
-    launcher = SeqFakeLauncher()
-    orch = JobOrchestrator(launcher=launcher, clock=FakeClock(), job_count=2, sequential_ramp=True)
-    orch.ensure_running()
-    orch.poll()  # reason='None'(곧 시작) → 취소 안 하고 대기
-    assert orch.cancellations == 0
-    assert launcher.submits == 1  # 직전 잡 대기 중 → 추가 제출 없음
-
-
-def test_roll_stops_one_and_refills_four_from_eight_jobs() -> None:
-    launcher = SeqFakeLauncher()
-    clock = FakeClock()
-    live: dict[str, int] = {}
-    orch = JobOrchestrator(launcher=launcher, clock=clock, job_count=9, sequential_ramp=True)
-    orch.ramp_interval_seconds = 0.0
-
-    orch.ensure_running()
-    for _ in range(7):
-        orch.poll()
     launcher.mark_running()
-    assert orch.running_count() == 8
+    clock.t = 239.0
+    orch.poll()
+    assert launcher.submits == 4
+    assert launcher.kills == 0
+    clock.t = 240.0
+    orch.poll()
+    assert launcher.kills == 1
+    assert launcher.submits == 8
+    assert orch.running_count() == 7
 
-    handles = orch.handles()
-    victim = handles[0]
-    for handle in handles:
-        live[handle.slurm_id] = 5
-    live[victim.slurm_id] = 0
 
-    orch.live_count_provider = lambda slurm_id: live.get(slurm_id, 0)
-    orch._last_roll = 1.0  # noqa: SLF001 - 다음 poll이 실제 롤링 tick이 되게 한다.
-    clock.t = orch.roll_period_seconds + 1.0
+def test_managed_loop_caps_squeue_at_fifteen() -> None:
+    orch, launcher, clock = _managed()
+    orch.ensure_running()
+    for tick in range(1, 6):
+        launcher.mark_running()
+        clock.t = tick * orch.control_period_seconds
+        orch.poll()
+    assert launcher.submits == 20
+    assert orch.running_count() == 15
 
+
+def test_managed_loop_stuck_at_cap_replaces_one_job() -> None:
+    orch, launcher, clock = _managed()
+    orch.ensure_running()
+    for tick in range(1, 5):
+        launcher.mark_running()
+        clock.t = tick * orch.control_period_seconds
+        orch.poll()
+    assert orch.running_count() == 15
+
+    pending = orch.handles()[-1]
+    launcher.running[pending.slurm_id] = False
+    launcher.reason[pending.slurm_id] = "Resources"
     before_submits = launcher.submits
+    before_kills = launcher.kills
+    clock.t += orch.control_period_seconds
     orch.poll()
 
-    assert launcher.kills == 1
+    assert launcher.kills == before_kills + 1
+    assert launcher.cancels == 0
+    assert launcher.submits == before_submits + 1
+    assert orch.running_count() == 15
+
+
+def test_managed_loop_saturation_every_third_tick_stops_extra_oldest_job() -> None:
+    clock = FakeClock()
+    holder = {"solve": 151}
+    launcher = FakeLauncher(clock)
+    orch = JobOrchestrator(
+        launcher=launcher,
+        clock=clock,
+        job_count=9,
+        sequential_ramp=True,
+        solve_provider=lambda: holder["solve"],
+    )
+    orch.ensure_running()
+    launcher.mark_running()
+    clock.t = orch.control_period_seconds
+    orch.poll()
+    before_kills = launcher.kills
+    launcher.mark_running()
+    clock.t = 2 * orch.control_period_seconds
+    orch.poll()
+    assert launcher.kills == before_kills + 2
+    assert orch.saturation_reductions == 1
+
+
+def test_managed_loop_uses_oldest_running_job_as_victim() -> None:
+    orch, launcher, clock = _managed()
+    orch.ensure_running()
+    launcher.mark_running()
+    victim = orch.handles()[0]
+    clock.t = orch.control_period_seconds
+    orch.poll()
     assert launcher.alive[victim.slurm_id] is False
-    assert launcher.submits == before_submits + 4
-    assert orch.running_count() == 11
+
+
+def test_managed_loop_ttl_kills_expired_jobs_without_immediate_refill() -> None:
+    clock = FakeClock()
+    launcher = FakeLauncher(clock)
+    orch = JobOrchestrator(
+        launcher=launcher,
+        clock=clock,
+        job_count=9,
+        max_lifetime_seconds=10.0,
+        sequential_ramp=True,
+    )
+    orch.ensure_running()
+    launcher.mark_running()
+    clock.t = 11.0
+    orch.poll()
+    assert launcher.kills == 4
+    assert launcher.submits == 4
+    assert orch.running_count() == 0

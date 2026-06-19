@@ -1,5 +1,5 @@
 [Unit]
-Description=Peets FEA — 컨테이너 유지 (오케스트레이터: 9 SLURM 잡 상시 유지 + 10h 만료 재기동)
+Description=Peets FEA — 컨테이너 유지 (4분 잡 출생 제어 + 단명 enroot 컨테이너)
 After=network-online.target peetsfea-pg.service
 Wants=network-online.target peetsfea-pg.service
 
@@ -20,7 +20,7 @@ RestartSec=10
 # 상시 가동: 실행시간 상한 없음(잡 수명 10h는 오케스트레이터가 내부 관리).
 TimeoutStopSec=200s
 # 하드 킬 대비: 잔류 peetsfea-edt 잡을 safe-scancel로 정리(raw scancel 금지 — /enroot 잔재 방지).
-# graceful SIGTERM으로 slot_service trap이 /enroot를 청소할 시간을 주고, 끝내 안 죽으면 강제 종료.
+# graceful SIGTERM으로 잡 스크립트 trap이 /enroot를 청소할 시간을 주고, 끝내 안 죽으면 강제 종료.
 ExecStopPost=/usr/bin/ssh gate1-harry261 bash edt-deploy/safe_scancel.sh
 
 [Install]

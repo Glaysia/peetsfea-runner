@@ -1,12 +1,12 @@
 #!/bin/bash
 # 잡당 서브 오케스트레이터 (롤링 라이프사이클) — 출생시 정해진 N개의 단명(1솔브) enroot 컨테이너를
-# **stagger(노드당 동시 콜드스타트 제한)** 로 가동하고, respawn 없이 드레인되며, 30분 TTL에 종료.
+# **stagger(노드당 동시 콜드스타트 제한)** 로 가동하고, respawn 없이 드레인되며, 20분 TTL에 종료.
 #
 #   1컨테이너 = 시뮬 1건 후 완전 종료(enroot remove) → AEDT·pyaedt 소멸 → 누수 OS회수.
 #   N = 제어기가 잡 출생 시 결정(EDT_JOB_CONTAINERS). respawn 없음 → 살아있는 컨테이너는 시간이 지나며 감소.
 #   동시 콜드스타트를 노드당 EDT_COLD_CAP개로 제한 → AEDT 동시 기동 gRPC herd 차단.
-#   제어기(:7879)에 살아있는 컨테이너 수 주기 보고 → 제어기가 '가장 적게 남은 잡'을 골라 교체.
-#   TTL(EDT_JOB_TTL_SEC, 기본 1800s) 경과 또는 전부 드레인 시 안전종료(강종 금지) → 잡 exit.
+#   제어기(:7879)에 살아있는 컨테이너 수 주기 보고(관측/대시보드).
+#   TTL(EDT_JOB_TTL_SEC, 기본 1200s) 경과 또는 전부 드레인 시 안전종료(강종 금지) → 잡 exit.
 # 주의: set -u 금지 — 구버전 bash 빈 연관배열 접근이 "unbound variable"로 잡을 즉사시킨다.
 echo "[orch] NODE=$(hostname) JOB=$SLURM_JOB_ID JIDX=${EDT_JOB_INDEX:-0} PART=${EDT_PARTITION:-}"
 ANSB=/opt/ohpc/pub/Electronics/v252
@@ -55,11 +55,11 @@ COLD_EST=${EDT_COLD_EST_SEC:-200}         # 콜드스타트로 간주하는 나�
 COLD_CAP=${EDT_COLD_CAP:-10}              # 노드당 동시 콜드스타트 상한(herd 차단). 10 동시 기동은 안전 확인됨.
 START=$(date +%s)
 
-# N = 제어기가 출생 시 결정한 컨테이너 수. env 없으면 /job_plan 1회 조회, 그것도 없으면 기본 12.
+# N = 제어기가 출생 시 결정한 컨테이너 수. env 없으면 /job_plan 1회 조회, 그것도 없으면 기본 20.
 fetch_N() { curl -s -m4 "$PLAN_URL" 2>/dev/null | grep -oE '"n"[ :]+[0-9]+' | grep -oE '[0-9]+$'; }
 N=${EDT_JOB_CONTAINERS:-}
 [ -z "$N" ] && N=$(fetch_N)
-[ -z "$N" ] && N=12
+[ -z "$N" ] && N=20
 [ "$N" -gt 20 ] 2>/dev/null && N=20
 [ "$N" -lt 1 ] 2>/dev/null && N=1
 echo "[orch] N=$N TTL=${TTL}s stagger=${STAGGER}s cold_cap=${COLD_CAP}"
