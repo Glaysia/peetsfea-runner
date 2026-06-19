@@ -58,7 +58,7 @@ REPORT_URL="http://127.0.0.1:$LIC/orch_report"
 case "${EDT_PARTITION:-}" in gpu*) NVD=all ;; *) NVD=void ;; esac
 
 # 라이프사이클 파라미터
-TTL=${EDT_JOB_TTL_SEC:-1200}              # 잡 수명(초, 20분) — 경과 시 안전종료
+TTL=${EDT_JOB_TTL_SEC:-1800}              # 잡 수명(초, 20분) — 경과 시 안전종료
 STAGGER=${EDT_SPAWN_STAGGER_SEC:-15}      # 컨테이너 출생 최소 간격(초)
 COLD_EST=${EDT_COLD_EST_SEC:-200}         # 콜드스타트로 간주하는 나이(초)
 COLD_CAP=${EDT_COLD_CAP:-10}              # 노드당 동시 콜드스타트 상한(herd 차단). 10 동시 기동은 안전 확인됨.
