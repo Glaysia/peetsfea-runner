@@ -37,9 +37,15 @@ def _spawn(argv: Sequence[str]) -> subprocess.Popen[bytes]:
     return subprocess.Popen(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def reverse_tunnel_argv(gate: str, *, port: int = DEFAULT_INGEST_PORT) -> list[str]:
-    """로컬 → gate 역터널: gate loopback:port → 로컬 ingest:port."""
-    return ["ssh", "-N", *_SSH_KEEPALIVE, "-R", f"{port}:127.0.0.1:{port}", gate]
+def reverse_tunnel_argv(gate: str, *, port: int = DEFAULT_INGEST_PORT, local_port: int | None = None) -> list[str]:
+    """로컬 → gate 역터널: gate loopback:port → 로컬 ingest:local_port.
+
+    다계정 포트 베이스 분리용 **비대칭** 지원: 게이트 측 포트(port)는 계정마다 다르게(7876/7886…)
+    쓰되 로컬 ingest 서버는 단일 포트(local_port, 기본=port)로 모은다. 같은 게이트 머신에 두 계정
+    잡이 co-locate해도 compute 노드 forward 바인딩이 충돌하지 않는다. local_port 생략 시 대칭(기존 동작).
+    """
+    lp = port if local_port is None else local_port
+    return ["ssh", "-N", *_SSH_KEEPALIVE, "-R", f"{port}:127.0.0.1:{lp}", gate]
 
 
 def forward_tunnel_argv(gate: str, *, port: int = DEFAULT_INGEST_PORT) -> list[str]:

@@ -190,3 +190,11 @@ def test_tunnel_argv_shapes() -> None:
     assert rev[:2] == ["ssh", "-N"] and "-R" in rev and "7876:127.0.0.1:7876" in rev and rev[-1] == "gate1"
     assert fwd[:2] == ["ssh", "-N"] and "-L" in fwd and "7876:127.0.0.1:7876" in fwd and fwd[-1] == "gate1"
     assert "ExitOnForwardFailure=yes" in rev  # 포워딩 실패 시 즉시 죽고 재기동.
+
+
+def test_reverse_tunnel_asymmetric_for_multi_account() -> None:
+    # 다계정: 두 번째 계정은 게이트 측 포트만 다르게(7886) 쓰고 로컬 ingest는 단일 포트(7876)로 모은다.
+    rev = reverse_tunnel_argv("gate1-hmlee31", port=7886, local_port=7876)
+    assert "-R" in rev and "7886:127.0.0.1:7876" in rev and rev[-1] == "gate1-hmlee31"
+    # local_port 생략 시 대칭(기존 동작) 유지.
+    assert "7876:127.0.0.1:7876" in reverse_tunnel_argv("gate1", port=7876)

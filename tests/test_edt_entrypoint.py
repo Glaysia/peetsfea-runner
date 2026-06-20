@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from peetsfea_runner.edt_entrypoint import _worker_env
+from peetsfea_runner.edt_entrypoint import _config_from_env, _worker_env
 
 
 def test_worker_env_namespaces_seed_and_output() -> None:
@@ -52,6 +52,17 @@ def test_seed_base_partitions_jobs_disjoint() -> None:
     }
     assert seeds_job0.isdisjoint(seeds_job1)
     assert min(seeds_job1) >= max(seeds_job0) + stride  # 잡1 대역이 잡0 대역 위로 분리
+
+
+def test_config_from_env_account_override(monkeypatch, tmp_path) -> None:
+    # 다계정: EDT_ACCOUNT_ID/EDT_HOST_ALIAS로 결과 태깅을 계정별로 분리(미지정 시 harry261 기본).
+    monkeypatch.setenv("EDT_OUTPUT_ROOT", str(tmp_path))
+    cfg_default, _ = _config_from_env()
+    assert (cfg_default.account_id, cfg_default.host_alias) == ("account_01", "gate1-harry261")
+    monkeypatch.setenv("EDT_ACCOUNT_ID", "account_02")
+    monkeypatch.setenv("EDT_HOST_ALIAS", "gate1-hmlee31")
+    cfg_hmlee, _ = _config_from_env()
+    assert (cfg_hmlee.account_id, cfg_hmlee.host_alias) == ("account_02", "gate1-hmlee31")
 
 
 def test_worker_env_gpu_pinning_round_robin() -> None:

@@ -78,6 +78,10 @@ def _config_from_env() -> tuple[EdtServiceConfig, int]:
         baseline_seed_start=int(os.environ.get("EDT_BASELINE_SEED_START", "0")),  # 워커별 seed 범위
         partition=os.environ.get("EDT_PARTITION", ""),  # 자동 벤치마크용 파티션/노드
         node=socket.gethostname(),
+        # 다계정: 계정/게이트별로 결과를 구분 태깅(기본은 harry261). 두 번째 계정(hmlee31)은
+        # EDT_ACCOUNT_ID/EDT_HOST_ALIAS로 오버라이드 → 로컬 단일 DB에서 account_id로 구분된다.
+        account_id=os.environ.get("EDT_ACCOUNT_ID", "account_01"),
+        host_alias=os.environ.get("EDT_HOST_ALIAS", "gate1-harry261"),
     )
     return config, max_sims
 
