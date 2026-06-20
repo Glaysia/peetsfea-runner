@@ -6,6 +6,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any, Iterator, Mapping
 
 import psycopg
@@ -113,6 +114,44 @@ class PostgresResultStore:
             )
             connection.execute(
                 "ALTER TABLE single_simulation_results ADD COLUMN IF NOT EXISTS gpu_used boolean"
+            )
+            # seq: 증분 커서(write-version). 쓰기(insert/update)마다 트리거가 nextval 부여 →
+            # 학습 주체가 seq>last_seq 변경분만 페치(전체 덤프/캐시 폴백 제거). (PLANS/data_plane_overhaul.html §2/§9)
+            connection.execute("CREATE SEQUENCE IF NOT EXISTS results_seq")
+            connection.execute(
+                "ALTER TABLE single_simulation_results ADD COLUMN IF NOT EXISTS seq bigint"
+            )
+            # 트리거 잠시 제거 후 기존 행 backfill(finished_at 순으로 seq 부여) → 그 다음 트리거 재생성.
+            connection.execute("DROP TRIGGER IF EXISTS bump_results_seq ON single_simulation_results")
+            connection.execute(
+                """
+                WITH ordered AS (
+                    SELECT request_id,
+                           row_number() OVER (ORDER BY finished_at NULLS FIRST, request_id) AS rn
+                    FROM single_simulation_results WHERE seq IS NULL
+                )
+                UPDATE single_simulation_results s
+                SET seq = nextval('results_seq')
+                FROM ordered o WHERE s.request_id = o.request_id
+                """
+            )
+            # 시퀀스를 현재 최대 seq 위로 맞춤(트리거가 그 위에서 이어가게).
+            connection.execute(
+                "SELECT setval('results_seq', GREATEST((SELECT COALESCE(max(seq),0) FROM single_simulation_results), 1))"
+            )
+            connection.execute(
+                """
+                CREATE OR REPLACE FUNCTION set_results_seq() RETURNS trigger AS $$
+                BEGIN NEW.seq := nextval('results_seq'); RETURN NEW; END;
+                $$ LANGUAGE plpgsql
+                """
+            )
+            connection.execute(
+                "CREATE TRIGGER bump_results_seq BEFORE INSERT OR UPDATE ON single_simulation_results "
+                "FOR EACH ROW EXECUTE FUNCTION set_results_seq()"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS ssr_seq_idx ON single_simulation_results (seq)"
             )
             connection.execute(
                 """
@@ -280,6 +319,29 @@ class PostgresResultStore:
                 return None
             columns = [c.name for c in description]
             return dict(zip(columns, row, strict=True))
+
+    def stream_results_since(
+        self, *, since: int = 0, limit: int | None = None, columns: "Sequence[str] | None" = None
+    ) -> "Iterator[dict[str, Any]]":
+        """`seq > since` 행을 seq 오름차순으로 **서버사이드 커서**(cur.stream)로 스트리밍 — 상수 메모리.
+        학습 주체의 증분 페치(since=last_seq)·전체동기(since=0)에 공용. 공유 쓰기 연결을 막지 않게 **전용 연결** 사용."""
+        self.initialize()
+        cols = ", ".join(columns) if columns else "*"
+        sql = f"SELECT {cols} FROM single_simulation_results WHERE seq > %s ORDER BY seq"
+        params: list[Any] = [int(since)]
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(int(limit))
+        conn = psycopg.connect(self.dsn, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                colnames: list[str] | None = None
+                for row in cur.stream(sql, params):
+                    if colnames is None:
+                        colnames = [c.name for c in (cur.description or [])]
+                    yield dict(zip(colnames, row, strict=True))
+        finally:
+            conn.close()
 
     def max_baseline_seed(self) -> int:
         """이미 사용한 baseline seed의 최대값. request_id=`base-{seed}-{i}`에서 {seed}를 파싱한 max(없으면 -1).

@@ -15,7 +15,12 @@ dependencies = [
   "peetsfea @ git+file:///home/peets/git/peetsfea.git@v0.3.8.0",
   "psutil",
   "pandas",
-  "pyaedt[graphics]==0.25.1"
+  "pyaedt[graphics]==0.25.1",
+  # 데이터플레인 갈아엎기(PLANS/data_plane_overhaul.html): read API = FastAPI/uvicorn + Arrow IPC 스트리밍.
+  # pyarrow는 cadquery가 이미 끌어옴. psycopg3 서버사이드 커서로 상수메모리 스트림.
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "pyarrow>=17",
 ]
 
 [project.optional-dependencies]

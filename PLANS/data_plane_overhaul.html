@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>데이터플레인 갈아엎기 — 증분 커서 API · 전체덤프/bulk 제거 (dev)</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",sans-serif}
+  .wrap{max-width:960px;margin:0 auto;padding:32px 22px 80px}
+  h1{font-size:24px;line-height:1.35;margin:0 0 6px}
+  h2{font-size:19px;margin:34px 0 10px;padding-top:14px;border-top:1px solid var(--bd)}
+  h3{font-size:16px;margin:18px 0 6px;color:var(--acc)}
+  .sub{color:var(--mut);margin:0 0 22px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 18px;margin:12px 0}
+  code{background:#1f2630;padding:1.5px 6px;border-radius:5px;font-size:13px;color:#ffa657}
+  pre{background:#010409;border:1px solid var(--bd);border-radius:8px;padding:13px 15px;overflow:auto;font-size:13.5px;line-height:1.55}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14px}
+  th,td{border:1px solid var(--bd);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#1f2630}
+  .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+  .pill{display:inline-block;padding:1px 9px;border-radius:20px;font-size:12px;border:1px solid var(--bd);margin-right:5px}
+  ul{margin:6px 0;padding-left:22px}li{margin:3px 0}
+  .del{border-left:3px solid var(--bad);background:#1c1214;padding:10px 14px;border-radius:0 8px 8px 0}
+  .add{border-left:3px solid var(--ok);background:#0f1c12;padding:10px 14px;border-radius:0 8px 8px 0}
+  .flow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:8px 0}
+  .box{background:#1f2630;border:1px solid var(--bd);border-radius:7px;padding:7px 11px;font-size:13px}
+  .arr{color:var(--mut);font-weight:700}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>데이터플레인 갈아엎기 — 증분 커서 API · 전체덤프/bulk 제거</h1>
+<p class="sub">dev 브랜치 · 학습쪽은 차이점(diff)만, full-sync도 빠르게 · 2026-06-20</p>
+
+<div class="card">
+<span class="pill bad">없앤다</span> <code>/results.parquet</code> 전체 DB 덤프 + <code>:7877</code> bulk 압축파일 sink<br>
+<span class="pill ok">새로</span> 단일 <b>증분 커서 스트림 API</b> — 학습 주체는 <b>마지막 커서 이후 변경분만</b> 받아오고, <code>since=0</code>이면 전체를 <b>컬럼형 스트리밍</b>으로 빠르게 받는다<br>
+<span class="pill warn">바꾼다</span> 토이 <code>http.server</code> → 실 ASGI(백프레셔·연결관리)로 FD死 부류 제거
+</div>
+
+<h2>1. 왜 — 현재 구조의 근본 결함</h2>
+<table>
+<tr><th>현재 경로</th><th>문제</th></tr>
+<tr><td class="bad"><code>GET /results.parquet</code> (전체 DB 덤프)</td><td>학습쪽이 매 라운드 <b>전체를 다시</b> 받아 재학습. 토이 서버에서 temp parquet 생성 + 동기 export → 부하·지연. FD 고갈 시 500 → 학습쪽 캐시 폴백 → <b>R² 가짜 정체</b>.</td></tr>
+<tr><td class="bad"><code>POST /bulk/&lt;rid&gt;</code> (:7877 압축 산출물 sink)</td><td>성공마다 AEDT tar.gz push → <b>단일 락 안에서 동기 압축</b> → 핸들러 스레드·CLOSE_WAIT 소켓 무한 누적 → FD死(1023/1024). <b>incoming staging 428GB·15601개 10시간째 누수</b>.</td></tr>
+<tr><td class="bad">stdlib <code>http.server</code> 5개 한 프로세스</td><td>연결수명/백프레셔/타임아웃 없음 → 누수가 구조적. 무거운 bulk가 가벼운 대시보드(학습 생명줄)를 같이 죽임.</td></tr>
+</table>
+<p class="mut">→ 점-수정 불가. "전체를 통째로 옮기는" 두 경로 자체를 없애고, <b>변경분만 흐르는 증분 모델</b>로 갈아엎는다.</p>
+
+<h2>2. 핵심 아이디어 — 단조 커서(write-version) 기반 증분</h2>
+<div class="add">
+모든 결과 행에 <b>단조 증가 <code>seq</code>(write-version)</b>를 둔다. <b>insert뿐 아니라 update(keep-best 교체)에도 bump</b>.
+학습 주체는 <code>last_seq</code>만 기억하고 <code>seq &gt; last_seq</code>인 행만 받는다 → 진짜 "차이점"(신규 + 갱신된 베스트)만 O(변경분).
+</div>
+<pre>-- 스키마(마이그레이션): 쓰기마다 증가하는 버전 컬럼 + 인덱스
+ALTER TABLE single_simulation_results ADD COLUMN seq BIGINT;
+CREATE SEQUENCE results_seq;
+-- insert/upsert 시: seq = nextval('results_seq')  (update에도 재발급 = 변경 감지)
+CREATE INDEX idx_results_seq ON single_simulation_results (seq);</pre>
+<ul>
+<li><b>왜 finished_at 아니라 seq?</b> 시계 역전·동시성 타이가 없고, keep-best <b>update</b>도 새 seq로 잡혀 학습쪽이 갱신된 베스트를 놓치지 않는다.</li>
+<li><b>재개 가능·멱등:</b> 커서는 클라이언트가 보관 → 서버는 무상태. 재시도/크래시 후 <code>last_seq</code>부터 다시 받으면 끝.</li>
+</ul>
+
+<h2>3. 새 API — 증분과 full-sync를 한 엔드포인트로</h2>
+<div class="flow">
+  <span class="box">학습쪽: last_seq 보관</span><span class="arr">→</span>
+  <span class="box ok">GET /api/results?since=last_seq</span><span class="arr">→</span>
+  <span class="box">seq&gt;since 행을 seq순 스트리밍</span><span class="arr">→</span>
+  <span class="box">응답 끝에 new max_seq</span><span class="arr">↻</span>
+  <span class="box">last_seq ← max_seq</span>
+</div>
+<pre>GET /api/results?since=&lt;seq&gt;&amp;limit=&lt;N&gt;&amp;format=arrow
+  since=0           → 전체 (cold start / full-sync)
+  since=last_seq    → 변경분만 (매 라운드)
+
+응답: Arrow IPC 스트림 (컬럼형 바이너리). 헤더 X-Max-Seq = 이번 배치 최대 seq.
+      행이 limit과 같으면 더 있음 → since=X-Max-Seq로 다음 페이지(루프).</pre>
+<table>
+<tr><th>요청</th><th>의미</th><th>학습쪽 동작</th></tr>
+<tr><td><code>since=0</code></td><td>전체 동기</td><td>seq 0부터 페이지 루프 → 전체 적재(빠름, §4)</td></tr>
+<tr><td><code>since=last_seq</code></td><td>증분</td><td>변경분만 받아 누적 학습 → R² 즉시 갱신</td></tr>
+</table>
+
+<h2>4. "전체를 다 받을 때도 빠르게" — 컬럼형 스트리밍</h2>
+<p>full-sync도 같은 엔드포인트(<code>since=0</code>)지만 <b>느리면 안 됨</b>. 토이 parquet-export(temp파일+동기)와 정반대로:</p>
+<ul>
+<li><b>Postgres 서버사이드 커서</b>(<code>cursor(name=...)</code>)로 배치 fetch → <b>상수 메모리</b>(전 행 적재 X).</li>
+<li>각 배치를 <b>Apache Arrow RecordBatch</b>로 변환해 IPC 스트림으로 write → 학습쪽 polars/pandas가 <b>제로카피급</b>으로 읽음(행별 JSON 대비 수~수십배).</li>
+<li>임시파일 0, 압축 sink 0, 락 0 → FD 누수 부류 자체가 없음.</li>
+<li>수만 행도 DB 스캔 속도로 흐른다. parquet가 꼭 필요하면 <b>클라이언트가</b> Arrow→parquet 저장(서버는 스트림만).</li>
+</ul>
+<pre>async def stream_results(since, limit):
+    async with db.server_side_cursor("SELECT ... WHERE seq>%s ORDER BY seq", since) as cur:
+        async for batch in cur.fetch_arrow_batches(size=10_000):   # 상수 메모리
+            yield arrow_ipc(batch)                                  # chunked 스트리밍
+    # 헤더/트레일러로 max_seq 전달</pre>
+
+<h2>5. 백엔드 교체 — 토이 → 실 ASGI</h2>
+<table>
+<tr><th></th><th>지금</th><th>새로</th></tr>
+<tr><td>서버</td><td>stdlib <code>http.server</code> ×5 (연결 무한·백프레셔 없음)</td><td><b>FastAPI/Starlette + uvicorn</b> — async, 연결/타임아웃/동시성 관리</td></tr>
+<tr><td>응답</td><td>HTML 문자열·행별 JSON·temp parquet</td><td>읽기 API JSON + <b>대용량은 Arrow IPC 스트리밍</b></td></tr>
+<tr><td>한계</td><td>FD soft 1024, 스레드 무한</td><td><code>LimitNOFILE=65536</code> + 워커/커넥션 캡(백프레셔)</td></tr>
+<tr><td>FD死</td><td>구조적 재발</td><td>스트리밍·무상태·풀관리 → 부류 소멸</td></tr>
+</table>
+
+<h2>6. 제거 대상 (명시)</h2>
+<div class="del">
+<b>완전 삭제:</b><br>
+• <code>GET /results.parquet</code> — 전체 DB 덤프 (→ <code>/api/results?since=</code>로 대체)<br>
+• <code>:7877</code> bulk 압축 산출물 sink + <code>edt_bulk_transfer.py</code> + ArchiveStore 압축경로 + incoming staging (428GB 정리)<br>
+• 컨테이너 entrypoint의 bulk-push (성공 시 tar.gz 업로드) 호출<br>
+<span class="mut">→ 학습은 raw AEDT 산출물이 아니라 <b>DB의 결과 행(설계 파라미터·S-param·지표)</b>만 쓴다. raw 아카이브가 정말 필요하면 web 경유가 아니라 <b>오브젝트스토리지/노드 보관 + 참조</b>로 out-of-band.</span>
+</div>
+
+<h2>7. 마이그레이션 (dev 브랜치)</h2>
+<ol>
+<li><b>스키마:</b> <code>seq</code> 컬럼 + 시퀀스 + 인덱스. 기존 행 backfill(현재 finished_at 순으로 seq 채움).</li>
+<li><b>쓰기경로:</b> insert/upsert(keep-best)에서 <code>seq=nextval</code> 부여(update에도).</li>
+<li><b>읽기 API:</b> FastAPI <code>/api/results</code>(Arrow 스트림, 서버사이드 커서). 대시보드 read API도 같이 이전.</li>
+<li><b>제거:</b> /results.parquet · :7877 bulk · entrypoint bulk-push · 압축 ArchiveStore.</li>
+<li><b>학습쪽 계약:</b> last_seq 보관 + <code>since=last_seq</code> 폴링(전체는 since=0 1회). RemoteDisconnected 시 같은 커서 재시도(멱등).</li>
+<li><b>운영:</b> uvicorn(워커 N) + <code>LimitNOFILE</code> systemd. ingest/lease/intake도 같은 ASGI 앱 라우트로 통합 or 분리.</li>
+</ol>
+
+<h2>8. 효과</h2>
+<table>
+<tr><td>학습 라운드</td><td class="ok">O(전체) → <b>O(변경분)</b>. R² 가짜 정체 소멸(차이점만 즉시 반영).</td></tr>
+<tr><td>full-sync</td><td class="ok">temp parquet·압축 0, <b>Arrow 스트리밍</b>으로 DB 스캔 속도.</td></tr>
+<tr><td>FD死</td><td class="ok">전체 덤프·bulk 압축 제거 + ASGI 관리 → <b>부류 소멸</b>.</td></tr>
+<tr><td>대시보드</td><td class="ok">무거운 데이터플레인과 운명 분리 → 안 죽음.</td></tr>
+</table>
+
+<h2>9. 결정 사항</h2>
+<table>
+<tr><th>질문</th><th>결정</th><th>이유</th></tr>
+<tr><td>프로세스 분할</td><td class="ok"><b>read/write 2평면 분리</b><br>· write: ingest+lease+intake<br>· read: 학습 Arrow API + 대시보드<br>(keeper는 그대로 → 총 3프로세스)</td><td>부하 성격 정반대. read가 무겁거나 재배포돼도 <b>결과 쓰기(ingest)는 안 흔들림</b>. 폴러 분리와 같은 원칙. 5분할은 과함 — 2분할이 적정.</td></tr>
+<tr><td>의존성</td><td class="ok"><b>pyarrow(서버+클라) + 클라 polars</b><br>전송 = <b>Arrow IPC over HTTP 스트리밍</b></td><td>커서 API(<code>since=</code>)와 한 엔드포인트로 통합·단순. DB-스캔 속도. (극한 필요 시 Arrow Flight도 가능하나 지금은 오버.)</td></tr>
+<tr><td>seq 재발급</td><td class="ok"><b>DB 트리거</b> (BEFORE INSERT OR UPDATE)<br>+ upsert <code>WHERE</code>로 no-op 방지</td><td>학습 diff 정확성 = "어떤 쓰기도 seq를 빠뜨리면 안 됨". 트리거는 INSERT·UPDATE 모두 원자적 보장 → 미래 쓰기경로가 깜빡해도 안전. keep-best는 실제 개선일 때만 UPDATE → 헛 bump 0.</td></tr>
+</table>
+<pre>-- seq 트리거
+CREATE FUNCTION set_results_seq() RETURNS trigger AS $$
+BEGIN NEW.seq := nextval('results_seq'); RETURN NEW; END $$ LANGUAGE plpgsql;
+CREATE TRIGGER bump_seq BEFORE INSERT OR UPDATE ON single_simulation_results
+  FOR EACH ROW EXECUTE FUNCTION set_results_seq();
+
+-- keep-best upsert: 실제 개선일 때만 UPDATE(= seq bump) → 안 바뀐 행 재페치 0
+INSERT INTO single_simulation_results (...) VALUES (...)
+ON CONFLICT (request_id) DO UPDATE SET ...
+  WHERE excluded.metric &gt; single_simulation_results.metric;</pre>
+
+<p class="mut" style="margin-top:24px">— 설계서. 확정되면 dev 브랜치에서 스키마→쓰기→읽기 API→제거 순으로 구현.</p>
+
+</div>
+</body>
+</html>
