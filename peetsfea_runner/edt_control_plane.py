@@ -25,9 +25,8 @@ from typing import Any
 # 종료 시 아카이브 flush(대용량 tar.gz 압축)에 줄 최대 시간. 초과하면 다음 기동에 위임(systemd 'failed' 방지).
 SHUTDOWN_FLUSH_DEADLINE_SECONDS = 45.0
 
-from .constants import ARCHIVE_BUFFER_BYTES, JOBS_PER_ACCOUNT
-from .edt_archive import ArchiveStore
-from .edt_bulk_transfer import DEFAULT_BULK_PORT, start_bulk_transfer_server
+from .constants import JOBS_PER_ACCOUNT
+from .edt_data_api import create_data_api_app
 from .edt_dashboard import start_dashboard_server
 from .edt_license_ctrl import (
     DEFAULT_LICENSE_CTRL_PORT,
@@ -53,8 +52,6 @@ from .single_simulation_store import DbTomlRegistry, SingleSimulationResultStore
 @dataclass(slots=True)
 class ControlPlaneConfig:
     db_path: Path
-    archive_root: Path
-    archive_buffer_bytes: int = ARCHIVE_BUFFER_BYTES  # 로컬 디스크에 맞춰 조정(FIFO 상한).
     ssh_host: str = "gate1-harry261"
     job_count: int = JOBS_PER_ACCOUNT
     # 잡 내부 서브 오케스트레이터: 1솔브 단명 enroot 컨테이너 N개를 띄우고 respawn 없이 종료.
@@ -62,8 +59,8 @@ class ControlPlaneConfig:
     dashboard_port: int = 8080
     intake_port: int = 7875  # historical env name; this now serves Adaptive TOML Registry.
     ingest_port: int = DEFAULT_INGEST_PORT  # 슈퍼컴 전용 결과 백채널(역터널로만 도달).
-    bulk_port: int = DEFAULT_BULK_PORT  # 슈퍼컴 전용 대용량 산출물 백채널(역터널로만 도달).
     priority_lease_port: int = DEFAULT_PRIORITY_LEASE_PORT  # 슈퍼컴 전용 우선순위 분배 백채널(역터널로만 도달).
+    data_api_port: int = 7884  # read 평면: 학습 주체용 증분 Arrow 스트림 API(EDT_ROLE=data, uvicorn).
     poll_interval_seconds: float = 60.0
     dashboard_peetsfea_version: str = ""  # 대시보드 표시 버전 필터(빈 값=전 버전). 예: "0.3.7".
     # 잡 제출 전략: 노드 기반(빈 노드에 --nodelist 핀, 내 잡 도는 노드 제외) + HTML 기준 관리 루프.
@@ -86,14 +83,13 @@ class ControlPlane:
     orchestrator: JobOrchestrator
     store: SingleSimulationResultStore
     toml_registry: TomlRegistryService
-    archive_store: ArchiveStore
     dashboard_port: int
     intake_port: int
     poll_interval_seconds: float
     ssh_host: str = "gate1-harry261"
     ingest_port: int = DEFAULT_INGEST_PORT
-    bulk_port: int = DEFAULT_BULK_PORT
     priority_lease_port: int = DEFAULT_PRIORITY_LEASE_PORT
+    data_api_port: int = 7884
     license_ctrl_port: int = DEFAULT_LICENSE_CTRL_PORT
     license_target: int = 100
     license_ceiling: int = 150
@@ -239,20 +235,19 @@ class ControlPlane:
             toml_registry_server = start_toml_registry_server(service=self.toml_registry, port=self.intake_port)
             # 결과 ingest(:7876): 슈퍼컴 컨테이너가 역터널로 push → 로컬 단일 DB.
             ingest_server = start_result_ingest_server(store=self.store, port=self.ingest_port)
-            # 대용량 산출물(:7877): project_dir tar.gz 스트림 수신 → 추출 → ArchiveStore.
-            bulk_server = start_bulk_transfer_server(archive_store=self.archive_store, port=self.bulk_port)
             # TOML lease(:7878): registry(:7875)의 active pool에서 ratio 기반으로 워커에 분배.
             lease_server = start_priority_lease_server(
                 queue=self.toml_registry, port=self.priority_lease_port
             )
-            for server in (dashboard, toml_registry_server, ingest_server, bulk_server, lease_server):
+            # bulk(:7877) 산출물 sink 제거됨 — 학습은 DB 결과 행만 쓰고, raw 아카이브는 out-of-band.
+            # (구 단일-락 압축 sink가 스레드/소켓 누수로 FD死를 일으켰음. PLANS/data_plane_overhaul.html)
+            for server in (dashboard, toml_registry_server, ingest_server, lease_server):
                 self._servers.append(server)
                 threading.Thread(target=server.serve_forever, daemon=True, name=type(server).__name__).start()
-            # 역터널: ingest/bulk/lease(라이선스는 control측). 전부 슈퍼컴 전용.
+            # 역터널: ingest/lease(라이선스는 control측). 전부 슈퍼컴 전용.
             if self.enable_ingest_tunnel:
                 for port, name in (
                     (self.ingest_port, "edt-ingest-rtunnel"),
-                    (self.bulk_port, "edt-bulk-rtunnel"),
                     (self.priority_lease_port, "edt-priority-rtunnel"),
                 ):
                     tunnel = SshTunnel(argv=reverse_tunnel_argv(self.ssh_host, port=port), name=name)
@@ -285,12 +280,6 @@ class ControlPlane:
                 _safe("tunnel", tunnel.stop)
             for server in self._servers:
                 _safe("server", server.shutdown)
-            if self.run_web:
-                # 아카이브 flush(대기 묶음 tar.gz 압축)는 수 분 걸릴 수 있어 systemd TimeoutStopSec를 넘기면
-                # 서비스가 'failed'로 죽는다. 별도 스레드 + 시한으로 감싸 시한 초과 시 다음 기동에 위임(유실 아님).
-                flusher = threading.Thread(target=lambda: _safe("flush", self.archive_store.flush), daemon=True)
-                flusher.start()
-                flusher.join(timeout=SHUTDOWN_FLUSH_DEADLINE_SECONDS)
 
     def _on_signal(self, signum: int, frame: FrameType | None) -> None:
         self.stop()
@@ -329,7 +318,6 @@ def build_control_plane(
     elif run_web:
         # web 전용 프로세스: 폴러가 없으니 control(keeper)의 자원 엔드포인트를 HTTP로 프록시.
         resource_provider = RemoteResourceProvider(base_url=f"http://127.0.0.1:{config.resource_port}")
-    archive_store = ArchiveStore(archive_root=config.archive_root, buffer_limit_bytes=config.archive_buffer_bytes)
     job_launcher = launcher if launcher is not None else SlurmJobLauncher(
         ssh_host=config.ssh_host,
         job_command=config.job_command,
@@ -358,14 +346,13 @@ def build_control_plane(
         orchestrator=orchestrator,
         store=store,
         toml_registry=toml_registry,
-        archive_store=archive_store,
         dashboard_port=config.dashboard_port,
         intake_port=config.intake_port,
         poll_interval_seconds=config.poll_interval_seconds,
         ssh_host=config.ssh_host,
         ingest_port=config.ingest_port,
-        bulk_port=config.bulk_port,
         priority_lease_port=config.priority_lease_port,
+        data_api_port=config.data_api_port,
         license_ctrl_port=config.license_ctrl_port,
         license_target=config.license_target,
         license_ceiling=config.license_ceiling,
@@ -393,21 +380,29 @@ def main() -> int:
     import os
 
     role = os.environ.get("EDT_ROLE", "all").strip().lower()
-    if role not in {"all", "web", "keeper"}:
-        raise ValueError(f"EDT_ROLE must be one of all|web|keeper, got {role!r}")
+    if role not in {"all", "web", "keeper", "data"}:
+        raise ValueError(f"EDT_ROLE must be one of all|web|keeper|data, got {role!r}")
+
+    # read 평면(data): 학습 주체용 증분 Arrow 스트림 API를 uvicorn으로 단독 서빙(write 평면과 격리).
+    # 무상태·읽기전용이라 ControlPlane 풀스택 불필요 — store만 열고 FastAPI/uvicorn으로 끝.
+    if role == "data":
+        import uvicorn
+
+        store = make_result_store(Path(os.environ.get("EDT_DB_PATH", "~/edt-deploy/results.duckdb")).expanduser())
+        app = create_data_api_app(store=store)
+        uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("EDT_DATA_API_PORT", "7884")))
+        return 0
+
     run_web = role in {"all", "web"}
     run_keeper = role in {"all", "keeper"}
 
     config = ControlPlaneConfig(
         db_path=Path(os.environ.get("EDT_DB_PATH", "~/edt-deploy/results.duckdb")).expanduser(),
-        archive_root=Path(os.environ.get("EDT_ARCHIVE_ROOT", "~/edt-archive")).expanduser(),
-        archive_buffer_bytes=int(os.environ.get("EDT_ARCHIVE_BUFFER_BYTES", str(ARCHIVE_BUFFER_BYTES))),
         ssh_host=os.environ.get("EDT_SSH_HOST", "gate1-harry261"),
         job_count=int(os.environ.get("EDT_JOB_COUNT", str(JOBS_PER_ACCOUNT))),
         dashboard_port=int(os.environ.get("EDT_DASHBOARD_PORT", "8080")),
         intake_port=int(os.environ.get("EDT_INTAKE_PORT", "7875")),
         ingest_port=int(os.environ.get("EDT_INGEST_PORT", str(DEFAULT_INGEST_PORT))),
-        bulk_port=int(os.environ.get("EDT_BULK_PORT", str(DEFAULT_BULK_PORT))),
         priority_lease_port=int(os.environ.get("EDT_PRIORITY_LEASE_PORT", str(DEFAULT_PRIORITY_LEASE_PORT))),
         license_ctrl_port=int(os.environ.get("EDT_LICENSE_CTRL_PORT", str(DEFAULT_LICENSE_CTRL_PORT))),
         license_target=int(os.environ.get("EDT_LICENSE_TARGET", "100")),

@@ -10,7 +10,7 @@
 - `GET /api/sim/<request_id>` — 단건 상세(입력 + telemetry + 출력 리포트 곡선).
 - `GET /api/failures?limit=` — 실패 요약(error_type별) + 최근 실패(on-demand).
 - `GET /api/resources` — 컨테이너별 실시간 부하(노드 CPULoad/mem) + 라이선스 + 잡 상태.
-- `GET /results.parquet` — 결과 데이터셋 parquet(zstd) 다운로드(DuckDB COPY 서버측 스트리밍). 쿼리: `?since=&state=&limit=`.
+- 전체 DB 덤프(`/results.parquet`)는 제거 — 학습은 read 평면 data API(:7884 `/api/results?since=`) 증분 Arrow 스트림 사용.
 - `GET /health` — 상태.
 """
 
@@ -248,10 +248,9 @@ def start_dashboard_server(
             elif path.startswith("/api/sim/"):
                 detail = build_sim_detail(store, path[len("/api/sim/"):], peetsfea_version=version_filter)
                 self._json(200 if detail else 404, detail or {"error": "not_found"})
-            elif path == "/results.parquet":
-                # 결과 데이터셋 다운로드 — DuckDB COPY로 parquet(zstd) 직접 내보내 스트리밍(web 메모리에 전 행 적재 안 함).
-                self._export_parquet(query)
             else:
+                # /results.parquet(전체 DB 덤프) 제거됨 — 학습은 read 평면 data API(:7884 /api/results?since=)로
+                # 증분 Arrow 스트림만 받는다(PLANS/data_plane_overhaul.html). FD死/전체재페치 부류 제거.
                 self._json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
@@ -310,40 +309,6 @@ def start_dashboard_server(
                 self._json(exc.status, {"error": "bad_request", "message": str(exc)})
             except Exception as exc:  # noqa: BLE001
                 self._json(500, {"error": type(exc).__name__, "message": str(exc)})
-
-        def _export_parquet(self, query: dict[str, list[str]]) -> None:
-            import os
-            import tempfile
-
-            since = query.get("since", [None])[0]
-            state = query.get("state", query.get("terminal_state", [None]))[0]
-            limit_raw = query.get("limit", [None])[0]
-            limit = int(limit_raw) if limit_raw and limit_raw.isdigit() else None
-            fd, tmp = tempfile.mkstemp(suffix=".parquet")
-            os.close(fd)
-            try:
-                # pyarrow 인프로세스 export(DuckDB 은퇴) — dest 파일 하나만 열고 닫아 fd 누수 없음.
-                store.export_parquet(Path(tmp), since=since, terminal_state=state, peetsfea_version=version_filter, limit=limit)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(os.path.getsize(tmp)))
-                self.send_header("Content-Disposition", 'attachment; filename="results.parquet"')
-                self.end_headers()
-                with open(tmp, "rb") as fh:  # 64KB chunk 스트리밍 — 메모리 일정
-                    for chunk in iter(lambda: fh.read(65536), b""):
-                        self.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            except Exception as exc:  # noqa: BLE001 — 내보내기 실패는 500으로.
-                try:
-                    self._json(500, {"error": "export_failed", "message": str(exc)})
-                except Exception:  # noqa: BLE001
-                    pass
-            finally:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
 
         def _send(self, status: int, content_type: str, body: bytes) -> None:
             try:
@@ -451,7 +416,6 @@ svg{display:block}.gpu{color:var(--bad);font-weight:700}.cpuonly{color:var(--mut
     <select id="dorigin"><option value="">전체 출처</option><option value="toml-">TOML registry</option><option value="base-">legacy baseline</option><option value="sweep-">legacy sweep</option><option value="prio-">static</option></select>
     <input id="dsearch" placeholder="검색(노드/설계id/입력값)"/>
     <button onclick="loadDataset()">새로고침</button>
-    <a href="/results.parquet" download>Parquet 다운로드 ↓</a>
     <span class="muted" id="dcount"></span>
   </div>
   <div style="overflow:auto;max-height:70vh"><table id="dtable"><thead></thead><tbody></tbody></table></div>

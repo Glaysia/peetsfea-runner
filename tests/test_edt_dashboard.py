@@ -73,7 +73,8 @@ def test_export_parquet_filters_and_excludes(tmp_path: Path) -> None:
     assert con.execute(f"SELECT count(*) FROM '{out2}'").fetchone()[0] == 2  # success만
 
 
-def test_results_parquet_endpoint_streams(tmp_path: Path) -> None:
+def test_results_parquet_endpoint_removed(tmp_path: Path) -> None:
+    # /results.parquet 전체 덤프 엔드포인트는 제거됨(데이터플레인 갈아엎기) → 404.
     store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
     store.initialize()
     _seed(store, "r0", 1.5, 12)
@@ -82,13 +83,15 @@ def test_results_parquet_endpoint_streams(tmp_path: Path) -> None:
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        data = urllib.request.urlopen(f"http://127.0.0.1:{port}/results.parquet").read()
+        import urllib.error
+
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/results.parquet", timeout=5)
+            raise AssertionError("expected 404")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404
     finally:
         server.shutdown()
-    assert data[:4] == b"PAR1" and data[-4:] == b"PAR1"  # parquet 매직
-    dl = tmp_path / "dl.parquet"
-    dl.write_bytes(data)
-    assert duckdb.connect().execute(f"SELECT count(*) FROM '{dl}'").fetchone()[0] == 1
 
 
 def test_fetch_rows_filter_terminal_state(tmp_path: Path) -> None:
@@ -101,7 +104,7 @@ def test_fetch_rows_filter_terminal_state(tmp_path: Path) -> None:
     assert len(store.fetch_rows(limit=1)) == 1
 
 
-def test_dashboard_server_serves_parquet_and_health(tmp_path: Path) -> None:
+def test_dashboard_server_serves_health(tmp_path: Path) -> None:
     store = SingleSimulationResultStore(db_path=tmp_path / "r.duckdb")
     store.initialize()
     _seed(store, "r0", 3.0, 15)
@@ -114,11 +117,8 @@ def test_dashboard_server_serves_parquet_and_health(tmp_path: Path) -> None:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as resp:
             assert resp.status == 200
             assert b'"count"' in resp.read()
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/results.parquet", timeout=5) as resp:
-            assert resp.headers["Content-Type"] == "application/octet-stream"
-            assert resp.read()[:4] == b"PAR1"  # parquet 매직
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as resp:
-            assert b"results.parquet" in resp.read()
+            assert resp.status == 200  # 대시보드 UI(전체 덤프 링크 제거됨)
     finally:
         server.shutdown()
         thread.join(timeout=5)

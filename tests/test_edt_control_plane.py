@@ -28,7 +28,7 @@ class FakeLauncher(JobLauncher):
 
 
 def test_build_control_plane_wires_orchestrator_store_intake(tmp_path: Path) -> None:
-    config = ControlPlaneConfig(db_path=tmp_path / "r.duckdb", archive_root=tmp_path / "arch", job_count=9)
+    config = ControlPlaneConfig(db_path=tmp_path / "r.duckdb", job_count=9)
     launcher = FakeLauncher()
     cp = build_control_plane(config, launcher=launcher)
 

@@ -42,7 +42,6 @@ from collections.abc import Mapping
 from typing import Any
 
 from .constants import SLOTS_PER_CONTAINER
-from .edt_bulk_transfer import DEFAULT_BULK_PORT, BulkPushSink
 from .edt_result_ingest import DEFAULT_INGEST_PORT, HttpResultSink
 from .edt_service import EdtServiceConfig, SteadyStateService, build_steady_state_service
 
@@ -216,10 +215,8 @@ def main() -> int:
     config, max_sims = _config_from_env()
     # 결과 sink: 기본은 ingest push(:7876, gate 경유 로컬 단일 DB). EDT_RESULT_INGEST_URL=""면 로컬 DuckDB 단독.
     ingest_url = os.environ.get("EDT_RESULT_INGEST_URL", f"http://127.0.0.1:{DEFAULT_INGEST_PORT}/ingest")
-    # 대용량 산출물 push(:7877): 성공 시 project_dir(aedt)를 로컬로 보내고 gpfs 원본 삭제. ""면 비활성(보관).
-    bulk_host = os.environ.get("EDT_BULK_HOST", "127.0.0.1")
-    bulk_port = int(os.environ.get("EDT_BULK_PORT", str(DEFAULT_BULK_PORT)))
-    bulk = BulkPushSink(host=bulk_host, port=bulk_port) if bulk_host else None
+    # bulk(:7877) 산출물 push 제거됨 — 단일-락 압축 sink가 FD死를 일으켜 폐지(PLANS/data_plane_overhaul.html).
+    # 학습은 DB 결과 행만 쓰고, raw AEDT 산출물은 orchestrator가 컨테이너 종료 후 reap에서 정리.
 
     record = None
     if ingest_url:
@@ -227,13 +224,6 @@ def main() -> int:
 
         def record(envelope: Mapping[str, Any]) -> None:
             sink.record(envelope)  # 결과 JSON → 로컬 단일 DB(:7876)
-            # 성공한 시뮬의 산출물(project_dir)을 :7877로 전송 → 아카이브 + gpfs 절약.
-            # 실패 산출물 정리는 record(=솔브 도중)에서 하면 peetsfea의 telemetry 쓰기와 레이스(FileNotFound)다.
-            # → orchestrator가 **컨테이너 완전 종료 후** 컨테이너별 output 디렉토리째 삭제(reap).
-            if bulk is not None and envelope.get("terminal_state") == "success":
-                out = envelope.get("output_dir")
-                if isinstance(out, str) and out:
-                    bulk.push(str(envelope.get("request_id") or ""), Path(out))
 
     service = build_steady_state_service(config, record=record)
     # EDT_PRIORITY_TOML: 고정 후보를 우선순위 레인에 시드(검증/단발 처리용; baseline보다 먼저 소비).
