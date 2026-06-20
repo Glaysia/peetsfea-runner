@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>다계정 뚫기 + 누수 회수 검증 — gate1-hmlee31 (부트스트랩·4h 테스트)</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",sans-serif}
+  .wrap{max-width:940px;margin:0 auto;padding:32px 22px 70px}
+  h1{font-size:23px;line-height:1.35;margin:0 0 6px}
+  h2{font-size:18px;margin:30px 0 10px;padding-top:13px;border-top:1px solid var(--bd)}
+  h3{font-size:15px;margin:16px 0 6px;color:var(--acc)}
+  .sub{color:var(--mut);margin:0 0 20px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 18px;margin:12px 0}
+  code{background:#1f2630;padding:1.5px 6px;border-radius:5px;font-size:13px;color:#ffa657}
+  pre{background:#010409;border:1px solid var(--bd);border-radius:8px;padding:13px 15px;overflow:auto;font-size:13px;line-height:1.5}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14px}
+  th,td{border:1px solid var(--bd);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#1f2630}
+  .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+  ul{margin:6px 0;padding-left:22px}li{margin:3px 0}
+  .rec{border-left:3px solid var(--ok);background:#0f1c12;padding:10px 14px;border-radius:0 8px 8px 0}
+  .flow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:8px 0}
+  .box{background:#1f2630;border:1px solid var(--bd);border-radius:7px;padding:7px 11px;font-size:13px}
+  .arr{color:var(--mut);font-weight:700}
+  .pill{display:inline-block;padding:1px 9px;border-radius:20px;font-size:12px;border:1px solid var(--bd);margin-right:5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>다계정 뚫기 + 누수 회수 검증 — gate1-hmlee31</h1>
+<p class="sub">두 번째 계정(hmlee31) 부트스트랩(수동·wipe-safe) → 4h 테스트 잡으로 누수 회수 + 계정 동작 검증 · harry261(주)는 그대로 · 2026-06-21</p>
+
+<div class="card">
+<span class="pill">목표 1</span> <b>다계정 기능 뚫기</b> — gate1-hmlee31에서 잡이 ssh/sbatch/ingest/license 전부 동작<br>
+<span class="pill">목표 2</span> <b>누수 회수 검증</b> — 1솔브=죽음 컨테이너로 잡이 4h 살아도 노드 리소스 평탄(→ "잡 안 죽여도 됨")<br>
+<span class="pill">목표 3</span> <b>수동 부트스트랩 스크립트</b> — 게이트 데이터 싹 지워도 Claude가 재구축 가능(자동화 불필요)
+</div>
+
+<h2>1. hmlee31 현황 (방금 점검)</h2>
+<table>
+<tr><th>항목</th><th>상태</th></tr>
+<tr><td>ssh <code>gate1-hmlee31</code></td><td class="ok">닿음 (user=hmlee31 @ gate1.hpc — harry261과 같은 게이트 머신, 다른 home)</td></tr>
+<tr><td>enroot 이미지 <code>~/runtime/enroot/aedt.sqsh</code></td><td class="ok">있음 (2.13GB) — 재사용</td></tr>
+<tr><td><code>~/edt-deploy</code> / venv / slot_service</td><td class="bad">없음 → <b>부트스트랩 필요</b></td></tr>
+<tr><td>현재 잡</td><td>0개 (깨끗)</td></tr>
+</table>
+
+<h2>2. 부트스트랩 스크립트 (수동 · wipe-safe)</h2>
+<p>게이트 데이터를 다 지워도 이걸로 재구축. 같은 게이트 머신이라 <b>harry261의 동작하는 venv를 복제 + 경로 수정</b>이 가장 빠르고 확실(동일 환경 보장). enroot 이미지는 이미 있음.</p>
+<pre>SRC=/home1/harry261/edt-deploy        # 동작 검증된 원본
+DST=/home1/hmlee31/edt-deploy
+G=gate1-hmlee31
+
+# 1) edt-deploy 복제 (venv + 스크립트). 같은 게이트 fs라 게이트 안에서 cp -a.
+ssh $G "rm -rf $DST && cp -a $SRC $DST 2>/dev/null || rsync -a $SRC/ $DST/"
+ssh $G "mkdir -p $DST/clogs ~/runtime/enroot"
+
+# 2) venv 경로 재지정 (harry261 → hmlee31). uv venv는 base python이 공유경로라 대부분 relocatable;
+#    pyvenv.cfg / bin shebang / activate의 절대경로만 치환. 우리는 \$VENVPY -m 로 호출(심링크 resolve면 OK).
+ssh $G "grep -rIl '/home1/harry261/edt-deploy' $DST 2>/dev/null | xargs -r sed -i 's#/home1/harry261/edt-deploy#/home1/hmlee31/edt-deploy#g'"
+ssh $G "$DST/venv/bin/python -c 'import peetsfea_runner, peetsfea, pyaedt, cadquery; import peetsfea_runner.edt_entrypoint; print(\"venv OK\", peetsfea.__version__)'"
+
+# 3) slot_service(orchestrator) 최신본 배포 (로컬 레포 → 게이트)
+scp deploy/orchestrator.sh $G:$DST/slot_service.sh
+
+# 4) (대안) 복제가 깨지면 깨끗한 재설치:
+#    ssh $G 'uv venv --python 3.12 ~/edt-deploy/venv'
+#    로컬에서 harry261 venv의 정확한 패키지 목록 확보:  ssh gate1-harry261 '~/edt-deploy/venv/bin/python -m pip freeze' (또는 uv pip freeze)
+#    → 그 목록 + peetsfea-0.3.8.1 wheel + peetsfea_runner wheel 을 scp 후 uv pip install --python ~/edt-deploy/venv</pre>
+<p class="mut">실행 시 (1)~(3)로 안 되면 (4) 깨끗 재설치로 폴백. 핵심 검증은 <code>venv OK</code> 줄(peetsfea_runner·peetsfea·pyaedt·cadquery import).</p>
+
+<h2>3. 다계정 기능 — 파라미터화 (harry261 하드코딩 제거)</h2>
+<p>지금 게이트가 <code>gate1-harry261</code>로 박혀있다. 계정/게이트를 파라미터로 빼서 harry261·hmlee31 둘 다 되게. 로컬 컨트롤 = "다계정 brain"(메모리).</p>
+<table>
+<tr><th>위치</th><th>지금</th><th>다계정</th></tr>
+<tr><td>런처 <code>ssh_host</code></td><td>"gate1-harry261"</td><td>계정별(<code>EDT_SSH_HOST</code>/계정 리스트). harry261·hmlee31 각 게이트로 sbatch</td></tr>
+<tr><td>역터널(ingest/lease/license)</td><td>harry261 게이트→로컬</td><td>각 게이트→로컬 동일 포트(둘 다 로컬 DB로 push). 같은 머신이라 포트 공유 가능</td></tr>
+<tr><td>게이트 home 경로</td><td><code>/home1/harry261/edt-deploy</code></td><td><code>$HOME/edt-deploy</code>(잡이 해당 계정으로 돌아 자동 해결)</td></tr>
+<tr><td>SLURM 계정/QOS</td><td>harry261</td><td>hmlee31 별도 — <b>license도 계정별 별도 체크아웃 = 총 용량 2배</b></td></tr>
+</table>
+<div class="rec">
+이번 테스트 단계에선 <b>풀 통합(키퍼가 두 게이트 동시 구동) 전</b>에, hmlee31에서 <b>독립 테스트 잡</b>으로 계정이 끝까지 도는지(ssh·sbatch·enroot·ingest 역터널·license)부터 뚫는다. 통과하면 그때 런처/터널을 계정 파라미터화해 키퍼에 통합.
+</div>
+
+<h2>4. 테스트 — hmlee31에서 4h 누수 검증</h2>
+<div class="flow">
+  <span class="box">harry261 키퍼: 그대로 운영</span><span class="arr">∥</span>
+  <span class="box ok">hmlee31: 테스트 잡 1개(per-solve, TTL=4h)</span><span class="arr">→</span>
+  <span class="box">1솔브 컨테이너 계속 재가동</span><span class="arr">→</span>
+  <span class="box">5분 간격 노드 리소스 측정 ×4h</span>
+</div>
+<ul>
+<li>부트스트랩 후 hmlee31에 <b>고유 이름 테스트 잡</b>(<code>hmlee-leaktest</code>) sbatch — cpu2 노드, <code>deploy/orchestrator.sh</code>(1솔브 컨테이너), <code>EDT_JOB_TTL_SEC=14400</code>(4h).</li>
+<li>결과 ingest는 로컬 DB로(역터널) — <b>다계정 ingest 동작도 함께 검증</b> + productive(학습 데이터).</li>
+<li>harry261 키퍼·10잡은 미간섭(다른 계정·다른 이름).</li>
+</ul>
+<h3>측정 (srun --overlap, 5분 간격)</h3>
+<pre>내_RSS합(MB)  / 내_스레드수 / 내_FD수      # 메모리·gRPC스레드·FD 누수 지표
+/enroot 사용량 / 살아있는 컨테이너 / 누적 솔브수   # 산출물 정리·사이클 횟수</pre>
+
+<h2>5. 성공 / 실패 기준</h2>
+<table>
+<tr><th></th><th>판정</th></tr>
+<tr><td class="ok"><b>통과</b></td><td>① hmlee31 잡이 끝까지 돌아 결과가 로컬 DB에 ingest(다계정 OK). ② 4h·수백 사이클에도 <b>RSS·스레드·FD 평탄</b>(추세≈0, 톱니만), /enroot 평탄 → <b>1솔브로 누수 회수 확정 = 잡 안 죽여도 됨</b>.</td></tr>
+<tr><td class="bad"><b>실패</b></td><td>잡이 어디선가 막힘(ssh/license/터널) → 그 지점 디버그. 또는 리소스 우상향 → 컨테이너 종료가 전량 회수 못 함(host netns 잔류/enroot 누락) → 원인 규명·수정·재테스트.</td></tr>
+</table>
+
+<h2>6. 절차 요약</h2>
+<ol>
+<li><b>부트스트랩</b> hmlee31 게이트(§2) → <code>venv OK</code> 확인.</li>
+<li>hmlee31에 테스트 잡(4h TTL, per-solve) sbatch + 역터널 기동(ingest 로컬로).</li>
+<li>5분 측정 루프 백그라운드 ×4h.</li>
+<li>(선택) harry261 장수 잡 1개 동시 관측 → 대조(장수=우상향 vs 1솔브=평탄).</li>
+<li>4h 후 추세 판정 → 통과 시: 런처/터널 계정 파라미터화 패치 + 키퍼 통합(다계정).</li>
+<li>테스트 잡 scancel + /enroot 정리.</li>
+</ol>
+
+<h2>7. 격리/안전</h2>
+<ul>
+<li>harry261 키퍼·프로덕션 미간섭(계정·이름 분리). 검증·패치 후에도 <b>harry261이 주(primary)</b>로 계속.</li>
+<li>부트스트랩은 wipe-safe — 게이트 데이터 다 지워도 §2로 재구축(수동, Claude 실행).</li>
+<li>hmlee31 결과 ingest는 정상 경로(같은 0.3.8.1 설계공간, 오염 아님).</li>
+<li>4h 후 테스트 잡·잔재 정리.</li>
+</ul>
+
+<p class="mut" style="margin-top:24px">— 통과하면: 다계정(harry261+hmlee31) 키퍼 통합 + slot_service per-solve 전환 + JobOrchestrator 적분-컨테이너 제어(홀짝·LUT 폐지, 잡 고정).</p>
+
+</div>
+</body>
+</html>
