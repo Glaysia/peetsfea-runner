@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -224,6 +225,13 @@ def main() -> int:
 
         def record(envelope: Mapping[str, Any]) -> None:
             sink.record(envelope)  # 결과 JSON → 로컬 단일 DB(:7876)
+            # bulk-push 제거로 사라진 **디스크 정리 대체**: 산출물(project_dir)은 더 이상 아카이브하지 않으므로
+            # ingest 후 삭제해 GPFS/$enroot 쿼터를 보호한다. 구 bulk-push가 성공 시 하던 삭제와 동일 타이밍이라
+            # output_dir은 record 시점에 안정(구 tar가 같은 시점에 읽었음). best-effort(ignore_errors).
+            if envelope.get("terminal_state") == "success":
+                out = envelope.get("output_dir")
+                if isinstance(out, str) and out:
+                    shutil.rmtree(out, ignore_errors=True)
 
     service = build_steady_state_service(config, record=record)
     # EDT_PRIORITY_TOML: 고정 후보를 우선순위 레인에 시드(검증/단발 처리용; baseline보다 먼저 소비).
