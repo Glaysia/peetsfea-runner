@@ -36,7 +36,7 @@ def test_submit_parses_slurm_id_and_sends_sbatch_script() -> None:
     argv, script = runner.calls[0]
     assert argv[-1] == "sbatch" and script is not None
     assert "#SBATCH --partition=cpu2" in script
-    assert "#SBATCH --cpus-per-task=48" in script  # cpu2 → 48코어
+    assert "#SBATCH --cpus-per-task=64" in script  # cpu2 → 64코어(QOS 하드캡)
     assert "#SBATCH --mem=480G" in script
     assert "export EDT_JOB_INDEX=3" in script
     assert "export EDT_PARTITION=cpu2" in script
@@ -67,12 +67,12 @@ def test_seed_epoch_provider_failure_falls_back_to_zero() -> None:
     assert "export EDT_BASELINE_SEED_EPOCH=0" in runner.calls[-1][1]  # type: ignore[operator]
 
 
-def test_cpus_per_partition_cpu2_48_other_24() -> None:
+def test_cpus_per_partition_cpu2_64_other_24() -> None:
     runner = FakeRunner()
     runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")
-    # cpu2 → 48
+    # cpu2 → 64 (QOS 하드캡)
     _launcher(runner, partitions=("cpu2",)).submit(0)
-    assert "#SBATCH --cpus-per-task=48" in runner.calls[-1][1]  # type: ignore[operator]
+    assert "#SBATCH --cpus-per-task=64" in runner.calls[-1][1]  # type: ignore[operator]
     # 그 외(gpu4) → 24
     _launcher(runner, partitions=("gpu4",)).submit(0)
     assert "#SBATCH --cpus-per-task=24" in runner.calls[-1][1]  # type: ignore[operator]
@@ -106,10 +106,9 @@ def test_random_partition_distribution() -> None:
     for _ in range(4):
         launcher.submit(0)
         seen.add(runner.calls[-1][1].split("--partition=")[1].split("\n")[0])  # type: ignore[union-attr]
-    assert {"cpu2", "gpu1", "gpu2", "gpu3"} <= seen
-    # 기본 파티션 후보에서 cpu1·gpu5 제외 확인
-    assert {"gpu2", "gpu3"} <= set(SlurmJobLauncher().partitions)
-    assert "cpu1" not in SlurmJobLauncher().partitions and "gpu5" not in SlurmJobLauncher().partitions
+    assert {"cpu2", "gpu1", "gpu2", "gpu3"} <= seen  # chooser가 명시 지정하면 gpu도 제출 가능(메커니즘)
+    # 기본 후보는 cpu2 전용으로 변경(gpu 노드는 GPU 미사용+코어 적어 느림 → 폐기).
+    assert set(SlurmJobLauncher().partitions) == {"cpu2"}
 
 
 def test_mem_override_applies_to_all_partitions_for_verify_scripts() -> None:

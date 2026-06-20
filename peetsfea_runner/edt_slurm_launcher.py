@@ -29,7 +29,9 @@ _SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 # 잡을 랜덤 분배하는 파티션(MASTER_PLAN §2.10 / Q5: 파티션별 성능 통계 자연 수집).
 # 최근 2시간(2026-06-19) 관측상 평균 RUNNING job이 4~5개에 묶였다. job당 AEDT 수는 충분하므로
 # cpu2/gpu1에 더해 MIX 여유가 보이는 gpu2/gpu3까지 후보를 넓혀 평균 RUNNING job 9개를 목표로 한다.
-DEFAULT_PARTITIONS: tuple[str, ...] = ("cpu2", "gpu1", "gpu2", "gpu3")
+# cpu2 전용: gpu 노드는 AEDT가 GPU를 실제로 안 써(nvidia-smi 0%·gpu_used는 거짓 config 플래그) CPU 솔브인데
+# 코어까지 적어 cpu2보다 느렸다(gpu 14~15분 vs cpu2 11분). → gpu 파티션 제거, cpu2만 사용.
+DEFAULT_PARTITIONS: tuple[str, ...] = ("cpu2",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,8 +63,8 @@ class SlurmJobLauncher:
     partitions: tuple[str, ...] = DEFAULT_PARTITIONS
     time_limit: str = "10:00:00"
     # cpus-per-task: cpu2 노드는 256코어지만 QOS cpu2_limit이 노드당 cpu=64로 하드캡(MaxTRESPerNode).
-    # 48로 운영(여유). GPU 파티션은 MIX 노드 백필 확률을 높이기 위해 24로 낮춘다.
-    cpus_cpu2: int = 48
+    # 하드캡까지 꽉 채워 64로 운영(GPU 폐기로 cpu2에 집중 → 잡당 코어 최대화).
+    cpus_cpu2: int = 64
     cpus_other: int = 24
     # gpu* 파티션은 노드당 GPU 4개. --gres=gpu:N을 요청해야 컨테이너가 GPU를 보고(peetsfea 0.3.6 자동감지),
     # 안 그러면 0 GPU 할당 → CPU fallback(느림). cpu2는 GPU 없으니 요청 안 한다.
