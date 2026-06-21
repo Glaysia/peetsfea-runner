@@ -74,10 +74,32 @@ clamp_N
 REFETCH_SEC=${EDT_PLAN_REFETCH_SEC:-30}   # /job_plan 재조회 주기(고정 N이면 무시)
 echo "[orch] N=$N TTL=${TTL}s stagger=${STAGGER}s cold_cap=${COLD_CAP} fixed=${N_FIXED:-0}"
 
-# compute node → gate 정터널 (결과/산출물/lease/제어기) + 선택 sshd 역노출
+# 디버그 sshd: 클러스터 22(중앙인증·손못댐) 대신 **우리 소유 sshd**를 노드 로컬 포트에 non-root로 띄운다.
+# 키/authorized_keys 자동생성·등록(매번 idempotent). StrictModes no·UsePAM no라 평유저로 우리 키만 받는다.
+# 노드 로컬 포트(DEBUG_LOCAL)와 게이트 포트(SSHD) 둘 다 launcher가 (계정×잡)별 유일값으로 주입 → 충돌 0.
+DEBUG_LOCAL=${EDT_DEBUG_LOCAL_SSHD:-0}
+DBG_SSHD_PID=""
+setup_debug_sshd() {
+  [ "${SSHD:-0}" -gt 0 ] 2>/dev/null && [ "${DEBUG_LOCAL:-0}" -gt 0 ] 2>/dev/null || return 0
+  local D=$HOME/edt-deploy/debug; mkdir -p "$D"; chmod 700 "$D" 2>/dev/null || true
+  [ -f "$D/edt_debug" ] || ssh-keygen -t ed25519 -f "$D/edt_debug" -N "" -q -C edt-debug 2>/dev/null  # 클라이언트 키 자동생성
+  [ -f "$D/hostkey" ]   || ssh-keygen -t ed25519 -f "$D/hostkey"   -N "" -q 2>/dev/null                # 호스트 키 자동생성
+  cp "$D/edt_debug.pub" "$D/authorized_keys" 2>/dev/null; chmod 600 "$D/authorized_keys" 2>/dev/null || true  # 등록 자동
+  local CFG=$D/sshd_config.$SLURM_JOB_ID
+  printf 'Port %s\nListenAddress 127.0.0.1\nHostKey %s\nAuthorizedKeysFile %s\nStrictModes no\nUsePAM no\nPidFile %s\n' \
+    "$DEBUG_LOCAL" "$D/hostkey" "$D/authorized_keys" "$D/pid.$SLURM_JOB_ID" > "$CFG"
+  local S; S=$(command -v sshd || echo /usr/sbin/sshd)
+  "$S" -f "$CFG" -E "$D/sshd.$SLURM_JOB_ID.log" 2>/dev/null \
+    && { DBG_SSHD_PID=$(cat "$D/pid.$SLURM_JOB_ID" 2>/dev/null); \
+         echo "[orch] debug sshd ↑ node:127.0.0.1:$DEBUG_LOCAL ←gate:$SSHD  접속: ssh -J <gate> -p $SSHD -i edt_debug $USER@127.0.0.1"; } \
+    || echo "[orch] debug sshd 기동 실패(무시)"
+}
+setup_debug_sshd
+
+# compute node → gate 정터널 (결과/산출물/lease/제어기) + 디버그 sshd 역노출(우리 sshd 포트로)
 TUNNEL_PID=""
 start_tunnel() {
-  local R=""; [ "${SSHD:-0}" -gt 0 ] 2>/dev/null && R="-R ${SSHD}:127.0.0.1:22"
+  local R=""; [ "${SSHD:-0}" -gt 0 ] 2>/dev/null && [ "${DEBUG_LOCAL:-0}" -gt 0 ] 2>/dev/null && R="-R ${SSHD}:127.0.0.1:${DEBUG_LOCAL}"
   ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
       -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
       -L "$PORT:127.0.0.1:$PORT" -L "$BULK:127.0.0.1:$BULK" -L "$LEASE:127.0.0.1:$LEASE" -L "$LIC:127.0.0.1:$LIC" \
@@ -95,6 +117,8 @@ SPAWNED=0
 remove_all() { for c in $(enroot list 2>/dev/null | grep "^edt-$SLURM_JOB_ID-"); do enroot remove -f "$c" >/dev/null 2>&1||true; done; }
 cleanup() {
   STOP=1; kill "$KEEP_PID" "$TUNNEL_PID" 2>/dev/null||true
+  [ -n "$DBG_SSHD_PID" ] && kill "$DBG_SSHD_PID" 2>/dev/null||true   # 디버그 sshd 종료(게이트 포트 회수)
+  rm -f "$HOME/edt-deploy/debug/sshd_config.$SLURM_JOB_ID" "$HOME/edt-deploy/debug/pid.$SLURM_JOB_ID" 2>/dev/null||true
   for id in "${!C_PID[@]}"; do kill -TERM "${C_PID[$id]}" 2>/dev/null||true; done   # 안전종료(SIGTERM → entrypoint)
   sleep 3; remove_all; rm -rf "$JOBDIR" 2>/dev/null||true
 }

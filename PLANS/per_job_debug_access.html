@@ -33,10 +33,10 @@
 <div class="wrap">
 
 <h1>잡별 디버그 접근 — 잡마다 sshd + 전용 포트</h1>
-<p class="sub">돌고 있는 임의의 잡 노드/컨테이너에 바로 ssh + 서비스 포트 포워딩으로 디버깅을 빠르게. 다계정 포트 베이스와 정합 · <b>계획서(미구현)</b> · 2026-06-21</p>
+<p class="sub">돌고 있는 임의의 잡 노드/컨테이너에 바로 ssh로 디버깅을 빠르게. 클러스터 22 미사용 · 다계정 포트 베이스와 정합 · <b>구현·검증 완료</b> · 2026-06-21</p>
 
 <div class="card">
-<b>한 줄 요지:</b> 잡 i가 뜰 때 그 컴퓨트 노드의 <b>sshd(22)</b>와 <b>전용 디버그 포트 1개</b>를 게이트의 <b>결정적 포트</b>로 역터널한다. 그러면 로컬에서 <code>ssh -J gate1-&lt;acct&gt; -p &lt;port&gt;</code> 한 방으로 그 잡 노드에 들어가 <code>enroot exec</code>로 컨테이너 안까지, 전용 포트로 debugpy/AEDT gRPC를 당겨볼 수 있다.
+<b>한 줄 요지:</b> 클러스터 노드 <b>22번 sshd는 중앙인증(IPA/Kerberos 등)이라 우리가 키를 못 넣는다</b> — 자기 노드 자기 자신에게도 등록 키 거부 확인됨. 그래서 잡마다 <b>우리 소유 sshd</b>를 노드-로컬 포트에 non-root로 띄우고(우리 host key + authorized_keys, <code>StrictModes no·UsePAM no</code> → 평유저로 우리 키만 받음), 그 포트를 게이트의 결정적 포트로 역터널한다. 로컬에서 <code>ssh -J &lt;gate&gt; -p &lt;port&gt; -i edt_debug &lt;user&gt;@127.0.0.1</code> 한 방으로 잡 노드 진입 → <code>enroot exec</code>로 컨테이너 안까지. <b>검증: n114 진입·컨테이너/AEDT 관측 성공.</b>
 </div>
 
 <h2>1. 동기 — 지금의 한계</h2>
@@ -50,21 +50,23 @@
 <p>충돌 없이 <b>잡 인덱스+계정</b>만으로 포트가 정해져야 한다(같은 게이트 머신을 두 계정이 공유 → [[multi-account-ingest-port-collision]]과 동일 함정). 7900–7999를 디버그용으로 예약, 계정 stride 50.</p>
 <table>
 <tr><th>용도</th><th>공식</th><th>harry261(acct0)</th><th>hmlee31(acct1)</th></tr>
-<tr><td><b>잡별 sshd</b>(노드 22)</td><td><code>7900 + 50·acct + job</code></td><td>7900–7908</td><td>7950–7958</td></tr>
-<tr><td><b>잡별 전용 디버그</b></td><td><code>7920 + 50·acct + job</code></td><td>7920–7928</td><td>7970–7978</td></tr>
+<tr><td><b>게이트 포트</b>(역터널 바인드)<br><span class="mut">EDT_ORCH_SSHD_PORT</span></td><td><code>7900 + 50·acct + job</code></td><td>7900–7908</td><td>7950–7958</td></tr>
+<tr><td><b>노드-로컬 sshd 포트</b>(우리 sshd listen)<br><span class="mut">EDT_DEBUG_LOCAL_SSHD</span></td><td><code>2200 + 50·acct + job</code></td><td>2200–2208</td><td>2250–2258</td></tr>
 </table>
-<p class="mut">잡 9개(0–8) 기준. 제어/데이터 포트(7876–7889)와 겹치지 않는 별도 대역. 게이트 loopback 바인딩이라 같은 머신의 두 계정도 포트가 달라 안 부딪힌다. env로 베이스 조정: <code>EDT_DEBUG_SSHD_BASE</code>(7900)·<code>EDT_DEBUG_PORT_BASE</code>(7920)·<code>EDT_DEBUG_ACCT_STRIDE</code>(50).</p>
+<p class="mut">잡 9개(0–8) 기준. <b>두 포트 다 (계정×잡)별로 유일</b> — 게이트는 1대(공유)라 게이트 포트가, 한 노드에 두 잡이 co-locate할 수 있어 노드-로컬 포트가 각각 충돌나면 안 된다. 제어/데이터 포트(7876–7889)와 별도 대역. launcher가 둘 다 결정적으로 계산·주입. env 베이스: <code>EDT_DEBUG_SSHD_BASE</code>(7900, 0=비활성)·<code>EDT_ACCOUNT_INDEX</code>·런처 <code>debug_local_base</code>(2200)·<code>debug_account_stride</code>(50).</p>
 
-<h2>3. 잡별 sshd 역터널</h2>
+<h2>3. 우리 소유 sshd + 역터널 (구현됨)</h2>
 <div class="flow">
-  <span class="box">컴퓨트 노드 sshd:22</span><span class="arr">— orchestrator <code>ssh -R</code> →</span>
-  <span class="box">gate 127.0.0.1:&lt;sshd_port&gt;</span><span class="arr">— 로컬 <code>ssh -J</code> →</span>
+  <span class="box">우리 sshd @ node:127.0.0.1:&lt;local&gt;</span><span class="arr">— orchestrator <code>-R</code> →</span>
+  <span class="box">gate 127.0.0.1:&lt;gate_port&gt;</span><span class="arr">— 로컬 <code>ssh -J -i edt_debug</code> →</span>
   <span class="box ok">잡 노드 셸</span>
 </div>
 <ul>
-<li>orchestrator의 keep_tunnel ssh에 <code>-R ${SSHD_PORT}:127.0.0.1:22</code> 추가(이미 <code>EDT_ORCH_SSHD_PORT</code> 훅 존재 — 값만 잡별로 주입).</li>
+<li><b>왜 22가 아니라 우리 sshd인가:</b> 노드 22 sshd는 중앙인증이라 <code>~/.ssh/authorized_keys</code>를 무시한다(자기 노드 자기 자신에게도 등록 키 거부 실측). 우리 sshd면 인증 규칙이 전부 우리 것.</li>
+<li>orchestrator <code>setup_debug_sshd()</code>(EDT_ORCH_SSHD_PORT&gt;0일 때): 호스트키·클라이언트키 <b>자동생성</b>(idempotent) + authorized_keys <b>자동등록</b> + non-root sshd를 <code>EDT_DEBUG_LOCAL_SSHD</code>에 기동(<code>StrictModes no·UsePAM no</code>). keep_tunnel이 <code>-R ${gate}:127.0.0.1:${local}</code>로 역노출.</li>
 <li>노드는 host netns 공유라 노드 셸에서 <code>enroot list</code>·<code>enroot exec &lt;c&gt; bash</code>로 <b>컨테이너 안</b>, <code>pgrep -a ansysedt</code>로 AEDT까지 바로.</li>
-<li>잡 종료 시 orchestrator trap이 keep_tunnel ssh를 죽여 게이트 포트 자동 회수(잔류 0).</li>
+<li>잡 종료 시 trap이 sshd + 터널 ssh를 죽여 포트·프로세스 자동 회수(잔류 0).</li>
+<li><b>검증:</b> hmlee31 job0 → 우리 sshd node:2250 ← gate:7950, 로컬 <code>ssh -J … -p 7950 -i edt_debug</code>로 n114 진입·컨테이너/AEDT 관측 성공.</li>
 </ul>
 
 <h2>4. 잡별 전용 디버그 포트</h2>
@@ -76,26 +78,26 @@
 <tr><td>잡 상태 endpoint</td><td>orchestrator가 디버그 포트에 <code>live/SPAWNED/ctnr/ansysedt</code> 미니 HTTP 서빙(관측)</td></tr>
 </table>
 
-<h2>5. 접속 레시피 (로컬에서)</h2>
-<pre># 잡 i 노드 셸 (acct=harry261 → sshd_port = 7900+i)
-ssh -J gate1-harry261 -p 7900 \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    harry261@127.0.0.1            # job 0 노드. (i번 잡은 -p $((7900+i)))
+<h2>5. 접속 레시피 (로컬에서) — 검증됨</h2>
+<pre># 0) 클라이언트 개인키 한 번만 로컬로 (orchestrator가 게이트에 자동생성해둠)
+scp &lt;gate&gt;:~/edt-deploy/debug/edt_debug ~/.ssh/edt_debug && chmod 600 ~/.ssh/edt_debug
 
-# 노드 안에서: 컨테이너/AEDT 들여다보기
+# 1) 잡 i 노드 진입 (acct=hmlee31 → gate_port = 7950+i)
+ssh -J gate1-hmlee31 -p 7950 -i ~/.ssh/edt_debug -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    hmlee31@127.0.0.1            # job 0 노드. i번 잡은 -p $((7950+i))
+
+# 2) 노드 안에서: 컨테이너/AEDT 들여다보기
 enroot list
 enroot exec edt-&lt;JOB&gt;-&lt;id&gt;-&lt;pid&gt; bash      # 컨테이너 안 셸
-pgrep -a ansysedt ; ls -l /proc/&lt;pid&gt;/fd | wc -l
-
-# 전용 디버그 포트를 로컬로 (debugpy/gRPC attach; acct0 job i → 7920+i)
-ssh -N -L 5678:127.0.0.1:7920 gate1-harry261   # 로컬 5678 → job0 디버그 포트</pre>
-<div class="rec">대시보드/헬퍼가 잡별로 <b>완성된 ssh 명령</b>을 출력해주면(포트가 job_index+account로 결정적이라 자동 생성) 클릭 한 번 디버깅. <code>/health</code>·부하탭에 잡별 <code>ssh_cmd</code> 필드 추가.</div>
+pgrep -a ansysedt ; ls /proc/&lt;pid&gt;/fd | wc -l</pre>
+<div class="rec">대시보드/헬퍼가 잡별로 <b>완성된 ssh 명령</b>을 출력해주면(포트가 job_index+account로 결정적이라 자동 생성) 클릭 한 번 디버깅. <code>/health</code>·부하탭에 잡별 <code>ssh_cmd</code> 필드 추가(후속).</div>
 
 <h2>6. 구현 변경점</h2>
 <table>
 <tr><th>파일</th><th>변경</th></tr>
-<tr><td><code>deploy/orchestrator.sh</code></td><td>keep_tunnel ssh에 <code>-R ${EDT_DEBUG_SSHD_PORT}:127.0.0.1:22</code> + <code>-R ${EDT_DEBUG_PORT}:127.0.0.1:${EDT_DEBUG_LOCAL}</code> 추가(값 있을 때만). 이미 있는 <code>$R</code>(SSHD) 훅 확장.</td></tr>
-<tr><td><code>edt_slurm_launcher.py</code></td><td>잡 출생 시 <code>EDT_DEBUG_SSHD_PORT</code>/<code>EDT_DEBUG_PORT</code>를 <code>base + stride·acct + job_index</code>로 계산해 주입(account_id로 acct 인덱스 매핑).</td></tr>
+<tr><td><code>deploy/orchestrator.sh</code> <span class="ok">✓</span></td><td><code>setup_debug_sshd()</code>: 키 자동생성·등록 + non-root sshd를 <code>EDT_DEBUG_LOCAL_SSHD</code>에 기동. keep_tunnel이 <code>-R ${EDT_ORCH_SSHD_PORT}:127.0.0.1:${EDT_DEBUG_LOCAL_SSHD}</code>로 역노출. trap 정리.</td></tr>
+<tr><td><code>edt_slurm_launcher.py</code> <span class="ok">✓</span></td><td>게이트(<code>EDT_ORCH_SSHD_PORT</code>)+노드로컬(<code>EDT_DEBUG_LOCAL_SSHD</code>)을 <code>base + stride·acct + job</code>로 계산·주입. <code>debug_sshd_port</code>/<code>debug_local_sshd_port</code> 헬퍼. control_plane은 <code>EDT_DEBUG_SSHD_BASE</code>/<code>EDT_ACCOUNT_INDEX</code> env.</td></tr>
 <tr><td><code>edt_dashboard.py</code></td><td>잡별 <code>ssh_cmd</code> 표시(결정적 포트 → 명령 자동 생성). 복붙용.</td></tr>
 <tr><td>(선택) <code>edt_entrypoint.py</code></td><td><code>EDT_DEBUGPY</code> 있으면 debugpy를 디버그 포트에 listen(컨테이너 내 원격 디버그).</td></tr>
 </table>

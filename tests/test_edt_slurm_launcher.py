@@ -53,14 +53,19 @@ def test_debug_sshd_port_injected_per_job_and_account() -> None:
     )
     launcher.submit(3)
     _, script = runner.calls[0]
-    assert "export EDT_ORCH_SSHD_PORT=7953" in script  # 7900 + 50*1 + 3
-    assert launcher.debug_sshd_port(0) == 7950 and launcher.debug_sshd_port(8) == 7958
-    # account 0(harry261)은 같은 잡이라도 다른 포트(충돌 회피).
-    assert SlurmJobLauncher(debug_sshd_base=7900, account_index=0).debug_sshd_port(3) == 7903
+    # 게이트 포트(역터널 바인드)와 노드-로컬 sshd 포트 둘 다 주입, 각각 (계정×잡)별 유일.
+    assert "export EDT_ORCH_SSHD_PORT=7953" in script   # gate  = 7900 + 50*1 + 3
+    assert "export EDT_DEBUG_LOCAL_SSHD=2253" in script  # local = 2200 + 50*1 + 3
+    assert launcher.debug_sshd_port(0) == 7950 and launcher.debug_local_sshd_port(0) == 2250
+    assert launcher.debug_sshd_port(8) == 7958 and launcher.debug_local_sshd_port(8) == 2258
+    # account 0(harry261)은 같은 잡이라도 다른 포트(같은 노드 co-locate 충돌 회피).
+    l0 = SlurmJobLauncher(debug_sshd_base=7900, account_index=0)
+    assert l0.debug_sshd_port(3) == 7903 and l0.debug_local_sshd_port(3) == 2203
 
 
 def test_debug_sshd_disabled_by_default_returns_none() -> None:
     assert SlurmJobLauncher().debug_sshd_port(0) is None  # base=0 → 비활성
+    assert SlurmJobLauncher().debug_local_sshd_port(0) is None
 
 
 def test_seed_epoch_injected_from_provider() -> None:
