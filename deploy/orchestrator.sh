@@ -1,12 +1,13 @@
 #!/bin/bash
-# 잡당 서브 오케스트레이터 (롤링 라이프사이클) — 출생시 정해진 N개의 단명(1솔브) enroot 컨테이너를
-# **stagger(노드당 동시 콜드스타트 제한)** 로 가동하고, respawn 없이 드레인되며, 20분 TTL에 종료.
+# 잡당 서브 오케스트레이터 (고정 잡 + respawn-to-N) — 단명(1솔브) enroot 컨테이너를 **stagger(노드당
+# 동시 콜드스타트 제한)** 로 가동하고, 죽으면 보충해 **목표 N을 유지**하며, TTL에 안전종료(키퍼가 재제출).
 #
-#   1컨테이너 = 시뮬 1건 후 완전 종료(enroot remove) → AEDT·pyaedt 소멸 → 누수 OS회수.
-#   N = 제어기가 잡 출생 시 결정(EDT_JOB_CONTAINERS). respawn 없음 → 살아있는 컨테이너는 시간이 지나며 감소.
+#   1컨테이너 = 시뮬 1건 후 완전 종료(unshare PID-ns → enroot remove) → AEDT 고아까지 전량 OS회수.
+#   N = 잡별 컨테이너 목표. /job_plan?job=i를 주기 재조회(적분제어가 동적 조절) 또는 EDT_JOB_CONTAINERS 고정.
+#     respawn-to-N: alive<N이면 보충, N 감소 시엔 자연 드레인(kill 안 함). 잡은 제어 목적으로 안 죽임.
 #   동시 콜드스타트를 노드당 EDT_COLD_CAP개로 제한 → AEDT 동시 기동 gRPC herd 차단.
-#   제어기(:7879)에 살아있는 컨테이너 수 주기 보고(관측/대시보드).
-#   TTL(EDT_JOB_TTL_SEC, 기본 1200s) 경과 또는 전부 드레인 시 안전종료(강종 금지) → 잡 exit.
+#   제어기(:7879)에 살아있는 컨테이너 수 주기 보고(관측/대시보드 + /orch_report 피드백).
+#   TTL(EDT_JOB_TTL_SEC) 경과 시 안전종료(강종 금지) → 잡 exit → 키퍼가 새 잡으로 교체(고정 인프라 유지).
 # 주의: set -u 금지 — 구버전 bash 빈 연관배열 접근이 "unbound variable"로 잡을 즉사시킨다.
 echo "[orch] NODE=$(hostname) JOB=$SLURM_JOB_ID JIDX=${EDT_JOB_INDEX:-0} PART=${EDT_PARTITION:-}"
 ANSB=/opt/ohpc/pub/Electronics/v252
@@ -64,14 +65,14 @@ COLD_EST=${EDT_COLD_EST_SEC:-200}         # 콜드스타트로 간주하는 나�
 COLD_CAP=${EDT_COLD_CAP:-10}              # 노드당 동시 콜드스타트 상한(herd 차단). 10 동시 기동은 안전 확인됨.
 START=$(date +%s)
 
-# N = 제어기가 출생 시 결정한 컨테이너 수. env 없으면 /job_plan 1회 조회, 그것도 없으면 기본 20.
+# N = 잡별 컨테이너 목표. EDT_JOB_CONTAINERS로 고정(테스트)하거나, 미설정 시 /job_plan?job=i에서 받아
+# 주기 재조회한다(적분제어가 동적으로 바꾼다 → respawn-to-N). 잡은 죽지 않고 컨테이너 수만 N에 맞춘다.
 fetch_N() { curl -s -m4 "$PLAN_URL" 2>/dev/null | grep -oE '"n"[ :]+[0-9]+' | grep -oE '[0-9]+$'; }
-N=${EDT_JOB_CONTAINERS:-}
-[ -z "$N" ] && N=$(fetch_N)
-[ -z "$N" ] && N=20
-[ "$N" -gt 20 ] 2>/dev/null && N=20
-[ "$N" -lt 1 ] 2>/dev/null && N=1
-echo "[orch] N=$N TTL=${TTL}s stagger=${STAGGER}s cold_cap=${COLD_CAP}"
+clamp_N() { [ -z "$N" ] && N=12; [ "$N" -gt 20 ] 2>/dev/null && N=20; [ "$N" -lt 0 ] 2>/dev/null && N=0; }
+if [ -n "${EDT_JOB_CONTAINERS:-}" ]; then N=$EDT_JOB_CONTAINERS; N_FIXED=1; else N=$(fetch_N); N_FIXED=""; fi
+clamp_N
+REFETCH_SEC=${EDT_PLAN_REFETCH_SEC:-30}   # /job_plan 재조회 주기(고정 N이면 무시)
+echo "[orch] N=$N TTL=${TTL}s stagger=${STAGGER}s cold_cap=${COLD_CAP} fixed=${N_FIXED:-0}"
 
 # compute node → gate 정터널 (결과/산출물/lease/제어기) + 선택 sshd 역노출
 TUNNEL_PID=""
@@ -157,18 +158,22 @@ report() {  # 제어기에 살아있는 컨테이너 수 보고(가장 적게 �
     -d "job=${EDT_JOB_INDEX:-0}&slurm=$SLURM_JOB_ID&live=$live&spawned=$SPAWNED&target=$N&age=$(( now - START ))" >/dev/null 2>&1 || true
 }
 
-LAST_SPAWN=0
+LAST_SPAWN=0; LAST_REFETCH=0
 while [ $STOP -eq 0 ]; do
-  reap
+  reap                                   # 죽은(1솔브 끝) 컨테이너 제거 → 슬롯 비움
   now=$(date +%s)
-  # 종료 조건: TTL 경과 또는 (N 다 띄웠는데 전부 드레인) → 안전종료
   if [ $(( now - START )) -ge "$TTL" ]; then echo "[orch] TTL ${TTL}s 도달 — 안전종료"; break; fi
-  if [ "$SPAWNED" -ge "$N" ] && [ "${#C_PID[@]}" -eq 0 ]; then echo "[orch] N개 전부 드레인 — 종료"; break; fi
-  # staggered 출생: 아직 N 미달 + 간격 충족 + 콜드스타트 cap 미만일 때만 1개
-  if [ "$SPAWNED" -lt "$N" ] && [ $(( now - LAST_SPAWN )) -ge "$STAGGER" ] && [ "$(young_count "$now")" -lt "$COLD_CAP" ]; then
+  # 잡별 목표 N 주기 재조회(고정 N이 아니면). 적분제어가 동적으로 바꾼 값을 반영.
+  if [ -z "$N_FIXED" ] && [ $(( now - LAST_REFETCH )) -ge "$REFETCH_SEC" ]; then
+    newn=$(fetch_N); LAST_REFETCH=$now
+    if [ -n "$newn" ]; then N=$newn; clamp_N; fi
+  fi
+  alive=${#C_PID[@]}
+  # respawn-to-N: 살아있는 수가 N 미만이면 stagger+cold_cap로 1개 보충(초과=N 감소는 자연 드레인, kill 안 함).
+  if [ "$alive" -lt "$N" ] && [ $(( now - LAST_SPAWN )) -ge "$STAGGER" ] && [ "$(young_count "$now")" -lt "$COLD_CAP" ]; then
     spawn_one; LAST_SPAWN=$now
   fi
   report "$now"
   sleep 2
 done
-echo "[orch] DONE job=$SLURM_JOB_ID spawned=$SPAWNED"
+echo "[orch] DONE job=$SLURM_JOB_ID 누적솔브사이클=$SPAWNED"
