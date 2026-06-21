@@ -65,6 +65,11 @@ class ControlPlaneConfig:
     dashboard_peetsfea_version: str = ""  # 대시보드 표시 버전 필터(빈 값=전 버전). 예: "0.3.7".
     # 잡 제출 전략: 노드 기반(빈 노드에 --nodelist 핀, 내 잡 도는 노드 제외). 잡은 고정 인프라(적분제어).
     node_based_jobs: bool = True
+    # 잡별 디버그 sshd: 잡 노드 22를 게이트 결정적 포트로 역터널(0=비활성, 7900 권장). 계정 stride로 다계정
+    # 충돌 회피(PLANS/per_job_debug_access.html). EDT_DEBUG_SSHD_BASE / EDT_ACCOUNT_INDEX env로 설정.
+    debug_sshd_base: int = 0
+    debug_account_stride: int = 50
+    account_index: int = 0
     # 라이선스 피드백 제어(:7879): 전역 동시 솔브를 target~ceiling 밴드로. lic_mine은 poller에서.
     license_ctrl_port: int = DEFAULT_LICENSE_CTRL_PORT
     license_target: int = 100  # permit 상한(<100이면 더 솔브)
@@ -321,6 +326,10 @@ def build_control_plane(
         node_based=config.node_based_jobs,
         # 재램프 시 이미 푼 baseline seed를 재탕하지 않게: store의 used-seed 프런티어 위로 seed epoch를 advance.
         seed_epoch_provider=store.max_baseline_seed,
+        # 잡별 디버그 sshd 역터널(0=비활성). 잡 노드에 ssh -J로 직접 진입.
+        debug_sshd_base=config.debug_sshd_base,
+        debug_account_stride=config.debug_account_stride,
+        account_index=config.account_index,
     )
     orchestrator = JobOrchestrator(
         launcher=job_launcher,
@@ -404,6 +413,8 @@ def main() -> int:
         license_target=int(os.environ.get("EDT_LICENSE_TARGET", "100")),
         license_ceiling=int(os.environ.get("EDT_LICENSE_CEILING", "150")),
         license_poll_seconds=float(os.environ.get("EDT_LICENSE_POLL_SECONDS", "60")),
+        debug_sshd_base=int(os.environ.get("EDT_DEBUG_SSHD_BASE", "0")),
+        account_index=int(os.environ.get("EDT_ACCOUNT_INDEX", "0")),
         dashboard_peetsfea_version=os.environ.get("EDT_DASHBOARD_PEETSFEA_VERSION", "").strip(),
         resource_port=int(os.environ.get("EDT_RESOURCE_PORT", str(DEFAULT_RESOURCE_PORT))),
         builtin_toml_path=Path(os.environ["EDT_BUILTIN_TOML_PATH"]).expanduser()

@@ -96,6 +96,12 @@ class SlurmJobLauncher:
     # None이면 미주입(orchestrator가 /job_plan 조회 또는 기본값). job_ttl_seconds=잡 수명(orchestrator self-exit).
     container_count_provider: Callable[[], int] | None = None
     job_ttl_seconds: int = 1800  # 잡 수명 30분
+    # 잡별 디버그 sshd: 잡 노드의 22를 게이트 결정적 포트로 역터널(EDT_ORCH_SSHD_PORT → orchestrator -R).
+    # 포트 = debug_sshd_base + debug_account_stride*account_index + job_index. base=0이면 비활성(프로덕션 기본).
+    # 계정 stride로 같은 게이트의 다계정 포트 충돌 회피(PLANS/per_job_debug_access.html).
+    debug_sshd_base: int = 0
+    debug_account_stride: int = 50
+    account_index: int = 0
     _avoid: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _submitted_nodes: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
@@ -111,6 +117,15 @@ class SlurmJobLauncher:
     def _ssh(self, remote: str, *, input_text: str | None = None) -> CommandResult:
         argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", self.ssh_host, remote]
         return self.command_runner(argv, input_text)
+
+    def debug_sshd_port(self, job_index: int) -> int | None:
+        """잡 i의 디버그 sshd 역터널 게이트 포트(결정적). 비활성(base=0)이면 None.
+
+        로컬에서 `ssh -J <gate> -p <port> <user>@127.0.0.1`로 그 잡 노드에 직접 진입(→ enroot exec).
+        """
+        if self.debug_sshd_base <= 0:
+            return None
+        return self.debug_sshd_base + self.debug_account_stride * self.account_index + job_index
 
     def _cpus_for(self, partition: str) -> int:
         return self.cpus_cpu2 if partition == "cpu2" else self.cpus_other
@@ -139,6 +154,9 @@ class SlurmJobLauncher:
                     n_line = f"export EDT_JOB_CONTAINERS={n}\n"
             except Exception:  # noqa: BLE001 — 제어기 조회 실패가 잡 제출을 막으면 안 됨.
                 n_line = ""
+        # 잡별 디버그 sshd 포트(결정적). 활성 시 orchestrator가 노드 22를 게이트 그 포트로 -R 역터널.
+        sshd_port = self.debug_sshd_port(job_index)
+        sshd_line = f"export EDT_ORCH_SSHD_PORT={sshd_port}\n" if sshd_port else ""
         return (
             "#!/bin/bash\n"
             f"#SBATCH --job-name={self.job_name_prefix}-{job_index}\n"
@@ -158,6 +176,7 @@ class SlurmJobLauncher:
             # 롤링 라이프사이클: orchestrator가 N개 컨테이너를 stagger 가동 후 TTL에 self-exit.
             f"export EDT_JOB_TTL_SEC={self.job_ttl_seconds}\n"
             f"{n_line}"
+            f"{sshd_line}"
             f"{self.job_command}\n"
         )
 

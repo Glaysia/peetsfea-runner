@@ -40,6 +40,27 @@ def test_submit_parses_slurm_id_and_sends_sbatch_script() -> None:
     assert "#SBATCH --mem=480G" in script
     assert "export EDT_JOB_INDEX=3" in script
     assert "export EDT_PARTITION=cpu2" in script
+    assert "EDT_ORCH_SSHD_PORT" not in script  # 디버그 sshd 기본 비활성
+
+
+def test_debug_sshd_port_injected_per_job_and_account() -> None:
+    # 잡별 sshd 역터널: 게이트 포트 = base + stride*account + job_index. 결정적 → ssh -J로 그 잡 노드 진입.
+    runner = FakeRunner()
+    runner.responses["sbatch"] = CommandResult(0, "Submitted batch job 1\n", "")
+    launcher = SlurmJobLauncher(
+        command_runner=runner, clock=lambda: 0.0,
+        debug_sshd_base=7900, debug_account_stride=50, account_index=1,  # hmlee31
+    )
+    launcher.submit(3)
+    _, script = runner.calls[0]
+    assert "export EDT_ORCH_SSHD_PORT=7953" in script  # 7900 + 50*1 + 3
+    assert launcher.debug_sshd_port(0) == 7950 and launcher.debug_sshd_port(8) == 7958
+    # account 0(harry261)은 같은 잡이라도 다른 포트(충돌 회피).
+    assert SlurmJobLauncher(debug_sshd_base=7900, account_index=0).debug_sshd_port(3) == 7903
+
+
+def test_debug_sshd_disabled_by_default_returns_none() -> None:
+    assert SlurmJobLauncher().debug_sshd_port(0) is None  # base=0 → 비활성
 
 
 def test_seed_epoch_injected_from_provider() -> None:
