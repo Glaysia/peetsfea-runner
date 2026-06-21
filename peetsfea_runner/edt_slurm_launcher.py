@@ -95,7 +95,7 @@ class SlurmJobLauncher:
     # 롤링 라이프사이클: 잡 출생 시 제어기가 LUT로 결정한 컨테이너 수 N을 주입(EDT_JOB_CONTAINERS).
     # None이면 미주입(orchestrator가 /job_plan 조회 또는 기본값). job_ttl_seconds=잡 수명(orchestrator self-exit).
     container_count_provider: Callable[[], int] | None = None
-    job_ttl_seconds: int = 1800  # 잡 수명 30분
+    job_ttl_seconds: int = 14400  # 잡 수명 4시간(orchestrator self-exit)
     # 잡별 디버그 sshd: 잡 노드에 **우리 소유 sshd**를 노드-로컬 포트에 띄우고(클러스터 22 미사용), 그 포트를
     # 게이트 결정적 포트로 역터널한다. 두 포트 모두 (계정×잡)별로 유일해야 충돌이 없다:
     #   게이트 포트  EDT_ORCH_SSHD_PORT  = debug_sshd_base  + stride*account + job  (게이트는 1대 = 전 잡 공유)

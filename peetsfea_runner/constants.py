@@ -21,8 +21,8 @@ EDTMGR_BACKSTOP_KILL_SECONDS: Final[int] = 150 * 60
 # --- SLURM 잡 출생 제어 -----------------------------------------------------
 # 레거시 keepalive 모드의 기본 슬롯 수. 현행 관리 루프는 별도 squeue cap(15)을 사용한다.
 JOBS_PER_ACCOUNT: Final[int] = 9
-# 잡 수명 상한. 빡센 해석 설정으로 솔브가 길어져 30분으로 상향(완료 전 종료 방지).
-JOB_MAX_LIFETIME_SECONDS: Final[int] = 30 * 60
+# 잡 수명 상한. 잡=고정 인프라(적분제어)라 길게 유지 — 4시간 주기 교체(드리프트/잔재 위생용).
+JOB_MAX_LIFETIME_SECONDS: Final[int] = 4 * 60 * 60
 
 # --- Phase 6: 아카이브 저장소 ------------------------------------------------
 # 묶음 압축 임계(20GB): 완료 project_dir들을 누적하다 이만큼 모이면 한 파일로 압축.
