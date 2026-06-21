@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>잡별 디버그 접근 — 잡마다 sshd + 전용 포트 (계획서)</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",sans-serif}
+  .wrap{max-width:960px;margin:0 auto;padding:32px 22px 70px}
+  h1{font-size:23px;line-height:1.35;margin:0 0 6px}
+  h2{font-size:18px;margin:30px 0 10px;padding-top:13px;border-top:1px solid var(--bd)}
+  h3{font-size:15px;margin:16px 0 6px;color:var(--acc)}
+  .sub{color:var(--mut);margin:0 0 20px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 18px;margin:12px 0}
+  code{background:#1f2630;padding:1.5px 6px;border-radius:5px;font-size:13px;color:#ffa657}
+  pre{background:#010409;border:1px solid var(--bd);border-radius:8px;padding:13px 15px;overflow:auto;font-size:13px;line-height:1.5}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14px}
+  th,td{border:1px solid var(--bd);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#1f2630}
+  .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+  ul{margin:6px 0;padding-left:22px}li{margin:3px 0}
+  .rec{border-left:3px solid var(--ok);background:#0f1c12;padding:10px 14px;border-radius:0 8px 8px 0}
+  .q{border-left:3px solid var(--warn);background:#1c170c;padding:10px 14px;border-radius:0 8px 8px 0;margin:8px 0}
+  .flow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:8px 0}
+  .box{background:#1f2630;border:1px solid var(--bd);border-radius:7px;padding:7px 11px;font-size:13px}
+  .arr{color:var(--mut);font-weight:700}
+  .pill{display:inline-block;padding:1px 9px;border-radius:20px;font-size:12px;border:1px solid var(--bd);margin-right:5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>잡별 디버그 접근 — 잡마다 sshd + 전용 포트</h1>
+<p class="sub">돌고 있는 임의의 잡 노드/컨테이너에 바로 ssh + 서비스 포트 포워딩으로 디버깅을 빠르게. 다계정 포트 베이스와 정합 · <b>계획서(미구현)</b> · 2026-06-21</p>
+
+<div class="card">
+<b>한 줄 요지:</b> 잡 i가 뜰 때 그 컴퓨트 노드의 <b>sshd(22)</b>와 <b>전용 디버그 포트 1개</b>를 게이트의 <b>결정적 포트</b>로 역터널한다. 그러면 로컬에서 <code>ssh -J gate1-&lt;acct&gt; -p &lt;port&gt;</code> 한 방으로 그 잡 노드에 들어가 <code>enroot exec</code>로 컨테이너 안까지, 전용 포트로 debugpy/AEDT gRPC를 당겨볼 수 있다.
+</div>
+
+<h2>1. 동기 — 지금의 한계</h2>
+<ul>
+<li>지금 잡 노드에 들어가는 길은 <code>srun --jobid=N --overlap --pty bash</code>뿐. SLURM 큐/권한에 묶이고, scp·IDE 리모트·GUI 포워딩 같은 ssh 도구를 못 쓴다.</li>
+<li>컨테이너 누수/AEDT 행(hang)/gRPC 문제를 볼 때 <b>대화형 ssh + 포트 포워딩</b>이 절실하다(debugpy attach, pyaedt 라이브 inspect, VS Code Remote).</li>
+<li>orchestrator엔 이미 <code>EDT_ORCH_SSHD_PORT</code>(<code>-R ${SSHD}:127.0.0.1:22</code>) 백채널 훅이 있다 — <b>기본 off(0)</b>. 이걸 잡별로 켜고 전용 포트를 더하면 끝.</li>
+</ul>
+
+<h2>2. 포트 할당 스킴 (결정적 · 다계정 정합)</h2>
+<p>충돌 없이 <b>잡 인덱스+계정</b>만으로 포트가 정해져야 한다(같은 게이트 머신을 두 계정이 공유 → [[multi-account-ingest-port-collision]]과 동일 함정). 7900–7999를 디버그용으로 예약, 계정 stride 50.</p>
+<table>
+<tr><th>용도</th><th>공식</th><th>harry261(acct0)</th><th>hmlee31(acct1)</th></tr>
+<tr><td><b>잡별 sshd</b>(노드 22)</td><td><code>7900 + 50·acct + job</code></td><td>7900–7908</td><td>7950–7958</td></tr>
+<tr><td><b>잡별 전용 디버그</b></td><td><code>7920 + 50·acct + job</code></td><td>7920–7928</td><td>7970–7978</td></tr>
+</table>
+<p class="mut">잡 9개(0–8) 기준. 제어/데이터 포트(7876–7889)와 겹치지 않는 별도 대역. 게이트 loopback 바인딩이라 같은 머신의 두 계정도 포트가 달라 안 부딪힌다. env로 베이스 조정: <code>EDT_DEBUG_SSHD_BASE</code>(7900)·<code>EDT_DEBUG_PORT_BASE</code>(7920)·<code>EDT_DEBUG_ACCT_STRIDE</code>(50).</p>
+
+<h2>3. 잡별 sshd 역터널</h2>
+<div class="flow">
+  <span class="box">컴퓨트 노드 sshd:22</span><span class="arr">— orchestrator <code>ssh -R</code> →</span>
+  <span class="box">gate 127.0.0.1:&lt;sshd_port&gt;</span><span class="arr">— 로컬 <code>ssh -J</code> →</span>
+  <span class="box ok">잡 노드 셸</span>
+</div>
+<ul>
+<li>orchestrator의 keep_tunnel ssh에 <code>-R ${SSHD_PORT}:127.0.0.1:22</code> 추가(이미 <code>EDT_ORCH_SSHD_PORT</code> 훅 존재 — 값만 잡별로 주입).</li>
+<li>노드는 host netns 공유라 노드 셸에서 <code>enroot list</code>·<code>enroot exec &lt;c&gt; bash</code>로 <b>컨테이너 안</b>, <code>pgrep -a ansysedt</code>로 AEDT까지 바로.</li>
+<li>잡 종료 시 orchestrator trap이 keep_tunnel ssh를 죽여 게이트 포트 자동 회수(잔류 0).</li>
+</ul>
+
+<h2>4. 잡별 전용 디버그 포트</h2>
+<p>잡마다 임의 서비스 1개를 로컬로 당기는 범용 포트. 컴퓨트 노드 loopback의 한 포트를 게이트로 역터널하고, 노드에서 그 포트로 무엇을 띄울지는 디버깅 상황에 따라.</p>
+<table>
+<tr><th>쓰임</th><th>방법</th></tr>
+<tr><td>pyaedt/AEDT gRPC 라이브 inspect</td><td>컨테이너의 <code>-grpcsrv &lt;p&gt;</code>를 노드 디버그 포트로 socat 중계 → 로컬에서 pyaedt attach</td></tr>
+<tr><td>python 원격 디버거</td><td>컨테이너 entrypoint를 <code>EDT_DEBUGPY=1</code>로 띄우면 debugpy가 디버그 포트 listen → 로컬 VS Code attach</td></tr>
+<tr><td>잡 상태 endpoint</td><td>orchestrator가 디버그 포트에 <code>live/SPAWNED/ctnr/ansysedt</code> 미니 HTTP 서빙(관측)</td></tr>
+</table>
+
+<h2>5. 접속 레시피 (로컬에서)</h2>
+<pre># 잡 i 노드 셸 (acct=harry261 → sshd_port = 7900+i)
+ssh -J gate1-harry261 -p 7900 \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    harry261@127.0.0.1            # job 0 노드. (i번 잡은 -p $((7900+i)))
+
+# 노드 안에서: 컨테이너/AEDT 들여다보기
+enroot list
+enroot exec edt-&lt;JOB&gt;-&lt;id&gt;-&lt;pid&gt; bash      # 컨테이너 안 셸
+pgrep -a ansysedt ; ls -l /proc/&lt;pid&gt;/fd | wc -l
+
+# 전용 디버그 포트를 로컬로 (debugpy/gRPC attach; acct0 job i → 7920+i)
+ssh -N -L 5678:127.0.0.1:7920 gate1-harry261   # 로컬 5678 → job0 디버그 포트</pre>
+<div class="rec">대시보드/헬퍼가 잡별로 <b>완성된 ssh 명령</b>을 출력해주면(포트가 job_index+account로 결정적이라 자동 생성) 클릭 한 번 디버깅. <code>/health</code>·부하탭에 잡별 <code>ssh_cmd</code> 필드 추가.</div>
+
+<h2>6. 구현 변경점</h2>
+<table>
+<tr><th>파일</th><th>변경</th></tr>
+<tr><td><code>deploy/orchestrator.sh</code></td><td>keep_tunnel ssh에 <code>-R ${EDT_DEBUG_SSHD_PORT}:127.0.0.1:22</code> + <code>-R ${EDT_DEBUG_PORT}:127.0.0.1:${EDT_DEBUG_LOCAL}</code> 추가(값 있을 때만). 이미 있는 <code>$R</code>(SSHD) 훅 확장.</td></tr>
+<tr><td><code>edt_slurm_launcher.py</code></td><td>잡 출생 시 <code>EDT_DEBUG_SSHD_PORT</code>/<code>EDT_DEBUG_PORT</code>를 <code>base + stride·acct + job_index</code>로 계산해 주입(account_id로 acct 인덱스 매핑).</td></tr>
+<tr><td><code>edt_dashboard.py</code></td><td>잡별 <code>ssh_cmd</code> 표시(결정적 포트 → 명령 자동 생성). 복붙용.</td></tr>
+<tr><td>(선택) <code>edt_entrypoint.py</code></td><td><code>EDT_DEBUGPY</code> 있으면 debugpy를 디버그 포트에 listen(컨테이너 내 원격 디버그).</td></tr>
+</table>
+
+<h2>7. 정리 · 보안</h2>
+<ul>
+<li><b>전부 게이트 loopback(127.0.0.1) 바인딩</b> — 외부 노출 없음(GatewayPorts off). 같은 게이트의 해당 계정만 도달.</li>
+<li>인증은 기존 ssh 키. 노드 sshd는 본인 잡 노드라 본인 키로 접속.</li>
+<li>잡 종료 시 orchestrator trap이 터널 ssh 종료 → 게이트 포트 즉시 회수. 잔류/누수 없음.</li>
+<li><b>디버그 전용·기본 off</b>: <code>EDT_DEBUG_SSHD_PORT</code> 미설정(0)이면 비활성(프로덕션 기본). 필요 시 잡/계정 단위로 켠다.</li>
+<li>ephemeral 호스트키라 <code>StrictHostKeyChecking=no</code>(같은 포트가 시간에 따라 다른 노드).</li>
+</ul>
+
+<h2>8. 단계</h2>
+<ol>
+<li>orchestrator.sh에 디버그 <code>-R</code> 2줄 + env 게이트(값 0이면 skip).</li>
+<li>launcher가 잡별 결정적 포트 주입(account×job). hmlee31에서 <code>ssh -J … -p 7950</code>로 노드 진입 검증.</li>
+<li>대시보드 잡별 <code>ssh_cmd</code> 출력.</li>
+<li>(선택) entrypoint debugpy + gRPC 중계 헬퍼.</li>
+</ol>
+
+<p class="mut" style="margin-top:24px">— 포트 스킴은 다계정 제어/데이터 포트 베이스(7876 harry261 / 7886 hmlee31)와 같은 철학: <b>계정×역할로 결정적 분리</b>, 게이트 loopback, 잡 종료 시 자동 회수.</p>
+
+</div>
+</body>
+</html>
