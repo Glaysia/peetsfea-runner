@@ -37,19 +37,15 @@ def test_build_control_plane_wires_orchestrator_store_intake(tmp_path: Path) -> 
     assert cp.dashboard_port == 8080 and cp.intake_port == 7875
     assert config.job_command.endswith("orchestrator.sh")
 
-    # HTML 기준 관리 루프: 시작 시 4개를 요청하고, 2분 홀짝 tick으로 squeue 15를 넘기지 않는다.
-    assert cp.orchestrator.sequential_ramp is True
-    cp.orchestrator.control_period_seconds = 0.0
+    # 잡은 고정 인프라: ensure_running이 job_count(9)개를 채우고, poll은 그 수를 유지한다(홀짝/cap 폐지).
     cp.orchestrator.ensure_running()
-    assert launcher.submits == 4
-    for _ in range(8):
-        cp.orchestrator.poll()
-    assert cp.orchestrator.running_count() == 15
+    assert launcher.submits == 9
+    assert cp.orchestrator.running_count() == 9
 
-    # 죽은 잡은 정리되지만 출생은 tick 정책과 cap을 따른다.
+    # 죽은 잡은 그 슬롯만 재기동 → 고정 9 유지.
     victim = cp.orchestrator.handles()[0]
     launcher.alive[victim.slurm_id] = False
     cp.orchestrator.poll()
     assert cp.orchestrator.restarts == 1
-    assert cp.orchestrator.running_count() <= 15
+    assert cp.orchestrator.running_count() == 9
     cp.orchestrator.shutdown()

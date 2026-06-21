@@ -63,9 +63,8 @@ class ControlPlaneConfig:
     data_api_port: int = 7884  # read 평면: 학습 주체용 증분 Arrow 스트림 API(EDT_ROLE=data, uvicorn).
     poll_interval_seconds: float = 60.0
     dashboard_peetsfea_version: str = ""  # 대시보드 표시 버전 필터(빈 값=전 버전). 예: "0.3.7".
-    # 잡 제출 전략: 노드 기반(빈 노드에 --nodelist 핀, 내 잡 도는 노드 제외) + HTML 기준 관리 루프.
+    # 잡 제출 전략: 노드 기반(빈 노드에 --nodelist 핀, 내 잡 도는 노드 제외). 잡은 고정 인프라(적분제어).
     node_based_jobs: bool = True
-    sequential_ramp: bool = True
     # 라이선스 피드백 제어(:7879): 전역 동시 솔브를 target~ceiling 밴드로. lic_mine은 poller에서.
     license_ctrl_port: int = DEFAULT_LICENSE_CTRL_PORT
     license_target: int = 100  # permit 상한(<100이면 더 솔브)
@@ -327,7 +326,6 @@ def build_control_plane(
         launcher=job_launcher,
         clock=time.monotonic,
         job_count=config.job_count,
-        sequential_ramp=config.sequential_ramp,
     )
     builtin_toml_text = (
         load_default_builtin_toml_text(config.builtin_toml_path)
