@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>적분 컨테이너 제어 — 잡 고정 + 컨테이너 수 적분 피드백 (리플 최소)</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",sans-serif}
+  .wrap{max-width:940px;margin:0 auto;padding:32px 22px 70px}
+  h1{font-size:23px;line-height:1.35;margin:0 0 6px}
+  h2{font-size:18px;margin:30px 0 10px;padding-top:13px;border-top:1px solid var(--bd)}
+  h3{font-size:15px;margin:16px 0 6px;color:var(--acc)}
+  .sub{color:var(--mut);margin:0 0 20px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 18px;margin:12px 0}
+  code{background:#1f2630;padding:1.5px 6px;border-radius:5px;font-size:13px;color:#ffa657}
+  pre{background:#010409;border:1px solid var(--bd);border-radius:8px;padding:13px 15px;overflow:auto;font-size:13px;line-height:1.5}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14px}
+  th,td{border:1px solid var(--bd);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#1f2630}
+  .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+  ul{margin:6px 0;padding-left:22px}li{margin:3px 0}
+  .rec{border-left:3px solid var(--ok);background:#0f1c12;padding:10px 14px;border-radius:0 8px 8px 0}
+  .q{border-left:3px solid var(--warn);background:#1c170c;padding:10px 14px;border-radius:0 8px 8px 0;margin:8px 0}
+  .flow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:8px 0}
+  .box{background:#1f2630;border:1px solid var(--bd);border-radius:7px;padding:7px 11px;font-size:13px}
+  .arr{color:var(--mut);font-weight:700}
+  .pill{display:inline-block;padding:1px 9px;border-radius:20px;font-size:12px;border:1px solid var(--bd);margin-right:5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>적분 컨테이너 제어 — 잡 고정 + 컨테이너 수 적분 피드백</h1>
+<p class="sub">지령 = 유효 AEDT 120 / 잡 10 / 리플 최소. <code>PLANS/job_birth_controller.html</code>(홀짝·LUT) 폐기 대체 · 누수=PID-ns 격리로 분리됨([[leak-reclaim-needs-pid-ns]]) · 2026-06-21 · <b>설계(미구현, 검토용)</b></p>
+
+<div class="card">
+<b>한 줄 요지:</b> 잡-죽임으로 제어하면 통째(±컨테이너 묶음)로 출렁여 리플. <b>잡을 안정 인프라로 고정</b>하고, 제어는 <b>컨테이너 수를 적분(I) 피드백으로 ±소량</b> 미세 조정한다. 누수 회수는 더 이상 제어가 겸직하지 않는다(컨테이너 1솔브=죽음 + PID-ns 격리가 전담).
+</div>
+
+<h2>1. 왜 바꾸나 — 현행의 리플 원인</h2>
+<ul>
+<li>현행 <code>_managed_poll</code>: 2분 tick에 <b>홀수=잡 4개 submit / 짝수=가장 오래된 잡 kill</b>, +12분 포화제어(solve&gt;150시 oldest kill), +squeue-stuck 회복. 잡 1개 = 컨테이너 ~12개 = 유효 AEDT ~12 묶음.</li>
+<li>잡 단위로 ±하니 actuation 분해능이 <b>±12 AEDT</b>. 코호트가 통째로 뜨고/지며 유효 AEDT가 출렁인다(실측 리플 stddev 26→44).</li>
+<li>게다가 잡-죽임이 <b>누수 회수까지 겸직</b>해서, 제어하려고 잡을 죽이면 멀쩡한 솔브도 같이 버려졌다.</li>
+</ul>
+
+<h2>2. 새 구조 — 두 관심사 분리</h2>
+<table>
+<tr><th>관심사</th><th>담당</th><th>메커니즘</th></tr>
+<tr><td><b>누수 회수</b></td><td>컨테이너</td><td>1솔브=죽음 + <code>unshare --pid</code> 격리 → 솔브마다 OS가 전량 회수. <b>이미 해결·검증됨.</b></td></tr>
+<tr><td><b>잡(인프라)</b></td><td>JobOrchestrator</td><td><b>10개 고정·안정 유지</b>(죽으면 재기동, TTL은 길게/없음). 제어 목적의 잡-죽임 폐지.</td></tr>
+<tr><td><b>처리량 제어</b></td><td>ContainerController(신규)</td><td>유효 AEDT를 120으로 — <b>총 컨테이너 수 N을 적분 피드백</b>으로 미세 조정, 10잡에 분배.</td></tr>
+</table>
+
+<h2>3. 제어 법칙 (적분 I)</h2>
+<pre>매 tick (Δt = 30~60s):
+  aedt   = 유효_AEDT_관측()                # elec_solve_hfss 동시 솔브 수 (solve_provider)
+  err    = 120 - aedt
+  step   = clamp(round(Ki * err), -ΔN_max, +ΔN_max)   # Ki≈0.3~0.5, ΔN_max=3
+  N_total = clamp(N_total + step, N_min, N_max)        # 적분 상태 = 총 컨테이너 수
+  per_job = 분배(N_total, 잡 10개)                      # 균등 + 나머지 라운드로빈
+  → 각 잡 orchestrator가 /job_plan에서 per_job[i]를 읽어 respawn-to-N</pre>
+<ul>
+<li><b>적분이라 정상상태 오차 0</b>: 평균이 정확히 120으로 수렴(비례항만 쓰면 옵셋 남음).</li>
+<li><b>step 클램프(±3)</b>로 한 tick의 출렁임 제한 → 매끈한 출생률(Little's Law: λ≈120/11.5≈10.4 컨/min이면 솔브중=120 일정).</li>
+<li>N은 <b>컨테이너 단위</b>라 분해능 ±1~3 AEDT(잡 단위 ±12 대비 4~12배 미세).</li>
+<li>콜드스타트 herd 차단: 잡당 출생은 orchestrator가 stagger+cold_cap으로 이미 처리(웨이브 금지).</li>
+</ul>
+
+<h2>4. 배선 — 컨트롤러 → orchestrator</h2>
+<div class="flow">
+  <span class="box">ContainerController (tick 30~60s)</span><span class="arr">→</span>
+  <span class="box">per-job N 분배</span><span class="arr">→</span>
+  <span class="box">control plane <code>/job_plan?job=i</code> (:7879)</span><span class="arr">→</span>
+  <span class="box ok">orchestrator: N 재조회 + respawn-to-N</span>
+</div>
+<table>
+<tr><th>구성요소</th><th>지금</th><th>바뀜</th></tr>
+<tr><td><code>JobOrchestrator</code> (edt_orchestrator.py)</td><td>홀짝/oldest/포화/stuck로 잡 ±</td><td><b>잡 10 고정 유지만</b>(poll의 비-managed 경로처럼 죽은 슬롯 재기동). <code>_managed_poll</code>·<code>_stop_oldest_running</code>·saturation·stuck 제거.</td></tr>
+<tr><td>신규 <code>ContainerController</code></td><td>—</td><td>적분 상태 N_total 보유, tick마다 갱신, per-job 분배를 <code>/job_plan</code>으로 노출.</td></tr>
+<tr><td><code>deploy/orchestrator.sh</code></td><td>N 1회 fetch 후 <b>drain</b>(respawn 없음)</td><td>N <b>주기 재조회</b> + <b>respawn-to-N</b>(leaktest_orchestrator.sh가 이미 가진 패턴 이식). 잡은 안 죽고 컨테이너만 N 유지.</td></tr>
+<tr><td>control plane (edt_control_plane.py)</td><td>job_plan 정적</td><td>ContainerController를 tick 구동 + <code>/job_plan</code>이 동적 per-job N 서빙 + <code>/orch_report</code>로 실측 N 피드백.</td></tr>
+</table>
+
+<h2>5. 폐지 대상 (코드/문구)</h2>
+<ul>
+<li><code>_managed_poll</code> 홀짝(submit4/kill1) · <code>sequential_ramp</code> 경로 · <code>submit_batch_jobs</code>.</li>
+<li><code>_stop_oldest_running</code>/<code>_oldest_running</code>(가장-늙은-잡 종료) · saturation(<code>saturation_*</code>, 12분 포화제어).</li>
+<li>squeue-stuck 회복(<code>_stuck_at_cap_recovery_pending</code>, <code>_queue_is_stuck</code>) — 잡 고정이라 cap 경합 소멸(단 PENDING 취소/노드회피는 인프라 유지용으로 남길지 검토).</li>
+<li>LUT(룩업 기반 N) — 적분으로 대체.</li>
+</ul>
+
+<h2>6. 확정 필요 (네 결정)</h2>
+<div class="q">
+<b>Q1. 게인/주기:</b> Ki=0.4, tick=45s, ΔN_max=3 으로 시작(보수적)? 더 빠르게(tick 30s)?<br>
+<b>Q2. N 범위:</b> N_min/N_max(예: 80~150)? 유효 120 목표면 컨테이너는 ~120±α(솔브중 비율 고려).<br>
+<b>Q3. 분배 정책:</b> 10잡 균등(나머지 라운드로빈)이 기본. 노드 포화/느린 잡 가중 뺄지?<br>
+<b>Q4. 잡 TTL:</b> 고정 인프라라 TTL 길게(예: 6~8h 후 교체)로 누수·드리프트 방지? 아니면 무기한+죽으면 재기동만?<br>
+<b>Q5. 구현 순서:</b> 컨트롤러+테스트(dev) 먼저 → orchestrator respawn 이식 → control plane 배선 → hmlee31 검증 → harry261 배포. 이 순서로?
+</div>
+
+<h2>7. 완료 기준</h2>
+<ul>
+<li><code>pytest tests/</code> 통과(신규 ContainerController 적분/분배/클램프 단위테스트 포함).</li>
+<li>라이브: 유효 AEDT <b>120 평균·리플 한 자릿수</b> 수렴(관측).</li>
+<li>구정책(홀짝/LUT/가장-늙은-잡/12분 포화) 코드·테스트·문구에서 제거.</li>
+</ul>
+
+<p class="mut" style="margin-top:24px">— 선행조건: PID-ns 누수 픽스(<code>0f0ac1d</code>)를 harry261에 배포해 plant를 안정화한 뒤 이 제어를 올려야 적분이 깨끗이 수렴한다(누수로 잡이 흔들리면 제어 대상이 비정상).</p>
+
+</div>
+</body>
+</html>
