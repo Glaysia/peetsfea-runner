@@ -63,10 +63,6 @@ class PostgresResultStore:
 
     def initialize(self) -> None:
         with self._locked_connect() as connection:
-            # 스키마 마이그레이션 직렬화: keeper/web/data가 동시에 initialize()를 돌리면 같은 카탈로그
-            # DDL(트리거 DROP+CREATE 등)이 경합해 "tuple concurrently updated"·"trigger already exists"로
-            # 죽는다. 세션 advisory lock으로 한 번에 하나만 마이그레이션(연결 닫히면 자동 해제).
-            connection.execute("SELECT pg_advisory_lock(728192001)")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS single_simulation_results (
@@ -206,10 +202,6 @@ class PostgresResultStore:
                 )
                 """
             )
-            # 마이그레이션 직렬화 해제(위 pg_advisory_lock). _locked_connect는 persistent 연결이라
-            # 명시 해제하지 않으면 세션 lock이 영구 보유돼 다른 프로세스의 initialize()가 영구 블록된다.
-            # (예외로 여기 도달 못 하면 프로세스가 죽으며 연결死 → 세션 lock 자동 해제.)
-            connection.execute("SELECT pg_advisory_unlock(728192001)")
 
     def record_envelope(self, envelope: Mapping[str, Any]) -> None:
         self.initialize()
