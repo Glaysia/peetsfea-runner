@@ -119,9 +119,19 @@ spawn_one() {
     --env "EDT_JOB_INDEX=${EDT_JOB_INDEX:-0}" --env "EDT_GPU_COUNT=${EDT_GPU_COUNT:-0}" \
     --env "EDT_SLOT_COUNT=1" --env "EDT_MAX_SIMS=1" \
     --env "EDT_BASELINE_BATCH=1" --env "EDT_BASELINE_WATERMARK=1" --env "EDT_BASELINE_SEED_START=$seed" \
+    --env "EDT_PID_NS=${EDT_PID_NS:-1}" \
     "$C" /bin/bash -lc '
       export PATH=/mnt/AnsysEM:$PATH
-      exec "$VENVPY" -m peetsfea_runner.edt_entrypoint
+      # PID-ns 격리(EDT_PID_NS=1): python을 새 PID 네임스페이스의 PID 1로 띄운다 → 1솔브 후 python exit 시
+      # 커널이 그 ns의 잔여 프로세스(고아 ansysedt)를 전량 SIGKILL → 노드 누수 회수.
+      # enroot --root가 user-ns 안 CAP_SYS_ADMIN을 줘서 평유저도 unshare --pid 허용. --mount-proc로 /proc 정합.
+      # EDT_PID_NS=0이면 격리 없이(=기존 enroot 동작) — A/B 대조군용.
+      if [ "${EDT_PID_NS:-1}" = "1" ] && unshare --pid --fork --mount-proc true 2>/dev/null; then
+        exec unshare --pid --fork --mount-proc "$VENVPY" -m peetsfea_runner.edt_entrypoint
+      else
+        [ "${EDT_PID_NS:-1}" = "1" ] && echo "[orch] WARN: unshare --pid 불가 — 격리 없이 진행" >&2
+        exec "$VENVPY" -m peetsfea_runner.edt_entrypoint
+      fi
     ' > "$CLOG/${SLURM_JOB_ID}-${id}.log" 2>&1 &
   C_PID[$id]=$!; C_NAME[$id]=$C; C_CHOME[$id]=$CHOME; C_OUT[$id]=$COUT; C_BORN[$id]=$(date +%s)
   SPAWNED=$((SPAWNED+1))

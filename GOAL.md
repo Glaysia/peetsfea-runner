@@ -7,7 +7,7 @@
 ## 핵심 구조 전환 (홀짝·LUT 폐지)
 근원: 잡-죽음이 **누수회수 + 제어**를 겸직 → 제어하려고 잡을 죽이면 통째(±14)로 출렁여 리플. 둘을 분리한다.
 
-- **누수 회수 = 컨테이너 단위.** 컨테이너 `1솔브 = 죽음`(EDT_SLOT_COUNT=1, EDT_MAX_SIMS=1) → 솔브마다 OS가 메모리·gRPC 스레드·FD 전량 회수. 잡이 누수 때문에 죽을 이유 없음.
+- **누수 회수 = 컨테이너 단위 + PID-ns 격리.** 컨테이너 `1솔브 = 죽음`(EDT_SLOT_COUNT=1, EDT_MAX_SIMS=1) → 솔브마다 OS가 메모리·gRPC 스레드·FD 전량 회수. **단, enroot는 host PID ns를 공유해 `enroot remove`만으론 AEDT 고아 프로세스가 살아남아 누적된다(4h 검증: RSS 14→433GB·FD 339→32273, 221사이클 선형 폭증).** 그래서 컨테이너를 `unshare --pid --fork --mount-proc`(EDT_PID_NS=1, deploy/orchestrator.sh)로 띄워 python을 새 PID ns의 PID 1로 만든다 → exit 시 커널이 고아 전량 SIGKILL. **A/B 검증 완료(687790 격리=평탄 vs 687794 무격리=우상향, 동일 24사이클·12컨테이너).** 이제 잡이 누수 때문에 죽을 이유 없음.
 - **잡 = 고정 인프라 10개(안 죽임).** 64코어 cpu2 노드. 누수회수용 재활용이 필요하면 길게·stagger(웨이브 금지). 제어 목적의 잡-죽임 폐지.
 - **제어 = 컨테이너 수 적분(I) 피드백.** 통째 잡이 아니라 컨테이너 ±1~3로 미세 actuate.
   - 매 tick(30~60s): `err = 120 - 유효AEDT`; `N += clamp(round(Ki·err), -3, +3)` (Ki≈0.3~0.5). 적분 → 정상상태 오차 0(평균 정확히 120).
@@ -20,12 +20,12 @@
 - 로컬 컨트롤 = 다계정 brain: 두 게이트에 잡 제출, 둘 다 로컬 DB로 ingest. **license도 계정별 별도 체크아웃 = 총 용량 2배.**
 - 부트스트랩은 **수동(Claude 실행 가능)·wipe-safe**: 게이트 데이터 다 지워도 재구축. (자동화 필수 아님.)
 
-## 즉시 다음 단계 — 검증 먼저 (SSOT: `PLANS/leak_reclaim_test.html`)
-1. **gate1-hmlee31 부트스트랩**(venv 복제+경로치환, enroot 이미지 재사용) → `venv OK` 확인.
-2. **4h 테스트 잡**(per-solve, TTL=14400) — harry261 키퍼 켜둔 채 별도 잡으로:
-   - 누수 회수 검증: RSS·스레드·FD·/enroot **평탄(추세≈0)** 이면 "잡 안 죽여도 됨" 확정.
-   - 다계정 검증: hmlee31 잡이 ssh·sbatch·enroot·ingest 역터널·license 끝까지 동작.
-3. 통과 시 → 런처/터널 계정 파라미터화 + 키퍼 통합 + 아래 제어 재작성.
+## 즉시 다음 단계 (SSOT: `PLANS/leak_reclaim_test.html`)
+1. ✅ **gate1-hmlee31 부트스트랩**(venv 복제+경로치환, enroot 이미지 재사용) — `venv OK` 확인 완료.
+2. ✅ **누수 회수 검증 완료** — 4h 무격리 런이 전제 파괴(RSS 14→433GB) 발견 → 원인=host PID ns 공유로 AEDT 고아 누적 → **PID-ns 격리(`unshare --pid`)로 해결**, 동일조건 A/B(687790 평탄 vs 687794 우상향)로 확정.
+3. ⏳ **프로덕션 적용 대기(승인 필요):** `deploy/orchestrator.sh`에 EDT_PID_NS 격리 스테이징됨(dev). harry261 키퍼에 배포 = 별도 승인 시.
+4. ⏳ **다계정 ingest 검증 미완:** 코드는 됨(비대칭 역터널·account 태깅, dev). 단 노드 공유 시 7876 forward 충돌 → 계정별 포트 베이스로 재검증 필요. [[multi-account-ingest-port-collision]]
+5. ⏳ 런처/터널 계정 파라미터화 + 키퍼 통합 + 아래 제어 재작성.
 
 ## 완료된 것
 - **데이터플레인 갈아엎기**(SSOT: `PLANS/data_plane_overhaul.html`) — 라이브 배포됨:
