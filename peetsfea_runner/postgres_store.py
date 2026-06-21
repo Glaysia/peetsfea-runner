@@ -63,6 +63,10 @@ class PostgresResultStore:
 
     def initialize(self) -> None:
         with self._locked_connect() as connection:
+            # 스키마 마이그레이션 직렬화: keeper/web/data가 동시에 initialize()를 돌리면 같은 카탈로그
+            # DDL(트리거 DROP+CREATE 등)이 경합해 "tuple concurrently updated"·"trigger already exists"로
+            # 죽는다. 세션 advisory lock으로 한 번에 하나만 마이그레이션(연결 닫히면 자동 해제).
+            connection.execute("SELECT pg_advisory_lock(728192001)")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS single_simulation_results (
