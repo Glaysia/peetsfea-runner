@@ -206,6 +206,10 @@ class PostgresResultStore:
                 )
                 """
             )
+            # 마이그레이션 직렬화 해제(위 pg_advisory_lock). _locked_connect는 persistent 연결이라
+            # 명시 해제하지 않으면 세션 lock이 영구 보유돼 다른 프로세스의 initialize()가 영구 블록된다.
+            # (예외로 여기 도달 못 하면 프로세스가 죽으며 연결死 → 세션 lock 자동 해제.)
+            connection.execute("SELECT pg_advisory_unlock(728192001)")
 
     def record_envelope(self, envelope: Mapping[str, Any]) -> None:
         self.initialize()
