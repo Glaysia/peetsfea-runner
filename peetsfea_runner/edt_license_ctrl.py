@@ -26,6 +26,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .edt_container_control import ContainerController
+
 DEFAULT_LICENSE_CTRL_PORT = 7879
 
 
@@ -151,17 +153,22 @@ class LicenseController:
 
 @dataclass
 class ContainerScheduler:
-    """잡 출생 시 현재 solve 실측을 계단형 LUT로 읽어 컨테이너 수 N을 결정한다.
+    """유효 AEDT(동시 솔브)를 지령으로 수렴시키는 **적분 컨테이너 제어**.
 
-    1컨테이너=1솔브=종료(respawn 없음)라 잡은 시간이 지나며 드레인된다. /orch_report는 관측/대시보드용이며
-    잡 교체 후보는 JobOrchestrator가 RUNNING 잡의 시작 시각으로 고른다.
+    잡은 고정 인프라(JobOrchestrator가 10개 안정 유지)고, 처리량 제어는 매 tick(control_period)마다
+    `ContainerController`가 `err=120-solve`로 총 컨테이너 N을 적분 갱신 → `plan_for(job)`이 잡별 목표를
+    돌려준다. orchestrator가 `/job_plan?job=i`를 주기 재조회해 respawn-to-N. (구 LUT·드레인 폐지 —
+    `PLANS/integral_container_control.html`.) /orch_report는 관측/대시보드용 실측 N 피드백.
     """
 
     snapshot_provider: Callable[[], Mapping[str, Any]]   # poller.snapshot
+    controller: ContainerController = field(default_factory=ContainerController)
+    control_period_seconds: float = 45.0  # 적분 tick 주기(키퍼 루프보다 길게 — 슬램 방지)
     report_ttl_seconds: float = 60.0
     clock: Callable[[], float] = time.monotonic
     _reports: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _last_control: float = field(default=float("-inf"), init=False, repr=False)
 
     def current_solve(self) -> int:
         try:
@@ -171,21 +178,14 @@ class ContainerScheduler:
         return int((snap.get("license") or {}).get("solve_mine") or 0)
 
     def decide_n(self, solve: int | None = None) -> int:
-        """LUT: 현재 동시 솔브 → 새 잡의 컨테이너 수 N."""
-        s = self.current_solve() if solve is None else int(solve)
-        if s <= 90:
-            return 20
-        if s <= 100:
-            return 15
-        if s <= 110:
-            return 14
-        if s <= 120:
-            return 13
-        if s <= 130:
-            return 12
-        if s <= 140:
-            return 11
-        return 10
+        """현재 총 컨테이너 목표 N_total(적분 상태). 관측/호환용 — 잡별 목표는 plan_for(i)."""
+        with self._lock:
+            return self.controller.n_total
+
+    def plan_for(self, job_index: int) -> int:
+        """잡 i의 현재 컨테이너 목표(/job_plan?job=i 서빙). 적분 N_total을 고정 잡들에 분배한 값."""
+        with self._lock:
+            return self.controller.plan_for(job_index)
 
     def report(self, slurm_id: str, live: int, **extra: Any) -> None:
         """orchestrator가 살아있는 컨테이너 수 보고."""
@@ -204,8 +204,21 @@ class ContainerScheduler:
             return int(r["live"])
 
     def tick(self) -> None:
-        """오래된(죽은 orchestrator) 보고 정리."""
+        """control_period마다 적분 1회(err=120-solve로 N_total 갱신) + 오래된 보고 정리.
+
+        키퍼 루프는 빠르게(수초) 돌므로, 적분 tick은 control_period_seconds로 율제한해야 ±dn_max가
+        매 루프 누적돼 한계로 슬램되지 않는다. solve 관측은 락 밖에서(스냅샷이 느릴 수 있음).
+        """
         now = self.clock()
+        do_control = False
+        with self._lock:
+            if (now - self._last_control) >= self.control_period_seconds:
+                do_control = True
+                self._last_control = now
+        if do_control:
+            solve = self.current_solve()
+            with self._lock:
+                self.controller.tick(solve)
         with self._lock:
             for sid in [s for s, r in self._reports.items() if now - r["ts"] > self.report_ttl_seconds]:
                 self._reports.pop(sid, None)
@@ -213,7 +226,11 @@ class ContainerScheduler:
     def status(self) -> dict[str, Any]:
         with self._lock:
             reps = {s: r["live"] for s, r in self._reports.items()}
-        return {"solve": self.current_solve(), "decide_n": self.decide_n(), "reports": reps}
+            n_total = self.controller.n_total
+        return {
+            "solve": self.current_solve(), "n_total": n_total,
+            "target_aedt": self.controller.target_aedt, "reports": reps,
+        }
 
 
 def start_license_ctrl_server(
@@ -246,7 +263,12 @@ def start_license_ctrl_server(
                 _write_json(self, 200, st)
                 return
             if parsed.path in ("/job_plan", "/container_plan"):
-                n = scheduler.decide_n() if scheduler is not None else 0
+                # 잡별 컨테이너 목표(적분 N_total을 고정 잡들에 분배). job 미지정이면 총 N_total.
+                if scheduler is None:
+                    n = 0
+                else:
+                    job_q = parse_qs(parsed.query).get("job", [""])[0]
+                    n = scheduler.plan_for(int(job_q)) if job_q.isdigit() else scheduler.decide_n()
                 _write_json(self, 200, {"n": n})
                 return
             _write_json(self, 404, {"error": "not_found"})

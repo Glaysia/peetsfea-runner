@@ -4,6 +4,7 @@ import json
 import threading
 import urllib.request
 
+from peetsfea_runner.edt_container_control import ContainerController
 from peetsfea_runner.edt_license_ctrl import (
     ContainerScheduler,
     LicenseController,
@@ -150,18 +151,27 @@ def test_per_job_handles_malformed_worker_id() -> None:
     assert c.per_job()["?"]["active"] == 1
 
 
-def test_container_scheduler_uses_html_lut() -> None:
-    scheduler = ContainerScheduler(snapshot_provider=lambda: {"license": {"solve_mine": 0}})
-    cases = [
-        (0, 20),
-        (90, 20),
-        (91, 15),
-        (100, 15),
-        (110, 14),
-        (120, 13),
-        (130, 12),
-        (140, 11),
-        (141, 10),
-        (150, 10),
-    ]
-    assert [scheduler.decide_n(solve) for solve, _ in cases] == [expected for _, expected in cases]
+def test_container_scheduler_integral_control_and_distribution() -> None:
+    # LUT 폐지 → 적분 제어. tick은 control_period로 율제한(키퍼 루프 슬램 방지), plan_for는 잡별 분배.
+    solve = {"v": 100}
+    t = {"v": 0.0}
+    sched = ContainerScheduler(
+        snapshot_provider=lambda: {"license": {"solve_mine": solve["v"]}},
+        controller=ContainerController(target_aedt=120, ki=0.4, dn_max=3, n_min=80, n_max=150, n_total=100),
+        control_period_seconds=45.0,
+        clock=lambda: t["v"],
+    )
+    sched.tick()                       # t=0 첫 tick: solve=100<120 → +3
+    assert sched.decide_n() == 103
+    sched.tick()                       # 주기 미경과 → 무시(율제한)
+    assert sched.decide_n() == 103
+    t["v"] = 45.0
+    sched.tick()                       # 주기 경과 → +3
+    assert sched.decide_n() == 106
+    dist = sched.controller.distribute()            # N_total을 고정 잡들에 분배
+    assert sum(dist) == 106 and max(dist) - min(dist) <= 1
+    assert sched.plan_for(0) == dist[0]             # /job_plan?job=0 == 분배[0]
+    t["v"] = 90.0
+    solve["v"] = 200                   # solve>지령 → 감소
+    sched.tick()
+    assert sched.decide_n() == 103

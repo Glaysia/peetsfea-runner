@@ -169,15 +169,13 @@ class ControlPlane:
             self.license_controller = controller
             if self.resource_poller is not None:
                 self.resource_poller.aedt_provider = controller.per_job  # 컨테이너(잡)별 pyaedt 수 → 부하 탭
-                # 잡 출생 시 LUT로 컨테이너 수 N 결정.
+                # 적분 컨테이너 제어: 잡은 고정, 잡별 컨테이너 목표를 /job_plan으로 동적 서빙.
                 self.container_scheduler = ContainerScheduler(
                     snapshot_provider=self.resource_poller.snapshot,
                 )
-                # 와이어링: 런처는 출생 시 N을 주입, orchestrator는 solve 실측으로 12분 포화 감압.
+                # container_count_provider 미주입(None) → orchestrator가 /job_plan?job=i를 주기
+                # 재조회해 respawn-to-N. solve_provider는 관측/상태용으로 유지.
                 if self.orchestrator is not None:
-                    launcher = self.orchestrator.launcher
-                    if isinstance(launcher, SlurmJobLauncher):
-                        launcher.container_count_provider = self.container_scheduler.decide_n
                     self.orchestrator.solve_provider = self.container_scheduler.current_solve
             license_server = start_license_ctrl_server(
                 controller=controller, scheduler=self.container_scheduler, port=self.license_ctrl_port
