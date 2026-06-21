@@ -79,10 +79,11 @@
 <table>
 <tr><th>구성요소</th><th>지금</th><th>바뀜</th></tr>
 <tr><td><code>JobOrchestrator</code> (edt_orchestrator.py)</td><td>홀짝/oldest/포화/stuck로 잡 ±</td><td><b>잡 10 고정 유지만</b>(poll의 비-managed 경로처럼 죽은 슬롯 재기동). <code>_managed_poll</code>·<code>_stop_oldest_running</code>·saturation·stuck 제거.</td></tr>
-<tr><td>신규 <code>ContainerController</code></td><td>—</td><td>적분 상태 N_total 보유, tick마다 갱신, per-job 분배를 <code>/job_plan</code>으로 노출.</td></tr>
+<tr><td><code>ContainerScheduler.decide_n</code> (edt_license_ctrl.py)</td><td><b>LUT</b>(solve→N 계단형, 잡 출생 시 1회)</td><td>LUT를 <b>적분 <code>ContainerController</code>로 교체</b>(이미 구현·테스트: <code>edt_container_control.py</code>). 스케줄러가 컨트롤러를 품고 tick마다 <code>tick(current_solve)</code>→N_total 갱신, <code>/job_plan?job=i</code>가 <code>plan_for(i)</code> 서빙. decide_n 의미가 "출생시 N"→"잡별 동적 목표"로 전환.</td></tr>
 <tr><td><code>deploy/orchestrator.sh</code></td><td>N 1회 fetch 후 <b>drain</b>(respawn 없음)</td><td>N <b>주기 재조회</b> + <b>respawn-to-N</b>(leaktest_orchestrator.sh가 이미 가진 패턴 이식). 잡은 안 죽고 컨테이너만 N 유지.</td></tr>
-<tr><td>control plane (edt_control_plane.py)</td><td>job_plan 정적</td><td>ContainerController를 tick 구동 + <code>/job_plan</code>이 동적 per-job N 서빙 + <code>/orch_report</code>로 실측 N 피드백.</td></tr>
+<tr><td>control plane (edt_control_plane.py)</td><td><code>sequential_ramp=True</code>로 managed 루프</td><td>orchestrator를 안정-잡 모드로, ContainerScheduler tick에 컨트롤러 구동 배선.</td></tr>
 </table>
+<div class="q"><b>⚠ 결합(쪼개기 금지):</b> LUT만 적분으로 바꾸고 JobOrchestrator 홀짝·orchestrator 드레인을 남기면 비정합(적분 N인데 잡은 churn·컨테이너는 드레인). <b>잡 고정 + respawn-to-N + 적분 LUT교체 = 한 묶음</b>으로 같이 가야 동작. 반쪽은 현 작동 시스템보다 나쁨 → coordinated 변경 + plant 안정화(PID-ns 배포) 선행 후 한 번에.</div>
 
 <h2>5. 폐지 대상 (코드/문구)</h2>
 <ul>
