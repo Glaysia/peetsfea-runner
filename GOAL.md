@@ -54,3 +54,13 @@ control plane을 **계정 리스트**로 일반화. 각 account = 독립 스택(
 - **hmlee31 poller license=None**: hmlee31 resource 서버(7892) 스냅샷에 license 없음 → solve=0 오독 → 적분 과spawn. lmstat 경로/파싱이 hmlee31 ssh 환경에서 실패하는 듯. 조사 필요.
 - **타깃 380(190×2) 비현실적**: harry261+hmlee31이 같은 cpu2 ~10노드 공유(타유저까지 경합). 노드가 병목이라 합쳐도 유효 AEDT ~150대에서 포화. 적분이 도달못할 190을 쫓아 n_max(220)에 영구 포화 → N=20/job 과spawn churn. **현실 타깃은 클러스터 용량(~150 합계)으로 낮춰야 적분 수렴·churn 제거.** 다계정의 "라이선스 2배"는 노드 남을 때만 의미 — 이 클러스터선 노드가 한계.
 - **현재 판단**: harry261 안정 축적 중·NRestarts=0·/enroot 평탄. 위 수정은 모두 재시작 필요(churn은 노드제한으로 비파괴적)이라, 안정 축적 우선으로 밤샘엔 기록만. 아침에 사용자와 타깃 현실화 + 포트주입 + license픽스 협응 수정.
+
+## 🌙 밤샘 최종 상태 (2026-06-23 ~01:30)
+- **harry261 단일계정 0.3.9.0으로 안정 축적**(account_01, ~77+ 결과·계속). hmlee31 비활성화(churn 제거 → harry261 풀클러스터).
+- **hmlee31 미해결(아침 인터랙티브 디버그용 단서):** ansysedt가 컨테이너 시작 시 rc=134(SIGABRT). 시도·배제한 것:
+  1. ✅ license 비어있던 것 → orchestrator 기본값 `1055@license-server`로 해결(harry261 작동값, IP 172.16.10.81은 미작동).
+  2. ✅ stale `~/Ansoft`·`~/.ansys`·`~/.mw`(harry261보다 오래됨, 옛 라이브러리 경로) 전부 백업·제거 → **그래도 rc=134 지속**.
+  3. ✅ 디버그 컨테이너서 ansysedt를 **직접**(no $HOME mount, HOME=/root) 돌리면 **정상 구동**(first-time config OK, rc=124 타임아웃=서버 살아있음). 즉 이미지·AEDT설치·license는 정상.
+  - **미규명 차이**: 실 컨테이너는 `$HOME:$HOME` 마운트 + `HOME=$CHOME`(엔트리포인트→backend→ansysedt). 디버그는 그게 없었음. ansysedt가 getpwuid 실홈(/home1/hmlee31)의 무언가를 읽어 abort하는 듯. backend가 ansysedt stderr를 DEVNULL로 버려(edt_aedt_backend.py:107-108) 실에러 미포착 — **DEVNULL을 파일로 바꿔 실 컨테이너의 ansysedt stderr를 잡는 게 다음 수**.
+  - 재활성: keeper/web unit EDT_ACCOUNTS에 `,gate1-hmlee31:account_02:1` 추가 + 위 stderr 캡처로 근본원인.
+- 백업: hmlee31 ~/Ansoft.stale.bak.*, ~/.ansys.stale.*, ~/.mw.stale.* (복원 가능).
