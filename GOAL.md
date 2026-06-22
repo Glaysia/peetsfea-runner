@@ -70,3 +70,6 @@ control plane을 **계정 리스트**로 일반화. 각 account = 독립 스택(
 - 실패 분포: **70 = "SSW report export did not create CSV"**(솔브는 도는데 리포트 CSV 미생성), 10 = FileNotFoundError, 2 = AssertionError, +"Raw Hfss.project_name must be str (actual=NoneType)"(코드).
 - **성공 솔브 elapsed ~85분 평균(35~140분)** — 사용자가 빡세게 한 설정이 예상(25분)보다 훨씬 김. 성공이 3.2코어/컨테이너(n_total 220→20/잡÷64코어)로도 완료되니 코어부족 아님 → 실패는 **미수렴 설계점 or 0.3.9.0 report export 이슈**.
 - **판단지점(사용자):** ① 해석설정 강도를 약간 낮춰 수렴율↑(정확도 vs 수율 트레이드오프) ② peetsfea 0.3.9.0의 SSW report export/project_name=None 회귀 조사(0.3.8.1과 비교) ③ 타깃 190→~90 낮추면 컨테이너당 코어↑로 솔브 빨라짐(수율↑일 수 있음, 단 성공률 자체는 설계점 수렴 문제라 큰 변화 불확실). 내가 함부로 안 바꿈(사용자 의도적 빡센설정 + 재시작 리스크).
+
+## ✅ 성공률 정정 (04:15)
+초기 낮은 성공률(누적 30%·최근14%)은 **hmlee31 churn + 램프 혼란기의 일시적 현상**이었음. hmlee31 비활성화·안정화 후 **최근 성공률 60~80%로 회복**(최근15: 12/15). 안정 단일계정 0.3.9.0이 정상 수율로 데이터 축적 중. ("report export 실패"는 일부 어려운 설계점에서 잔존하나 dominant 아님 — 빡센 설정의 자연스런 일부.)
