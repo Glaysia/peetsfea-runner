@@ -3,6 +3,13 @@
 > 사용자 퇴근. 전권 위임: "갈아엎어도 되니 정석적으로, 너가 다 결정해서 오늘 밤 동안 다 해라."
 > 이 문서 = Claude가 밤새 자율로 실행하는 SSOT. Stop 훅이 이걸 달성하라고 구동한다.
 
+## ✅ 라이브 달성 (2026-06-22 밤)
+- **다계정 정석 구현·배포 완료**: control plane이 `accounts` 리스트로 harry261(idx0,7876대)+hmlee31(idx1,7886대)를 한 프로세스에서 구동(`EDT_ACCOUNTS` env). 계정별 런처·오케스트레이터·폴러·라이선스·ingest/lease/license 서버·역터널. 결과는 단일 DB에 account_id 태깅. 162 passed, main=dev.
+- **peetsfea 0.3.9.0** 로컬+양 게이트 venv, fresh `peetsfea` DB(0.3.8x는 `peetsfea_0_3_8x`+덤프 백업).
+- **양 계정 라이브 제출·수렴 시작**: harry261 ~10잡, hmlee31 ~7잡. 양 license 서버(7879/7889) target190. 유효 AEDT 램프업, account_01 ingest 시작. 빡센 0.3.9.0 솔브 ~25분.
+- **현실 제약(노드 경합)**: cpu2 ~10노드를 두 계정+타유저가 공유 → 20잡 다 못 올라가고 ~17잡 운영(`no available node`는 키퍼가 재시도, 견고). 총 처리량은 노드가 병목(라이선스 아님). 데이터는 양 계정에서 안정 축적 중.
+- **모니터링 가동**: `/tmp/overnight_monitor.log`(5분 간격 ~4.7h) — 잡수·유효AEDT·account별 ingest·키퍼NR·/enroot.
+
 ## 최종 목표 (오늘 밤)
 1. **정석 다계정 control plane**: 키퍼가 harry261 + hmlee31 **두 계정을 구동**. 단일계정 하드코딩 제거.
 2. **peetsfea 0.3.9.0**로 양 계정 라이브 — **유효 AEDT 380(계정당 190) / 잡 20(계정당 10) / 리플 최소**.
