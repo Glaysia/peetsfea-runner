@@ -48,3 +48,9 @@ control plane을 **계정 리스트**로 일반화. 각 account = 독립 스택(
 ## 완료된 것 (히스토리)
 - 데이터플레인(seq커서+Arrow :7884, bulk/ArchiveStore 제거). cpu2 64코어. 적분제어 통합 3/3. PID-ns 누수픽스. 잡별 sshd. 4h TTL. 키퍼 견고화. peetsfea 0.3.9.0 venv. 0.3.8x DB 백업/격리.
 - 참고: PLANS/integral_container_control.html, PLANS/per_job_debug_access.html, PLANS/data_plane_overhaul.html, [[multi-account-ingest-port-collision]], [[leak-reclaim-needs-pid-ns]].
+
+## ⚠ 밤샘 중 발견 (재시작 필요 → 사용자 인지 하에 수정 권장)
+- **계정별 포트 미주입**: 런처가 EDT_INGEST_PORT/LICENSE_CTRL_PORT/PRIORITY_LEASE_PORT를 잡 sbatch에 주입 안 함 → 양 계정 잡이 기본 7876/7878/7879로 push/fetch(같은 gate loopback의 harry261 역터널 경유). 결과는 들어오나(account_02 태깅 OK) hmlee31이 자기 컨트롤러(7889) 대신 harry261 컨트롤러(7879)를 따름. 수정: 런처에 ingest/lease/license_port 필드 추가 + sbatch export(account.port_base에서).
+- **hmlee31 poller license=None**: hmlee31 resource 서버(7892) 스냅샷에 license 없음 → solve=0 오독 → 적분 과spawn. lmstat 경로/파싱이 hmlee31 ssh 환경에서 실패하는 듯. 조사 필요.
+- **타깃 380(190×2) 비현실적**: harry261+hmlee31이 같은 cpu2 ~10노드 공유(타유저까지 경합). 노드가 병목이라 합쳐도 유효 AEDT ~150대에서 포화. 적분이 도달못할 190을 쫓아 n_max(220)에 영구 포화 → N=20/job 과spawn churn. **현실 타깃은 클러스터 용량(~150 합계)으로 낮춰야 적분 수렴·churn 제거.** 다계정의 "라이선스 2배"는 노드 남을 때만 의미 — 이 클러스터선 노드가 한계.
+- **현재 판단**: harry261 안정 축적 중·NRestarts=0·/enroot 평탄. 위 수정은 모두 재시작 필요(churn은 노드제한으로 비파괴적)이라, 안정 축적 우선으로 밤샘엔 기록만. 아침에 사용자와 타깃 현실화 + 포트주입 + license픽스 협응 수정.
