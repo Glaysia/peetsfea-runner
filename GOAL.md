@@ -1,49 +1,43 @@
-# GOAL — 안정 잡 + 컨테이너 적분제어 (리플 최소) · 다계정
+# GOAL — 다계정 적분제어 정석 구현 + 0.3.9.0 + 밤샘 모니터링 (자율 실행)
 
-## 지령 (setpoint)
-- **유효 AEDT(동시 솔브, `elec_solve_hfss`) = 120**, **잡 = 10**, **리플 최소**.
-- plant가 예측 가능해짐: GPU 노드 폐기 → cpu2 전용·균일(솔브 ~11.5분 일정). 적분제어가 깔끔히 수렴할 조건.
+> 사용자 퇴근. 전권 위임: "갈아엎어도 되니 정석적으로, 너가 다 결정해서 오늘 밤 동안 다 해라."
+> 이 문서 = Claude가 밤새 자율로 실행하는 SSOT. Stop 훅이 이걸 달성하라고 구동한다.
 
-## 핵심 구조 전환 (홀짝·LUT 폐지)
-근원: 잡-죽음이 **누수회수 + 제어**를 겸직 → 제어하려고 잡을 죽이면 통째(±14)로 출렁여 리플. 둘을 분리한다.
+## 최종 목표 (오늘 밤)
+1. **정석 다계정 control plane**: 키퍼가 harry261 + hmlee31 **두 계정을 구동**. 단일계정 하드코딩 제거.
+2. **peetsfea 0.3.9.0**로 양 계정 라이브 — **유효 AEDT 380(계정당 190) / 잡 20(계정당 10) / 리플 최소**.
+3. 빡센 솔브(정확도↑, 2~3배≈25~35분) 결과가 단일 DB로 ingest(account_id 태깅), **밤새(~4h+) 모니터링**.
 
-- **누수 회수 = 컨테이너 단위 + PID-ns 격리.** 컨테이너 `1솔브 = 죽음`(EDT_SLOT_COUNT=1, EDT_MAX_SIMS=1) → 솔브마다 OS가 메모리·gRPC 스레드·FD 전량 회수. **단, enroot는 host PID ns를 공유해 `enroot remove`만으론 AEDT 고아 프로세스가 살아남아 누적된다(4h 검증: RSS 14→433GB·FD 339→32273, 221사이클 선형 폭증).** 그래서 컨테이너를 `unshare --pid --fork --mount-proc`(EDT_PID_NS=1, deploy/orchestrator.sh)로 띄워 python을 새 PID ns의 PID 1로 만든다 → exit 시 커널이 고아 전량 SIGKILL. **A/B 검증 완료(687790 격리=평탄 vs 687794 무격리=우상향, 동일 24사이클·12컨테이너).** 이제 잡이 누수 때문에 죽을 이유 없음.
-- **잡 = 고정 인프라 10개(안 죽임).** 64코어 cpu2 노드. 누수회수용 재활용이 필요하면 길게·stagger(웨이브 금지). 제어 목적의 잡-죽임 폐지.
-- **제어 = 컨테이너 수 적분(I) 피드백.** 통째 잡이 아니라 컨테이너 ±1~3로 미세 actuate.
-  - 매 tick(30~60s): `err = 120 - 유효AEDT`; `N += clamp(round(Ki·err), -3, +3)` (Ki≈0.3~0.5). 적분 → 정상상태 오차 0(평균 정확히 120).
-  - 잡 10개에 균등 분배, 잡당 출생 큐로 **stagger**(노드당 콜드스타트 cap) → 코호트 제거.
-- **수학(Little's Law):** 매끈한 출생률 λ=120/11.5≈10.4 컨테이너/min → 솔브중=120 일정(리플≈0). 리플은 λ 버스트에서만 생김.
-- **폐지:** 2분 홀짝(submit4/kill1), LUT, 가장-늙은-잡 종료, squeue 15 stuck 회복, 12분 포화제어.
+## 아키텍처 (정석 — 계정별 런타임 스택)
+control plane을 **계정 리스트**로 일반화. 각 account = 독립 스택(검증된 단일계정 로직 재사용), 공유는 DB·대시보드뿐:
+- account = {ssh_host, account_id, host_alias, account_index, port_base, job_count, target_aedt}.
+  - harry261: gate1-harry261, account_01, idx0, 포트 7876/7878/7879, 잡10, target190.
+  - hmlee31 : gate1-hmlee31, account_02, idx1, 포트 7886/7888/7889, 잡10, target190.
+- 계정별: 런처(ssh_host) + 오케스트레이터(잡10 고정·respawn-to-N) + 적분 컨트롤러(190/10) + license/job_plan 서버(포트베이스) + ingest 서버(포트베이스) + 역터널(대칭, gate:78x6→local:78x6). 컨테이너는 account 태깅(EDT_ACCOUNT_ID).
+- **공유**: postgres DB 1개(양 계정 결과, account_id 구분) + 대시보드 1개(:8080, 공유 DB 읽어 양 계정 표시).
+- 적분은 계정별 독립(각 190 수렴) → 합 380. 노드/라이선스 차이를 계정별로 자가흡수.
+- 구현: `ControlPlaneConfig.accounts: list`로 확장, 기동 루프가 계정마다 스택 생성. 단일계정은 accounts=[harry261] 특수케이스. **테스트 추가**(다계정 라우팅·포트 분리·태깅).
 
-## 다계정 (harry261 + hmlee31)
-- 게이트/계정을 파라미터화(ssh_host·역터널·게이트 home·SLURM 계정). harry261 하드코딩 제거.
-- 로컬 컨트롤 = 다계정 brain: 두 게이트에 잡 제출, 둘 다 로컬 DB로 ingest. **license도 계정별 별도 체크아웃 = 총 용량 2배.**
-- 부트스트랩은 **수동(Claude 실행 가능)·wipe-safe**: 게이트 데이터 다 지워도 재구축. (자동화 필수 아님.)
+## 실행 순서 (단계별, 검증하며)
+0. **현재 상태**: 서비스 down(pg만), DB 격리됨(peetsfea→peetsfea_0_3_8x, 백업 db_backups/peetsfea_0.3.8x_*.dump), 0.3.9.0 로컬+harry261게이트 venv 적용. harry261 단일계정 코드는 라이브 직전(target190/잡10).
+1. **hmlee31 게이트 준비**: peetsfea 0.3.9.0 동기화(로컬 venv→hmlee31 게이트 venv, harry261 때처럼) + 최신 orchestrator.sh 배포. venv import/솔브 경로 확인.
+2. **다계정 control plane 구현**(코드 갈아엎기 OK): accounts 리스트 + 계정별 스택 + 라우팅 + 태깅. `pytest tests/ -q` 통과. main 커밋, dev 동기화.
+3. **순차 기동**(동시 init race 회피): harry261 스택 먼저 완전 기동 → 검증 → hmlee31 스택 기동. fresh peetsfea 생성. 양 계정 잡 제출·orchestrator /job_plan fetch·PID-ns·컨테이너 솔브 확인.
+4. **수렴 검증**: 유효 AEDT가 380(계정별 190)으로 오르는지, account_id별 ingest 들어오는지, 리플·키퍼 안정.
+5. **밤새 모니터링(~4h+)**: 30~60min 간격 — 실패율·유효 AEDT/target·리플·NRestarts·/enroot 누수·고아 AEDT·account별 결과율. 문제 시 자가수정(키퍼는 노드부족/예외에 안 죽게 이미 견고화됨). 큰 이상이면 안전 정지 + 기록.
 
-## 즉시 다음 단계 (SSOT: `PLANS/leak_reclaim_test.html`)
-1. ✅ **gate1-hmlee31 부트스트랩**(venv 복제+경로치환, enroot 이미지 재사용) — `venv OK` 확인 완료.
-2. ✅ **누수 회수 검증 완료** — 4h 무격리 런이 전제 파괴(RSS 14→433GB) 발견 → 원인=host PID ns 공유로 AEDT 고아 누적 → **PID-ns 격리(`unshare --pid`)로 해결**, 동일조건 A/B(687790 평탄 vs 687794 우상향)로 확정.
-3. ⏳ **프로덕션 적용 대기(승인 필요):** `deploy/orchestrator.sh`에 EDT_PID_NS 격리 스테이징됨(dev). harry261 키퍼에 배포 = 별도 승인 시.
-4. ⏳ **다계정 ingest 검증 미완:** 코드는 됨(비대칭 역터널·account 태깅, dev). 단 노드 공유 시 7876 forward 충돌 → 계정별 포트 베이스로 재검증 필요. [[multi-account-ingest-port-collision]]
-5. ⏳ 런처/터널 계정 파라미터화 + 키퍼 통합 + 아래 제어 재작성.
-
-## 완료된 것
-- **데이터플레인 갈아엎기**(SSOT: `PLANS/data_plane_overhaul.html`) — 라이브 배포됨:
-  - seq 증분 커서(트리거) + read API `:7884 /api/results?since=`(Arrow IPC 스트림). 학습은 변경분만.
-  - `/results.parquet`·`:7877 bulk`·ArchiveStore 제거(FD死 부류 소멸). entrypoint 성공-삭제로 디스크 정리.
-  - 프로세스: keeper / web / **data(read 평면)** / pg.
-- **cpu2 전용 + 64코어** — gpu 노드 폐기(GPU 미사용 확인: nvidia-smi 0%, peetsfea는 gpus 넘기나 HFSS 미가속).
-
-## 주요 수정 대상 (검증 통과 후)
-- `peetsfea_runner/edt_orchestrator.py`: 홀짝·LUT·가장-늙은-잡 종료·포화제어 제거 → **잡10 고정 + 컨테이너 수 적분제어**.
-- slot_service: 프로덕션 장수-AEDT형 → **per-solve(1솔브 컨테이너)형** 전환(누수 회수를 컨테이너로).
-- `peetsfea_runner/edt_slurm_launcher.py` + 터널: **계정 파라미터화**(harry261/hmlee31).
-- `peetsfea_runner/edt_control_plane.py`: 다계정 키퍼 통합, 적분제어 tick(30~60s) 배선.
-- 테스트 갱신.
+## 안전·원칙
+- 매 코드 변경 후 `pytest` 통과 확인. 프로덕션 기동은 **순차**(advisory lock 폐기 → concurrent init race는 순차로만 회피).
+- 키퍼는 가용노드 부족/submit 예외에 안 죽음(`7b59f6b`). PID-ns로 누수 회수. 4h 잡 TTL.
+- 되돌리기: 0.3.8x는 `peetsfea_0_3_8x` DB + 덤프로 복원 가능. 코드는 git(main/dev) 히스토리.
+- 망가뜨리면(오늘 advisory lock·예외누락으로 2번 깸) **즉시 원인 격리 + 안전버전 복귀**, 무한 crash-loop 방치 금지.
 
 ## 완료 조건
-- `.venv/bin/python -m pytest tests/ -q` 통과.
-- 유효 AEDT가 **120 평균·리플 한 자릿수**로 수렴(라이브 관측).
-- 다계정(harry261+hmlee31) 둘 다 잡 제출·ingest 정상.
-- 구정책(홀짝/LUT/가장-늙은-잡/12분 포화) 문구·동작 코드/테스트에서 제거.
-- 서비스 재시작/배포는 별도 요청 시에만(harry261 주, hmlee31 검증).
+- 다계정 control plane이 harry261+hmlee31 둘 다 잡 제출·ingest(account_id 태깅) 정상.
+- peetsfea 0.3.9.0 빡센 솔브가 양 계정에서 돌고 결과 DB 적재.
+- 유효 AEDT **380 평균 수렴·리플 한 자릿수**(라이브), 키퍼 NRestarts 안정.
+- `pytest tests/ -q` 통과. main=dev 일치. 밤새 모니터링 로그 남김.
+
+## 완료된 것 (히스토리)
+- 데이터플레인(seq커서+Arrow :7884, bulk/ArchiveStore 제거). cpu2 64코어. 적분제어 통합 3/3. PID-ns 누수픽스. 잡별 sshd. 4h TTL. 키퍼 견고화. peetsfea 0.3.9.0 venv. 0.3.8x DB 백업/격리.
+- 참고: PLANS/integral_container_control.html, PLANS/per_job_debug_access.html, PLANS/data_plane_overhaul.html, [[multi-account-ingest-port-collision]], [[leak-reclaim-needs-pid-ns]].
