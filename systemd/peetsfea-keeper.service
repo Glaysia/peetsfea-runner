@@ -15,6 +15,8 @@ Environment=EDT_STORE_BACKEND=postgres
 Environment=EDT_PG_DSN=postgresql://peets@127.0.0.1:5433/peetsfea
 Environment=EDT_SSH_HOST=gate1-harry261
 Environment=EDT_JOB_COUNT=10
+# 다계정: 한 키퍼가 harry261(idx0, 포트 7876대) + hmlee31(idx1, 포트 7886대) 둘 다 구동.
+Environment=EDT_ACCOUNTS=gate1-harry261:account_01:0,gate1-hmlee31:account_02:1
 Restart=always
 RestartSec=10
 # 상시 가동: 실행시간 상한 없음(잡 수명 10h는 오케스트레이터가 내부 관리).
@@ -22,6 +24,7 @@ TimeoutStopSec=200s
 # 하드 킬 대비: 잔류 peetsfea-edt 잡을 safe-scancel로 정리(raw scancel 금지 — /enroot 잔재 방지).
 # graceful SIGTERM으로 잡 스크립트 trap이 /enroot를 청소할 시간을 주고, 끝내 안 죽으면 강제 종료.
 ExecStopPost=/usr/bin/ssh gate1-harry261 bash edt-deploy/safe_scancel.sh
+ExecStopPost=-/usr/bin/ssh gate1-hmlee31 bash edt-deploy/safe_scancel.sh
 
 [Install]
 WantedBy=default.target

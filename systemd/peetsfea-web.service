@@ -20,8 +20,10 @@ Environment=EDT_ARCHIVE_BUFFER_BYTES=1099511627776
 Environment=EDT_SSH_HOST=gate1-harry261
 Environment=EDT_DASHBOARD_PORT=8080
 Environment=EDT_INTAKE_PORT=7875
-# 대시보드에 노출할 결과 버전(빈 값=전 버전). 버전 채택 바뀌면 여기만 고치고 web만 재시작.
-Environment=EDT_DASHBOARD_PEETSFEA_VERSION=0.3.8
+# 다계정: web도 계정 리스트를 돌려 계정별 ingest 서버(7876대/7886대) + 역터널을 띄운다.
+Environment=EDT_ACCOUNTS=gate1-harry261:account_01:0,gate1-hmlee31:account_02:1
+# 대시보드에 노출할 결과 버전(빈 값=전 버전). 0.3.9.0 버전업 — 필터 해제(전 버전 표시).
+Environment=EDT_DASHBOARD_PEETSFEA_VERSION=
 Restart=always
 RestartSec=10
 # web teardown은 터널/서버 정지 + 아카이브 flush(45s 시한). scancel 없음 → 짧게 끝난다.
