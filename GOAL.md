@@ -64,3 +64,9 @@ control plane을 **계정 리스트**로 일반화. 각 account = 독립 스택(
   - **미규명 차이**: 실 컨테이너는 `$HOME:$HOME` 마운트 + `HOME=$CHOME`(엔트리포인트→backend→ansysedt). 디버그는 그게 없었음. ansysedt가 getpwuid 실홈(/home1/hmlee31)의 무언가를 읽어 abort하는 듯. backend가 ansysedt stderr를 DEVNULL로 버려(edt_aedt_backend.py:107-108) 실에러 미포착 — **DEVNULL을 파일로 바꿔 실 컨테이너의 ansysedt stderr를 잡는 게 다음 수**.
   - 재활성: keeper/web unit EDT_ACCOUNTS에 `,gate1-hmlee31:account_02:1` 추가 + 위 stderr 캡처로 근본원인.
 - 백업: hmlee31 ~/Ansoft.stale.bak.*, ~/.ansys.stale.*, ~/.mw.stale.* (복원 가능).
+
+## ⚠ 성공률 발견 (아침 판단 필요 — 솔브설정/엔진 영역, 인프라는 정상)
+- **성공률 ~30%(36/119), 최근 14%(7/50)로 하락.** 인프라는 안정(NR=0·/enroot 평탄·서비스 全 active)이라 시스템 문제 아님 — 솔브-파이프라인.
+- 실패 분포: **70 = "SSW report export did not create CSV"**(솔브는 도는데 리포트 CSV 미생성), 10 = FileNotFoundError, 2 = AssertionError, +"Raw Hfss.project_name must be str (actual=NoneType)"(코드).
+- **성공 솔브 elapsed ~85분 평균(35~140분)** — 사용자가 빡세게 한 설정이 예상(25분)보다 훨씬 김. 성공이 3.2코어/컨테이너(n_total 220→20/잡÷64코어)로도 완료되니 코어부족 아님 → 실패는 **미수렴 설계점 or 0.3.9.0 report export 이슈**.
+- **판단지점(사용자):** ① 해석설정 강도를 약간 낮춰 수렴율↑(정확도 vs 수율 트레이드오프) ② peetsfea 0.3.9.0의 SSW report export/project_name=None 회귀 조사(0.3.8.1과 비교) ③ 타깃 190→~90 낮추면 컨테이너당 코어↑로 솔브 빨라짐(수율↑일 수 있음, 단 성공률 자체는 설계점 수렴 문제라 큰 변화 불확실). 내가 함부로 안 바꿈(사용자 의도적 빡센설정 + 재시작 리스크).
