@@ -56,12 +56,21 @@ class JobOrchestrator:
     submitted: int = field(default=0, init=False)
     restarts: int = field(default=0, init=False)  # 죽어서 재기동한 횟수
     expiries: int = field(default=0, init=False)  # max_lifetime 만료로 교체한 횟수
+    submit_failures: int = field(default=0, init=False)  # 가용 노드/ssh/sbatch 일시 실패 횟수
+    last_submit_error: str = field(default="", init=False)
     _jobs: dict[int, JobHandle] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
-    def _submit(self, job_index: int) -> None:
-        self._jobs[job_index] = self.launcher.submit(job_index)
+    def _submit(self, job_index: int) -> bool:
+        try:
+            self._jobs[job_index] = self.launcher.submit(job_index)
+        except Exception as exc:  # noqa: BLE001 - Slurm availability and ssh failures are transient.
+            self.submit_failures += 1
+            self.last_submit_error = f"{type(exc).__name__}: {exc}"
+            print(f"[orchestrator] submit failed job={job_index}: {self.last_submit_error}", flush=True)
+            return False
         self.submitted += 1
+        return True
 
     def ensure_running(self) -> None:
         """초기 기동: job_count개 잡 슬롯을 채운다."""
@@ -80,12 +89,12 @@ class JobOrchestrator:
                     self._submit(i)
                     continue
                 if not self.launcher.is_alive(handle):
-                    self._submit(i)
-                    self.restarts += 1
+                    if self._submit(i):
+                        self.restarts += 1
                 elif (now - handle.started_at) >= self.max_lifetime_seconds:
                     self.launcher.kill(handle)
-                    self._submit(i)
-                    self.expiries += 1
+                    if self._submit(i):
+                        self.expiries += 1
 
     def running_count(self) -> int:
         with self._lock:

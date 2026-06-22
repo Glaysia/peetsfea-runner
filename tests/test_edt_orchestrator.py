@@ -17,8 +17,11 @@ class FakeLauncher(JobLauncher):
         self.submits = 0
         self.kills = 0
         self.alive: dict[str, bool] = {}
+        self.fail_after: int | None = None
 
     def submit(self, job_index: int) -> JobHandle:
+        if self.fail_after is not None and self.submits >= self.fail_after:
+            raise RuntimeError("no available node")
         self.submits += 1
         sid = f"s-{job_index}-{self.submits}"
         self.alive[sid] = True
@@ -84,3 +87,22 @@ def test_shutdown_kills_all() -> None:
     orch.shutdown()
     assert launcher.kills == 6
     assert orch.running_count() == 0
+
+
+def test_submit_failure_does_not_crash_or_drop_existing_jobs() -> None:
+    launcher = FakeLauncher()
+    launcher.fail_after = 3
+    orch = JobOrchestrator(launcher=launcher, clock=FakeClock(), job_count=5)
+
+    orch.ensure_running()
+
+    assert launcher.submits == 3
+    assert orch.running_count() == 3
+    assert orch.submit_failures == 2
+    assert "no available node" in orch.last_submit_error
+
+    launcher.fail_after = None
+    orch.poll()
+
+    assert launcher.submits == 5
+    assert orch.running_count() == 5
