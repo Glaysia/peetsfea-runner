@@ -28,11 +28,11 @@ class ContainerController:
     파라미터는 전부 config(설계 문서 §6의 확정 대상). 기본값은 보수적 시작점.
     """
 
-    target_aedt: int = 120          # 지령: 동시 솔브(elec_solve_hfss) 수
+    target_aedt: int = 190          # 지령: 동시 솔브(elec_solve_hfss) 수
     ki: float = 0.4                 # 적분 게인 (0.3~0.5). 클수록 빠르지만 출렁임↑
     dn_max: int = 3                 # tick당 N 변화 상한(±) — 매끈한 출생률 유지
     n_min: int = 80                 # 컨테이너 수 하한
-    n_max: int = 150                # 컨테이너 수 상한
+    n_max: int = 220                # 컨테이너 수 상한
     job_count: int = JOBS_PER_ACCOUNT  # 분배 대상 고정 잡 수(10)
     n_total: int = field(default=-1)   # 적분 상태(총 컨테이너). -1이면 target으로 초기화.
 

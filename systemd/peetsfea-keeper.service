@@ -14,7 +14,7 @@ Environment=EDT_ROLE=keeper
 Environment=EDT_STORE_BACKEND=postgres
 Environment=EDT_PG_DSN=postgresql://peets@127.0.0.1:5433/peetsfea
 Environment=EDT_SSH_HOST=gate1-harry261
-Environment=EDT_JOB_COUNT=9
+Environment=EDT_JOB_COUNT=10
 Restart=always
 RestartSec=10
 # 상시 가동: 실행시간 상한 없음(잡 수명 10h는 오케스트레이터가 내부 관리).

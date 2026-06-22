@@ -19,8 +19,8 @@ SIM_HARD_ABORT_SECONDS: Final[int] = 140 * 60
 EDTMGR_BACKSTOP_KILL_SECONDS: Final[int] = 150 * 60
 
 # --- SLURM 잡 출생 제어 -----------------------------------------------------
-# 레거시 keepalive 모드의 기본 슬롯 수. 현행 관리 루프는 별도 squeue cap(15)을 사용한다.
-JOBS_PER_ACCOUNT: Final[int] = 9
+# 고정 잡 수(적분제어 분배 분모 + 키퍼 기본 job_count). 키퍼는 EDT_JOB_COUNT env로 override.
+JOBS_PER_ACCOUNT: Final[int] = 10
 # 잡 수명 상한. 잡=고정 인프라(적분제어)라 길게 유지 — 4시간 주기 교체(드리프트/잔재 위생용).
 JOB_MAX_LIFETIME_SECONDS: Final[int] = 4 * 60 * 60
 
