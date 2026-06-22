@@ -50,6 +50,9 @@ if [ -n "$ENROOT_FREE_GB" ] && [ "$ENROOT_FREE_GB" -lt "$ENROOT_MIN_GB" ] 2>/dev
 fi
 
 GATE=${EDT_GATE_HOST:-gate1}
+# 다계정: hmlee31 게이트는 .bashrc에 ANSYSLMD_LICENSE_FILE 미설정이라 컨테이너 라이선스가 비어
+# ansysedt가 시작 시 rc=134(SIGABRT)로 죽는다(0 솔브 + churn). 전역 FlexLM 기본값 보장(env 있으면 우선).
+: "${ANSYSLMD_LICENSE_FILE:=1055@172.16.10.81}"; export ANSYSLMD_LICENSE_FILE
 PORT=${EDT_INGEST_PORT:-7876}; BULK=${EDT_BULK_PORT:-7877}
 LEASE=${EDT_PRIORITY_LEASE_PORT:-7878}; LIC=${EDT_LICENSE_CTRL_PORT:-7879}
 SSHD=${EDT_ORCH_SSHD_PORT:-0}
