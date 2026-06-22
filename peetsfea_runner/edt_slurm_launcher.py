@@ -105,6 +105,10 @@ class SlurmJobLauncher:
     debug_local_base: int = 2200
     debug_account_stride: int = 50
     account_index: int = 0
+    # 다계정 태깅: 잡이 띄우는 컨테이너가 결과를 어느 계정으로 ingest했는지 단일 DB에서 구분하게 한다.
+    # sbatch 스크립트가 EDT_ACCOUNT_ID/EDT_HOST_ALIAS를 export → orchestrator.sh가 컨테이너로 전달.
+    account_id: str = "account_01"
+    host_alias: str = "gate1-harry261"
     _avoid: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _submitted_nodes: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
@@ -183,6 +187,9 @@ class SlurmJobLauncher:
             f"#SBATCH --mem={mem}\n"
             f"export EDT_JOB_INDEX={job_index}\n"
             f"export EDT_PARTITION={partition}\n"
+            # 다계정 태깅: 컨테이너가 결과 ingest 시 account_id로 단일 DB에 구분 기록.
+            f"export EDT_ACCOUNT_ID={self.account_id}\n"
+            f"export EDT_HOST_ALIAS={self.host_alias}\n"
             # EDT_GPU_COUNT: 컨테이너 supervisor가 워커별 CUDA_VISIBLE_DEVICES=index%N 핀닝에 사용(GPU 분산).
             f"export EDT_GPU_COUNT={gpus}\n"
             # EDT_BASELINE_SEED_EPOCH: entrypoint가 seed_base에 더해 재램프마다 새 설계공간을 탐색(재탕 방지).

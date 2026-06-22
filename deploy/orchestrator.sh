@@ -142,6 +142,7 @@ spawn_one() {
     --env "EDT_PRIORITY_LEASE_URL=$LEASE_URL" --env "EDT_LICENSE_CTRL_URL=" \
     --env "EDT_REFERENCE_SWEEP=$REF" --env "EDT_PARTITION=${EDT_PARTITION:-}" --env "VENVPY=$VENVPY" \
     --env "EDT_JOB_INDEX=${EDT_JOB_INDEX:-0}" --env "EDT_GPU_COUNT=${EDT_GPU_COUNT:-0}" \
+    --env "EDT_ACCOUNT_ID=${EDT_ACCOUNT_ID:-account_01}" --env "EDT_HOST_ALIAS=${EDT_HOST_ALIAS:-gate1-harry261}" \
     --env "EDT_SLOT_COUNT=1" --env "EDT_MAX_SIMS=1" \
     --env "EDT_BASELINE_BATCH=1" --env "EDT_BASELINE_WATERMARK=1" --env "EDT_BASELINE_SEED_START=$seed" \
     --env "EDT_PID_NS=${EDT_PID_NS:-1}" \
