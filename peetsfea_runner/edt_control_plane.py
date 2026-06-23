@@ -105,7 +105,10 @@ class ControlPlaneConfig:
     # 채우면 각 AccountConfig마다 계정 스택을 띄운다(harry261 + hmlee31 …).
     accounts: tuple[AccountConfig, ...] = ()
     # 잡 내부 서브 오케스트레이터: 1솔브 단명 enroot 컨테이너 N개를 띄우고 respawn 없이 종료.
-    job_command: str = "bash $HOME/edt-deploy/orchestrator.sh"
+    # 단일 canonical 배포본(git 체크아웃) 1벌을 /gpfs에서 양 계정이 공유(두 게이트=같은 PC, harry261 홈은
+    # 공유친화 umask). orchestrator 안의 DEPLOY=$HOME/edt-deploy라 venv·clogs·debug는 자연히 per-user.
+    # 배포: 로컬에서 git push gate-harry main → 게이트 git checkout. 수동 scp 없음.
+    job_command: str = "bash /gpfs/home1/harry261/peetsfea-runner/deploy/orchestrator.sh"
     dashboard_port: int = 8080
     intake_port: int = 7875  # historical env name; this now serves Adaptive TOML Registry.
     ingest_port: int = DEFAULT_INGEST_PORT  # 슈퍼컴 전용 결과 백채널(역터널로만 도달).
