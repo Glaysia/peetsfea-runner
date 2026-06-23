@@ -125,3 +125,17 @@ enroot start --root --rw --mount $ANSB/AnsysEM:/mnt/AnsysEM ... \
 </div>
 </body>
 </html>
+<hr>
+<h2>★ 실행 (라이브 2026-06-23 17:38) — hmlee31에서 4 config 동시</h2>
+<div class="card">
+<b>hmlee31 rc=134 근본원인 = /gpfs 경로!</b> peetsfea가 sweep TOML을 <code>/gpfs/home1/hmlee31/...</code>로 resolve(홈이 /gpfs 심링크)하는데 컨테이너는 <code>/home1</code>만 마운트 → spec 로드 실패 → ansysedt rc=134였다. <b>컨테이너에 <code>--mount /gpfs:/gpfs</code> 추가로 해결</b>(디버그 솔브 정상 구동 확인). ← orchestrator.sh에 이 마운트 넣으면 다계정 재활성 가능.<br>
+<b>env-config 프로토타입(0.3.9.1용):</b> <code>ssw_ports.py</code>의 SOLVE_CORES·SETUP_MAXIMUM/MINIMUM_PASSES·MIN_CONVERGED·MAX_DELTA_S·MESH_MAX_ELEMENTS·MESH_MAX_LENGTH·SKIN_DEPTH_LAYERS를 <code>EXP_*</code> env에서 읽게 패치 → 같은 venv로 4 config 동시 가능. (0.3.9.1에선 이걸 정식 config로.)
+</div>
+<table>
+<tr><th>config</th><th>변경(그 외 현행: cores16·pass16/9/4·δS0.003·elems50000·1mm·skin4)</th><th>잡</th><th>솔브시간</th><th>상태</th></tr>
+<tr><td><b>A</b></td><td>cores 4→16 만</td><td>692415</td><td>(측정중)</td><td>R</td></tr>
+<tr><td><b>B</b></td><td>cores16 + MAX_PASSES 16→13</td><td>692416</td><td>(측정중)</td><td>R</td></tr>
+<tr><td><b>C</b></td><td>cores16 + MESH_ELEMENTS 50000→20000</td><td>692417</td><td>(측정중)</td><td>R</td></tr>
+<tr><td><b>D</b></td><td>cores16 + SKIN_LAYERS 4→2 (25um 유지)</td><td>692418</td><td>(측정중)</td><td>R</td></tr>
+</table>
+<p class="mut">고정 seed=77777(같은 설계점, apples-to-apples), 각 16코어, n115 co-locate(4×16=64코어=노드캡, 경합 0). 결과는 <code>~hmlee31/edt-deploy/exp_results/&lt;cfg&gt;.log</code>의 DONE 라인(elapsed·rc·state). 30분 이내 들어오는 config 채택, 없으면 조합(B+C 등) 2차.</p>
