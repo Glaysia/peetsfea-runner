@@ -28,7 +28,7 @@ class ContainerController:
     파라미터는 전부 config(설계 문서 §6의 확정 대상). 기본값은 보수적 시작점.
     """
 
-    target_aedt: int = 190          # 지령: 동시 솔브(elec_solve_hfss) 수
+    target_aedt: int = 125          # 지령: 동시 솔브(elec_solve_hfss) 수 — 계정별. 다계정(2)→시스템 총 250
     ki: float = 0.4                 # 적분 게인 (0.3~0.5). 클수록 빠르지만 출렁임↑
     dn_max: int = 3                 # tick당 N 변화 상한(±) — 매끈한 출생률 유지
     n_min: int = 80                 # 컨테이너 수 하한

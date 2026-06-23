@@ -1,75 +1,47 @@
-# GOAL — 다계정 적분제어 정석 구현 + 0.3.9.0 + 밤샘 모니터링 (자율 실행)
+# GOAL — 0.3.9.1(솔브 가속) + 다계정 정석 안정화 (20잡 / 유효AEDT 250)
 
-> 사용자 퇴근. 전권 위임: "갈아엎어도 되니 정석적으로, 너가 다 결정해서 오늘 밤 동안 다 해라."
-> 이 문서 = Claude가 밤새 자율로 실행하는 SSOT. Stop 훅이 이걸 달성하라고 구동한다.
+> 2026-06-23: 솔브 92분의 **근본원인 규명** + 사용자가 0.3.9.1 가속안 확정. 이 문서 = 현재 SSOT.
 
-## ✅ 라이브 달성 (2026-06-22 밤)
-- **다계정 정석 구현·배포 완료**: control plane이 `accounts` 리스트로 harry261(idx0,7876대)+hmlee31(idx1,7886대)를 한 프로세스에서 구동(`EDT_ACCOUNTS` env). 계정별 런처·오케스트레이터·폴러·라이선스·ingest/lease/license 서버·역터널. 결과는 단일 DB에 account_id 태깅. 162 passed, main=dev.
-- **peetsfea 0.3.9.0** 로컬+양 게이트 venv, fresh `peetsfea` DB(0.3.8x는 `peetsfea_0_3_8x`+덤프 백업).
-- **양 계정 라이브 제출·수렴 시작**: harry261 ~10잡, hmlee31 ~7잡. 양 license 서버(7879/7889) target190. 유효 AEDT 램프업, account_01 ingest 시작. 빡센 0.3.9.0 솔브 ~25분.
-- **현실 제약(노드 경합)**: cpu2 ~10노드를 두 계정+타유저가 공유 → 20잡 다 못 올라가고 ~17잡 운영(`no available node`는 키퍼가 재시도, 견고). 총 처리량은 노드가 병목(라이선스 아님). 데이터는 양 계정에서 안정 축적 중.
-- **모니터링 가동**: `/tmp/overnight_monitor.log`(5분 간격 ~4.7h) — 잡수·유효AEDT·account별 ingest·키퍼NR·/enroot.
+## ★ 핵심 발견 — 솔브 92분의 진짜 원인 (메시 오퍼레이션 + 지오메트리)
+0.3.8 시절 솔브는 **median 11분**(p10 7.6 / p90 16.1, 구 DB 8039건)이었는데 0.3.9.0은 **median 87분 (~8배)**. 원인은 **솔버 설정이 아니라 두 변화의 곱**:
+1. **메시 오퍼레이션 변경** (`peetsfea` 커밋 `0d67754`, 0.3.8.3): 단일 `Length1` 메시 → **`AssignSkinDepthOp` 신설**(구리 표면 25um×4층 조밀 표면메시). 0.3.8.0(11분)엔 이게 없었음.
+2. **지오메트리 3배** (0.3.9.0 "y-span-freedom"): `width_max_mm` 360→**1080**, 코일 y-bounds 480→**1440**. 구리 표면적 3배 → skin-depth 표면메시 폭증.
+- 즉 **큰 코일 위의 skin-depth 메시 op**이 시간 지배자. 패스/delta_S/코어는 0.3.8 이래 거의 불변(코어=4, delta_S=0.003, 패스 16/9/4).
+- 실험 확증: round-1 단일노브(코어16/패스13/메시20k/skin2) **전부 65분 초과**(코어16은 레버 아님). round-2 조합 중 **skin=2 + 패스/delta_S 감속** 둘이 30분 내(R4 19분, R3 26분).
+- 상세: `PLANS/solve_time_30min_tuning.html`.
 
-## 최종 목표 (오늘 밤)
-1. **정석 다계정 control plane**: 키퍼가 harry261 + hmlee31 **두 계정을 구동**. 단일계정 하드코딩 제거.
-2. **peetsfea 0.3.9.0**로 양 계정 라이브 — **유효 AEDT 380(계정당 190) / 잡 20(계정당 10) / 리플 최소**.
-3. 빡센 솔브(정확도↑, 2~3배≈25~35분) 결과가 단일 DB로 ingest(account_id 태깅), **밤새(~4h+) 모니터링**.
+## ★ 0.3.9.1 가속안 (사용자 확정 — 사용자가 peetsfea 패치)
+> "스킨뎁스 적용, 시작 메시 10만 이하, 10% 리파인먼트로 30패스 — 훨씬 빠르고 정밀."
+- skin-depth 메시 op은 **유지**하되(정확도), **시작 메시 ≤100k**, **percent_refinement 10%**, **30 passes**. 더 빠르고 정밀(사용자 단독 검증).
+- 패치 주체 = **사용자**(peetsfea git에 v0.3.9.1 태그 생성 + 양 게이트 venv).
 
-## 아키텍처 (정석 — 계정별 런타임 스택)
-control plane을 **계정 리스트**로 일반화. 각 account = 독립 스택(검증된 단일계정 로직 재사용), 공유는 DB·대시보드뿐:
-- account = {ssh_host, account_id, host_alias, account_index, port_base, job_count, target_aedt}.
-  - harry261: gate1-harry261, account_01, idx0, 포트 7876/7878/7879, 잡10, target190.
-  - hmlee31 : gate1-hmlee31, account_02, idx1, 포트 7886/7888/7889, 잡10, target190.
-- 계정별: 런처(ssh_host) + 오케스트레이터(잡10 고정·respawn-to-N) + 적분 컨트롤러(190/10) + license/job_plan 서버(포트베이스) + ingest 서버(포트베이스) + 역터널(대칭, gate:78x6→local:78x6). 컨테이너는 account 태깅(EDT_ACCOUNT_ID).
-- **공유**: postgres DB 1개(양 계정 결과, account_id 구분) + 대시보드 1개(:8080, 공유 DB 읽어 양 계정 표시).
-- 적분은 계정별 독립(각 190 수렴) → 합 380. 노드/라이선스 차이를 계정별로 자가흡수.
-- 구현: `ControlPlaneConfig.accounts: list`로 확장, 기동 루프가 계정마다 스택 생성. 단일계정은 accounts=[harry261] 특수케이스. **테스트 추가**(다계정 라우팅·포트 분리·태깅).
+## 현재 상태 (이 세션에서 세팅 완료 — 서비스 down 대기)
+- **서비스 전체 정지**(keeper/web/data), pg만 active. 양 게이트 잡 0(safe_scancel 정리됨). 실험잡도 취소.
+- **DB 비움**: fresh `peetsfea`(0 테이블, 앱 기동 시 initialize() DDL). 구 0.3.9.0 데이터는 `peetsfea_0_3_9_0x`로 보존(리네임, 복사 아님). 0.3.8x는 `peetsfea_0_3_8x` 유지.
+- **다계정 재활성**: keeper/web unit `EDT_ACCOUNTS=gate1-harry261:account_01:0,gate1-hmlee31:account_02:1`.
+- **지령 = 계정당 125**(`edt_container_control.py` target_aedt), 2계정 → **시스템 총 유효AEDT 250**. 잡 **10/계정 → 총 20**(EDT_JOB_COUNT=10). 550 라이선스 풀 대비 여유(안정화).
+- **버전핀 0.3.9.1**: `pyproject.toml` peetsfea@...@v0.3.9.1.
+- **rc=134 근본픽스 프로덕션 반영**: `orchestrator.sh`에 `--mount /gpfs:/gpfs` 추가(실험에서만 있던 것). 양 게이트 home이 /gpfs/home1로 resolve → 양 계정 견고화(additive, harry261 회귀 없음). 라이선스 기본값 `1055@license-server`·EDT_ACCOUNT_ID는 이미 반영됨.
 
-## 실행 순서 (단계별, 검증하며)
-0. **현재 상태**: 서비스 down(pg만), DB 격리됨(peetsfea→peetsfea_0_3_8x, 백업 db_backups/peetsfea_0.3.8x_*.dump), 0.3.9.0 로컬+harry261게이트 venv 적용. harry261 단일계정 코드는 라이브 직전(target190/잡10).
-1. **hmlee31 게이트 준비**: peetsfea 0.3.9.0 동기화(로컬 venv→hmlee31 게이트 venv, harry261 때처럼) + 최신 orchestrator.sh 배포. venv import/솔브 경로 확인.
-2. **다계정 control plane 구현**(코드 갈아엎기 OK): accounts 리스트 + 계정별 스택 + 라우팅 + 태깅. `pytest tests/ -q` 통과. main 커밋, dev 동기화.
-3. **순차 기동**(동시 init race 회피): harry261 스택 먼저 완전 기동 → 검증 → hmlee31 스택 기동. fresh peetsfea 생성. 양 계정 잡 제출·orchestrator /job_plan fetch·PID-ns·컨테이너 솔브 확인.
-4. **수렴 검증**: 유효 AEDT가 380(계정별 190)으로 오르는지, account_id별 ingest 들어오는지, 리플·키퍼 안정.
-5. **밤새 모니터링(~4h+)**: 30~60min 간격 — 실패율·유효 AEDT/target·리플·NRestarts·/enroot 누수·고아 AEDT·account별 결과율. 문제 시 자가수정(키퍼는 노드부족/예외에 안 죽게 이미 견고화됨). 큰 이상이면 안전 정지 + 기록.
+## 사용자 인계 (0.3.9.1 패치 후 기동 순서)
+1. **사용자**: peetsfea git에 `v0.3.9.1` 태그(skin유지+시작메시≤100k+refine10%+30pass).
+2. 로컬 runner venv 동기화: `cd ~/mnt/8tb/peetsfea-runner && uv sync`(또는 uv pip install) — 핀이 v0.3.9.1라 태그 생성 후 가능. **runner도 0.3.9.1이어야** sweep 지오메트리 일치.
+3. 양 게이트 venv(harry261·hmlee31) 0.3.9.1 동기화 + 최신 orchestrator.sh 배포(/gpfs 마운트 포함).
+4. **순차 기동**(동시 init race 회피): `systemctl --user start peetsfea-web` → 검증 → `peetsfea-keeper` → `peetsfea-data`.
+5. 검증: 양 계정 잡 제출·account_id별 ingest·유효AEDT가 250(계정125)으로 수렴·키퍼 NR 안정·/enroot 평탄.
+
+## ⚠ 인계 시 주의 (이전 다계정 라이브에서 관측된 잔여 이슈)
+- **계정별 포트 주입**: 런처가 잡 sbatch에 ingest/lease/license 포트를 account.port_base에서 주입하는지 확인(미주입이면 hmlee31이 harry261 컨트롤러 7879를 따름 — 결과는 들어오나 제어 분리 안 됨). [[multi-account-ingest-port-collision]].
+- **hmlee31 poller license=None**: lmstat 파싱이 hmlee31 ssh 환경에서 실패하면 solve=0 오독→과spawn. 기동 후 resource 스냅샷 license 값 확인.
+- **노드 경합**: cpu2 ~10노드를 두 계정+타유저 공유. 250(125×2)은 이전 380보다 보수적이라 노드병목 여유 — 단 0.3.9.1로 솔브가 빨라지면(≈25분) 컨테이너 회전↑로 같은 유효AEDT에 더 많은 컨테이너 필요할 수 있음. n_max=220/계정 포화 시 관측 후 상향 검토. [[multi-account-live-node-contention]].
+- **hmlee31 venv 실험 흔적**: ssw_ports.py(EXP_* env 읽기, 기본값=프로덕션 동일이라 무해)·edt_aedt_backend.py(stdout 노출) 패치 잔존. 0.3.9.1 재설치 시 깨끗이 덮임.
 
 ## 안전·원칙
-- 매 코드 변경 후 `pytest` 통과 확인. 프로덕션 기동은 **순차**(advisory lock 폐기 → concurrent init race는 순차로만 회피).
-- 키퍼는 가용노드 부족/submit 예외에 안 죽음(`7b59f6b`). PID-ns로 누수 회수. 4h 잡 TTL.
-- 되돌리기: 0.3.8x는 `peetsfea_0_3_8x` DB + 덤프로 복원 가능. 코드는 git(main/dev) 히스토리.
-- 망가뜨리면(오늘 advisory lock·예외누락으로 2번 깸) **즉시 원인 격리 + 안전버전 복귀**, 무한 crash-loop 방치 금지.
-
-## 완료 조건
-- 다계정 control plane이 harry261+hmlee31 둘 다 잡 제출·ingest(account_id 태깅) 정상.
-- peetsfea 0.3.9.0 빡센 솔브가 양 계정에서 돌고 결과 DB 적재.
-- 유효 AEDT **380 평균 수렴·리플 한 자릿수**(라이브), 키퍼 NRestarts 안정.
-- `pytest tests/ -q` 통과. main=dev 일치. 밤새 모니터링 로그 남김.
+- 코드 변경 후 `pytest tests/ -q`. 프로덕션 기동은 **순차**(advisory lock 폐기됨). 키퍼는 노드부족/예외에 안 죽음(`7b59f6b`), PID-ns 누수회수, 4h 잡 TTL.
+- 되돌리기: 0.3.9.0 데이터=`peetsfea_0_3_9_0x`, 0.3.8x=`peetsfea_0_3_8x`. 코드=git(dev). 핀을 v0.3.9.0으로 되돌리면 구버전 복귀.
 
 ## 완료된 것 (히스토리)
-- 데이터플레인(seq커서+Arrow :7884, bulk/ArchiveStore 제거). cpu2 64코어. 적분제어 통합 3/3. PID-ns 누수픽스. 잡별 sshd. 4h TTL. 키퍼 견고화. peetsfea 0.3.9.0 venv. 0.3.8x DB 백업/격리.
-- 참고: PLANS/integral_container_control.html, PLANS/per_job_debug_access.html, PLANS/data_plane_overhaul.html, [[multi-account-ingest-port-collision]], [[leak-reclaim-needs-pid-ns]].
-
-## ⚠ 밤샘 중 발견 (재시작 필요 → 사용자 인지 하에 수정 권장)
-- **계정별 포트 미주입**: 런처가 EDT_INGEST_PORT/LICENSE_CTRL_PORT/PRIORITY_LEASE_PORT를 잡 sbatch에 주입 안 함 → 양 계정 잡이 기본 7876/7878/7879로 push/fetch(같은 gate loopback의 harry261 역터널 경유). 결과는 들어오나(account_02 태깅 OK) hmlee31이 자기 컨트롤러(7889) 대신 harry261 컨트롤러(7879)를 따름. 수정: 런처에 ingest/lease/license_port 필드 추가 + sbatch export(account.port_base에서).
-- **hmlee31 poller license=None**: hmlee31 resource 서버(7892) 스냅샷에 license 없음 → solve=0 오독 → 적분 과spawn. lmstat 경로/파싱이 hmlee31 ssh 환경에서 실패하는 듯. 조사 필요.
-- **타깃 380(190×2) 비현실적**: harry261+hmlee31이 같은 cpu2 ~10노드 공유(타유저까지 경합). 노드가 병목이라 합쳐도 유효 AEDT ~150대에서 포화. 적분이 도달못할 190을 쫓아 n_max(220)에 영구 포화 → N=20/job 과spawn churn. **현실 타깃은 클러스터 용량(~150 합계)으로 낮춰야 적분 수렴·churn 제거.** 다계정의 "라이선스 2배"는 노드 남을 때만 의미 — 이 클러스터선 노드가 한계.
-- **현재 판단**: harry261 안정 축적 중·NRestarts=0·/enroot 평탄. 위 수정은 모두 재시작 필요(churn은 노드제한으로 비파괴적)이라, 안정 축적 우선으로 밤샘엔 기록만. 아침에 사용자와 타깃 현실화 + 포트주입 + license픽스 협응 수정.
-
-## 🌙 밤샘 최종 상태 (2026-06-23 ~01:30)
-- **harry261 단일계정 0.3.9.0으로 안정 축적**(account_01, ~77+ 결과·계속). hmlee31 비활성화(churn 제거 → harry261 풀클러스터).
-- **hmlee31 미해결(아침 인터랙티브 디버그용 단서):** ansysedt가 컨테이너 시작 시 rc=134(SIGABRT). 시도·배제한 것:
-  1. ✅ license 비어있던 것 → orchestrator 기본값 `1055@license-server`로 해결(harry261 작동값, IP 172.16.10.81은 미작동).
-  2. ✅ stale `~/Ansoft`·`~/.ansys`·`~/.mw`(harry261보다 오래됨, 옛 라이브러리 경로) 전부 백업·제거 → **그래도 rc=134 지속**.
-  3. ✅ 디버그 컨테이너서 ansysedt를 **직접**(no $HOME mount, HOME=/root) 돌리면 **정상 구동**(first-time config OK, rc=124 타임아웃=서버 살아있음). 즉 이미지·AEDT설치·license는 정상.
-  - **미규명 차이**: 실 컨테이너는 `$HOME:$HOME` 마운트 + `HOME=$CHOME`(엔트리포인트→backend→ansysedt). 디버그는 그게 없었음. ansysedt가 getpwuid 실홈(/home1/hmlee31)의 무언가를 읽어 abort하는 듯. backend가 ansysedt stderr를 DEVNULL로 버려(edt_aedt_backend.py:107-108) 실에러 미포착 — **DEVNULL을 파일로 바꿔 실 컨테이너의 ansysedt stderr를 잡는 게 다음 수**.
-  - 재활성: keeper/web unit EDT_ACCOUNTS에 `,gate1-hmlee31:account_02:1` 추가 + 위 stderr 캡처로 근본원인.
-- 백업: hmlee31 ~/Ansoft.stale.bak.*, ~/.ansys.stale.*, ~/.mw.stale.* (복원 가능).
-
-## ⚠ 성공률 발견 (아침 판단 필요 — 솔브설정/엔진 영역, 인프라는 정상)
-- **성공률 ~30%(36/119), 최근 14%(7/50)로 하락.** 인프라는 안정(NR=0·/enroot 평탄·서비스 全 active)이라 시스템 문제 아님 — 솔브-파이프라인.
-- 실패 분포: **70 = "SSW report export did not create CSV"**(솔브는 도는데 리포트 CSV 미생성), 10 = FileNotFoundError, 2 = AssertionError, +"Raw Hfss.project_name must be str (actual=NoneType)"(코드).
-- **성공 솔브 elapsed ~85분 평균(35~140분)** — 사용자가 빡세게 한 설정이 예상(25분)보다 훨씬 김. 성공이 3.2코어/컨테이너(n_total 220→20/잡÷64코어)로도 완료되니 코어부족 아님 → 실패는 **미수렴 설계점 or 0.3.9.0 report export 이슈**.
-- **판단지점(사용자):** ① 해석설정 강도를 약간 낮춰 수렴율↑(정확도 vs 수율 트레이드오프) ② peetsfea 0.3.9.0의 SSW report export/project_name=None 회귀 조사(0.3.8.1과 비교) ③ 타깃 190→~90 낮추면 컨테이너당 코어↑로 솔브 빨라짐(수율↑일 수 있음, 단 성공률 자체는 설계점 수렴 문제라 큰 변화 불확실). 내가 함부로 안 바꿈(사용자 의도적 빡센설정 + 재시작 리스크).
-
-## ✅ 성공률 정정 (04:15)
-초기 낮은 성공률(누적 30%·최근14%)은 **hmlee31 churn + 램프 혼란기의 일시적 현상**이었음. hmlee31 비활성화·안정화 후 **최근 성공률 60~80%로 회복**(최근15: 12/15). 안정 단일계정 0.3.9.0이 정상 수율로 데이터 축적 중. ("report export 실패"는 일부 어려운 설계점에서 잔존하나 dominant 아님 — 빡센 설정의 자연스런 일부.)
+- 다계정 control plane(accounts 리스트·계정별 스택·account_id 태깅, 162 passed). 데이터플레인(seq커서+Arrow :7884). 적분제어. PID-ns 누수픽스. 잡별 sshd. 4h TTL. 키퍼 견고화.
+- hmlee31 rc=134 근본원인 = **/gpfs 미마운트**(sweep TOML이 /gpfs 경로 resolve, 컨테이너는 /home1만) → `--mount /gpfs:/gpfs`로 해결(실험 확증, 이제 프로덕션 반영).
+- 솔브 92분 근본원인 규명(메시 op + 3배 지오메트리) → 0.3.9.1 가속안 확정.
+- 참고: PLANS/solve_time_30min_tuning.html, PLANS/integral_container_control.html, [[local-enroot-aedt-setup]], [[edt-result-ingest-topology]].
