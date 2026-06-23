@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>솔브 92.3분 → 30분 튜닝 실험 (pass·mesh·코어) → peetsfea 0.3.9.1</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",sans-serif}
+  .wrap{max-width:980px;margin:0 auto;padding:32px 22px 70px}
+  h1{font-size:23px;line-height:1.35;margin:0 0 6px}
+  h2{font-size:18px;margin:30px 0 10px;padding-top:13px;border-top:1px solid var(--bd)}
+  h3{font-size:15px;margin:16px 0 6px;color:var(--acc)}
+  .sub{color:var(--mut);margin:0 0 20px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 18px;margin:12px 0}
+  code{background:#1f2630;padding:1.5px 6px;border-radius:5px;font-size:13px;color:#ffa657}
+  pre{background:#010409;border:1px solid var(--bd);border-radius:8px;padding:13px 15px;overflow:auto;font-size:13px;line-height:1.5}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13.5px}
+  th,td{border:1px solid var(--bd);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:#1f2630}
+  .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+  .rec{border-left:3px solid var(--ok);background:#0f1c12;padding:10px 14px;border-radius:0 8px 8px 0}
+  .q{border-left:3px solid var(--warn);background:#1c170c;padding:10px 14px;border-radius:0 8px 8px 0;margin:8px 0}
+  .pill{display:inline-block;padding:1px 9px;border-radius:20px;font-size:12px;border:1px solid var(--bd);margin-right:5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>솔브 92.3분 → 30분 튜닝 실험 (pass·mesh·코어)</h1>
+<p class="sub">고정 design point에서 해석설정을 바꿔가며 시간 vs 정확도를 측정해 ~30분 config를 찾고 peetsfea 0.3.9.1에 굳힌다 · 프로덕션(harry261 가동) 미간섭 · 2026-06-23</p>
+
+<div class="card">
+<b>목표:</b> 1솔브 92.3분 → <b>~30분</b>(약 3배 단축). 정확도는 "현재 92분 결과(ground truth)" 대비 핵심 지표 허용오차 내 유지.<br>
+<b>제약:</b> 빡센 설정으로 한 이유=정확도. 무작정 줄이면 정확도 손실 → <b>시간·정확도를 같이 측정</b>해 trade-off 곡선에서 30분 지점을 고른다.<br>
+<b>전제:</b> 모든 노브는 <code>peetsfea/backend/pyaedt/ssw_ports.py</code> 상수. 0.3.9.1에서 이걸 config화하면 TOML/env로 튜닝 가능.
+</div>
+
+<h2>1. 현재 설정 + 시간 드라이버 (영향 큰 순)</h2>
+<table>
+<tr><th>노브 (ssw_ports.py)</th><th>현재값</th><th>시간영향</th><th>줄이는 방향(가설)</th><th>정확도 리스크</th></tr>
+<tr><td><code>SOLVE_CORES</code></td><td><b>4</b></td><td class="bad">매우 큼</td><td>8~16 (HFSS 직접해 병렬). 코어 4는 너무 낮다.</td><td class="ok">없음(같은 해, 더 빠름) — 단 동시솔브수↓(throughput trade-off)</td></tr>
+<tr><td><code>SETUP_MAXIMUM_PASSES</code> / <code>MINIMUM_PASSES</code> / <code>MINIMUM_CONVERGED_PASSES</code></td><td>16 / 9 / 4</td><td class="bad">매우 큼</td><td>10 / 5 / 2~3. 각 pass=메시정제+풀솔브라 pass 수가 1차 드라이버.</td><td class="warn">중 — 덜 수렴하면 S파라미터 흔들림</td></tr>
+<tr><td><code>SETUP_MAX_DELTA_S</code></td><td>0.003</td><td class="warn">큼</td><td>0.01~0.02 (느슨). 타이트할수록 pass↑.</td><td class="warn">중 — 수렴 기준 완화</td></tr>
+<tr><td><code>MESH_MAX_ELEMENTS</code> / <code>MESH_MAX_LENGTH</code></td><td>50000 / 1mm</td><td class="warn">큼</td><td>30000 / 1.5mm (성김). 초기메시↓ → pass당↓.</td><td class="warn">중 — 형상 디테일 손실</td></tr>
+<tr><td>구리 skin depth <code>MESH_COPPER_SKIN_DEPTH_LAYERS</code> / <code>_SKIN_DEPTH</code></td><td>4층 / 25um</td><td class="warn">중</td><td>2~3층. 표면 메시 절반.</td><td class="warn">중 — 도체 손실(Q) 정확도</td></tr>
+<tr><td><code>SETUP_PERCENT_REFINEMENT</code></td><td>26</td><td>중</td><td>유지~30. 높이면 pass당 메시↑(느림)이나 수렴 빨라 pass수↓ — 양날.</td><td class="ok">낮음</td></tr>
+<tr><td><code>SWEEP_RANGE_COUNT</code> (0.1~100MHz)</td><td>81</td><td>작음(보간sweep)</td><td>유지. adaptive 솔브가 시간 지배 — sweep은 보간이라 영향 적음. 먼저 건드리지 말 것.</td><td class="ok">낮음</td></tr>
+</table>
+<p class="mut">관측: 프로덕션 컨테이너는 코어 경합으로 솔브당 ~3~4코어밖에 못 받았다(over-spawn). <b>SOLVE_CORES↑ + 동시 컨테이너수↓</b>가 단일솔브 시간을 가장 크게 줄인다 — 단 throughput(시간당 솔브수)은 동시성↓로 상쇄될 수 있어, 시간·throughput 둘 다 본다.</p>
+
+<h2>2. 실험 방법 — 격리·고정·측정</h2>
+<ul>
+<li><b>고정 design point 1개</b>(seed 고정)로 모든 변형을 돌려 <b>같은 형상</b>에서 시간·정확도를 apples-to-apples 비교(설계점 변동 confound 제거). 대표성 위해 2~3개 design point로 교차확인.</li>
+<li><b>격리 실행:</b> harry261 프로덕션은 그대로 두고, <b>hmlee31 게이트(현재 idle)</b> 또는 별도 노드에서 <b>디버그 컨테이너 1개</b>로 단일 솔브(no /job_plan, no ingest). 프로덕션 미간섭.</li>
+<li><b>설정 override(임시):</b> 0.3.9.1 전이라 상수를 직접 못 바꾸면 — 컨테이너 안에서 <code>ssw_ports.py</code>의 SETUP_* 상수를 <b>sed/패치</b>하거나 monkeypatch 후 단일 솔브. (0.3.9.1에선 이 상수들을 env/TOML로 빼서 패치 없이 스윕.)</li>
+<li><b>측정:</b> ① <b>wall-clock 솔브시간</b>(adaptive 시작~끝), ② <b>수렴 pass수</b>(setup_pass_counts), ③ <b>최종 delta-S</b>, ④ <b>핵심 결과지표</b>(아래 §4) — 전부 한 솔브에서 로그/CSV로.</li>
+</ul>
+
+<h3>디버그 단일솔브 골격 (게이트에서)</h3>
+<pre># 고정 design point TOML(예: builtin widest seed N) 하나로, 상수 패치 후 1솔브 + 시간측정
+# (0.3.9.1 전 임시: 컨테이너 안에서 ssw_ports.py SETUP_* 를 sed)
+C=tune-$$; enroot create --name $C ~/runtime/enroot/aedt.sqsh
+enroot start --root --rw --mount $ANSB/AnsysEM:/mnt/AnsysEM ... \
+  --env ANSYSLMD_LICENSE_FILE=1055@license-server $C bash -lc '
+  F=/.../site-packages/peetsfea/backend/pyaedt/ssw_ports.py
+  sed -i "s/SETUP_MAXIMUM_PASSES = 16/SETUP_MAXIMUM_PASSES = 10/; \
+          s/SETUP_MINIMUM_PASSES = 9/SETUP_MINIMUM_PASSES = 5/; \
+          s/SETUP_MINIMUM_CONVERGED_PASSES = 4/SETUP_MINIMUM_CONVERGED_PASSES = 2/; \
+          s/SETUP_MAX_DELTA_S = 0.003/SETUP_MAX_DELTA_S = 0.01/; \
+          s/SOLVE_CORES = 4/SOLVE_CORES = 12/" $F
+  time $VENVPY -m peetsfea_runner.edt_entrypoint  # EDT_MAX_SIMS=1, 고정 seed
+'</pre>
+
+<h2>3. 테스트 매트릭스 (단계적 — 한 번에 1~2 노브)</h2>
+<p>베이스라인부터 시작해 영향 큰 노브부터 단계적으로. 각 행 = 고정 design point 1솔브.</p>
+<table>
+<tr><th>#</th><th>변경</th><th>노림</th><th>기록</th></tr>
+<tr><td>B</td><td><b>베이스라인</b>(현행 그대로)</td><td>92분·정확도 = ground truth 확정</td><td>시간·pass·delta-S·핵심지표</td></tr>
+<tr><td>1</td><td><code>SOLVE_CORES 4→12</code> (그 외 동일)</td><td>코어만으로 얼마나 빨라지나(정확도 불변)</td><td>시간 단축률</td></tr>
+<tr><td>2</td><td>1 + <code>MAX_PASSES 16→10, MIN 9→5, MIN_CONV 4→2</code></td><td>pass 축소 효과 + 정확도 영향</td><td>시간·정확도</td></tr>
+<tr><td>3</td><td>2 + <code>MAX_DELTA_S 0.003→0.01</code></td><td>수렴 완화로 추가 단축</td><td>시간·정확도</td></tr>
+<tr><td>4</td><td>3 + <code>MESH_MAX_ELEMENTS 50000→30000, skin layers 4→2</code></td><td>메시 성김으로 pass당 단축</td><td>시간·정확도(Q 주의)</td></tr>
+<tr><td>5+</td><td>30분 근처에서 노브 미세조정(정확도 회복 ↔ 시간)</td><td>30분 + 허용오차 동시 만족점</td><td>최종 config 확정</td></tr>
+</table>
+<div class="rec">순서가 핵심: <b>코어(정확도 무손실)부터</b> 최대한 짜내고, 그 다음 pass→delta-S→mesh(정확도 손실 동반) 순으로. 코어만으로 30분이 되면 정확도 손실 0으로 끝.</div>
+
+<h2>4. 정확도 가드 (필수 — 빡세게 한 이유)</h2>
+<p>각 변형의 결과를 <b>베이스라인(92분) 같은 design point</b>와 비교. SSW 핵심 물리지표로 허용오차 판정:</p>
+<ul>
+<li><b>공진주파수</b>(6.78MHz 근처 S11/입력임피던스 최소점) — Δf 허용 예: &lt;1%.</li>
+<li><b>결합계수 k</b> / S21 피크 — 허용 예: &lt;2~3%.</li>
+<li><b>Q(도체손실 민감)</b> — skin depth 층수 줄이면 가장 먼저 흔들림. 허용 예: &lt;5%.</li>
+<li><b>S-파라미터 곡선</b>(0.1~100MHz) RMS 편차 — 허용 예: &lt;-40dB 또는 곡선 육안 일치.</li>
+<li><b>수렴 여부</b>: MIN_CONVERGED_PASSES 줄였을 때 delta-S가 실제로 수렴했는지(미수렴이면 신뢰불가).</li>
+</ul>
+<div class="q"><b>허용오차는 네가 정해라</b>(물리/응용 기준). 위 %는 시작점 예시. 30분 후보 중 핵심지표가 허용오차 내인 가장 빠른 것을 채택.</div>
+
+<h2>5. 측정 자동화 (스윕)</h2>
+<ul>
+<li>매트릭스를 스크립트로: 각 config마다 상수 패치 → 고정 seed 1솔브 → (시간, pass수, delta-S, 핵심지표 CSV) 한 줄 기록 → 표 생성.</li>
+<li>2~3개 design point로 교차(한 점에서 30분이어도 다른 형상은 다를 수 있음 — 평균/최악 둘 다).</li>
+<li>throughput 관점도: 단일솔브 시간↓ 했지만 코어↑로 동시솔브↓면 시간당 솔브수는? <code>(동시 컨테이너수) / (솔브분)</code>로 비교 — 30분·고코어가 92분·저코어보다 시간당 유용결과가 많은지.</li>
+</ul>
+
+<h2>6. peetsfea 0.3.9.1 반영</h2>
+<ul>
+<li>승자 config의 SETUP_*/MESH_*/SOLVE_CORES 값을 0.3.9.1 기본값으로. 가능하면 <b>TOML/env로 노출</b>(상수 하드코딩 → 설정화)해 패치 없이 재튜닝.</li>
+<li>SOLVE_CORES 올리면 컨테이너 적분제어의 동시 컨테이너 목표도 같이 낮춰야(코어 경합 방지) — 노드 64코어 ÷ SOLVE_CORES = 노드당 적정 컨테이너수. 0.3.9.1 롤아웃 시 타깃 재설정.</li>
+<li>0.3.9.1 게이트 venv 동기화(harry261/hmlee31) + fresh DB 또는 버전필터로 0.3.9.0과 분리.</li>
+</ul>
+
+<h2>7. 절차 요약</h2>
+<ol>
+<li>고정 design point 1~3개 선정(대표 형상).</li>
+<li>hmlee31/별도 노드에서 디버그 단일솔브 골격 검증(베이스라인 92분·정확도 재현).</li>
+<li>매트릭스 #1→#5 스윕(코어→pass→delta-S→mesh), 시간·정확도 기록.</li>
+<li>30분 + 허용오차 만족 config 확정(교차 design point 확인).</li>
+<li>0.3.9.1에 반영(+ 설정화 + 컨테이너 타깃 재설정) → 양 게이트 배포.</li>
+</ol>
+
+<p class="mut" style="margin-top:24px">— 핵심 통찰: <b>SOLVE_CORES=4가 낮다</b>. 정확도 손실 0인 코어 증설부터 짜내고(동시성↓ 감안), 부족분만 pass/delta-S/mesh로. 정확도는 92분 ground truth 대비 핵심 물리지표로 가드.</p>
+
+</div>
+</body>
+</html>
