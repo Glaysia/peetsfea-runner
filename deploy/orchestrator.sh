@@ -138,7 +138,6 @@ spawn_one() {
     --mount "$ANSB/AnsysEM:/mnt/AnsysEM" --mount "$ANSB:/ansys_inc/v252" \
     --mount "$ANSB/licensingclient:/mnt/licensingclient" --mount "$HOME:$HOME" --mount "$JOBDIR:$JOBDIR" \
     --mount /gpfs:/gpfs \
-
     --env ANSYSEM_ROOT252=/mnt/AnsysEM --env ANS_IGNOREOS=1 --env "NVIDIA_VISIBLE_DEVICES=$NVD" \
     --env "ANSYSLMD_LICENSE_FILE=${ANSYSLMD_LICENSE_FILE:-}" \
     --env "HOME=$CHOME" --env "TMPDIR=$CHOME/tmp" \
