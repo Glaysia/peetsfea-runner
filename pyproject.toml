@@ -12,7 +12,7 @@ dependencies = [
   "duckdb>=1.5",
   "ocp-vscode>=3.1.2",
   "pexpect>=4.9",
-  "peetsfea @ git+file:///home/peets/git/peetsfea.git@v0.3.9.3",
+  "peetsfea @ git+file:///home/peets/git/peetsfea.git@v0.3.9.4",
   "psutil",
   "pandas",
   "pyaedt[graphics]==0.25.1",
