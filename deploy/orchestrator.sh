@@ -152,6 +152,10 @@ spawn_one() {
     --env "EDT_PID_NS=${EDT_PID_NS:-1}" \
     "$C" /bin/bash -lc '
       export PATH=/mnt/AnsysEM:$PATH
+      # private /dev/shm: enroot는 host /dev/shm을 공유 → 크래시한 ansysedt가 남긴 stale __KMP_REGISTERED_LIB_*가
+      # 누적·타계정 소유라, 다른 계정(hmlee31) ansysedt가 OpenMP SHM을 못 열어 "Can'"'"'t open SHM"으로 startup abort(rc=134).
+      # 컨테이너마다 tmpfs를 /dev/shm에 덮어 격리 → 매번 깨끗(잔재·교차계정 오염 0). enroot --root user-ns가 mount 허용.
+      mount -t tmpfs -o size=24g tmpfs /dev/shm 2>/dev/null || true
       # PID-ns 격리(EDT_PID_NS=1, 기본): python=새 PID 네임스페이스의 PID 1 → 1솔브 후 exit 시
       # 커널이 그 ns의 잔여 프로세스(고아 ansysedt) 전량 SIGKILL → 노드 누수 회수. enroot는 host PID ns를
       # 공유해 enroot remove만으론 AEDT 고아가 살아남아 누적(4h 검증: RSS 14→433GB·FD 339→32273).
