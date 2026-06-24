@@ -57,9 +57,36 @@ class ContainerController:
         base, rem = divmod(self.n_total, self.job_count)
         return [base + (1 if i < rem else 0) for i in range(self.job_count)]
 
-    def plan_for(self, job_index: int) -> int:
-        """잡 i의 현재 컨테이너 목표(/job_plan 서빙용). 범위 밖 인덱스는 0."""
-        dist = self.distribute()
+    def distribute_weighted(self, live_by_job: dict[int, int], *, floor: int = 2, cap: int = 20) -> list[int]:
+        """로드밸런싱 분배: 잡별 **실측 live(=그 노드에서 실제 띄운 용량)** 에 비례해 N_total을 나눈다.
+        못 채우는 잡(낮은 live)은 적게, 잘 도는 잡은 많이 → 한가한 잡의 잉여를 바쁜 잡으로 이동.
+        floor: idle/미보고 잡도 최소 가중(회복 여지). cap: 잡당 상한(orchestrator clamp_N=20 정합).
+        보고가 전혀 없으면 균등 분배로 폴백(기동 초기 = 기존 동작)."""
+        if self.job_count <= 0:
+            return []
+        if not live_by_job:
+            return self.distribute()
+        weights = [max(int(live_by_job.get(i, floor)), floor) for i in range(self.job_count)]
+        total_w = sum(weights)
+        if total_w <= 0:
+            return self.distribute()
+        raw = [self.n_total * w / total_w for w in weights]
+        targets = [min(int(x), cap) for x in raw]
+        # 내림 + cap으로 빠진 나머지를 소수부 큰(아직 cap 안 닿은) 잡부터 +1
+        rem = self.n_total - sum(targets)
+        order = sorted(range(self.job_count), key=lambda i: raw[i] - int(raw[i]), reverse=True)
+        idx = 0
+        while rem > 0 and idx < self.job_count * 2:
+            j = order[idx % self.job_count]
+            if targets[j] < cap:
+                targets[j] += 1
+                rem -= 1
+            idx += 1
+        return targets
+
+    def plan_for(self, job_index: int, live_by_job: dict[int, int] | None = None) -> int:
+        """잡 i의 현재 컨테이너 목표(/job_plan 서빙용). live_by_job 주면 로드밸런싱 분배, 없으면 균등. 범위밖=0."""
+        dist = self.distribute_weighted(live_by_job) if live_by_job else self.distribute()
         return dist[job_index] if 0 <= job_index < len(dist) else 0
 
 

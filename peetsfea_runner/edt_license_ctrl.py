@@ -182,10 +182,31 @@ class ContainerScheduler:
         with self._lock:
             return self.controller.n_total
 
+    def _live_by_job_locked(self, now: float) -> dict[int, int]:
+        """fresh orch_report에서 잡인덱스→실측 live(가장 최근 보고 우선). 로드밸런싱 가중치용."""
+        out: dict[int, int] = {}
+        best_ts: dict[int, float] = {}
+        for r in self._reports.values():
+            if (now - r["ts"]) > self.report_ttl_seconds:
+                continue
+            j = r.get("job")
+            if j is None:
+                continue
+            try:
+                ji = int(j)
+            except (TypeError, ValueError):
+                continue
+            if ji not in best_ts or r["ts"] > best_ts[ji]:
+                best_ts[ji] = r["ts"]
+                out[ji] = int(r.get("live", 0))
+        return out
+
     def plan_for(self, job_index: int) -> int:
-        """잡 i의 현재 컨테이너 목표(/job_plan?job=i 서빙). 적분 N_total을 고정 잡들에 분배한 값."""
+        """잡 i의 현재 컨테이너 목표(/job_plan?job=i 서빙). 적분 N_total을 잡별 실측 live에 **비례 재분배**
+        (로드밸런싱): 못 채우는 한가한 잡의 잉여를 잘 도는 잡에 더 준다. 보고 없으면 균등 폴백."""
         with self._lock:
-            return self.controller.plan_for(job_index)
+            live_by_job = self._live_by_job_locked(self.clock())
+            return self.controller.plan_for(job_index, live_by_job)
 
     def report(self, slurm_id: str, live: int, **extra: Any) -> None:
         """orchestrator가 살아있는 컨테이너 수 보고."""
