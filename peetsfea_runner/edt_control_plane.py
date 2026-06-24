@@ -427,6 +427,9 @@ def build_control_plane(
                 ingest_port=acct_cfg.ingest_port,
                 priority_lease_port=acct_cfg.priority_lease_port,
                 license_ctrl_port=acct_cfg.license_ctrl_port,
+                # 계정간 노드 분리: 모든 계정 username(ssh_host gate1-<user>에서 추출) → _busy_nodes가 squeue -u로
+                # 상대 계정 점유 노드까지 제외(co-locate 방지). --exclusive는 QOS(노드당 64cpu)와 충돌해 못 씀.
+                peer_users=tuple(a.ssh_host.removeprefix("gate1-") for a in account_configs),
             )
         acct_orchestrator = JobOrchestrator(
             launcher=acct_launcher,

@@ -115,6 +115,10 @@ class SlurmJobLauncher:
     ingest_port: int = 7876
     priority_lease_port: int = 7878
     license_ctrl_port: int = 7879
+    # 계정간 노드 분리: 모든 계정의 SLURM username. control plane이 주입한다. _busy_nodes가 squeue -u로
+    # **상대 계정 점유 노드까지** 보고 제외 → 두 계정 잡이 같은 노드에 co-locate 안 됨(cross-account SHM 충돌
+    # 방지). 같은 클러스터(gate1)라 squeue -u <peer>로 상대 노드 조회 가능. 비면 자기 계정만(--me).
+    peer_users: tuple[str, ...] = ()
     _avoid: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _submitted_nodes: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
@@ -188,9 +192,8 @@ class SlurmJobLauncher:
             f"{nodelist_line}"
             f"#SBATCH --time={self.time_limit}\n"
             "#SBATCH --nodes=1 --ntasks=1\n"
-            # 노드 배타 점유: 한 노드에 한 계정의 한 잡만 → 두 계정 AEDT가 같은 노드에 안 섞인다.
-            # (co-locate 시 cross-account OpenMP 'Can't open SHM'로 늦게 램프한 계정 컨테이너가 rc=134 abort.)
-            "#SBATCH --exclusive\n"
+            # 노드 배타는 --exclusive 안 씀(노드 전체 256cpu 요구 → QOS cpu2_limit 64cpu/node와 충돌, QOSMaxCpuPerNode).
+            # 대신 _busy_nodes가 양 계정 점유 노드(squeue -u)를 제외 → node_based 핀으로 계정간 노드 분리.
             f"#SBATCH --cpus-per-task={cpus}\n"
             f"{gres_line}"
             f"#SBATCH --mem={mem}\n"
@@ -215,8 +218,13 @@ class SlurmJobLauncher:
         )
 
     def _busy_nodes(self) -> set[str]:
-        """내 잡(RUNNING/PENDING)이 이미 점유한 노드 — 노드당 1잡을 위해 제외 대상."""
-        result = self._ssh("squeue -h --me -t RUNNING,PENDING -o '%N'")
+        """양 계정의 잡(RUNNING/PENDING)이 점유한 노드 — 노드당 1잡 + 계정간 분리 위해 제외.
+        peer_users(모든 계정 username) 있으면 squeue -u로 상대 계정 노드까지, 없으면 --me(자기만)."""
+        if self.peer_users:
+            query = f"squeue -h -u {','.join(self.peer_users)} -t RUNNING,PENDING -o '%N'"
+        else:
+            query = "squeue -h --me -t RUNNING,PENDING -o '%N'"
+        result = self._ssh(query)
         if result.returncode != 0:
             return set()
         nodes: set[str] = set()
