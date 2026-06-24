@@ -109,7 +109,7 @@ class ControlPlaneConfig:
     # 단일 canonical 배포본(git 체크아웃) 1벌을 /gpfs에서 양 계정이 공유(두 게이트=같은 PC, harry261 홈은
     # 공유친화 umask). orchestrator 안의 DEPLOY=$HOME/edt-deploy라 venv·clogs·debug는 자연히 per-user.
     # 배포: 로컬에서 git push gate-harry main → 게이트 git checkout. 수동 scp 없음.
-    job_command: str = "bash /gpfs/home1/harry261/peetsfea-runner/deploy/orchestrator.sh"
+    job_command: str = "bash $HOME/peetsfea-runner/deploy/orchestrator.sh"
     dashboard_port: int = 8080
     intake_port: int = 7875  # historical env name; this now serves Adaptive TOML Registry.
     ingest_port: int = DEFAULT_INGEST_PORT  # 슈퍼컴 전용 결과 백채널(역터널로만 도달).
@@ -149,7 +149,7 @@ class ControlPlane:
     license_poll_seconds: float = 60.0
     dashboard_peetsfea_version: str = ""  # 대시보드 표시 버전 필터(빈 값=전 버전).
     resources_store: SingleSimulationResultStore | None = None  # control측: 자원 시계열 전용 소형 DB.
-    resource_provider: RemoteResourceProvider | None = None  # web측: control의 자원 엔드포인트 프록시.
+    resource_provider: RemoteResourceProvider | AggregatingResourceProvider | None = None  # web측: control 자원 프록시(다계정=합산).
     enable_ingest_tunnel: bool = True  # 테스트에선 ssh 역터널 비활성.
     # 역할 분리: web=대시보드/intake/ingest/bulk/터널/아카이브/폴러(DB 보유), keeper=오케스트레이터(9잡 유지, DB 무관).
     # 둘 다 True면 단일 프로세스(기존 동작). 분리 운영 시 web 재시작이 컨테이너를 건드리지 않는다(scancel은 keeper만).

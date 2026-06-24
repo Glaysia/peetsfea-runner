@@ -188,6 +188,9 @@ class SlurmJobLauncher:
             f"{nodelist_line}"
             f"#SBATCH --time={self.time_limit}\n"
             "#SBATCH --nodes=1 --ntasks=1\n"
+            # 노드 배타 점유: 한 노드에 한 계정의 한 잡만 → 두 계정 AEDT가 같은 노드에 안 섞인다.
+            # (co-locate 시 cross-account OpenMP 'Can't open SHM'로 늦게 램프한 계정 컨테이너가 rc=134 abort.)
+            "#SBATCH --exclusive\n"
             f"#SBATCH --cpus-per-task={cpus}\n"
             f"{gres_line}"
             f"#SBATCH --mem={mem}\n"
