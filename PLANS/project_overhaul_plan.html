@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>프로젝트 갈아엎기 계획 — 모순·구조실패 점검 (10%/day 픽)</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--p0:#f85149;--p1:#d29922;--p2:#58a6ff;--p3:#8b949e}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",sans-serif}
+  .wrap{max-width:1060px;margin:0 auto;padding:32px 22px 80px}
+  h1{font-size:24px;line-height:1.35;margin:0 0 6px}
+  h2{font-size:19px;margin:34px 0 12px;padding-top:14px;border-top:1px solid var(--bd)}
+  h3{font-size:15px;margin:14px 0 6px;color:var(--acc)}
+  .sub{color:var(--mut);margin:0 0 20px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 18px;margin:12px 0}
+  code{background:#1f2630;padding:1.5px 6px;border-radius:5px;font-size:13px;color:#ffa657}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13.5px}
+  th,td{border:1px solid var(--bd);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:#1f2630}
+  .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+  .item{border:1px solid var(--bd);border-left-width:4px;border-radius:0 9px 9px 0;padding:12px 16px;margin:10px 0;background:var(--card)}
+  .item.P0{border-left-color:var(--p0)} .item.P1{border-left-color:var(--p1)} .item.P2{border-left-color:var(--p2)} .item.P3{border-left-color:var(--p3)}
+  .tag{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11.5px;border:1px solid var(--bd);margin-right:5px;vertical-align:middle}
+  .P0b{background:#2a0f0f;color:#ff8b82} .P1b{background:#251c08;color:#e3b341} .P2b{background:#0d1d2e;color:#79c0ff} .sz{background:#13241a;color:#56d364}
+  .id{font-weight:700;color:#ffa657;margin-right:6px}
+  .item b.lbl{color:var(--mut);font-weight:600;display:inline-block;min-width:42px}
+  ul{margin:6px 0}
+  .rec{border-left:3px solid var(--ok);background:#0f1c12;padding:9px 13px;border-radius:0 8px 8px 0;margin:8px 0}
+  .ko{border-left:3px solid var(--bad);background:#1c1010;padding:9px 13px;border-radius:0 8px 8px 0;margin:8px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>프로젝트 갈아엎기 계획 — 산재한 모순·구조 실패</h1>
+<p class="sub">2026-06-24 세션 진단 종합. <b>매일 1개(≈10%)씩 골라 dev에서 최적화</b>하기 위한 픽 리스트. 우선순위 <span class="tag P0b">P0 발산/사고</span> <span class="tag P1b">P1 효율손실</span> <span class="tag P2b">P2 견고성</span> <span class="tag" style="color:var(--p3)">P3 정리</span> · 크기 <span class="tag sz">S 반나절</span> <span class="tag sz">M 하루</span> <span class="tag sz">L 며칠</span></p>
+
+<div class="card">
+<b>핵심 관통 모순 (1줄 요약):</b> 컨트롤러는 <b>유효 AEDT(동시 솔브 수)</b>를 지령으로 수렴시키는데, 실제 천장은 <b>anshpc(HPC 라이선스, 900)</b>와 <b>노드 용량</b>이다. 컨트롤러가 이 천장을 모른 채 지령(250)을 쫓아 <b>과-spawn → 라이선스 고갈 → 솔브 실패 → 유효 AEDT 더 낮게 관측 → 더 spawn</b>의 <span class="bad">양의 피드백(발산)</span>이 핵심 병. 이번 세션의 90% 실패(analyze 즉시 False)가 전부 여기서 나왔다. 아래 항목 대부분이 이 한 모순의 가지들이다.
+</div>
+
+<h2>A. 자원 제어 — 진짜 병목을 모르는 제어기 (최상위)</h2>
+
+<div class="item P0">
+<span class="id">A1</span><span class="tag P0b">P0</span><span class="tag sz">M</span> <b>적분 컨트롤러가 라이선스/노드 천장을 모른다 (양의 피드백 발산)</b>
+<p><b class="lbl">증거</b> target_aedt=250인데 anshpc 900을 16코어 솔브 12개씩 먹어 ~75 동시가 천장. 유효 AEDT 77에서 정체, 명목(컨테이너) 106+로 계속 spawn. 30분 성공률 5%.</p>
+<p><b class="lbl">모순</b> <code>err = target − 관측유효</code>인데, 실패로 관측유효가 낮으면 err↑ → 더 spawn → 라이선스 더 고갈 → 더 실패. 음의 피드백이어야 할 게 양의 피드백.</p>
+<div class="rec"><b>제안</b> 컨트롤러에 <b>자원 천장 항</b> 추가: <code>n_total ≤ min(target, anshpc_free/hpc_per_solve, node_slots)</code>. lmstat의 anshpc 가용분(poller가 이미 봄)을 관측해 spawn 상한을 동적으로. 실패율이 임계 초과면 spawn 동결(anti-windup).</div>
+</div>
+
+<div class="item P0">
+<span class="id">A2</span><span class="tag P0b">P0</span><span class="tag sz">S</span> <b>SOLVE_CORES ↔ 동시성이 암묵 결합 (모델에 없음)</b>
+<p><b class="lbl">증거</b> 16코어=12 anshpc/솔브 → 최대 ~75 동시. 6코어=2 → ~450. 0.3.9.1에서 코어 16으로 올리며 동시성 천장이 1/6로 떨어진 걸 아무도 모델 안 함 → 0.3.9.5(6코어)까지 4번 버전 돌고서야 발견.</p>
+<div class="rec"><b>제안</b> <code>max_concurrent_solve = anshpc_pool / max(1, SOLVE_CORES−HPC_FREE_CORES)</code>를 명시 상수/계산으로 박고, target_aedt를 이 값으로 자동 clamp. 코어수 바꾸면 동시성 천장이 따라 바뀌게.</div>
+</div>
+
+<div class="item P1">
+<span class="id">A3</span><span class="tag P1b">P1</span><span class="tag sz">S</span> <b>wait_for_license가 데스크톱만, 솔버 HPC는 안 막음</b>
+<p><b class="lbl">증거</b> 0.3.9.5 <code>wait_for_license=True</code> = 데스크톱 <code>-waitforlicense</code>만. analyze(HFSS HPC 솔버)는 anshpc 없으면 그냥 False. → 여전히 즉시 실패.</p>
+<div class="rec"><b>제안</b> 솔버 단계 anshpc 대기/큐 방법 조사(<code>ANSYSLI_TIMEOUT</code> 등 라이선스 인터커넥트 대기 변수, batch solve 옵션) + peetsfea의 analyze 래퍼에 라이선스-실패 재시도(대기 후 retry) 추가. [세션 중 조사 미완 — 이어서]</div>
+</div>
+
+<div class="item P2">
+<span class="id">A4</span><span class="tag P2b">P2</span><span class="tag sz">M</span> <b>두 제어 루프 + 방금 추가한 로드밸런싱의 상호작용 미검증</b>
+<p><b class="lbl">증거</b> 잡(고정 인프라) + 컨테이너 N(적분) + 잡별 가중 재분배(distribute_weighted, 이번 세션 추가). 셋이 동시에 actuate. 가중 재분배가 적분 출력을 다시 쪼개 → 진동/편중 가능.</p>
+<div class="rec"><b>제안</b> 제어 다이어그램 1장으로 정리(루프 주기·게인·상한) + 통합 시뮬/단위테스트로 안정성(진동·수렴) 검증. PLANS/integral_container_control.html 갱신.</div>
+</div>
+
+<h2>B. 스케줄링 · 노드</h2>
+
+<div class="item P1">
+<span class="id">B1</span><span class="tag P1b">P1</span><span class="tag sz">S</span> <b>잡 수(20) vs 노드 용량 불일치 → 만성 PENDING</b>
+<p><b class="lbl">증거</b> 10잡/계정 × 2 = 20잡, 패킹 2/노드 + 계정분리 → 계정당 5노드 = 10노드 필요. cpu2 ~10노드를 타유저와 공유(mix 7/alloc 3) → hmlee31 2잡 상시 PENDING(Resources). 카운트 18에서 정체.</p>
+<div class="rec"><b>제안</b> 잡 수를 노드 가용에 맞춰 동적으로(가용 노드×2/계정) 또는 줄여서 PENDING 제거. "고정 인프라"의 고정값을 클러스터 현실로.</div>
+</div>
+
+<div class="item P1">
+<span class="id">B2</span><span class="tag P1b">P1</span><span class="tag sz">S</span> <b>노드 핀 경직 — ReqNodeNotAvail 고착</b>
+<p><b class="lbl">증거</b> 런처가 <code>--nodelist=n107</code>로 핀 → n107이 빠지자 잡이 그 노드만 기다리며 PENDING 고착(694396).</p>
+<div class="rec"><b>제안</b> <code>pending_reason()</code>에서 ReqNodeNotAvail/Resources 장기 감지 시 <code>avoid_node</code> 등록 + scancel/재제출로 다른 노드 재라우팅(이미 avoid_node 인프라 있음 — 트리거만 연결).</div>
+</div>
+
+<div class="item P1">
+<span class="id">B3</span><span class="tag P1b">P1</span><span class="tag sz">S</span> <b>/enroot 포화 노드에 핀 → 가드 즉시종료 churn (20 찍자마자 하락)</b>
+<p><b class="lbl">증거</b> 타유저가 채운 n113(free 43G&lt;80G)에 잡이 떨어지면 orchestrator가 즉시 "스킵 종료" → 카운트 진동. 런처가 노드 선택 시 /enroot 여유를 안 봄.</p>
+<div class="rec"><b>제안</b> <code>_candidate_nodes()</code>에 /enroot 여유 사전필터(scontrol/df로 free&lt;임계 노드 제외). 또는 가드 발동 노드를 avoid_node로.</div>
+</div>
+
+<div class="item P2">
+<span class="id">B4</span><span class="tag P2b">P2</span><span class="tag sz">M</span> <b>계정간 노드 분리(peer_users)가 샌다</b>
+<p><b class="lbl">증거</b> n112·n114를 양 계정이 공유(겹침). squeue 반영지연 race + 노드부족으로 분리 회피가 깨짐.</p>
+<div class="rec"><b>제안</b> 분리를 명시적 노드-셋 파티션(계정별 노드 풀 할당)으로, 또는 cross-account 예약을 control plane in-process 공유 상태로(squeue race 제거). private /dev/shm로 SHM 충돌은 막혀 치명적이진 않으니 P2.</div>
+</div>
+
+<h2>C. 라이선스 · 오펀 누수</h2>
+
+<div class="item P1">
+<span class="id">C1</span><span class="tag P1b">P1</span><span class="tag sz">M</span> <b>teardown이 HPC 라이선스를 깨끗이 안 놓음 → linger로 풀 막힘</b>
+<p><b class="lbl">증거</b> 버전전환마다 scancel한 16코어 솔브의 anshpc가 <b>linger 상태로 648개(풀 72%)</b> 잔류. lmremove 불가("Cannot remove a linger license"), 강제회수 권한/방법 없음. ~3시간 자연 timeout 대기.</p>
+<div class="rec"><b>제안</b> graceful teardown에서 ansysedt에 라이선스 release 신호(clean exit) 우선 + linger 기간 짧게 설정 가능한지(옵션파일/벤더) 조사. 최소한 버전전환을 잡 TTL 회전으로(scancel 대신) 해 linger 폭증 방지.</div>
+</div>
+
+<div class="item P3">
+<span class="id">C2</span><span class="tag" style="color:var(--p3)">P3</span><span class="tag sz">S</span> <b>orphan ansysedt/라이선스 모니터링·알람 부재</b>
+<p><b class="lbl">증거</b> 우리 잡=0인데 라이선스 76 desktop·64 solve 잡힌 걸 수동 lmstat로야 발견.</p>
+<div class="rec"><b>제안</b> poller에 "내 잡 없는데 잡힌 라이선스(orphan)" 지표 + 대시보드 노출.</div>
+</div>
+
+<h2>D. /dev/shm · 컨테이너 격리</h2>
+
+<div class="item P2">
+<span class="id">D1</span><span class="tag P2b">P2</span><span class="tag sz">S</span> <b>enroot가 host /dev/shm 공유 → KMP 오펀 오염 (패치됨, 근본은 남음)</b>
+<p><b class="lbl">증거</b> 공유 /dev/shm에 stale <code>__KMP_REGISTERED_LIB_*</code>(타계정 소유) 누적 → hmlee31 ansysedt "Can't open SHM" abort(rc=134). 컨테이너별 private tmpfs /dev/shm 마운트로 임시패치.</p>
+<div class="rec"><b>제안</b> enroot 설정(hook/conf)에서 /dev/shm을 컨테이너 private로 기본화(orchestrator 인라인 mount 의존 제거). 노드 부팅 시 stale KMP 청소 cron도 고려.</div>
+</div>
+
+<h2>E. 관측 · 대시보드</h2>
+
+<div class="item P2">
+<span class="id">E1</span><span class="tag P2b">P2</span><span class="tag sz">S</span> <b>다계정 합산층이 임시방편 (merge 버그 다발) <span class="ok">— 일부 수정됨</span></b>
+<p><b class="lbl">증거</b> <code>_merge_histories</code> 30s 버킷 과합산 → 추세 18→36/72 뻥튀기. <code>_merge_snapshots</code> 노드 통째 덮어쓰기 → n110 CPU 클로버. (둘 다 이번 세션 수정 8b4fac8.) 패턴: AggregatingResourceProvider가 급조됨.</p>
+<div class="rec"><b>제안</b> 합산층 단위테스트 보강(다계정·오프셋 폴·노드 중복 케이스) + 라이선스 추세도 같은 carry-forward 일관 적용 검증.</div>
+</div>
+
+<div class="item P2">
+<span class="id">E2</span><span class="tag P2b">P2</span><span class="tag sz">M</span> <b>lmstat 파싱 / 계정별 poller fragility</b>
+<p><b class="lbl">증거</b> "hmlee31 poller license=None"(과거), lmstat 경로 하드코딩, 계정별 중복 폴, /status 엔드포인트 None 반환.</p>
+<div class="rec"><b>제안</b> lmstat 1회 폴을 공유(계정별 중복 제거), 파싱 견고화 + 실패 시 명시 에러, /status 스키마 점검.</div>
+</div>
+
+<h2>F. 솔브 설정 · peetsfea 코드</h2>
+
+<div class="item P1">
+<span class="id">F1</span><span class="tag P1b">P1</span><span class="tag sz">L</span> <b>솔브 설정이 움직이는 표적 — 정확도↔속도↔자원 trade-off 비체계</b>
+<p><b class="lbl">증거</b> 0.3.9.0(지오메트리 3배 y-span) → 솔브 11→87분(8배). 0.3.8.3 skin-depth 메시 op 신설. 0.3.9.1~5에서 코어16→6, 메시 floor→fallback, pass 16/16/16, wait_for_license… 6번 버전을 더듬어 찾음.</p>
+<div class="rec"><b>제안</b> 설계공간×메시×코어×라이선스를 묶은 <b>1장 trade-off 모델/대시보드</b>: "이 설정이면 솔브 X분·anshpc Y/솔브·동시 Z·정확도 W". 버전 바꿀 때 사전 예측되게. (PLANS/solve_time_30min_tuning.html 확장.)</div>
+</div>
+
+<div class="item P2">
+<span class="id">F2</span><span class="tag P2b">P2</span><span class="tag sz">M</span> <b>남은 비-anshpc 실패 (실질 코드/지오메트리 버그)</b>
+<p><b class="lbl">증거</b> <code>Raw Hfss.project_name must be str (NoneType)</code> ×20, <code>tx/rx_port edge_vertices 매칭 실패</code> ×11, <code>SSW solve telemetry process did not stop</code> ×9.</p>
+<div class="rec"><b>제안</b> 각각 재현 + peetsfea 수정. project_name=None은 세션 생성 레이스/실패 처리, edge_vertices는 특정 지오메트리 엣지 매칭, telemetry는 정리 타임아웃.</div>
+</div>
+
+<div class="item P3">
+<span class="id">F3</span><span class="tag" style="color:var(--p3)">P3</span><span class="tag sz">S</span> <b>16패스 강제(16/16/16)로 대부분 "수렴 안됨" 후 스윕</b>
+<p><b class="lbl">증거</b> batch.log "Adaptive Passes did not converge" → 그래도 스윕 진행. min=conv=max=16이라 사실상 16패스 고정·수렴요구 빡셈.</p>
+<div class="rec"><b>제안</b> 수렴기준(delta_S)·패스수를 설계점 난이도에 맞춰. 정확도 가드(F1과 연계)로 수렴-미수렴 결과 품질 차이 측정.</div>
+</div>
+
+<h2>G. 배포 · 환경</h2>
+
+<div class="item P2">
+<span class="id">G1</span><span class="tag P2b">P2</span><span class="tag sz">M</span> <b>pyproject 의존성 불완전 (재현 안 됨)</b>
+<p><b class="lbl">증거</b> venv 재생성 시 <code>psycopg</code>·<code>uvicorn[standard]</code>·<code>path</code>·pytest 누락(수동설치였음). 서비스가 import 실패. requires-python <code>==3.12.*</code> vs peetsfea <code>==3.12.12</code> uv 해석 충돌.</p>
+<div class="rec"><b>제안</b> 런타임/dev 의존성 전부 pyproject에 선언(psycopg[binary], uvicorn[standard], path…). requires-python을 peetsfea와 정합(==3.12.12). uv.lock 커밋해 재현 고정.</div>
+</div>
+
+<div class="item P2">
+<span class="id">G2</span><span class="tag P2b">P2</span><span class="tag sz">M</span> <b>배포 토폴로지 ad-hoc (게이트 bare 레포·venv 산재)</b>
+<p><b class="lbl">증거</b> 게이트별 <code>~/git/peetsfea.git</code> bare 레포, canonical을 harry261 홈에(공유친화 umask 의존), venv 3개 수동 동기화, 두 게이트=같은 PC인데 별도 취급한 흔적.</p>
+<div class="rec"><b>제안</b> 배포를 한 스크립트/문서로 표준화(git push → checkout → venv 동기화). "같은 PC + /gpfs 공유" 전제를 명시하고 canonical 위치·권한을 문서화. [세션 중 절반 정리됨]</div>
+</div>
+
+<div class="item P3">
+<span class="id">G3</span><span class="tag" style="color:var(--p3)">P3</span><span class="tag sz">S</span> <b>DB 단일 + 역터널 의존 (SPOF)</b>
+<p><b class="lbl">증거</b> 결과가 역터널로 로컬 단일 PG에 push. web 재시작 시 ingest/터널 잠깐 끊김.</p>
+<div class="rec"><b>제안</b> ingest 재시도/버퍼링 견고화(이미 일부), 단일 DB 백업/복구 루틴 정례화.</div>
+</div>
+
+<h2>우선순위 요약 (픽 순서 권장)</h2>
+<table>
+<tr><th>순서</th><th>항목</th><th>왜 먼저</th><th>크기</th></tr>
+<tr><td>1</td><td><b>A1</b> 컨트롤러 자원 천장 인식</td><td>발산 피드백 = 모든 실패의 뿌리. 이거 하나로 성공률 근본 안정</td><td>M</td></tr>
+<tr><td>2</td><td><b>A2</b> 코어↔동시성 명시 결합</td><td>A1의 짝. 코어 바꿀 때마다 헤매는 것 종결</td><td>S</td></tr>
+<tr><td>3</td><td><b>B1/B2/B3</b> 노드 핀·포화·잡수</td><td>잡 진동/PENDING 제거 → 처리량 직결, 작음</td><td>S×3</td></tr>
+<tr><td>4</td><td><b>A3/C1</b> 라이선스 대기·linger</td><td>HPC 고갈 내성. 조사 필요</td><td>S~M</td></tr>
+<tr><td>5</td><td><b>F1</b> trade-off 모델</td><td>설정 변경의 나침반 — 이후 모든 솔브튜닝 가속</td><td>L</td></tr>
+<tr><td>6+</td><td>D1·E1·E2·F2·F3·G1·G2·G3</td><td>견고성·정리</td><td>S~M</td></tr>
+</table>
+
+<div class="ko"><b>운영 메모(작성 시점):</b> anshpc 16코어 오펀(linger)이 빠지는 중(54→37)이라 성공률 5%→54%로 자가회복 중. A1을 넣으면 이런 외부 변동(타유저/오펀)에도 과-spawn 없이 안정 수렴함. 갈아엎기의 1번 후보.</div>
+
+<p class="mut" style="margin-top:22px">— 이 문서는 dev 브랜치의 픽 리스트다. 매일 1개 항목을 골라 dev에서 구현·검증·커밋하고, 이 표의 순서/크기를 참고해 ~10%씩 전진한다. 항목 완료 시 해당 카드에 <span class="ok">— 완료</span> 표시 + 커밋 해시를 남긴다.</p>
+
+</div>
+</body>
+</html>
