@@ -373,10 +373,73 @@ class RemoteResourceProvider:
         return []
 
 
+def _merge_snapshots(snaps: list[dict[str, Any]]) -> dict[str, Any]:
+    """다계정 스냅샷 병합. 계정별(mine/solve_mine·counts·jobs·nodes)은 합산/병합,
+    클러스터 공통(issued/in_use/solve_in_use·feature)은 대표값 1개(첫 비어있지 않은 것)."""
+    snaps = [s for s in snaps if isinstance(s, dict)]
+    if not snaps:
+        return _empty_snapshot()
+    jobs: list[Any] = []
+    nodes: dict[str, Any] = {}
+    running = pending = mine = solve_mine = 0
+    cluster: dict[str, Any] = {}
+    ts = 0.0
+    ok = False
+    for s in snaps:
+        jobs.extend(s.get("jobs") or [])
+        nodes.update(s.get("nodes") or {})
+        c = s.get("counts") or {}
+        running += int(c.get("running") or 0)
+        pending += int(c.get("pending") or 0)
+        lic = s.get("license") or {}
+        mine += int(lic.get("mine") or 0)
+        solve_mine += int(lic.get("solve_mine") or 0)
+        if lic and not cluster:  # 클러스터 전역값은 한 번만(합산 금지 — 모든 계정이 같은 FlexLM 풀)
+            cluster = {k: lic.get(k) for k in ("feature", "issued", "in_use", "solve_feature", "solve_in_use")}
+        ts = max(ts, float(s.get("ts") or 0))
+        ok = ok or bool(s.get("ok"))
+    return {
+        "ts": ts, "ok": ok, "jobs": jobs, "nodes": nodes,
+        "license": {**cluster, "mine": mine, "solve_mine": solve_mine},
+        "counts": {"running": running, "pending": pending},
+    }
+
+
+def _merge_histories(hists: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """다계정 시계열을 ts 30s 버킷으로 합산. 계정별 수치는 sum, 클러스터(lic_inuse)는 max."""
+    SUM = ("running", "pending", "lic_mine", "load", "myload", "cpus",
+           "mem_used_mb", "mem_total_mb", "nominal_aedt", "effective_aedt")
+    bucket: dict[int, dict[str, Any]] = {}
+    for h in hists:
+        for p in h:
+            t = float(p.get("ts") or 0)
+            b = bucket.setdefault(int(round(t / 30.0)), {"ts": t})
+            b["ts"] = max(b["ts"], t)
+            for k in SUM:
+                b[k] = b.get(k, 0) + (p.get(k) or 0)
+            b["lic_inuse"] = max(b.get("lic_inuse", 0), int(p.get("lic_inuse") or 0))
+    return [bucket[k] for k in sorted(bucket)]
+
+
+@dataclass
+class AggregatingResourceProvider:
+    """다계정: 여러 RemoteResourceProvider를 단일 뷰로 합산(대시보드가 양 계정을 다 본다).
+    계정별 수치는 합, 클러스터 전역(issued/in_use)은 대표값. 계정 1개면 그 계정 그대로."""
+
+    providers: list[RemoteResourceProvider]
+
+    def snapshot(self) -> dict[str, Any]:
+        return _merge_snapshots([p.snapshot() for p in self.providers])
+
+    def history(self, since_ts: float | None = None) -> list[dict[str, Any]]:
+        return _merge_histories([p.history(since_ts) for p in self.providers])
+
+
 __all__ = [
     "CommandRunner",
     "ResourcePoller",
     "RemoteResourceProvider",
+    "AggregatingResourceProvider",
     "parse_remote",
     "start_resource_server",
     "DEFAULT_RESOURCE_PORT",

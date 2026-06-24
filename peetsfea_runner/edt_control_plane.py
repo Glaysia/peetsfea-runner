@@ -38,6 +38,7 @@ from .edt_orchestrator import JobLauncher, JobOrchestrator
 from .edt_priority_lease import DEFAULT_PRIORITY_LEASE_PORT, start_priority_lease_server
 from .edt_resources import (
     DEFAULT_RESOURCE_PORT,
+    AggregatingResourceProvider,
     RemoteResourceProvider,
     ResourcePoller,
     start_resource_server,
@@ -394,9 +395,14 @@ def build_control_plane(
         resources_store = make_result_store(resources_db)  # PG 백엔드면 같은 PG(resource_snapshots 테이블).
         resources_store.initialize()
     elif run_web:
-        # web 전용 프로세스: 폴러가 없으니 control(keeper)의 자원 엔드포인트를 HTTP로 프록시(primary 계정 포트).
-        resource_provider = RemoteResourceProvider(
-            base_url=f"http://127.0.0.1:{account_configs[0].resource_port}"
+        # web 전용 프로세스: 폴러가 없으니 control(keeper)의 자원 엔드포인트를 HTTP로 프록시.
+        # 다계정: **모든 계정**의 자원 포트를 합산(AggregatingResourceProvider) → 대시보드가 양 계정을 다 본다.
+        # (이전엔 account_configs[0]만 읽어 hmlee31 등 비-primary 계정을 통째로 무시했음.)
+        resource_provider = AggregatingResourceProvider(
+            providers=[
+                RemoteResourceProvider(base_url=f"http://127.0.0.1:{a.resource_port}")
+                for a in account_configs
+            ]
         )
 
     accounts: list[AccountRuntime] = []
