@@ -385,9 +385,18 @@ def _merge_snapshots(snaps: list[dict[str, Any]]) -> dict[str, Any]:
     cluster: dict[str, Any] = {}
     ts = 0.0
     ok = False
+    node_sum = ("desktop", "solve", "mycpu")  # 노드 계정별 값 → 합산
     for s in snaps:
         jobs.extend(s.get("jobs") or [])
-        nodes.update(s.get("nodes") or {})
+        # 노드 필드별 병합(통째 update 금지): 계정별(desktop/solve/mycpu)은 합산, 노드 전역(cpuload/cputot/mem…)은
+        # 비어있지 않은 값 채택 → 비-소유 계정의 license-only 엔트리가 소유 계정의 CPU를 덮어쓰지 않는다(n110 버그).
+        for node, fields in (s.get("nodes") or {}).items():
+            dst = nodes.setdefault(node, {})
+            for k, v in (fields or {}).items():
+                if k in node_sum:
+                    dst[k] = (dst.get(k) or 0) + (v or 0)
+                elif v not in (None, 0) or k not in dst:
+                    dst[k] = v
         c = s.get("counts") or {}
         running += int(c.get("running") or 0)
         pending += int(c.get("pending") or 0)
@@ -406,19 +415,35 @@ def _merge_snapshots(snaps: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _merge_histories(hists: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
-    """다계정 시계열을 ts 30s 버킷으로 합산. 계정별 수치는 sum, 클러스터(lic_inuse)는 max."""
+    """다계정 시계열 합산. 각 계정의 **최신값을 carry-forward**하며 더한다(매 시점 = 계정별 최신 1점의 합).
+    30s로 다운샘플. 계정별 수치는 sum, 클러스터(lic_inuse)는 max.
+    이전 버그: 30s 버킷 안의 점을 **전부 더해**(계정별 2~4점) 실제 18 → 36/72로 뻥튀기됐다."""
     SUM = ("running", "pending", "lic_mine", "load", "myload", "cpus",
            "mem_used_mb", "mem_total_mb", "nominal_aedt", "effective_aedt")
-    bucket: dict[int, dict[str, Any]] = {}
-    for h in hists:
+    events: list[tuple[float, int, Mapping[str, Any]]] = []
+    for ai, h in enumerate(hists):
         for p in h:
-            t = float(p.get("ts") or 0)
-            b = bucket.setdefault(int(round(t / 30.0)), {"ts": t})
-            b["ts"] = max(b["ts"], t)
-            for k in SUM:
-                b[k] = b.get(k, 0) + (p.get(k) or 0)
-            b["lic_inuse"] = max(b.get("lic_inuse", 0), int(p.get("lic_inuse") or 0))
-    return [bucket[k] for k in sorted(bucket)]
+            if isinstance(p, Mapping):
+                events.append((float(p.get("ts") or 0), ai, p))
+    if not events:
+        return []
+    events.sort(key=lambda e: e[0])
+    latest: dict[int, Mapping[str, Any]] = {}  # 계정 → 최신 점(carry-forward)
+    out: list[dict[str, Any]] = []
+    last_key: int | None = None
+    for t, ai, p in events:
+        latest[ai] = p
+        row: dict[str, Any] = {"ts": t}
+        for k in SUM:
+            row[k] = sum((lp.get(k) or 0) for lp in latest.values())
+        row["lic_inuse"] = max((int(lp.get("lic_inuse") or 0) for lp in latest.values()), default=0)
+        key = int(round(t / 30.0))
+        if key == last_key and out:
+            out[-1] = row  # 같은 30s 버킷이면 최신으로 교체(다운샘플 — 점 폭증 방지)
+        else:
+            out.append(row)
+            last_key = key
+    return out
 
 
 @dataclass
