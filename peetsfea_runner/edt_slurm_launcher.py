@@ -109,6 +109,12 @@ class SlurmJobLauncher:
     # sbatch 스크립트가 EDT_ACCOUNT_ID/EDT_HOST_ALIAS를 export → orchestrator.sh가 컨테이너로 전달.
     account_id: str = "account_01"
     host_alias: str = "gate1-harry261"
+    # 다계정 백채널 포트: orchestrator가 EDT_*_PORT로 받아 **자기 계정**의 ingest/lease/컨트롤러(:license_ctrl_port)에
+    # 연결한다. 미주입이면 orchestrator 기본(7876/7878/7879=account_01)을 써서 비-primary 계정(hmlee31)이
+    # primary 컨트롤러를 따라가 /job_plan 피드백 루프가 끊긴다(컨테이너·솔브 저조). → sbatch에 계정별 포트 export.
+    ingest_port: int = 7876
+    priority_lease_port: int = 7878
+    license_ctrl_port: int = 7879
     _avoid: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _submitted_nodes: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
@@ -190,6 +196,10 @@ class SlurmJobLauncher:
             # 다계정 태깅: 컨테이너가 결과 ingest 시 account_id로 단일 DB에 구분 기록.
             f"export EDT_ACCOUNT_ID={self.account_id}\n"
             f"export EDT_HOST_ALIAS={self.host_alias}\n"
+            # 계정별 백채널 포트 — orchestrator가 자기 계정 ingest/lease/컨트롤러에 연결(피드백 루프 분리).
+            f"export EDT_INGEST_PORT={self.ingest_port}\n"
+            f"export EDT_PRIORITY_LEASE_PORT={self.priority_lease_port}\n"
+            f"export EDT_LICENSE_CTRL_PORT={self.license_ctrl_port}\n"
             # EDT_GPU_COUNT: 컨테이너 supervisor가 워커별 CUDA_VISIBLE_DEVICES=index%N 핀닝에 사용(GPU 분산).
             f"export EDT_GPU_COUNT={gpus}\n"
             # EDT_BASELINE_SEED_EPOCH: entrypoint가 seed_base에 더해 재램프마다 새 설계공간을 탐색(재탕 방지).

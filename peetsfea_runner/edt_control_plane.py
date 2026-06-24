@@ -423,6 +423,10 @@ def build_control_plane(
                 account_index=acct_cfg.account_index,
                 account_id=acct_cfg.account_id,
                 host_alias=acct_cfg.host_alias,
+                # 계정별 백채널 포트 주입 → orchestrator가 자기 계정 컨트롤러/ingest를 쓴다(다계정 피드백 분리).
+                ingest_port=acct_cfg.ingest_port,
+                priority_lease_port=acct_cfg.priority_lease_port,
+                license_ctrl_port=acct_cfg.license_ctrl_port,
             )
         acct_orchestrator = JobOrchestrator(
             launcher=acct_launcher,
