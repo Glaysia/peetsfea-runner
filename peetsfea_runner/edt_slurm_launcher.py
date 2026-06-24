@@ -115,12 +115,15 @@ class SlurmJobLauncher:
     ingest_port: int = 7876
     priority_lease_port: int = 7878
     license_ctrl_port: int = 7879
-    # 계정간 노드 분리: 모든 계정의 SLURM username. control plane이 주입한다. _busy_nodes가 squeue -u로
-    # **상대 계정 점유 노드까지** 보고 제외 → 두 계정 잡이 같은 노드에 co-locate 안 됨(cross-account SHM 충돌
-    # 방지). 같은 클러스터(gate1)라 squeue -u <peer>로 상대 노드 조회 가능. 비면 자기 계정만(--me).
+    # 계정간 노드 분리: **상대 계정들**의 SLURM username(자기 제외). control plane이 주입한다. _peer_nodes가
+    # squeue -u로 상대 계정 점유 노드를 보고 **항상 배제** → 한 노드엔 한 계정만(cross-account OpenMP SHM 충돌
+    # 방지). 같은 클러스터(gate1)라 squeue -u <peer> 조회 가능. 비면 단일계정(배제 없음).
     peer_users: tuple[str, ...] = ()
+    # 노드당 **같은 계정** 잡 수 상한(packing). 1잡/노드(spread)면 한 계정이 가용 노드를 다 먹어 상대 계정이
+    # 빈 노드를 못 찾고 co-locate→SHM 충돌. 2잡/노드로 몰아 담으면 절반 노드만 써 상대 계정 자리를 남긴다.
+    max_jobs_per_node: int = 2
     _avoid: dict[str, float] = field(default_factory=dict, init=False, repr=False)
-    _submitted_nodes: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _submitted_nodes: dict[str, list[float]] = field(default_factory=dict, init=False, repr=False)
 
     def _seed_epoch(self) -> int:
         """다음 잡의 baseline seed 시작 오프셋. 사용한 최대 seed 바로 위(프런티어+1)에서 시작 → 재탕 0."""
@@ -217,22 +220,26 @@ class SlurmJobLauncher:
             f"{self.job_command}\n"
         )
 
-    def _busy_nodes(self) -> set[str]:
-        """양 계정의 잡(RUNNING/PENDING)이 점유한 노드 — 노드당 1잡 + 계정간 분리 위해 제외.
-        peer_users(모든 계정 username) 있으면 squeue -u로 상대 계정 노드까지, 없으면 --me(자기만)."""
-        if self.peer_users:
-            query = f"squeue -h -u {','.join(self.peer_users)} -t RUNNING,PENDING -o '%N'"
-        else:
-            query = "squeue -h --me -t RUNNING,PENDING -o '%N'"
-        result = self._ssh(query)
+    def _nodes_of(self, who: str) -> list[str]:
+        """squeue 인자 who(--me 또는 -u <users>)로 RUNNING/PENDING 잡의 노드 리스트(잡당 1줄, 중복=노드당 잡수)."""
+        result = self._ssh(f"squeue -h {who} -t RUNNING,PENDING -o '%N'")
         if result.returncode != 0:
+            return []
+        return [n.strip() for n in result.stdout.splitlines() if n.strip() and not n.strip().startswith("(")]
+
+    def _peer_nodes(self) -> set[str]:
+        """상대 계정(peer_users)이 점유한 노드 — 항상 배제(cross-account SHM 충돌 방지). 한 노드엔 한 계정만."""
+        peers = tuple(u for u in self.peer_users if u)
+        if not peers:
             return set()
-        nodes: set[str] = set()
-        for line in result.stdout.splitlines():
-            name = line.strip()
-            if name and not name.startswith("("):  # PENDING 사유는 '(Resources)' 형태 → 제외
-                nodes.add(name)
-        return nodes
+        return set(self._nodes_of(f"-u {','.join(peers)}"))
+
+    def _own_counts(self) -> dict[str, int]:
+        """내 계정 잡의 노드별 개수(squeue 반영분) — max_jobs_per_node 캡 + packing 판정용."""
+        counts: dict[str, int] = {}
+        for n in self._nodes_of("--me"):
+            counts[n] = counts.get(n, 0) + 1
+        return counts
 
     def _candidate_nodes(self) -> list[tuple[str, str]]:
         """대상 파티션의 가용 노드 (node, partition). idle 우선, 그다음 mix."""
@@ -275,9 +282,15 @@ class SlurmJobLauncher:
         now = self.clock()
         return {n for n, t in self._avoid.items() if (now - t) < self.avoid_cooldown_seconds}
 
-    def _reserved_nodes(self) -> set[str]:
+    def _reserved_counts(self) -> dict[str, int]:
+        """최근 제출한 노드별 로컬 예약 수(squeue 반영 전 race 방지). packing 위해 노드당 여러 건 카운트."""
         now = self.clock()
-        return {n for n, t in self._submitted_nodes.items() if (now - t) < self.submit_reservation_seconds}
+        counts: dict[str, int] = {}
+        for n, ts_list in self._submitted_nodes.items():
+            recent = sum(1 for t in ts_list if (now - t) < self.submit_reservation_seconds)
+            if recent:
+                counts[n] = recent
+        return counts
 
     def pending_reason(self, handle: JobHandle) -> str:
         """PENDING 사유(squeue %r). 'None'/빈값=곧 시작, 'Resources'/'Priority' 등=한동안 대기."""
@@ -287,11 +300,22 @@ class SlurmJobLauncher:
         return result.stdout.strip().splitlines()[0].strip()
 
     def _ordered_candidates(self) -> list[tuple[str, str]]:
-        """제출 후보 노드 순서: 빈 노드 중 가중 선택된 파티션을 앞에(나머지는 fallback). busy·회피 노드 제외."""
-        skip = self._busy_nodes() | self._avoided_nodes() | self._reserved_nodes()
-        cands = [(n, p) for (n, p) in self._candidate_nodes() if n not in skip]
+        """제출 후보 노드 순서: ① 상대 계정 노드 항상 배제(SHM) ② 내 잡 수(squeue+예약)가 max 이상인 노드 배제
+        ③ **packing**: 내가 이미 쓰는(아직 max 미만) 노드를 빈 노드보다 앞에 둬, 절반 노드만 쓰고 상대 자리를 남긴다."""
+        peer = self._peer_nodes()
+        own = self._own_counts()
+        reserved = self._reserved_counts()
+        avoided = self._avoided_nodes()
+
+        def load(n: str) -> int:
+            return own.get(n, 0) + reserved.get(n, 0)
+
+        cands = [(n, p) for (n, p) in self._candidate_nodes()
+                 if n not in peer and n not in avoided and load(n) < self.max_jobs_per_node]
         if not cands:
             return []
+        # packing: 내가 이미 잡을 올린(부분 점유) 노드 우선 → 그 노드를 max까지 채운 뒤 새 노드로.
+        cands.sort(key=lambda np: 0 if load(np[0]) > 0 else 1)
         by_part: dict[str, list[tuple[str, str]]] = {}
         for n, p in cands:
             by_part.setdefault(p, []).append((n, p))
@@ -326,7 +350,7 @@ class SlurmJobLauncher:
         if match is None:
             raise SlurmLauncherError(f"could not parse sbatch output: {result.stdout.strip()!r}")
         if node:
-            self._submitted_nodes[node] = self.clock()
+            self._submitted_nodes.setdefault(node, []).append(self.clock())
         return JobHandle(job_index=job_index, slurm_id=match.group(1), started_at=self.clock(), node=node)
 
     def is_alive(self, handle: JobHandle) -> bool:

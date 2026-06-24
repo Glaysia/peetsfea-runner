@@ -205,9 +205,9 @@ def _last_script(runner: FakeRunner) -> str:
     return [s for a, s in runner.calls if a[-1] == "sbatch" and s][-1]
 
 
-def test_node_based_pins_nodelist_and_excludes_busy() -> None:
+def test_node_based_packs_own_partial_node() -> None:
     sinfo = "n001 cpu2 idle\nn002 cpu2 idle\nn010 gpu1 idle\n"
-    runner = _node_runner(sinfo, busy="n001\n")  # n001은 내 잡이 점유 → 제외
+    runner = _node_runner(sinfo, busy="n001\n")  # n001에 내 잡 1개(< max 2) → packing 대상(빈 노드보다 우선)
     launcher = SlurmJobLauncher(
         command_runner=runner, clock=lambda: 0.0, partitions=("cpu2", "gpu1"),
         node_based=True, cpu2_weight=1.0,  # cpu2 강제
@@ -215,9 +215,19 @@ def test_node_based_pins_nodelist_and_excludes_busy() -> None:
     handle = launcher.submit(2)
     assert handle.slurm_id == "500"
     script = _last_script(runner)
-    assert "#SBATCH --nodelist=n002" in script  # n001 busy 제외 → 다음 idle cpu2 노드
+    assert "#SBATCH --nodelist=n001" in script  # 부분점유 노드를 max까지 채운다(packing) → 절반 노드만 써 상대 자리 확보
     assert "#SBATCH --partition=cpu2" in script
-    assert "--nodelist=n001" not in script
+
+
+def test_node_based_excludes_peer_account_nodes() -> None:
+    runner = _node_runner("n001 cpu2 idle\nn002 cpu2 idle\n", busy="")
+    runner.responses["squeue -h -u"] = CommandResult(0, "n001\n", "")  # 상대 계정이 n001 점유
+    launcher = SlurmJobLauncher(
+        command_runner=runner, clock=lambda: 0.0, partitions=("cpu2",),
+        node_based=True, cpu2_weight=1.0, peer_users=("peeruser",),
+    )
+    handle = launcher.submit(0)
+    assert handle.node == "n002"  # 상대 점유 n001 배제(cross-account SHM 충돌 방지) → 다음 노드
 
 
 def test_node_based_weighted_cpu2_vs_gpu() -> None:
@@ -251,8 +261,8 @@ def test_node_based_no_available_node_raises() -> None:
         launcher.submit(0)
 
 
-def test_node_based_all_busy_raises() -> None:
-    runner = _node_runner("n001 cpu2 idle\n", busy="n001\n")  # 유일 후보가 busy
+def test_node_based_all_full_raises() -> None:
+    runner = _node_runner("n001 cpu2 idle\n", busy="n001\nn001\n")  # 유일 후보가 max(2) 꽉 참 → 후보 없음
     launcher = SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0,
                                 partitions=("cpu2",), node_based=True)
     with pytest.raises(SlurmLauncherError):
@@ -296,10 +306,11 @@ def test_node_based_avoids_cancelled_node() -> None:
     assert h2.node == "n002"              # n001 회피 → 다음 노드
 
 
-def test_node_based_reserves_newly_submitted_node_for_burst_spread() -> None:
+def test_node_based_packs_burst_onto_same_node() -> None:
     runner = _node_runner("n001 cpu2 idle\nn002 cpu2 idle\n", busy="")
     launcher = SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0,
                                 partitions=("cpu2",), node_based=True, cpu2_weight=1.0)
     h1 = launcher.submit(0)
     h2 = launcher.submit(1)
-    assert (h1.node, h2.node) == ("n001", "n002")
+    # 2잡/노드 packing: 첫 잡이 n001 예약 → 둘째도 n001(load 1<2) 채운 뒤 이동. burst여도 같은 노드로 몰아 담는다.
+    assert (h1.node, h2.node) == ("n001", "n001")
