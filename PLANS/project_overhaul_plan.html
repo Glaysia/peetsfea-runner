@@ -75,10 +75,17 @@
 <div class="rec"><b>제안</b> 잡 수를 노드 가용에 맞춰 동적으로(가용 노드×2/계정) 또는 줄여서 PENDING 제거. "고정 인프라"의 고정값을 클러스터 현실로.</div>
 </div>
 
-<div class="item P1">
-<span class="id">B2</span><span class="tag P1b">P1</span><span class="tag sz">S</span> <b>노드 핀 경직 — ReqNodeNotAvail 고착</b>
-<p><b class="lbl">증거</b> 런처가 <code>--nodelist=n107</code>로 핀 → n107이 빠지자 잡이 그 노드만 기다리며 PENDING 고착(694396).</p>
-<div class="rec"><b>제안</b> <code>pending_reason()</code>에서 ReqNodeNotAvail/Resources 장기 감지 시 <code>avoid_node</code> 등록 + scancel/재제출로 다른 노드 재라우팅(이미 avoid_node 인프라 있음 — 트리거만 연결).</div>
+<div class="item P0">
+<span class="id">B2</span><span class="tag P0b">P0</span><span class="tag sz">M</span> <b>노드 핀 경직 + 중복 과제출 — "잡이 올라가자마자 내려온다" / 처리량 붕괴</b>
+<p><b class="lbl">증거(실측)</b> PD 사유 <code>ReqNodeNotAvail:n113 ×9, :n107 ×3</code> — 런처가 잡을 <b>n113(타유저 포화 43G)·n107(드레인)</b>에 <code>--nodelist</code>로 핀 → 그 노드 영구 불가라 <b>잡이 영영 PENDING 고착</b>. 게다가 잡 이름 중복 <code>edt-9 ×3, edt-8 ×2, edt-3 ×2</code> → 총 <b>32잡(슬롯 10×2 초과)</b>인데 RUNNING은 13뿐. 처리량 660→468/h로 붕괴, 카운트는 PENDING 무더기로 부풀고 RUNNING은 적어 "올라가자마자 내려온" 것처럼 보임.</p>
+<p><b class="lbl">두 원인</b> ① 런처가 <b>불가/포화 노드를 후보로 골라 핀</b>(sinfo가 잠깐 idle/mix로 보여도 우리 할당 거부) → ReqNodeNotAvail 고착. ② 키퍼 <code>poll()</code>이 <b>고착 PENDING 슬롯을 살아있다고 못 보고 재제출</b> → 같은 인덱스 중복 누적(슬롯-잡 추적 결함).</p>
+<div class="rec"><b>해결책(구현 명세)</b>
+<ul>
+<li><b>① 런처 후보 필터</b> — <code>_candidate_nodes()/_ordered_candidates()</code>에서 불가 노드 사전 제외: sinfo state가 <code>alloc/drain/down/resv</code>면 빼고, <b>/enroot df free&lt;임계</b> 노드 빼고(B3과 공유), 최근 <code>ReqNodeNotAvail</code> 띄운 노드는 <code>avoid_node</code> 쿨다운.</li>
+<li><b>② 키퍼 고착 감지</b> — 제출 후 <code>pending_reason()</code> 폴링: <code>ReqNodeNotAvail</code>(또는 <code>Resources</code>가 N초↑ 지속)면 그 핀 노드 <code>avoid_node</code> 등록 + 해당 잡 <code>scancel</code> + 다른 노드로 재제출. (avoid_node 인프라는 이미 있음 — <b>트리거만 연결</b>.)</li>
+<li><b>③ 중복 방지 가드</b> — <code>poll()</code> 슬롯 재제출 전 <b>그 인덱스에 active(R/PD) 잡이 이미 있으면 재제출 금지</b>(squeue 이름으로 확인). 슬롯-핸들 추적이 PENDING을 alive로 일관 인식하게 점검.</li>
+<li><b>운영 일시완화(코드 무관)</b> — <code>scancel --me -t PENDING</code>로 고착·중복 PENDING 정리 → 키퍼가 빈 슬롯 재충전. (런처가 또 n113/n107 고르면 재발하므로 ①②가 근본.)</li>
+</ul></div>
 </div>
 
 <div class="item P1">
@@ -173,8 +180,8 @@
 <table>
 <tr><th>순서</th><th>항목</th><th>왜 먼저</th><th>크기</th></tr>
 <tr><td>1</td><td><b>A1</b> 컨트롤러 자원 천장 인식</td><td>발산 피드백 = 모든 실패의 뿌리. 이거 하나로 성공률 근본 안정</td><td>M</td></tr>
-<tr><td>2</td><td><b>A2</b> 코어↔동시성 명시 결합</td><td>A1의 짝. 코어 바꿀 때마다 헤매는 것 종결</td><td>S</td></tr>
-<tr><td>3</td><td><b>B1/B2/B3</b> 노드 핀·포화·잡수</td><td>잡 진동/PENDING 제거 → 처리량 직결, 작음</td><td>S×3</td></tr>
+<tr><td>2</td><td><b>B2</b> 노드핀 고착+중복제출 <span class="tag P0b">P0</span></td><td>"올라가자마자 내려온다"·처리량 붕괴의 직접 원인. ①②③ 명세 있음. 임시완화는 scancel로 가능</td><td>M</td></tr>
+<tr><td>3</td><td><b>A2</b> 코어↔동시성 명시 결합 / <b>B1·B3</b> 잡수·포화</td><td>A1의 짝 + 노드 잔여 churn 제거</td><td>S</td></tr>
 <tr><td>4</td><td><b>A3/C1</b> 라이선스 대기·linger</td><td>HPC 고갈 내성. 조사 필요</td><td>S~M</td></tr>
 <tr><td>5</td><td><b>F1</b> trade-off 모델</td><td>설정 변경의 나침반 — 이후 모든 솔브튜닝 가속</td><td>L</td></tr>
 <tr><td>6+</td><td>D1·E1·E2·F2·F3·G1·G2·G3</td><td>견고성·정리</td><td>S~M</td></tr>
