@@ -76,7 +76,8 @@
 </div>
 
 <div class="item P0">
-<span class="id">B2</span><span class="tag P0b">P0</span><span class="tag sz">M</span> <b>노드 핀 경직 + 중복 과제출 — "잡이 올라가자마자 내려온다" / 처리량 붕괴</b>
+<span class="id">B2</span><span class="tag P0b">P0</span><span class="tag sz">M</span> <b>노드 핀 경직 + 중복 과제출 — "잡이 올라가자마자 내려온다" / 처리량 붕괴 <span class="ok">— 완료 (4398655)</span></b>
+<p class="mut" style="margin:4px 0 0">구현: 키퍼 잡유지를 <code>squeue --me</code> 1회 스냅샷(<code>list_active_by_index</code>) 기반으로 전환 — 잡이름 <code>peetsfea-edt-{i}</code>로 슬롯당 진실 1개 강제. ① 중복제거(RUNNING/최古만 남기고 cancel) ② <b>채택(adopt)</b>으로 재시작 후 재제출 차단(중복 근본원인) ③ hard PENDING(ReqNodeNotAvail 등)·장기정체 시 <code>avoid_node</code>+cancel+타노드 재제출. Resources 정상대기는 임계(600s) 전 미관여.</p>
 <p><b class="lbl">증거(실측)</b> PD 사유 <code>ReqNodeNotAvail:n113 ×9, :n107 ×3</code> — 런처가 잡을 <b>n113(타유저 포화 43G)·n107(드레인)</b>에 <code>--nodelist</code>로 핀 → 그 노드 영구 불가라 <b>잡이 영영 PENDING 고착</b>. 게다가 잡 이름 중복 <code>edt-9 ×3, edt-8 ×2, edt-3 ×2</code> → 총 <b>32잡(슬롯 10×2 초과)</b>인데 RUNNING은 13뿐. 처리량 660→468/h로 붕괴, 카운트는 PENDING 무더기로 부풀고 RUNNING은 적어 "올라가자마자 내려온" 것처럼 보임.</p>
 <p><b class="lbl">두 원인</b> ① 런처가 <b>불가/포화 노드를 후보로 골라 핀</b>(sinfo가 잠깐 idle/mix로 보여도 우리 할당 거부) → ReqNodeNotAvail 고착. ② 키퍼 <code>poll()</code>이 <b>고착 PENDING 슬롯을 살아있다고 못 보고 재제출</b> → 같은 인덱스 중복 누적(슬롯-잡 추적 결함).</p>
 <div class="rec"><b>해결책(구현 명세)</b>
@@ -200,7 +201,7 @@
 <table>
 <tr><th>순서</th><th>항목</th><th>왜 먼저</th><th>크기</th></tr>
 <tr><td>1</td><td><b>A1</b> 컨트롤러 자원 천장 인식</td><td>발산 피드백 = 모든 실패의 뿌리. 이거 하나로 성공률 근본 안정</td><td>M</td></tr>
-<tr><td>2</td><td><b>B2</b> 노드핀 고착+중복제출 <span class="tag P0b">P0</span></td><td>"올라가자마자 내려온다"·처리량 붕괴의 직접 원인. ①②③ 명세 있음. 임시완화는 scancel로 가능</td><td>M</td></tr>
+<tr><td>2</td><td><b>B2</b> 노드핀 고착+중복제출 <span class="tag P0b">P0</span> <span class="ok">✓완료</span></td><td>"올라가자마자 내려온다"·처리량 붕괴의 직접 원인. squeue 스냅샷 reconcile(채택+중복제거+stuck재배치)로 해결 — 4398655</td><td>M</td></tr>
 <tr><td>3</td><td><b>A2</b> 코어↔동시성 명시 결합 / <b>B1·B3·B5</b> 잡수·포화·파티션폴백</td><td>A1의 짝 + 노드 잔여 churn 제거. <b>B5</b>(cpu2 우선→gpu 폴백)로 PENDING 근본 완화</td><td>S</td></tr>
 <tr><td>4</td><td><b>A3/C1</b> 라이선스 대기·linger</td><td>HPC 고갈 내성. 조사 필요</td><td>S~M</td></tr>
 <tr><td>5</td><td><b>F1</b> trade-off 모델</td><td>설정 변경의 나침반 — 이후 모든 솔브튜닝 가속</td><td>L</td></tr>
