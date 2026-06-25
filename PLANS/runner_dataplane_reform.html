@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runner ⇄ Learning 데이터플레인 계약 v2.0</title>
+<style>
+  :root{--bg:#0f1117;--card:#161a23;--line:#2a2f3d;--fg:#e6e9ef;--mut:#9aa4b2;
+        --acc:#7ee787;--blu:#9fd0ff;--red:#ff7b72;--yel:#ffd479;--pill:#1b2030}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,"Pretendard",Segoe UI,sans-serif;line-height:1.6}
+  .wrap{max-width:1120px;margin:0 auto;padding:34px 24px 100px}
+  h1{font-size:25px;margin:0 0 4px}
+  .sub{color:var(--mut);font-size:14px;margin-bottom:18px}
+  h2{font-size:18px;margin:36px 0 12px;padding-top:18px;border-top:1px solid var(--line)}
+  h2 .n{display:inline-block;width:26px;height:26px;line-height:26px;text-align:center;background:var(--acc);color:#0b0d12;border-radius:7px;font-size:14px;margin-right:9px;font-weight:700}
+  h3{font-size:14.5px;margin:18px 0 6px;color:var(--blu)}
+  p{margin:8px 0} ul{margin:8px 0;padding-left:22px} li{margin:5px 0}
+  code{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;background:#0b0d12;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:12.5px;color:var(--yel)}
+  pre{background:#0b0d12;border:1px solid var(--line);border-left:3px solid var(--blu);border-radius:0 8px 8px 0;padding:12px 14px;overflow:auto;font-size:12.5px;font-family:"JetBrains Mono",ui-monospace,monospace;color:#cdd6e3;white-space:pre}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:12px 0}
+  table{border-collapse:collapse;width:100%;font-size:12.5px;margin:10px 0}
+  th,td{border-bottom:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top}
+  th{color:var(--mut);font-size:11.5px;text-transform:uppercase;letter-spacing:.3px}
+  td.m,code{font-variant-ligatures:none}
+  td.m{font-family:"JetBrains Mono",ui-monospace,monospace;color:#cdd6e3;white-space:nowrap}
+  .bad{color:var(--red)} .good{color:var(--acc)} .req{color:var(--yel);font-weight:600}
+  .tag{font-size:11px;padding:2px 7px;border-radius:5px;font-weight:600}
+  .tag.r{background:#3a2730;color:#ffbdb0} .tag.l{background:#26344a;color:#9fd0ff} .tag.both{background:#26342a;color:#a7f0bd}
+  .must{display:inline-block;background:#3a2730;color:#ffbdb0;font-size:11px;font-weight:700;border-radius:4px;padding:1px 6px;margin-right:6px}
+  .note{font-size:12.5px;color:var(--mut)}
+  .kpi{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}
+  .kpi div{flex:1;min-width:170px;background:var(--card);border:1px solid var(--line);border-radius:9px;padding:11px 13px}
+  .kpi b{display:block;font-size:20px;color:var(--acc)} .kpi span{font-size:12px;color:var(--mut)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Runner ⇄ Learning 데이터플레인 계약 <b style="color:var(--acc)">v2.0</b></h1>
+  <div class="sub">바이트 단위 확정 계약. 양측이 이 문서만 보고 독립 구현해도 일치한다. 합의로 미루는 항목 없음 · 2026-06-25</div>
+
+  <div class="card">
+    <p><b>이 문서의 지위.</b> 이건 위시리스트가 아니라 <span class="req">규범적(normative) 계약</span>이다.
+    아래 스키마·dtype·엔드포인트·인코딩·커서 규칙은 <span class="req">그대로 구현 대상</span>이며, "추후 협의" 항목은 없다.
+    <span class="must">MUST</span> = 필수, <span class="must" style="background:#2a3340;color:#9fd0ff">SHOULD</span> = 권장.
+    변경은 §11 절차로만.</p>
+  </div>
+
+  <!-- 0 -->
+  <h2><span class="n">0</span>비협상 원칙 (Hard constraints)</h2>
+  <ul>
+    <li><span class="must">MUST</span> 분석 핫 경로에 <span class="bad">CSV/JSON 텍스트로 직렬화된 측정값이 절대 존재하지 않는다.</span> 모든 수치는 <b>타입 있는 컬럼형 바이너리(Arrow)</b>로만 흐른다. <code>csv_text_by_report_json</code> 같은 필드는 v2 어떤 응답에도 없다.</li>
+    <li><span class="must">MUST</span> 모든 fetch는 <b>증분</b>이다. 클라이언트는 단조 정수 커서 <code>seq</code> 하나로 "이미 본 것 이후"만 받는다. 풀 재전송 경로는 <b>존재하지 않는다</b>(<code>since=0</code>은 최초 1회 부트스트랩일 뿐 동일 데이터 재수신 불가).</li>
+    <li><span class="must">MUST</span> 컬럼 프로젝션. 클라이언트가 필요한 컬럼만 요청한다. 기본 응답에 주파수 스윕은 포함되지 않는다(별도 엔드포인트).</li>
+    <li><span class="must">MUST</span> 측정→컬럼 변환(파싱)은 <b>쓰기(ingestion) 시점 1회</b>. 읽는 쪽은 절대 파싱하지 않는다.</li>
+    <li><span class="must">MUST</span> append-only·immutable. terminal 상태가 된 row는 이후 변경 없음. <code>seq</code>는 재사용·역행 없음.</li>
+  </ul>
+  <div class="kpi">
+    <div><b>&lt; 2 KB</b><span>results 행당 (스칼라)</span></div>
+    <div><b>≤ 2 s</b><span>신규 1만 행 fetch</span></div>
+    <div><b>&lt; 200 ms</b><span>신규 0건 재요청</span></div>
+    <div><b>0 byte</b><span>핫 경로 CSV 텍스트</span></div>
+  </div>
+
+  <!-- 1 -->
+  <h2><span class="n">1</span>전송 포맷 (Wire) <span class="tag both">BOTH</span></h2>
+  <ul>
+    <li><span class="must">MUST</span> 바디 = <b>Apache Arrow IPC <u>stream</u> format</b> (RecordBatch 연속). Parquet 파일 직빵 서빙도 허용하나 기본은 Arrow IPC stream.</li>
+    <li><span class="must">MUST</span> 압축 = Arrow IPC <b>body buffer compression = ZSTD</b> (메시지 자체에 코덱 기록 → 자기서술적, HTTP Content-Encoding 불필요).<br>
+        <code>pa.ipc.IpcWriteOptions(compression="zstd")</code> 로 기록, 읽기는 <code>pa.ipc.open_stream</code> 가 자동 해제.</li>
+    <li><span class="must">MUST</span> <code>Content-Type: application/vnd.apache.arrow.stream</code></li>
+    <li><span class="must">MUST</span> 숫자 dtype 고정: 실수=<code>float64</code>(double), 정수/커서=<code>int64</code>, 시각=<code>timestamp[us, tz=UTC]</code>, 문자열=<code>utf8</code>(저카디널리티는 <code>dictionary&lt;utf8&gt;</code> 허용). null 허용 컬럼은 Arrow validity bitmap 사용(빈 문자열/0으로 위장 금지).</li>
+    <li><span class="must">MUST</span> 행 순서 = <code>seq</code> 오름차순.</li>
+  </ul>
+
+  <!-- 2 -->
+  <h2><span class="n">2</span>스키마 A — <code>results</code> (설계 1행, 핫·스칼라) <span class="tag r">RUNNER 저장+서빙</span></h2>
+  <p>operating frequency <code>f_op = 6.78e6 Hz</code> 에서의 동작점 측정 + 손실 + 수렴 + 입력 + 메타. 단위: Z=Ω, 손실=W, 시각=UTC.</p>
+  <table>
+    <tr><th>필드</th><th>Arrow dtype</th><th>null</th><th>의미</th></tr>
+    <tr><td class="m">seq</td><td class="m">int64</td><td>no</td><td><b>커서/PK.</b> 전역 단조증가, row 확정 시 할당, 재사용·역행 없음(갭 허용)</td></tr>
+    <tr><td class="m">request_id</td><td class="m">utf8</td><td>no</td><td>요청 식별</td></tr>
+    <tr><td class="m">design_id</td><td class="m">utf8</td><td>yes</td><td>설계 식별(있으면)</td></tr>
+    <tr><td class="m">point_hash</td><td class="m">utf8</td><td>yes</td><td>입력점 해시(중복 판정)</td></tr>
+    <tr><td class="m">peetsfea_version</td><td class="m">dictionary&lt;utf8&gt;</td><td>no</td><td>예 <code>0.3.9.0</code></td></tr>
+    <tr><td class="m">terminal_state</td><td class="m">dictionary&lt;utf8&gt;</td><td>no</td><td><code>success</code> | <code>failed</code></td></tr>
+    <tr><td class="m">node</td><td class="m">dictionary&lt;utf8&gt;</td><td>yes</td><td>실행 노드</td></tr>
+    <tr><td class="m">started_at / finished_at</td><td class="m">timestamp[us,UTC]</td><td>yes</td><td>—</td></tr>
+    <tr><td class="m">elapsed_ms</td><td class="m">int64</td><td>yes</td><td>—</td></tr>
+    <tr><td class="m">error_stage / error_type / error_message</td><td class="m">utf8</td><td>yes</td><td>실패 시</td></tr>
+    <tr><td class="m">point_values</td><td class="m">map&lt;utf8, float64&gt;</td><td>no</td><td><b>입력</b>. key=free_owner_path (예 <code>modeled_objects[role=tx_ssw_coil].width_ratio</code>), value=실수</td></tr>
+    <tr><td colspan="4" style="color:var(--acc);font-weight:600;padding-top:12px">— 동작점 측정 @ f_op (모두 float64, success인데 추출 불가면 null) —</td></tr>
+    <tr><td class="m">op_freq_hz</td><td class="m">float64</td><td>yes</td><td>실제 사용 동작주파수(=f_op)</td></tr>
+    <tr><td class="m">op_re_z11, op_im_z11</td><td class="m">float64</td><td>yes</td><td>Z11 실/허 (TX 자기) — <b>R_tx=re, L/C는 §3 스윕</b></td></tr>
+    <tr><td class="m">op_re_z22, op_im_z22</td><td class="m">float64</td><td>yes</td><td>Z22 실/허 (RX 자기) — R_rx=re</td></tr>
+    <tr><td class="m">op_re_z12, op_im_z12</td><td class="m">float64</td><td>yes</td><td>Z12 실/허 (상호) — <b>M = |im|/ω</b></td></tr>
+    <tr><td class="m">max_mag_delta_s</td><td class="m">float64</td><td>yes</td><td>HFSS MaxMagDeltaS, 마지막 adaptive pass(수렴). 없으면 null</td></tr>
+    <tr><td colspan="4" style="color:var(--acc);font-weight:600;padding-top:12px">— 재질별 손실 [W] (float64, nullable) —</td></tr>
+    <tr><td class="m">loss_w_copper_tx, loss_w_fr4_tx, loss_w_ferrite_tx</td><td class="m">float64</td><td>yes</td><td>TX 측</td></tr>
+    <tr><td class="m">loss_w_copper_rx, loss_w_fr4_rx, loss_w_ferrite_rx</td><td class="m">float64</td><td>yes</td><td>RX 측(ferrite_rx 없으면 null)</td></tr>
+  </table>
+  <p class="note"><span class="must">MUST</span> 컬럼명·dtype·null 정책 위와 동일. 추가 컬럼은 §11(additive, nullable)만 허용. <span class="must" style="background:#2a3340;color:#9fd0ff">SHOULD</span> 손실은 원시 W로 저장(비율 정규화는 learning이 함).</p>
+
+  <!-- 3 -->
+  <h2><span class="n">3</span>스키마 B — <code>sweeps</code> (주파수 스윕, long-format, warm) <span class="tag r">RUNNER 저장+서빙</span></h2>
+  <p>설계당 전 주파수 점의 Z(f). learning의 L(저주파)·자기공진 C 추출에 필요. <b>long-format</b> 채택(설계당 N행). 다운샘플 금지(<span class="must">MUST</span> 풀 해상도).</p>
+  <table>
+    <tr><th>필드</th><th>Arrow dtype</th><th>null</th><th>의미</th></tr>
+    <tr><td class="m">result_seq</td><td class="m">int64</td><td>no</td><td>FK → results.seq</td></tr>
+    <tr><td class="m">freq_hz</td><td class="m">float64</td><td>no</td><td>주파수[Hz]. 오름차순</td></tr>
+    <tr><td class="m">re_z11, im_z11</td><td class="m">float64</td><td>no</td><td>Z11(f)</td></tr>
+    <tr><td class="m">re_z22, im_z22</td><td class="m">float64</td><td>no</td><td>Z22(f)</td></tr>
+    <tr><td class="m">re_z12, im_z12</td><td class="m">float64</td><td>no</td><td>Z12(f)</td></tr>
+  </table>
+  <p class="note">정렬 <span class="must">MUST</span> <code>(result_seq ASC, freq_hz ASC)</code>. <span class="must" style="background:#2a3340;color:#9fd0ff">SHOULD</span> 저장은 result_seq 파티션 Parquet(zstd, dict). 배열 대안(results에 <code>list&lt;float64&gt;</code> 컬럼)은 금지 — long-format으로 통일.</p>
+
+  <!-- 4 -->
+  <h2><span class="n">4</span>엔드포인트 (정확한 시그니처) <span class="tag r">RUNNER</span></h2>
+
+  <h3>GET /api/v2/results</h3>
+  <pre>query params:
+  since   int64   default 0       # 이 값 "초과"(seq &gt; since)만 반환
+  limit   int32   default 50000   # 최대 200000. 페이지 크기
+  version utf8    optional        # 주면 해당 버전만
+  state   utf8    default "success"   # "success" | "failed" | "any"
+  columns utf8    optional        # 콤마구분 results 필드명. 생략=전체. seq는 항상 포함
+
+200 OK:
+  Content-Type: application/vnd.apache.arrow.stream
+  Body: Arrow IPC stream(ZSTD), §2 스키마(projected), seq&gt;since AND 필터, seq ASC, ≤ limit행
+  Headers:
+    X-Next-Since: int64   # 이 페이지에서 "스캔한" 최대 seq (필터와 무관). 클라 다음 since
+    X-Has-More:   "true"|"false"   # 더 남았는지
+4xx/5xx:
+  Content-Type: application/json   { "error": str, "message": str }</pre>
+
+  <h3>GET /api/v2/sweeps</h3>
+  <pre>query params (since 와 result_seqs 는 상호배타):
+  since        int64   # result_seq &gt; since 인 설계의 스윕 전부 (증분)
+  result_seqs  utf8    # 콤마구분 int64. 지정 설계들만
+  limit        int32   default 2000000
+  columns      utf8    optional
+
+200 OK: Arrow IPC stream(ZSTD), §3 스키마, (result_seq,freq_hz) ASC, ≤ limit행
+  Headers: X-Next-Since:int64 (스캔한 최대 result_seq), X-Has-More:"true"|"false"</pre>
+
+  <h3>GET /api/v2/health</h3>
+  <pre>200 OK application/json:
+  { "status":"ok", "schema_version":"2.0",
+    "results_max_seq": int64, "results_rows": int64,
+    "sweeps_max_result_seq": int64 }</pre>
+
+  <h3>예시 흐름</h3>
+  <pre>1) 부트스트랩:   GET /results?since=0&amp;state=success&amp;version=0.3.9.0   (페이지 반복: since←X-Next-Since while X-Has-More)
+2) 신규 설계 스윕: GET /sweeps?since=&lt;직전 sweeps 최대 result_seq&gt;
+3) 다음 라운드:   GET /results?since=&lt;로컬 results 최대 seq&gt;   → 신규 0건이면 빈 스트림 + X-Has-More:false</pre>
+
+  <!-- 5 -->
+  <h2><span class="n">5</span>커서 · 증분 의미론 (엣지케이스까지) <span class="tag both">BOTH</span></h2>
+  <ul>
+    <li><span class="must">MUST</span> <code>seq</code>는 전역 단조증가, row 확정 시 할당, 갭 허용, 재사용/감소 없음.</li>
+    <li><span class="must">MUST</span> 페이징: 응답 <code>limit</code>행 가득 차면 <code>X-Has-More:true</code>. 클라는 <code>since = X-Next-Since</code>로 반복. <b>row의 seq가 아니라 헤더 <code>X-Next-Since</code>로 전진</b>(필터로 0행 페이지여도 커서 전진 보장 → state 필터 시 무한 재스캔 방지).</li>
+    <li><span class="must">MUST</span> idempotent: 같은 <code>since</code> 재요청은 같은 결과. 신규 없으면 0행 + <code>X-Has-More:false</code>, 수백 바이트, &lt;200ms.</li>
+    <li><span class="must">MUST</span> immutability: <code>seq</code>가 응답에 나온 순간 그 row는 불변. (집계/재계산으로 과거 row 값이 바뀌면 계약 위반.)</li>
+    <li><span class="must" style="background:#2a3340;color:#9fd0ff">SHOULD</span> 서버 타임아웃/대용량 시 <code>limit</code>로 조절. 클라는 <code>X-Has-More</code> 따라 자연히 페이징.</li>
+  </ul>
+
+  <!-- 6 -->
+  <h2><span class="n">6</span>의미 매핑 — 컬럼 → surrogate 타깃 <span class="tag both">BOTH (합의된 의미)</span></h2>
+  <p>양측이 "이 컬럼이 무엇인지" 동일하게 이해하도록 고정. featurization(아래)은 learning이 수행.</p>
+  <table>
+    <tr><th>surrogate 타깃</th><th>출처</th><th>계산</th></tr>
+    <tr><td class="m">R_tx_mOhm / R_rx_mOhm</td><td class="m">op_re_z11 / op_re_z22</td><td>×1000 (Ω→mΩ)</td></tr>
+    <tr><td class="m">M_nH</td><td class="m">op_im_z12</td><td>|op_im_z12| / (2π·f_op) ×1e9</td></tr>
+    <tr><td class="m">conv_delta</td><td class="m">max_mag_delta_s</td><td>그대로 (≤0/null→mask)</td></tr>
+    <tr><td class="m">L_tx_uH / L_rx_uH</td><td class="m">sweeps.im_z11 / im_z22</td><td>im_z / (2π·f) at 최저 freq ×1e6</td></tr>
+    <tr><td class="m">C_tx2_pF / C_rx2_pF</td><td class="m">sweeps.im_z11 / im_z22</td><td>im_z의 +→− 영점(자기공진 f_SRF) → 1/(L·(2π f_SRF)²) ×1e12</td></tr>
+    <tr><td class="m">loss_ratio_{m}_{side}</td><td class="m">loss_w_{m}_{side}</td><td>측별 합으로 정규화(tx 합=1, rx 합=1)</td></tr>
+  </table>
+  <p class="note">즉 <b>M·R·conv·loss는 results 스칼라만으로</b>, <b>L·C2는 sweeps</b>만 있으면 추출된다. 스칼라 fetch가 항상 핫, 스윕은 신규 설계에만.</p>
+
+  <!-- 7 -->
+  <h2><span class="n">7</span>SLA / 수용 기준 (측정 방법 포함)</h2>
+  <table>
+    <tr><th>항목</th><th>기준</th><th>측정</th></tr>
+    <tr><td>results 행당 페이로드</td><td class="good">&lt; 2 KB</td><td>응답 bytes / 행수</td></tr>
+    <tr><td>신규 1만 행 results fetch</td><td class="good">≤ 2 s, ≤ 10 MB</td><td>since=현재-1만, 벽시계</td></tr>
+    <tr><td>신규 0건 재요청</td><td class="good">&lt; 200 ms, &lt; 4 KB</td><td>since=max_seq 재호출</td></tr>
+    <tr><td>sweeps 1만 설계 fetch</td><td class="good">≤ 10 s, ≤ 200 MB</td><td>since 증분</td></tr>
+    <tr><td>핫 경로 CSV 텍스트</td><td class="good">0</td><td>스키마에 부재</td></tr>
+  </table>
+  <p class="note">기준선: 현행 <span class="bad">500행 full=1 = 811 MB / 10.7 s</span> (5,574행 ≈ 9 GB, 매 라운드 풀싱크). v2는 신규분만.</p>
+
+  <!-- 8 -->
+  <h2><span class="n">8</span>LEARNING 측 구현 명세 (이 레포에서) <span class="tag l">LEARNING</span></h2>
+  <div class="card">
+    <p>신규 모듈 <code>0_3_9/dataplane.py</code> (현 <code>surrogate.py</code>의 <code>_fetch_arrow/_fetch_df/_parse_report_csv/_extract_row</code> 대체).</p>
+    <pre>artifacts/
+  results_cache.parquet   # §2 results, append-only, key=seq
+  sweeps_cache.parquet    # §3 sweeps, append-only, key=(result_seq,freq_hz)
+  feature_cache.parquet   # 추출된 13타깃 + 입력, key=seq  (모델이 읽는 것)
+
+def sync_results():   # GET /api/v2/results?since=local_max_seq  (X-Has-More 동안 페이징) → append
+def sync_sweeps(new_seqs):  # GET /api/v2/sweeps?since=...  신규 설계만 → append
+def featurize(new_rows, sweeps):  # §6 매핑으로 13타깃 추출(숫자 배열 위, 텍스트 파싱 0) → feature_cache append
+def build_dataset():  # sync_results→sync_sweeps(신규)→featurize(신규)→feature_cache에서 df,X,Y,groups
+                      #   (FENCE/transform_Y/Surrogate 는 그대로)</pre>
+    <ul>
+      <li><span class="must">MUST</span> <code>since=0</code> 풀싱크 호출 제거. 부트스트랩 1회 후엔 신규 seq만.</li>
+      <li><span class="must">MUST</span> CSV 텍스트 파싱 코드 전부 삭제. L/C 추출(<code>_extract_LC2</code>)은 <code>sweeps</code> 숫자 배열 입력으로 재작성.</li>
+      <li><span class="must">MUST</span> 버전 불일치 시 feature_cache 무효화(재부트스트랩).</li>
+      <li><span class="must" style="background:#2a3340;color:#9fd0ff">SHOULD</span> 수용 테스트 스크립트: 신규 0건 재호출 &lt;200ms, 신규 N행 처리 시간 로깅.</li>
+    </ul>
+  </div>
+
+  <!-- 9 -->
+  <h2><span class="n">9</span>마이그레이션 — 무중단 병행 컷오버</h2>
+  <table>
+    <tr><th>단계</th><th>RUNNER</th><th>LEARNING</th><th>게이트</th></tr>
+    <tr><td>P0</td><td>v2 스키마 테이블 생성 + ingestion에서 쓰기시 추출 적재 + 기존 csv_text에서 1회 백필</td><td>스키마 리뷰</td><td>health.results_rows == 기존 success 수</td></tr>
+    <tr><td>P1</td><td><code>/api/v2/*</code> 출시(구 <code>/api/results?full=1</code> 병행 유지)</td><td><code>dataplane.py</code> 개발(브랜치), 구·신 결과 동일성 검증</td><td>v2 추출 == 현행 추출 (모든 타깃 일치)</td></tr>
+    <tr><td>P2</td><td>—</td><td><code>build_dataset</code> v2 컷오버, CSV 파싱 삭제</td><td>SLA(§7) 통과</td></tr>
+    <tr><td>P3</td><td>구 <code>full=1</code> / <code>csv_text_by_report_json</code> <b>제거</b></td><td>구 경로 참조 0 확인</td><td>느린 경로 물리적 부재</td></tr>
+  </table>
+  <p class="note"><span class="must">MUST</span> P1에서 <b>동일성 게이트</b>: 같은 설계 집합에 대해 v2 추출 13타깃이 현행 CSV 추출과 비트수준 동일(부동소수 허용오차 1e-9)이어야 컷오버. 어긋나면 컷오버 금지.</p>
+
+  <!-- 10 -->
+  <h2><span class="n">10</span>버전·변경관리 §11 <span class="tag both">BOTH</span></h2>
+  <ul>
+    <li><code>schema_version</code> (health). v2.x = <b>additive only</b>(신규 nullable 컬럼). 기존 컬럼 dtype/의미 in-place 변경 <span class="must">MUST NOT</span>.</li>
+    <li>breaking 변경은 <code>/api/v3</code> 신설 + 병행 기간. 무단 변경 금지.</li>
+    <li>컬럼 추가/제거는 이 문서 개정 + 양측 ack 후.</li>
+  </ul>
+
+  <div class="card" style="margin-top:24px">
+    <p class="note">이 계약은 코드가 아니다. 그러나 위 §2/§3 스키마와 §4 시그니처는 <span class="req">구현이 정확히 따라야 하는 사양</span>이며,
+    runner와 learning은 이 문서만으로 독립 구현해도 P1 동일성 게이트를 통과해야 한다. 통과하지 못하면 그건 구현 버그이지 계약 모호성이 아니다.</p>
+  </div>
+
+</div>
+</body>
+</html>
