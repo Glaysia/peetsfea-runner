@@ -102,7 +102,8 @@
 </div>
 
 <div class="item P1">
-<span class="id">B5</span><span class="tag P1b">P1</span><span class="tag sz">S</span> <b>파티션 폴백 — cpu2 최우선, 가용 부족 시 gpu 노드까지 확장</b>
+<span class="id">B5</span><span class="tag P1b">P1</span><span class="tag sz">S</span> <b>파티션 폴백 — cpu2 최우선, 가용 부족 시 gpu 노드까지 확장 <span class="ok">— 완료 (46dcbec)</span></b>
+<p class="mut" style="margin:4px 0 0">구현: <code>DEFAULT_PARTITIONS=(cpu2,gpu1,gpu2,gpu3)</code> 복원·gpu는 폴백전용. <code>_select_partition</code> cpu2 엄격우선(가중랜덤 폐지) → cpu2 후보 0일 때만 gpu. <code>_candidate_nodes</code>에 sinfo <code>%C</code> free-core 프리필터(B3) 추가 — idle 코어&lt;요청 cpus 노드 제외 → cpu2 진짜 포화 시 gpu 폴백 즉시. B2 stuck감지와 짝(cpu2 핀 막히면 avoid→gpu).</p>
 <p><b class="lbl">동기</b> 만성 PENDING(B1)의 근본은 <b>cpu2(~10노드) 단일 파티션을 타유저와 공유</b>해 슬롯이 모자란 것. gpu 파티션 노드는 CPU 솔브에도 쓸 수 있는데(HFSS analyze는 CPU 코어가 본체, GPU는 옵션) 지금은 cpu2만 노린다. <b>cpu2를 1순위로 꽉 채우고, 남는 잡만 gpu 노드로 흘려보내면</b> PENDING 고착이 풀린다.</p>
 <p><b class="lbl">현상</b> cpu2 mix 7/alloc 3이라 hmlee31 2잡 상시 PENDING(Resources). 카운트 18 정체. gpu 파티션은 놀고 있어도 후보에서 빠져 있음.</p>
 <div class="rec"><b>제안(구현 명세)</b>
@@ -202,7 +203,7 @@
 <tr><th>순서</th><th>항목</th><th>왜 먼저</th><th>크기</th></tr>
 <tr><td>1</td><td><b>A1</b> 컨트롤러 자원 천장 인식</td><td>발산 피드백 = 모든 실패의 뿌리. 이거 하나로 성공률 근본 안정</td><td>M</td></tr>
 <tr><td>2</td><td><b>B2</b> 노드핀 고착+중복제출 <span class="tag P0b">P0</span> <span class="ok">✓완료</span></td><td>"올라가자마자 내려온다"·처리량 붕괴의 직접 원인. squeue 스냅샷 reconcile(채택+중복제거+stuck재배치)로 해결 — 4398655</td><td>M</td></tr>
-<tr><td>3</td><td><b>A2</b> 코어↔동시성 명시 결합 / <b>B1·B3·B5</b> 잡수·포화·파티션폴백</td><td>A1의 짝 + 노드 잔여 churn 제거. <b>B5</b>(cpu2 우선→gpu 폴백)로 PENDING 근본 완화</td><td>S</td></tr>
+<tr><td>3</td><td><b>A2</b> 코어↔동시성 명시 결합 / <b>B1·B3·B5</b> 잡수·포화·파티션폴백 <span class="ok">✓B5·B3</span></td><td>A1의 짝 + 노드 잔여 churn 제거. <b>B5</b>(cpu2 우선→gpu 폴백)+B3 free-core 프리필터 완료 — 46dcbec. B1(잡수 동적화)만 남음</td><td>S</td></tr>
 <tr><td>4</td><td><b>A3/C1</b> 라이선스 대기·linger</td><td>HPC 고갈 내성. 조사 필요</td><td>S~M</td></tr>
 <tr><td>5</td><td><b>F1</b> trade-off 모델</td><td>설정 변경의 나침반 — 이후 모든 솔브튜닝 가속</td><td>L</td></tr>
 <tr><td>5'</td><td><b>E3</b> 레지스트리 동시성 버그</td><td>어댑티브 루프가 :7875로 카드/ratio 못 박음 = 외부 최적화 마비. 행잠금만 넣으면 S. web 재시작이 임시완화</td><td>S</td></tr>
