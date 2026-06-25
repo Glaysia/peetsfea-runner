@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 import random
 from collections.abc import Sequence
 
-from .edt_orchestrator import JobHandle
+from .edt_orchestrator import JobHandle, JobInfo
 
 Clock = Callable[[], float]
 
@@ -298,6 +298,30 @@ class SlurmJobLauncher:
         if result.returncode != 0 or not result.stdout.strip():
             return ""
         return result.stdout.strip().splitlines()[0].strip()
+
+    def list_active_by_index(self) -> dict[int, list[JobInfo]]:
+        """squeue --me 1회로 내 활성 잡을 job_index(잡이름 접미사)별로 그룹화 — state·node·reason 포함.
+        키퍼가 ① 중복제거 ② 막힌 PENDING 재배치 ③ 재시작 후 채택에 쓴다(슬롯당 잡 1개 truth)."""
+        states = ",".join(sorted(_ACTIVE_STATES))
+        result = self._ssh(f"squeue --me -h -t {states} -o '%i|%j|%T|%N|%r'")
+        out: dict[int, list[JobInfo]] = {}
+        if result.returncode != 0:
+            return out
+        prefix = f"{self.job_name_prefix}-"
+        for line in result.stdout.splitlines():
+            parts = line.split("|")
+            if len(parts) < 5:
+                continue
+            sid, name, state, node, reason = (p.strip() for p in parts[:5])
+            if not name.startswith(prefix):
+                continue
+            suffix = name[len(prefix):]
+            if not suffix.isdigit():
+                continue
+            # PENDING은 %N이 비거나 '(reason)' 형태 → 노드 미상으로 둔다(회피는 reason의 노드명으로).
+            node = "" if (not node or node.startswith("(")) else node
+            out.setdefault(int(suffix), []).append(JobInfo(slurm_id=sid, state=state, node=node, reason=reason))
+        return out
 
     def _ordered_candidates(self) -> list[tuple[str, str]]:
         """제출 후보 노드 순서: ① 상대 계정 노드 항상 배제(SHM) ② 내 잡 수(squeue+예약)가 max 이상인 노드 배제
