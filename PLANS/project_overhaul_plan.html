@@ -104,6 +104,17 @@
 <div class="item P1">
 <span class="id">B5</span><span class="tag P1b">P1</span><span class="tag sz">S</span> <b>파티션 폴백 — cpu2 최우선, 가용 부족 시 gpu 노드까지 확장 <span class="ok">— 완료 (46dcbec)</span></b>
 <p class="mut" style="margin:4px 0 0">구현: <code>DEFAULT_PARTITIONS=(cpu2,gpu1,gpu2,gpu3)</code> 복원·gpu는 폴백전용. <code>_select_partition</code> cpu2 엄격우선(가중랜덤 폐지) → cpu2 후보 0일 때만 gpu. <code>_candidate_nodes</code>에 sinfo <code>%C</code> free-core 프리필터(B3) 추가 — idle 코어&lt;요청 cpus 노드 제외 → cpu2 진짜 포화 시 gpu 폴백 즉시. B2 stuck감지와 짝(cpu2 핀 막히면 avoid→gpu).</p>
+<div class="rec" style="margin-top:8px"><b>후속 — 폴백 파티션 풀 확장 (미적용, 키퍼 재시작 필요)</b>
+<p style="margin:4px 0">실측 클러스터 파티션(2026-06-26 <code>sinfo</code>): <code>cpu2</code>(10노드·256코어, 주력) 외에 폴백 가능한 게 더 있다 — 현재 <code>gpu1/2/3</code>만 넣었지만 <b>가장 크고 여유 많은 게 빠져있다</b>:</p>
+<table style="font-size:12px">
+<tr><th>파티션</th><th>노드</th><th>코어</th><th>현재 여유(mix)</th><th>폴백</th></tr>
+<tr><td class="m">gpu4</td><td>29</td><td>56</td><td><b>mix 12</b> (alloc 16, resv 1)</td><td class="bad">빠짐</td></tr>
+<tr><td class="m">gpu6</td><td>25</td><td>48</td><td><b>mix 18</b> (alloc 6, drain 1)</td><td class="bad">빠짐</td></tr>
+<tr><td class="m">gpu5</td><td>6</td><td>64</td><td>mix 1</td><td class="bad">빠짐</td></tr>
+<tr><td class="m">gpu1/2/3</td><td>14/11/10</td><td>48/56/56</td><td>mix 7/7/10</td><td class="ok">포함</td></tr>
+<tr><td class="m">cpu1</td><td>10</td><td>48</td><td>mix 3</td><td class="mut">후보(CPU 솔브)</td></tr>
+</table>
+<p style="margin:4px 0"><b>제안</b>: <code>DEFAULT_PARTITIONS</code>에 <code>gpu4·gpu5·gpu6</code> 추가(특히 mix 많은 gpu4·gpu6). 코어(48~64)·메모리(768G~1024G)는 우리 잡(24코어/384G)에 충분. cpu1(CPU 솔브, gpu보다 빠름)도 우선순위 폴백 후보. <b>주의</b> ① 키퍼 재시작(=safe_scancel 잡 리스폰) 필요 → 다음 배포 때 묶기. ② gpu4/5/6 우리 계정 <b>제출 권한(QOS/AllowGroups) 미확인</b> — 넣고 거부되는지 1회 검증. 동기: hmlee31 폴백 잡이 gpu2/gpu3에서 <code>Priority</code>로 대기 중인데, 여유 많은 gpu4/gpu6를 후보에서 빼놔 자리 못 찾았을 수 있음.</p></div>
 <p><b class="lbl">동기</b> 만성 PENDING(B1)의 근본은 <b>cpu2(~10노드) 단일 파티션을 타유저와 공유</b>해 슬롯이 모자란 것. gpu 파티션 노드는 CPU 솔브에도 쓸 수 있는데(HFSS analyze는 CPU 코어가 본체, GPU는 옵션) 지금은 cpu2만 노린다. <b>cpu2를 1순위로 꽉 채우고, 남는 잡만 gpu 노드로 흘려보내면</b> PENDING 고착이 풀린다.</p>
 <p><b class="lbl">현상</b> cpu2 mix 7/alloc 3이라 hmlee31 2잡 상시 PENDING(Resources). 카운트 18 정체. gpu 파티션은 놀고 있어도 후보에서 빠져 있음.</p>
 <div class="rec"><b>제안(구현 명세)</b>
