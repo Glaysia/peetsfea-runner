@@ -48,6 +48,122 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+# --- 데이터플레인 추출(PLANS/runner_dataplane_reform.html) -------------------------------------
+# 시뮬 종료 시점(인제스트)에 CSV 리포트 텍스트를 **1회** 파싱해 타입 컬럼으로 적재한다. 이후 모든 reader는
+# 숫자 컬럼만 읽어 csv_text 재파싱/대용량 전송을 없앤다. 추출 의미론은 learning surrogate `_extract_row`와
+# 동일: op=Results1_Pass 마지막행 col 8/9/10/11/13, sweep=Results3_Freq col0(kHz)·8~13, 손실=Results2_Last
+# 행0을 재질(copper/fr4/ferrite)×측면(tx/rx) 버킷으로 raw W 합산(Region_Abs 제외).
+_DP_SCALAR_COLS: tuple[str, ...] = (
+    "op_freq_hz",
+    "op_re_z11", "op_im_z11", "op_re_z22", "op_im_z22", "op_re_z12", "op_im_z12",
+    "max_mag_delta_s",
+    "loss_w_copper_tx", "loss_w_fr4_tx", "loss_w_ferrite_tx",
+    "loss_w_copper_rx", "loss_w_fr4_rx", "loss_w_ferrite_rx",
+)
+_DP_LOSS_BUCKETS: tuple[str, ...] = ("copper_tx", "fr4_tx", "ferrite_tx", "copper_rx", "fr4_rx", "ferrite_rx")
+_DP_SWEEP_COLS: tuple[str, ...] = ("re_z11", "im_z11", "re_z22", "im_z22", "re_z12", "im_z12")
+F_OP_HZ = 6.78e6  # operating frequency(계약 §2). Results2_Last에 실측이 있으면 그 값, 없으면 이 상수.
+
+
+def _to_float_or_none(x: Any) -> float | None:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v else None  # NaN -> None
+
+
+def _parse_report_csv(text: str) -> tuple[list[str], list[list[float | None]]]:
+    """리포트 CSV 텍스트 -> (헤더 컬럼명, [행[float|None]]). learning `_parse_report_csv`와 동일."""
+    import csv
+    import io
+
+    rows = list(csv.reader(io.StringIO(text or "")))
+    if not rows:
+        return [], []
+    cols = [c.strip().strip('"') for c in rows[0]]
+    data = [[_to_float_or_none(x) for x in r] for r in rows[1:] if r]
+    return cols, data
+
+
+def _insert_sweep_rows(
+    connection: "psycopg.Connection", request_id: str, sweep_rows: list[dict[str, float | None]]
+) -> None:
+    """freq_sweep 다건 삽입(executemany는 cursor 메서드라 connection.cursor() 경유)."""
+    sw_cols = ("request_id", "freq_hz", *_DP_SWEEP_COLS)
+    sw_ph = ", ".join("%s" for _ in sw_cols)
+    with connection.cursor() as cur:
+        cur.executemany(
+            f"INSERT INTO freq_sweep ({', '.join(sw_cols)}) VALUES ({sw_ph})",
+            [[request_id, s["freq_hz"], *[s[c] for c in _DP_SWEEP_COLS]] for s in sweep_rows],
+        )
+
+
+def _extract_dataplane(
+    result: Mapping[str, Any],
+) -> tuple[dict[str, float | None], list[dict[str, float | None]]]:
+    """result.csv_text_by_report -> (스칼라 컬럼 dict, freq_sweep 행 리스트). best-effort:
+    어떤 예외에도 인제스트를 깨지 않고 부분추출이라도 보존한다(실패분은 None/빈 리스트)."""
+    scalars: dict[str, float | None] = {c: None for c in _DP_SCALAR_COLS}
+    sweep_rows: list[dict[str, float | None]] = []
+    try:
+        reports = result.get("csv_text_by_report")
+        if not isinstance(reports, Mapping):
+            return scalars, sweep_rows
+        # 동작점 Z: Results1_Pass 마지막 데이터행 (col 8 reZ11, 9 imZ11, 10 reZ22, 11 imZ22, 13 imZ12)
+        _pc, prows = _parse_report_csv(str(reports.get("Results1_Pass", "")))
+        if prows:
+            fp = prows[-1]
+
+            def _at(i: int) -> float | None:
+                return fp[i] if i < len(fp) else None
+
+            scalars["op_re_z11"], scalars["op_im_z11"] = _at(8), _at(9)
+            scalars["op_re_z22"], scalars["op_im_z22"] = _at(10), _at(11)
+            scalars["op_re_z12"], scalars["op_im_z12"] = _at(12), _at(13)
+            scalars["op_freq_hz"] = F_OP_HZ  # Results2 실측 있으면 아래에서 덮어씀
+        # max_mag_delta_s: 현행 솔브설정(16/16/16 고정, MaxMagDeltaS 미export)에선 소스 없음 → null 유지.
+        # 수렴 delta export가 켜지면(계획서 F3) 여기서 추출. 계약 §2 "없으면 null" 준수.
+        # 주파수 스윕: Results3_Freq (col0 Freq[kHz]->Hz, 8~13 = re/im Z11/Z22/Z12)
+        _fc, frows = _parse_report_csv(str(reports.get("Results3_Freq", "")))
+        seen: set[float] = set()
+        for r in frows:
+            if len(r) < 14 or r[0] is None or r[0] <= 0:
+                continue
+            fhz = r[0] * 1e3
+            if fhz in seen:
+                continue
+            seen.add(fhz)
+            sweep_rows.append({"freq_hz": fhz, **{k: r[8 + j] for j, k in enumerate(_DP_SWEEP_COLS)}})
+        # 재질별 손실(raw W): Results2_Last 행0을 측면×재질 버킷으로 합산
+        lcols, lrows = _parse_report_csv(str(reports.get("Results2_Last", "")))
+        if lrows:
+            lrow = lrows[0]
+            # Results2_Last col0 = "Freq [MHz]" 실측 → op_freq_hz(있을 때만 상수 덮어씀)
+            if lrow and lrow[0] is not None and lrow[0] > 0:
+                scalars["op_freq_hz"] = lrow[0] * 1e6
+            buck: dict[str, float | None] = {b: None for b in _DP_LOSS_BUCKETS}
+            for i, c in enumerate(lcols):
+                cn = str(c).strip('"')
+                if not cn.startswith("loss_W_") or "Region_Abs" in cn or i >= len(lrow):
+                    continue
+                v = lrow[i]
+                if v is None:
+                    continue
+                side = "tx" if "tx" in cn else "rx"
+                mat = "copper" if "copper" in cn else ("fr4" if "fr4" in cn else ("ferrite" if "ferrite" in cn else None))
+                if mat is None:
+                    continue
+                bkey = f"{mat}_{side}"
+                if bkey in buck:
+                    buck[bkey] = (buck[bkey] or 0.0) + v
+            for b in _DP_LOSS_BUCKETS:
+                scalars[f"loss_w_{b}"] = buck[b]
+    except Exception:
+        pass
+    return scalars, sweep_rows
+
+
 @dataclass(slots=True)
 class PostgresResultStore:
     """`SingleSimulationResultStore`(DuckDB)와 동일한 공개 메서드 시그니처/반환형을 가진 Postgres 백엔드.
@@ -221,6 +337,26 @@ class PostgresResultStore:
                 )
                 """
             )
+            # 데이터플레인 reform: csv_text를 인제스트 시 1회 추출해 채우는 타입 스칼라 컬럼들.
+            # (PLANS/runner_dataplane_reform.html §4. csv_text_by_report_json은 P3 컷오버 전까지 병행 유지.)
+            for _c in _DP_SCALAR_COLS:
+                connection.execute(
+                    f"ALTER TABLE single_simulation_results ADD COLUMN IF NOT EXISTS {_c} double precision"
+                )
+            # 주파수 스윕(long-format). result_seq는 seq 트리거가 update마다 바뀌므로 안정 PK인 request_id로 링크.
+            # /api/sweeps는 results와 request_id 조인 후 r.seq>since로 증분(seq는 커서 전용).
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS freq_sweep (
+                    request_id text,
+                    freq_hz double precision,
+                    re_z11 double precision, im_z11 double precision,
+                    re_z22 double precision, im_z22 double precision,
+                    re_z12 double precision, im_z12 double precision,
+                    PRIMARY KEY (request_id, freq_hz)
+                )
+                """
+            )
 
     def record_envelope(self, envelope: Mapping[str, Any]) -> None:
         self.initialize()
@@ -265,6 +401,9 @@ class PostgresResultStore:
             "elapsed_ms": float(_elapsed) if isinstance(_elapsed, (int, float)) and not isinstance(_elapsed, bool) else None,
             "gpu_used": bool(tel.get("gpu_used")),
         }
+        # 데이터플레인: csv_text를 인제스트 시 1회 추출해 타입 컬럼/스윕으로 적재(reader는 숫자만 읽음).
+        dp_scalars, sweep_rows = _extract_dataplane(result)
+        row.update(dp_scalars)
         columns = tuple(row)
         placeholders = ", ".join("%s" for _ in columns)
         # keep-best: 이미 'success'가 있으면 비-success로 덮어쓰지 않는다.
@@ -277,7 +416,13 @@ class PostgresResultStore:
             "OR EXCLUDED.terminal_state = 'success'"
         )
         with self._locked_connect() as connection:
-            connection.execute(sql, [row[column] for column in columns])
+            with connection.transaction():
+                connection.execute(sql, [row[column] for column in columns])
+                # 스윕은 success + 추출분이 있을 때만 교체. (실패/무추출은 기존 스윕을 건드리지 않음 —
+                # keep-best로 결과행이 no-op일 때 스윕만 날아가는 일 방지.)
+                if row["terminal_state"] == "success" and sweep_rows:
+                    connection.execute("DELETE FROM freq_sweep WHERE request_id = %s", [request_id])
+                    _insert_sweep_rows(connection, request_id, sweep_rows)
 
     def fetch_rows(
         self,
@@ -361,6 +506,92 @@ class PostgresResultStore:
                     yield dict(zip(colnames, row, strict=True))
         finally:
             conn.close()
+
+    def stream_sweeps_since(
+        self,
+        *,
+        since: int = 0,
+        result_seqs: "Sequence[int] | None" = None,
+    ) -> "Iterator[dict[str, Any]]":
+        """freq_sweep을 results.seq 커서로 (result_seq, freq_hz) 오름차순 스트리밍(계약 §3/§4).
+        result_seqs 주면 그 설계들만(since 무시·상호배타). 페이지 경계는 호출측이 처리(설계 분할 금지)."""
+        self.initialize()
+        if result_seqs is not None:
+            clause = "r.seq = ANY(%s)"
+            param: Any = [int(x) for x in result_seqs]
+        else:
+            clause = "r.seq > %s"
+            param = int(since)
+        sql = (
+            "SELECT r.seq AS result_seq, fs.freq_hz, "
+            "fs.re_z11, fs.im_z11, fs.re_z22, fs.im_z22, fs.re_z12, fs.im_z12 "
+            "FROM freq_sweep fs JOIN single_simulation_results r ON r.request_id = fs.request_id "
+            "WHERE " + clause + " ORDER BY r.seq, fs.freq_hz"
+        )
+        conn = psycopg.connect(self.dsn, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                colnames: list[str] | None = None
+                for row in cur.stream(sql, [param]):
+                    if colnames is None:
+                        colnames = [c.name for c in (cur.description or [])]
+                    yield dict(zip(colnames, row, strict=True))
+        finally:
+            conn.close()
+
+    def dataplane_health(self) -> dict[str, int]:
+        """계약 §4 /api/v2/health 용 지표: results 최대 seq·행수, sweeps 보유 설계의 최대 result_seq."""
+        self.initialize()
+        with self._locked_connect() as connection:
+            rmax, rrows = connection.execute(
+                "SELECT COALESCE(max(seq), 0), count(*) FROM single_simulation_results"
+            ).fetchone()
+            smax = connection.execute(
+                "SELECT COALESCE(max(r.seq), 0) FROM single_simulation_results r "
+                "WHERE EXISTS (SELECT 1 FROM freq_sweep fs WHERE fs.request_id = r.request_id)"
+            ).fetchone()[0]
+        return {"results_max_seq": int(rmax), "results_rows": int(rrows), "sweeps_max_result_seq": int(smax)}
+
+    def backfill_dataplane(self, *, batch: int = 500, limit: int | None = None) -> dict[str, int]:
+        """기존 success 행의 csv_text에서 스칼라/스윕을 1회 추출해 채운다(멱등: op_re_z11 IS NULL만).
+        구 API 병행 구간에서 신규 컬럼을 채우는 마이그레이션 P0. 반환: 처리/스윕행 카운트."""
+        self.initialize()
+        processed = 0
+        swept = 0
+        last_seq = 0  # seq 커서로 페이지 전진 → 추출이 None인 행도 재선택되지 않음(무한루프 방지)
+        while True:
+            with self._locked_connect() as connection:
+                rows = connection.execute(
+                    "SELECT seq, request_id, csv_text_by_report_json FROM single_simulation_results "
+                    "WHERE terminal_state = 'success' AND seq > %s AND op_re_z11 IS NULL "
+                    "AND csv_text_by_report_json IS NOT NULL AND csv_text_by_report_json <> '{}' "
+                    "ORDER BY seq LIMIT %s",
+                    [last_seq, int(batch)],
+                ).fetchall()
+            if not rows:
+                break
+            for seq, request_id, csvj in rows:
+                last_seq = int(seq)
+                try:
+                    result = {"csv_text_by_report": json.loads(csvj or "{}")}
+                except json.JSONDecodeError:
+                    result = {"csv_text_by_report": {}}
+                scalars, sweep_rows = _extract_dataplane(result)
+                set_clause = ", ".join(f"{c} = %s" for c in _DP_SCALAR_COLS)
+                with self._locked_connect() as connection:
+                    with connection.transaction():
+                        connection.execute(
+                            f"UPDATE single_simulation_results SET {set_clause} WHERE request_id = %s",
+                            [*[scalars[c] for c in _DP_SCALAR_COLS], request_id],
+                        )
+                        if sweep_rows:
+                            connection.execute("DELETE FROM freq_sweep WHERE request_id = %s", [request_id])
+                            _insert_sweep_rows(connection, request_id, sweep_rows)
+                processed += 1
+                swept += len(sweep_rows)
+                if limit is not None and processed >= limit:
+                    return {"processed": processed, "sweep_rows": swept}
+        return {"processed": processed, "sweep_rows": swept}
 
     def max_baseline_seed(self) -> int:
         """이미 사용한 baseline seed의 최대값. request_id=`base-{seed}-{i}`에서 {seed}를 파싱한 max(없으면 -1).
