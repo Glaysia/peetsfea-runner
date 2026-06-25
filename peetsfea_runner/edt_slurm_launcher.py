@@ -26,12 +26,11 @@ Clock = Callable[[], float]
 _ACTIVE_STATES = frozenset({"RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "RESIZING", "REQUEUED"})
 _SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 
-# 잡을 랜덤 분배하는 파티션(MASTER_PLAN §2.10 / Q5: 파티션별 성능 통계 자연 수집).
-# 최근 2시간(2026-06-19) 관측상 평균 RUNNING job이 4~5개에 묶였다. job당 AEDT 수는 충분하므로
-# cpu2/gpu1에 더해 MIX 여유가 보이는 gpu2/gpu3까지 후보를 넓혀 평균 RUNNING job 9개를 목표로 한다.
-# cpu2 전용: gpu 노드는 AEDT가 GPU를 실제로 안 써(nvidia-smi 0%·gpu_used는 거짓 config 플래그) CPU 솔브인데
-# 코어까지 적어 cpu2보다 느렸다(gpu 14~15분 vs cpu2 11분). → gpu 파티션 제거, cpu2만 사용.
-DEFAULT_PARTITIONS: tuple[str, ...] = ("cpu2",)
+# 잡 배치 파티션 — **cpu2 최우선, 포화 시 gpu 폴백**(B5, PLANS/project_overhaul_plan.html).
+# _select_partition이 cpu2를 엄격 우선(가중랜덤 아님)하므로 gpu1/2/3은 **cpu2에 자리가 없을 때만** 쓴다.
+# gpu 노드는 AEDT가 GPU를 실제로 안 써(CPU 솔브) 코어 적어 cpu2보다 느리지만(gpu 14~15분 vs cpu2 11분),
+# cpu2가 타유저로 포화돼 잡이 자리를 못 찾을 때 처리량을 흘려보내는 폴백으로만 쓴다(평시엔 cpu2만).
+DEFAULT_PARTITIONS: tuple[str, ...] = ("cpu2", "gpu1", "gpu2", "gpu3")
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,9 +79,9 @@ class SlurmJobLauncher:
     # node_based=True면 파티션에 던지지 않고 **빈 노드를 골라 --nodelist로 핀**한다. sinfo로 idle/mix 노드를
     # 찾고, 이미 내 잡이 도는 노드는 제외(노드당 1잡 = 과적재 방지). 오케스트레이터의 순차 램프와 짝.
     node_based: bool = False
-    # 노드 선택 시 파티션 가중: cpu2와 gpu가 둘 다 가용이면 cpu2를 이 확률로 고른다(나머지는 gpu).
+    # (B5 이전 가중선택용 — 이제 _select_partition이 cpu2 엄격 우선이라 미사용. 구성 호환 위해 필드 유지.)
     cpu2_weight: float = 0.7
-    rng: Callable[[], float] = random.random  # 가중 선택용(테스트 주입 가능)
+    rng: Callable[[], float] = random.random
     # 막힌 PENDING으로 취소된 노드를 이 시간 동안 후보에서 제외(그 노드가 한동안 안 비므로). clock 단위.
     avoid_cooldown_seconds: float = 300.0
     # 같은 control tick에서 연속 제출할 때 squeue 반영 지연으로 같은 노드를 다시 고르지 않게 하는 짧은 로컬 예약.
@@ -242,8 +241,12 @@ class SlurmJobLauncher:
         return counts
 
     def _candidate_nodes(self) -> list[tuple[str, str]]:
-        """대상 파티션의 가용 노드 (node, partition). idle 우선, 그다음 mix."""
-        result = self._ssh(f"sinfo -h -N -p {','.join(self.partitions)} -o '%N %P %t'")
+        """대상 파티션의 가용 노드 (node, partition). idle 우선, 그다음 mix.
+
+        sinfo %C(=A/I/O/T)가 있으면 **idle 코어가 우리 잡 cpus 미만인 노드는 제외**(B3 free-core 프리필터):
+        --nodelist 핀은 코어가 모자라도 sbatch가 PENDING(ReqNodeNotAvail)으로 받아줘 고착되므로, 애초에
+        안 들어가는 노드를 후보에서 뺀다 → cpu2가 진짜 포화면 후보 0 → gpu 폴백이 즉시 작동(B5)."""
+        result = self._ssh(f"sinfo -h -N -p {','.join(self.partitions)} -o '%N %P %t %C'")
         if result.returncode != 0:
             return []
         idle: list[tuple[str, str]] = []
@@ -255,20 +258,25 @@ class SlurmJobLauncher:
             node, partition, state = parts[0], parts[1].rstrip("*"), parts[2].lower()
             if partition not in self.partitions:
                 continue
-            if state == "idle":
-                idle.append((node, partition))
-            elif state in ("mix", "mixed"):
-                mixed.append((node, partition))
+            if state not in ("idle", "mix", "mixed"):
+                continue
+            # free-core 필터: %C가 있을 때만(없으면 통과 — 구 테스트/포맷 호환). idle 코어 < 요청 cpus면 제외.
+            if len(parts) >= 4 and "/" in parts[3]:
+                try:
+                    idle_cores = int(parts[3].split("/")[1])
+                except (ValueError, IndexError):
+                    idle_cores = None
+                if idle_cores is not None and idle_cores < self._cpus_for(partition):
+                    continue
+            (idle if state == "idle" else mixed).append((node, partition))
         return idle + mixed
 
     def _select_partition(self, available: set[str]) -> str:
-        """가용 파티션 중 가중 선택: cpu2/gpu 둘 다면 cpu2를 cpu2_weight 확률로."""
-        has_cpu2 = "cpu2" in available
-        gpus = sorted(p for p in available if p.startswith("gpu"))
-        if has_cpu2 and gpus:
-            return "cpu2" if self.rng() < self.cpu2_weight else self.partition_chooser(gpus)
-        if has_cpu2:
+        """**cpu2 엄격 우선, gpu 폴백 전용**(B5): cpu2에 후보 노드가 있으면 무조건 cpu2를 먼저 채우고,
+        cpu2가 포화(후보 0)일 때만 gpu로 흘린다. 가중랜덤(cpu2_weight) 폐지 — gpu는 평시 미사용 폴백."""
+        if "cpu2" in available:
             return "cpu2"
+        gpus = sorted(p for p in available if p.startswith("gpu"))
         if gpus:
             return self.partition_chooser(gpus)
         return self.partition_chooser(sorted(available))

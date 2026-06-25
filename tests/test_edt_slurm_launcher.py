@@ -133,8 +133,8 @@ def test_random_partition_distribution() -> None:
         launcher.submit(0)
         seen.add(runner.calls[-1][1].split("--partition=")[1].split("\n")[0])  # type: ignore[union-attr]
     assert {"cpu2", "gpu1", "gpu2", "gpu3"} <= seen  # chooser가 명시 지정하면 gpu도 제출 가능(메커니즘)
-    # 기본 후보는 cpu2 전용으로 변경(gpu 노드는 GPU 미사용+코어 적어 느림 → 폐기).
-    assert set(SlurmJobLauncher().partitions) == {"cpu2"}
+    # 기본 후보 = cpu2 + gpu 폴백(B5). _select_partition이 cpu2 엄격 우선, gpu는 cpu2 포화 시만.
+    assert set(SlurmJobLauncher().partitions) == {"cpu2", "gpu1", "gpu2", "gpu3"}
 
 
 def test_mem_override_applies_to_all_partitions_for_verify_scripts() -> None:
@@ -230,19 +230,37 @@ def test_node_based_excludes_peer_account_nodes() -> None:
     assert handle.node == "n002"  # 상대 점유 n001 배제(cross-account SHM 충돌 방지) → 다음 노드
 
 
-def test_node_based_weighted_cpu2_vs_gpu() -> None:
-    sinfo = "n001 cpu2 idle\nn010 gpu1 idle\n"
-    # rng<cpu2_weight → cpu2
-    r1 = _node_runner(sinfo)
-    SlurmJobLauncher(command_runner=r1, clock=lambda: 0.0, partitions=("cpu2", "gpu1"),
-                     node_based=True, cpu2_weight=0.7, rng=lambda: 0.1).submit(0)
-    assert "--nodelist=n001" in _last_script(r1) and "--partition=cpu2" in _last_script(r1)
-    # rng>=cpu2_weight → gpu (gres 포함)
-    r2 = _node_runner(sinfo)
+def test_node_based_cpu2_priority_gpu_fallback() -> None:
+    # B5: cpu2+gpu 둘 다 가용 → 항상 cpu2(엄격 우선, rng 무관)
+    both = "n001 cpu2 idle\nn010 gpu1 idle\n"
+    for rng_val in (0.1, 0.9):
+        r = _node_runner(both)
+        SlurmJobLauncher(command_runner=r, clock=lambda: 0.0, partitions=("cpu2", "gpu1"),
+                         node_based=True, rng=lambda: rng_val).submit(0)
+        s = _last_script(r)
+        assert "--partition=cpu2" in s and "--nodelist=n001" in s
+    # cpu2 후보 없음(gpu만 가용) → gpu 폴백(gres 포함)
+    r2 = _node_runner("n010 gpu1 idle\n")
     SlurmJobLauncher(command_runner=r2, clock=lambda: 0.0, partitions=("cpu2", "gpu1"),
-                     node_based=True, cpu2_weight=0.7, rng=lambda: 0.9).submit(0)
+                     node_based=True).submit(0)
     s2 = _last_script(r2)
-    assert "--nodelist=n010" in s2 and "--partition=gpu1" in s2 and "--gres=gpu:1" in s2
+    assert "--partition=gpu1" in s2 and "--nodelist=n010" in s2 and "--gres=gpu:1" in s2
+
+
+def test_candidate_free_core_filter_falls_back_to_gpu_when_cpu2_full() -> None:
+    # %C(A/I/O/T): cpu2 mix는 idle 16<64라 제외, gpu1은 idle 64>=24라 후보 → cpu2 포화 시 gpu 폴백
+    sinfo = "n001 cpu2 mix 240/16/0/256\nn010 gpu1 idle 0/64/0/64\n"
+    runner = _node_runner(sinfo)
+    SlurmJobLauncher(command_runner=runner, clock=lambda: 0.0, partitions=("cpu2", "gpu1"),
+                     node_based=True).submit(0)
+    s = _last_script(runner)
+    assert "--partition=gpu1" in s and "--nodelist=n010" in s  # cpu2 코어부족으로 제외 → gpu
+
+    # 반대로 cpu2에 64코어 여유 있으면 cpu2 우선
+    runner2 = _node_runner("n001 cpu2 mix 192/64/0/256\nn010 gpu1 idle 0/64/0/64\n")
+    SlurmJobLauncher(command_runner=runner2, clock=lambda: 0.0, partitions=("cpu2", "gpu1"),
+                     node_based=True).submit(0)
+    assert "--partition=cpu2" in _last_script(runner2) and "--nodelist=n001" in _last_script(runner2)
 
 
 def test_node_based_prefers_idle_over_mix() -> None:
