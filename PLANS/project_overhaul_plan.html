@@ -136,6 +136,13 @@
 <div class="rec"><b>제안</b> lmstat 1회 폴을 공유(계정별 중복 제거), 파싱 견고화 + 실패 시 명시 에러, /status 스키마 점검.</div>
 </div>
 
+<div class="item P1">
+<span class="id">E3</span><span class="tag P1b">P1</span><span class="tag sz">S</span> <b>어댑티브 TOML 레지스트리(:7875)가 동시 갱신에 깨짐 — DB 동시성 버그 (TCP 아님)</b>
+<p><b class="lbl">증거(실측)</b> 외부 어댑티브 루프(host peets 172.16.165.84, pid 2997692)가 :7875로 카드/ratio 등록·lease하는데 web 로그에 <code>psycopg.InternalError: tuple concurrently updated</code> (<code>postgres_store.py:711 toml_registry_list</code> ← <code>edt_toml_registry.py:163 lease_chunk</code>) 반복 + <code>psycopg.DuplicateObject: trigger "bump_results_seq" already exists</code>(initialize DDL 비멱등). 진단 시 <code>adaptive_tomls</code> 6장(builtin-widest+custom-2~6) <b>ratio 전부 NULL(합 0)</b> — 85에서 더 망가짐. :7875는 127.0.0.1 바인딩(터널 경유)이고 요청은 정상 도착·응답 → <b>네트워크/2PC간 TCP 문제 아님, 서버측 DB 문제 확정.</b></p>
+<p><b class="lbl">원인</b> ① 어댑티브 루프의 chunk lease(next_seed 갱신)와 레지스트리 read/set_ratios가 <b>같은 <code>adaptive_tomls</code> 행을 행잠금/재시도 없이 동시 UPDATE</b> → MVCC 충돌 → 요청 500 → 루프엔 "연결 끊김"처럼 보임. ② set_ratios가 이 충돌로 계속 실패해 ratio가 NULL로 남음. ③ initialize()의 트리거 생성이 비멱등이라 web 재시작 시 init 트랜잭션이 깨질 수 있음.</p>
+<div class="rec"><b>제안</b> 레지스트리 DB 메서드(<code>toml_registry_list</code>/<code>lease_chunk</code>/<code>set_ratios</code>/next_seed 전진)에 <b>행잠금(<code>SELECT … FOR UPDATE</code>) 또는 직렬화-실패 재시도</b> 추가(레지스트리 mutation 직렬화). 트리거 DDL <code>CREATE … IF NOT EXISTS</code>(또는 DROP 후 생성)로 멱등화. <b>임시완화(코드 무관)</b>: web만 재시작 → DB 트랜잭션 상태 리셋·ratio 다음 라운드 재설정(키퍼/솔브 무손상). 단 부하 들어오면 재발하므로 행잠금이 근본.</div>
+</div>
+
 <h2>F. 솔브 설정 · peetsfea 코드</h2>
 
 <div class="item P1">
@@ -184,6 +191,7 @@
 <tr><td>3</td><td><b>A2</b> 코어↔동시성 명시 결합 / <b>B1·B3</b> 잡수·포화</td><td>A1의 짝 + 노드 잔여 churn 제거</td><td>S</td></tr>
 <tr><td>4</td><td><b>A3/C1</b> 라이선스 대기·linger</td><td>HPC 고갈 내성. 조사 필요</td><td>S~M</td></tr>
 <tr><td>5</td><td><b>F1</b> trade-off 모델</td><td>설정 변경의 나침반 — 이후 모든 솔브튜닝 가속</td><td>L</td></tr>
+<tr><td>5'</td><td><b>E3</b> 레지스트리 동시성 버그</td><td>어댑티브 루프가 :7875로 카드/ratio 못 박음 = 외부 최적화 마비. 행잠금만 넣으면 S. web 재시작이 임시완화</td><td>S</td></tr>
 <tr><td>6+</td><td>D1·E1·E2·F2·F3·G1·G2·G3</td><td>견고성·정리</td><td>S~M</td></tr>
 </table>
 
