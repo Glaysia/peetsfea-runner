@@ -23,6 +23,13 @@ _PG_LOCKS: dict[str, threading.RLock] = {}
 _PG_CONNS: dict[str, "psycopg.Connection"] = {}
 _PG_LOCKS_GUARD = threading.Lock()
 
+# 스키마 DDL은 프로세스당 1회만 돌린다. initialize()가 record_envelope/모든 registry 메서드
+# 첫머리에서 호출돼 매번 DROP/CREATE TRIGGER·CREATE OR REPLACE FUNCTION를 재실행하던 churn 제거.
+_INITIALIZED_DSNS: set[str] = set()
+# 프로세스간(웹·키퍼 동시 기동) DDL 직렬화용 advisory lock 키. 같은 DB에 둘이 동시에 트리거/함수
+# DDL을 돌리면 pg catalog가 "tuple concurrently updated"/DuplicateObject를 냈다(E3 근본원인).
+_INIT_LOCK_KEY = 1885434740  # 'peet'
+
 
 def _pg_lock(dsn: str) -> threading.RLock:
     with _PG_LOCKS_GUARD:
@@ -62,7 +69,19 @@ class PostgresResultStore:
             yield conn
 
     def initialize(self) -> None:
-        with self._locked_connect() as connection:
+        # 프로세스당 1회 + 프로세스간 advisory lock으로 직렬화. 매 호출마다 DDL을 재실행하던 걸 막아
+        # web·keeper 동시 DDL이 catalog를 "tuple concurrently updated"/DuplicateObject 내던 것 차단(E3).
+        with _pg_lock(self.dsn):
+            if self.dsn in _INITIALIZED_DSNS:
+                return
+            with self._locked_connect() as connection:
+                self._ensure_schema(connection)
+            _INITIALIZED_DSNS.add(self.dsn)
+
+    def _ensure_schema(self, connection: "psycopg.Connection") -> None:
+        # 모든 스키마 DDL을 단일 트랜잭션 + advisory lock 아래서 원자적으로. xact lock은 커밋 시 자동 해제.
+        with connection.transaction():
+            connection.execute("SELECT pg_advisory_xact_lock(%s)", [_INIT_LOCK_KEY])
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS single_simulation_results (
