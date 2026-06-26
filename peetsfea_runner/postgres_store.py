@@ -87,15 +87,15 @@ def _parse_report_csv(text: str) -> tuple[list[str], list[list[float | None]]]:
 
 
 def _insert_sweep_rows(
-    connection: "psycopg.Connection", request_id: str, sweep_rows: list[dict[str, float | None]]
+    connection: "psycopg.Connection", point_hash: str, sweep_rows: list[dict[str, float | None]]
 ) -> None:
-    """freq_sweep 다건 삽입(executemany는 cursor 메서드라 connection.cursor() 경유)."""
-    sw_cols = ("request_id", "freq_hz", *_DP_SWEEP_COLS)
+    """freq_sweep 다건 삽입(point_hash로 링크). executemany는 cursor 메서드라 connection.cursor() 경유."""
+    sw_cols = ("point_hash", "freq_hz", *_DP_SWEEP_COLS)
     sw_ph = ", ".join("%s" for _ in sw_cols)
     with connection.cursor() as cur:
         cur.executemany(
             f"INSERT INTO freq_sweep ({', '.join(sw_cols)}) VALUES ({sw_ph})",
-            [[request_id, s["freq_hz"], *[s[c] for c in _DP_SWEEP_COLS]] for s in sweep_rows],
+            [[point_hash, s["freq_hz"], *[s[c] for c in _DP_SWEEP_COLS]] for s in sweep_rows],
         )
 
 
@@ -201,7 +201,9 @@ class PostgresResultStore:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS single_simulation_results (
-                    request_id text PRIMARY KEY,
+                    -- request_id는 카드슬롯+카운터라 라운드마다 재사용된다 → PK 아님(다른 설계를 덮어쓰던 버그).
+                    -- 설계 정체성 = point_hash. dedup/keep-best는 아래 부분 유니크 인덱스(point_hash)로 한다.
+                    request_id text,
                     account_id text,
                     host_alias text,
                     partition text,
@@ -343,17 +345,30 @@ class PostgresResultStore:
                 connection.execute(
                     f"ALTER TABLE single_simulation_results ADD COLUMN IF NOT EXISTS {_c} double precision"
                 )
-            # 주파수 스윕(long-format). result_seq는 seq 트리거가 update마다 바뀌므로 안정 PK인 request_id로 링크.
-            # /api/sweeps는 results와 request_id 조인 후 r.seq>since로 증분(seq는 커서 전용).
+            # dedup/keep-best 키 = **설계 정체성**. point_hash 있는 설계는 point_hash로 유니크(다른 설계가
+            # request_id 재사용으로 서로를 덮어쓰던 버그 차단). point_hash 없는 실패행은 request_id로 유니크(keep-best).
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ssr_point_hash_uniq "
+                "ON single_simulation_results (point_hash) WHERE point_hash IS NOT NULL AND point_hash <> ''"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ssr_request_id_fail_uniq "
+                "ON single_simulation_results (request_id) WHERE point_hash IS NULL OR point_hash = ''"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS ssr_request_id_idx ON single_simulation_results (request_id)"
+            )
+            # 주파수 스윕(long-format). **point_hash(설계 정체성)로 링크** — request_id는 재사용되고 seq는
+            # update마다 bump되므로 안정 키는 point_hash. /api/v2/sweeps는 results와 point_hash 조인 후 r.seq>since.
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS freq_sweep (
-                    request_id text,
+                    point_hash text,
                     freq_hz double precision,
                     re_z11 double precision, im_z11 double precision,
                     re_z22 double precision, im_z22 double precision,
                     re_z12 double precision, im_z12 double precision,
-                    PRIMARY KEY (request_id, freq_hz)
+                    PRIMARY KEY (point_hash, freq_hz)
                 )
                 """
             )
@@ -406,23 +421,30 @@ class PostgresResultStore:
         row.update(dp_scalars)
         columns = tuple(row)
         placeholders = ", ".join("%s" for _ in columns)
-        # keep-best: 이미 'success'가 있으면 비-success로 덮어쓰지 않는다.
-        # ON CONFLICT DO UPDATE ... WHERE (기존이 success가 아니거나 신규가 success일 때만 갱신).
-        update_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c != "request_id")
+        point_hash = row["point_hash"]
+        # dedup 키 = **설계 정체성**. point_hash 있으면 point_hash로(다른 설계가 request_id 재사용으로
+        # 서로를 덮어쓰던 버그 차단), 없으면(실패) request_id로 keep-best. 부분 유니크 인덱스로 추론.
+        if point_hash:
+            conflict = "(point_hash) WHERE point_hash IS NOT NULL AND point_hash <> ''"
+            key_col = "point_hash"
+        else:
+            conflict = "(request_id) WHERE point_hash IS NULL OR point_hash = ''"
+            key_col = "request_id"
+        # keep-best: 기존이 success가 아니거나 신규가 success일 때만 갱신(success 행 불변 — 다른 적재가 못 덮음).
+        update_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c != key_col)
         sql = (
             f"INSERT INTO single_simulation_results ({', '.join(columns)}) VALUES ({placeholders}) "
-            f"ON CONFLICT (request_id) DO UPDATE SET {update_set} "
+            f"ON CONFLICT {conflict} DO UPDATE SET {update_set} "
             "WHERE single_simulation_results.terminal_state <> 'success' "
             "OR EXCLUDED.terminal_state = 'success'"
         )
         with self._locked_connect() as connection:
             with connection.transaction():
                 connection.execute(sql, [row[column] for column in columns])
-                # 스윕은 success + 추출분이 있을 때만 교체. (실패/무추출은 기존 스윕을 건드리지 않음 —
-                # keep-best로 결과행이 no-op일 때 스윕만 날아가는 일 방지.)
-                if row["terminal_state"] == "success" and sweep_rows:
-                    connection.execute("DELETE FROM freq_sweep WHERE request_id = %s", [request_id])
-                    _insert_sweep_rows(connection, request_id, sweep_rows)
+                # 스윕은 success + point_hash + 추출분이 있을 때만 교체(point_hash로 키). 실패/무추출은 기존 보존.
+                if row["terminal_state"] == "success" and sweep_rows and point_hash:
+                    connection.execute("DELETE FROM freq_sweep WHERE point_hash = %s", [point_hash])
+                    _insert_sweep_rows(connection, point_hash, sweep_rows)
 
     def fetch_rows(
         self,
@@ -473,6 +495,7 @@ class PostgresResultStore:
         if version_clause:
             sql += " AND " + version_clause
             params.extend(version_params)
+        sql += " ORDER BY seq DESC LIMIT 1"  # request_id는 더 이상 유니크 아님 → 최신 1건
         with self._locked_connect() as connection:
             cur = connection.execute(sql, params)
             row = cur.fetchone()
@@ -525,7 +548,7 @@ class PostgresResultStore:
         sql = (
             "SELECT r.seq AS result_seq, fs.freq_hz, "
             "fs.re_z11, fs.im_z11, fs.re_z22, fs.im_z22, fs.re_z12, fs.im_z12 "
-            "FROM freq_sweep fs JOIN single_simulation_results r ON r.request_id = fs.request_id "
+            "FROM freq_sweep fs JOIN single_simulation_results r ON r.point_hash = fs.point_hash "
             "WHERE " + clause + " ORDER BY r.seq, fs.freq_hz"
         )
         conn = psycopg.connect(self.dsn, autocommit=True)
@@ -548,7 +571,7 @@ class PostgresResultStore:
             ).fetchone()
             smax = connection.execute(
                 "SELECT COALESCE(max(r.seq), 0) FROM single_simulation_results r "
-                "WHERE EXISTS (SELECT 1 FROM freq_sweep fs WHERE fs.request_id = r.request_id)"
+                "WHERE EXISTS (SELECT 1 FROM freq_sweep fs WHERE fs.point_hash = r.point_hash)"
             ).fetchone()[0]
         return {"results_max_seq": int(rmax), "results_rows": int(rrows), "sweeps_max_result_seq": int(smax)}
 
@@ -562,15 +585,16 @@ class PostgresResultStore:
         while True:
             with self._locked_connect() as connection:
                 rows = connection.execute(
-                    "SELECT seq, request_id, csv_text_by_report_json FROM single_simulation_results "
+                    "SELECT seq, point_hash, csv_text_by_report_json FROM single_simulation_results "
                     "WHERE terminal_state = 'success' AND seq > %s AND op_re_z11 IS NULL "
+                    "AND point_hash IS NOT NULL AND point_hash <> '' "
                     "AND csv_text_by_report_json IS NOT NULL AND csv_text_by_report_json <> '{}' "
                     "ORDER BY seq LIMIT %s",
                     [last_seq, int(batch)],
                 ).fetchall()
             if not rows:
                 break
-            for seq, request_id, csvj in rows:
+            for seq, point_hash, csvj in rows:
                 last_seq = int(seq)
                 try:
                     result = {"csv_text_by_report": json.loads(csvj or "{}")}
@@ -581,12 +605,12 @@ class PostgresResultStore:
                 with self._locked_connect() as connection:
                     with connection.transaction():
                         connection.execute(
-                            f"UPDATE single_simulation_results SET {set_clause} WHERE request_id = %s",
-                            [*[scalars[c] for c in _DP_SCALAR_COLS], request_id],
+                            f"UPDATE single_simulation_results SET {set_clause} WHERE point_hash = %s",
+                            [*[scalars[c] for c in _DP_SCALAR_COLS], point_hash],
                         )
                         if sweep_rows:
-                            connection.execute("DELETE FROM freq_sweep WHERE request_id = %s", [request_id])
-                            _insert_sweep_rows(connection, request_id, sweep_rows)
+                            connection.execute("DELETE FROM freq_sweep WHERE point_hash = %s", [point_hash])
+                            _insert_sweep_rows(connection, point_hash, sweep_rows)
                 processed += 1
                 swept += len(sweep_rows)
                 if limit is not None and processed >= limit:

@@ -155,7 +155,7 @@ def _rec_full(store, rid, *, state="success", n_sweep=5):  # type: ignore[no-unt
     store.record_envelope({
         "request_id": rid, "terminal_state": state, "peetsfea_version": "0.3.9.5", "node": "n100",
         "started_at": "2026-06-25T10:00:00+00:00", "finished_at": "2026-06-25T10:15:00+00:00",
-        "result": {"design_id": rid, "point_hash": "ph", "point_values": {"a": 1.5, "b": 2.0},
+        "result": {"design_id": rid, "point_hash": f"ph-{rid}", "point_values": {"a": 1.5, "b": 2.0},
                    "csv_text_by_report": reports, "solve_telemetry": {"elapsed_ms": 900000.0, "gpu_used": True}},
         "error": {},
     })
@@ -176,7 +176,7 @@ def test_dataplane_extraction_columns_and_sweep(pg_store) -> None:  # type: igno
     assert (cu_tx, fr4_tx, fe_tx, cu_rx, fr4_rx) == (0.01, 0.02, 0.03, 0.04, 0.05)
     assert fe_rx is None  # rx ferrite 없음 → null
     with pg_store._locked_connect() as c:
-        sw = c.execute("SELECT freq_hz, re_z11, im_z11 FROM freq_sweep WHERE request_id='d-1' ORDER BY freq_hz").fetchall()
+        sw = c.execute("SELECT freq_hz, re_z11, im_z11 FROM freq_sweep WHERE point_hash='ph-d-1' ORDER BY freq_hz").fetchall()
     assert len(sw) == 5
     assert sw[0][0] == 100.0 * 1e3 and sw[0][1] == 1.0  # kHz->Hz, re_z11
     assert [s[0] for s in sw] == sorted(s[0] for s in sw)
@@ -289,5 +289,40 @@ def test_backfill_dataplane(pg_store) -> None:  # type: ignore[no-untyped-def]
     assert out["processed"] == 1 and out["sweep_rows"] == 5
     with pg_store._locked_connect() as c:
         v = c.execute("SELECT op_re_z11 FROM single_simulation_results WHERE request_id='bf-1'").fetchone()[0]
-        n = c.execute("SELECT count(*) FROM freq_sweep WHERE request_id='bf-1'").fetchone()[0]
+        n = c.execute("SELECT count(*) FROM freq_sweep WHERE point_hash='ph-bf-1'").fetchone()[0]
     assert v == 10.0 and n == 5
+
+
+def _rec_design(store, rid, ph, state="success"):  # type: ignore[no-untyped-def]
+    store.record_envelope({
+        "request_id": rid, "terminal_state": state, "finished_at": "2026-06-26T10:00:00+00:00",
+        "result": {"design_id": ph, "point_hash": ph, "point_values": {"x": 1.0}}, "error": {},
+    })
+
+
+def test_different_designs_same_request_id_both_survive(pg_store) -> None:  # type: ignore[no-untyped-def]
+    # 버그 재현 방지: 같은 request_id(카드슬롯 재사용)라도 다른 point_hash는 서로 삭제/덮어쓰지 않는다.
+    _rec_design(pg_store, "toml-custom-3-5", "designA")
+    _rec_design(pg_store, "toml-custom-3-5", "designB")  # 같은 request_id, 다른 설계
+    with pg_store._locked_connect() as c:
+        phs = {r[0] for r in c.execute(
+            "SELECT point_hash FROM single_simulation_results WHERE point_hash IN ('designA','designB')").fetchall()}
+    assert phs == {"designA", "designB"}  # 예전엔 designB가 designA를 덮어썼음 → 이제 둘 다 생존
+
+
+def test_same_design_resolve_keepbest(pg_store) -> None:  # type: ignore[no-untyped-def]
+    # 같은 point_hash 재시도는 1행 유지(keep-best), 실패가 success를 덮지 않음.
+    _rec_design(pg_store, "r1", "D", "success")
+    _rec_design(pg_store, "r2", "D", "failed")  # 같은 설계 다른 request_id, failed
+    with pg_store._locked_connect() as c:
+        rows = c.execute("SELECT terminal_state FROM single_simulation_results WHERE point_hash='D'").fetchall()
+    assert len(rows) == 1 and rows[0][0] == "success"  # 1행·success 불변
+
+
+def test_failures_without_point_hash_dedup_by_request_id(pg_store) -> None:  # type: ignore[no-untyped-def]
+    # point_hash 없는 실패행은 request_id로 keep-best(누적 안 됨).
+    _rec(pg_store, "f1", "failed")
+    _rec(pg_store, "f1", "failed")  # 같은 request_id 재인제스트
+    with pg_store._locked_connect() as c:
+        n = c.execute("SELECT count(*) FROM single_simulation_results WHERE request_id='f1'").fetchone()[0]
+    assert n == 1  # 중복 안 생김
