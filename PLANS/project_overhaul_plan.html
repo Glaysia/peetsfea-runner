@@ -132,6 +132,19 @@
 <span class="id">C1</span><span class="tag P1b">P1</span><span class="tag sz">M</span> <b>teardown이 HPC 라이선스를 깨끗이 안 놓음 → linger로 풀 막힘</b>
 <p><b class="lbl">증거</b> 버전전환마다 scancel한 16코어 솔브의 anshpc가 <b>linger 상태로 648개(풀 72%)</b> 잔류. lmremove 불가("Cannot remove a linger license"), 강제회수 권한/방법 없음. ~3시간 자연 timeout 대기.</p>
 <div class="rec"><b>제안</b> graceful teardown에서 ansysedt에 라이선스 release 신호(clean exit) 우선 + linger 기간 짧게 설정 가능한지(옵션파일/벤더) 조사. 최소한 버전전환을 잡 TTL 회전으로(scancel 대신) 해 linger 폭증 방지.</div>
+<div class="rec" style="margin-top:8px"><b>2026-07-02 실측 정정 — lmremove는 사실 먹힌다</b>
+<p style="margin:4px 0">기존 "lmremove 불가"는 틀림. <code>feature+user+host+display</code>를 지정하면 <b>우리 죽은 체크아웃은 강제 회수됨</b>(linger 거부 안 함). 서비스 내린 뒤 실측: 우리 stale 체크아웃 <b>774→4</b>, <code>anshpc 348→32</code>·<code>hfss 132→4</code>·<code>electronics3d_gui 550(만석)→412</code>. 원-라이너:</p>
+<pre style="font-size:11.5px;white-space:pre-wrap">LM=/opt/ohpc/pub/Electronics/v252/licensingclient/linx64/lmutil
+$LM lmstat -a -c 1055@license-server | awk '/^Users of /{f=$3;sub(/:/,"",f)}
+  /start (Mon|Tue|Wed|Thu|Fri|Sat|Sun)/ && ($1=="harry261"||$1=="hmlee31"){print f,$1,$2,$3}' | sort -u |
+  while read feat u h d; do $LM lmremove -c 1055@license-server "$feat" "$u" "$h" "$d"; done   # 2~3패스</pre></div>
+<div class="rec" style="margin-top:8px"><b>요구 설계 — ansysedt 종료 시 pyaedt가 라이선스 회수까지 (keeper)</b>
+<ul>
+<li><b>① pyaedt graceful release (1차)</b> — 솔브 종료/entrypoint 정리 시 pyaedt가 <b>명시적으로 데스크톱·솔버 라이선스를 반납</b>: <code>hfss.release_desktop(close_projects=True, close_on_exit=True)</code> 또는 <code>Desktop.close_desktop()</code>로 FlexLM checkin이 정상 발생하게(현재는 프로세스 급종료로 checkin 없이 linger). 예외/타임아웃에도 finally로 반드시 호출. 이게 근본 — linger 자체를 안 만듦.</li>
+<li><b>② teardown lmremove 안전망 (2차)</b> — ①이 실패(크래시·SIGKILL)해 linger가 남으면, per-solve 컨테이너 exit trap(slot_service) 또는 keeper <code>ExecStopPost</code>에서 <b>그 잡의 노드에 대한 우리 체크아웃만</b> 위 원-라이너로 lmremove. 컨테이너=노드(host=n&lt;NNN&gt;)라 <b>자기 노드 한정</b>으로 좁혀 남의 잡 영향 0.</li>
+<li><b>③ 주기 sweep (3차)</b> — keeper 폴 루프에 "우리 잡 없는 노드의 우리 체크아웃" 감지→회수(오펀 지표 C2와 연계). 잡 0인데 라이선스 잡힌 상태를 자동 청소.</li>
+<li><b>주의</b> lmremove 대상은 <b>반드시 harry261/hmlee31 + 우리 잡 노드</b>로 필터(남의 체크아웃 절대 안 건드림). host를 우리 <code>squeue --me</code> 노드셋으로 교차검증.</li>
+</ul></div>
 </div>
 
 <div class="item P3">
